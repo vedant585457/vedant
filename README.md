@@ -47,6 +47,25 @@ chronological order. Hierarchical indentation shows the agent tree; `--ascii`
 swaps all glyphs. `--json` writes JSONL to stdout and prose to stderr; a plain
 `--log-file` also captures events the terminal filter hid.
 
+## Agent lifecycle animation
+
+`LifecycleTracker` pairs a **visible start and terminal state** for every agent
+and task — spawn, delegate, active work, reasoning, review, retry, merge, done.
+
+```bash
+python vedant_osint.py lifecycle               # scripted demonstration
+python vedant_osint.py lifecycle --self-test   # 33 guarantee checks
+python vedant_osint.py lifecycle --json        # records + counters + events
+```
+
+Status text is model-safe: `sanitize_status` refuses deliberation phrasing and
+caps every string at 20 words, and reasoning is reported as a `StatusSummary`
+(decision · criterion · next action) with no narrative field. All active work
+shares one transient line carrying counters and elapsed time, so permanent lines
+grow with transitions, not ticks. Ctrl-C, exceptions, cancellation and
+`shutdown()` (also via `atexit`) all close open records — an interrupted run
+never leaves a spinner running.
+
 ## Run state
 
 `RunStateStore` is the single source of truth for a mission in flight: objective,
@@ -148,7 +167,7 @@ Authorised use only — collect from systems you own or are explicitly permitted
 | Phase | Scope | State |
 |-------|-------|-------|
 | 1 | Foundation — CLI skeleton, config probing, version reporting | ✅ done |
-| 2 | Contracts — settings, `doctor`, preflight, models, run-state, renderer | ✅ done |
+| 2 | Contracts — settings, `doctor`, preflight, models, state, renderer, lifecycle | ✅ done |
 | 3 | Orchestration — LangGraph Master Agent + runtime Subagent factory | ⬜ next |
 | 4 | Browser — browser-use / Playwright sessions and capture | ⬜ |
 | 5 | Collection — passive OSINT sources, artefact hashing | ⬜ |

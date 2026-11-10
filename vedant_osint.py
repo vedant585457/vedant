@@ -172,6 +172,38 @@ terminal filter hid::
     python vedant_osint.py renderer --record trace.jsonl --replay trace.jsonl
     python vedant_osint.py renderer --from-state case/state.json
 
+Agent lifecycle animation
+-------------------------
+``LifecycleTracker`` renders the *life* of each agent, worker and task on top of
+the event renderer: spawn, delegation, active work, reasoning, review, retry,
+merge and completion.  Reusable methods: ``spawn``, ``delegate``,
+``active_work`` (context manager), ``reasoning``, ``review``, ``retry_task``,
+``merge``, ``complete``.
+
+* **Concise, model-safe text only.**  :func:`sanitize_status` refuses
+  deliberation ("let me think step by step", "my reasoning", "hmm") and caps
+  every string at 20 words / 120 chars.  Reasoning is reported through
+  :class:`StatusSummary` — decision, criterion, next action — which has no field
+  for narrative, so hidden chain-of-thought cannot reach the terminal, a log or
+  a report.
+* **One animated line, not one per agent.**  Active work shares a single
+  transient status line carrying ``N active · M done · elapsed`` and the current
+  summary.  Permanent lines appear only on state transitions, so a 100-task run
+  produces ~300 lines rather than thousands of ticks.  ``--heartbeat N`` adds
+  throttled progress lines if you want them.
+* **Start and terminal are paired.**  Every record gets exactly one start line
+  and one terminal line with elapsed time and attempt number.  Exceptions mark
+  the record ``failed``, cancellation marks it ``cancelled``, Ctrl-C marks it
+  ``interrupted``, and ``shutdown()`` (idempotent, also registered with
+  ``atexit``) closes anything still open — so an interrupted run can never leave
+  a spinner turning or a task without an ending.
+
+::
+
+    python vedant_osint.py lifecycle                 # scripted demonstration
+    python vedant_osint.py lifecycle --self-test     # 33 guarantee checks
+    python vedant_osint.py lifecycle --json          # records + counters + events
+
 Usage
 -----
 ::
@@ -183,6 +215,7 @@ Usage
     python vedant_osint.py models                       # typed model catalogue + self-test
     python vedant_osint.py state --stress               # run-state concurrency self-test
     python vedant_osint.py renderer --self-test         # CLI-only renderer guarantees
+    python vedant_osint.py lifecycle --self-test        # lifecycle animation guarantees
     python vedant_osint.py doctor                       # full capability health check
     python vedant_osint.py policy -o "..." --scope example.com          # safety preflight only
     python vedant_osint.py mission --target example.com -o "map the attack surface"
@@ -253,6 +286,8 @@ from __future__ import annotations
 # ══════════════════════════════════════════════════════════════════════════
 
 # --- standard library: cheap, side-effect free -------------------------------
+import asyncio
+import atexit
 import hashlib
 import importlib.util
 import io
@@ -265,13 +300,14 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum, IntEnum
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 # --- third party: CLI surface -------------------------------------------------
 # Typer + Rich are the only hard imports.  They are imported at module level
@@ -283,6 +319,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
+from rich.status import Status
 from rich.table import Table
 from rich.text import Text
 
@@ -303,7 +340,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 7
+VERSION_MINOR: int = 8
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -356,7 +393,7 @@ BUILD_PHASE_NAME: str = "Contracts"
 #: Section banners shared by the banner panel and ``version --json``.
 PHASE_ROADMAP: tuple[tuple[int, str, str], ...] = (
     (1, "Foundation", "CLI skeleton, config probing, version reporting"),
-    (2, "Contracts", "Settings, doctor, preflight, models, run-state, renderer"),
+    (2, "Contracts", "Settings, doctor, preflight, models, state, renderer, lifecycle"),
     (3, "Orchestration", "LangGraph Master Agent + runtime Subagent factory"),
     (4, "Browser", "browser-use/Playwright sessions and capture"),
     (5, "Collection", "passive OSINT sources, artefact hashing/chain of custody"),
@@ -8002,7 +8039,1153 @@ def run_renderer_self_test() -> list[RendererCheck]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 18. Entry point
+# 18. Agent lifecycle animation
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Task 7 renders *events*.  This section renders the *life* of each agent and
+# task: spawn, delegation, active work, reasoning, review, retry, merge and
+# completion — with elapsed time and live counters, animated, without flooding
+# the terminal and without ever showing hidden reasoning.
+#
+# Three rules, each enforced in code:
+#
+#   1. CONCISE, MODEL-SAFE TEXT ONLY.  Every status string passes through
+#      :func:`sanitize_status`, which rejects deliberation phrasing ("let me
+#      think step by step", "my reasoning", "first, I will consider") and
+#      truncates prose.  Reasoning is reported as a *summary* — the current
+#      decision, the quality criterion, or the next action — never as a train of
+#      thought.  :meth:`LifecycleTracker.reasoning` therefore accepts structured
+#      fields, not free-form paragraphs.
+#   2. ONE ANIMATED LINE, NOT ONE PER AGENT.  All active work shares a single
+#      transient status line carrying counters and elapsed time.  Permanent
+#      lines are emitted only on state *transitions* (start and terminal), so
+#      the log grows with the number of entities, not with the number of ticks.
+#   3. START AND TERMINAL ARE PAIRED.  Every record gets exactly one start line
+#      and one terminal line.  ``shutdown()`` is idempotent, runs from
+#      ``atexit``, and turns anything still running into an explicit
+#      ``interrupted`` record — so an aborted run can never leave a spinner
+#      turning or an entity without an ending.
+
+class LifecycleState(str, Enum):
+    """States of a tracked agent, worker or task."""
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    WAITING = "waiting"          # blocked on a dependency or a human
+    RETRYING = "retrying"
+    REVIEWING = "reviewing"
+    MERGING = "merging"
+    DONE = "done"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    INTERRUPTED = "interrupted"  # the run stopped underneath it
+    MERGED = "merged"
+
+    @property
+    def terminal(self) -> bool:
+        return self in {
+            LifecycleState.DONE,
+            LifecycleState.FAILED,
+            LifecycleState.CANCELLED,
+            LifecycleState.INTERRUPTED,
+            LifecycleState.MERGED,
+        }
+
+
+class LifecycleKind(str, Enum):
+    """What is being tracked."""
+
+    AGENT = "agent"
+    SUBAGENT = "subagent"
+    WORKER = "worker"
+    TASK = "task"
+
+
+class UnsafeStatusError(ValueError):
+    """Raised when status text would leak deliberation or exceed the limit."""
+
+
+#: Phrasing that indicates deliberation rather than a status summary.  These
+#: are refused because chain-of-thought must never reach the console, a log or
+#: a report — the operator needs the decision, not the monologue.
+_DELIBERATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\b(let me|let's|i'?ll|i will|i'?m going to|we will now)\s+"
+               r"(think|reason|consider|walk through|ponder|figure out)", re.I),
+    re.compile(r"\b(chain[- ]of[- ]thought|thought process|my reasoning|internal monologue)\b", re.I),
+    re.compile(r"\bstep[- ]?(by[- ]?step|1|one)\b[^.]{0,20}\b(think|reason|consider)", re.I),
+    re.compile(r"\b(first|second|third|finally),?\s+(i|we)\s+(think|consider|reason|will now)", re.I),
+    re.compile(r"\b(hmm+|uhh+|erm+|wait,)\b", re.I),
+    re.compile(r"\b(tokens? by tokens?|as a language model|my training data)\b", re.I),
+    re.compile(r"\b(on second thought|scratch that|actually,? let me)\b", re.I),
+)
+
+#: Upper bounds.  Chosen so a full status line fits an 80-column CI log.
+STATUS_TEXT_LIMIT: int = 120
+STATUS_FIELD_LIMIT: int = 60
+STATUS_MAX_WORDS: int = 20
+
+
+def sanitize_status(text: str, *, limit: int = STATUS_TEXT_LIMIT, strict: bool = False) -> str:
+    """Reduce *text* to a single concise, model-safe status line.
+
+    Collapses whitespace and control characters, refuses deliberation phrasing,
+    and truncates at a word boundary.  With ``strict=True`` prohibited phrasing
+    raises :class:`UnsafeStatusError` instead of being replaced — used by tests
+    and by any caller that must fail closed.
+    """
+
+    if not isinstance(text, str):
+        raise TypeError(f"status text must be str, got {type(text).__name__}")
+
+    cleaned = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return "working"
+
+    if any(pattern.search(cleaned) for pattern in _DELIBERATION_PATTERNS):
+        if strict:
+            raise UnsafeStatusError("status text contains deliberation; report a decision, criterion or next action")
+        # Keep the signal, drop the monologue.
+        cleaned = "considering options — see decision below"
+
+    words = cleaned.split()
+    if len(words) > STATUS_MAX_WORDS:
+        cleaned = " ".join(words[:STATUS_MAX_WORDS]) + "…"
+    if len(cleaned) > limit:
+        cut = cleaned[: limit - 1]
+        cleaned = (cut.rsplit(" ", 1)[0] if " " in cut else cut) + "…"
+    return cleaned
+
+
+def format_elapsed(seconds: float) -> str:
+    """Compact human duration: ``0.4s``, ``12s``, ``2m03s``, ``1h02m``."""
+
+    seconds = max(0.0, float(seconds))
+    if seconds < 10:
+        return f"{seconds:.1f}s"
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    minutes, rest = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m{rest:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+class StatusSummary(StrictModel):
+    """A structured, model-safe summary of what an agent is doing.
+
+    Exactly the three things an operator needs from a reasoning step: the
+    decision taken, the criterion being applied, and what happens next.  There
+    is deliberately no field for narrative.
+    """
+
+    decision: str | None = Field(default=None, max_length=STATUS_FIELD_LIMIT)
+    criterion: str | None = Field(default=None, max_length=STATUS_FIELD_LIMIT)
+    next_action: str | None = Field(default=None, max_length=STATUS_FIELD_LIMIT)
+    note: str | None = Field(default=None, max_length=STATUS_FIELD_LIMIT)
+
+    @field_validator("decision", "criterion", "next_action", "note", mode="before")
+    @classmethod
+    def _sanitise(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        return sanitize_status(str(value), limit=STATUS_FIELD_LIMIT, strict=True)
+
+    def is_empty(self) -> bool:
+        return not any((self.decision, self.criterion, self.next_action, self.note))
+
+    def render(self, limit: int = STATUS_TEXT_LIMIT) -> str:
+        """``decision · criterion · next: action`` — no narrative, one line.
+
+        Truncated at :data:`STATUS_TEXT_LIMIT` so a summary never wraps into
+        three lines in an 80-column CI log.
+        """
+
+        parts: list[str] = []
+        if self.decision:
+            parts.append(self.decision)
+        if self.criterion:
+            parts.append(f"criterion: {self.criterion}")
+        if self.next_action:
+            parts.append(f"next: {self.next_action}")
+        if self.note:
+            parts.append(self.note)
+        joined = " · ".join(parts) if parts else "working"
+        return sanitize_status(joined, limit=limit)
+
+
+@dataclass
+class LifecycleRecord:
+    """Mutable lifecycle state for one agent, worker or task."""
+
+    id: str
+    kind: LifecycleKind
+    label: str
+    parent: str | None = None
+    state: LifecycleState = LifecycleState.QUEUED
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    started_monotonic: float | None = None
+    finished_monotonic: float | None = None
+    attempts: int = 1
+    summary: StatusSummary | None = None
+    terminal_emitted: bool = False
+    start_emitted: bool = False
+    note: str | None = None
+    counters: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def elapsed_seconds(self) -> float:
+        if self.started_monotonic is None:
+            return 0.0
+        end = self.finished_monotonic if self.finished_monotonic is not None else time.monotonic()
+        return max(0.0, end - self.started_monotonic)
+
+    @property
+    def terminal(self) -> bool:
+        return self.state.terminal
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "kind": self.kind.value,
+            "label": self.label,
+            "parent": self.parent,
+            "state": self.state.value,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "finished_at": self.finished_at.isoformat() if self.finished_at else None,
+            "elapsed_seconds": round(self.elapsed_seconds, 3),
+            "attempts": self.attempts,
+            "summary": self.summary.render() if self.summary else None,
+            "terminal_emitted": self.terminal_emitted,
+            "counters": dict(self.counters),
+        }
+
+
+class _LiveStatus:
+    """One shared transient status line.  Never more than one is running."""
+
+    def __init__(self, console: Console, *, enabled: bool, refresh_per_second: float = 8.0) -> None:
+        self.console = console
+        self.enabled = bool(enabled and console.is_terminal)
+        self.refresh_per_second = max(1.0, float(refresh_per_second))
+        self._status: Status | None = None
+        self._text = ""
+        self._suspend_depth = 0
+        self._lock = threading.RLock()
+
+    @property
+    def running(self) -> bool:
+        with self._lock:
+            return self._status is not None
+
+    def _start(self) -> None:
+        if not self.enabled or self._status is not None:
+            return
+        self._status = Status(
+            self._text or "working",
+            console=self.console,
+            spinner="dots",
+            refresh_per_second=self.refresh_per_second,
+        )
+        self._status.start()
+
+    def update(self, text: str) -> None:
+        with self._lock:
+            if not self.enabled:
+                return
+            self._text = text
+            if self._status is None and self._suspend_depth == 0:
+                self._start()
+            elif self._status is not None:
+                self._status.update(text)
+
+    def suspend(self) -> None:
+        """Stop the spinner so a permanent line can be printed cleanly."""
+
+        with self._lock:
+            self._suspend_depth += 1
+            if self._suspend_depth == 1 and self._status is not None:
+                self._status.stop()
+                self._status = None
+
+    def resume(self) -> None:
+        with self._lock:
+            if self._suspend_depth > 0:
+                self._suspend_depth -= 1
+            if self._suspend_depth == 0 and self.enabled and self._text:
+                self._start()
+
+    def stop(self) -> None:
+        """Stop for good and restore the cursor.  Idempotent."""
+
+        with self._lock:
+            if self._status is not None:
+                self._status.stop()
+                self._status = None
+            self._suspend_depth = 0
+
+
+class LifecycleTracker:
+    """Animated, non-flooding lifecycle tracking for agents, workers and tasks.
+
+    Wraps an :class:`EventRenderer` (which owns permanent lines) and a single
+    :class:`_LiveStatus` (which owns the transient line).  All public methods
+    are thread-safe; concurrent Workers cannot produce interleaved output or
+    duplicate terminal records.
+    """
+
+    def __init__(
+        self,
+        renderer: EventRenderer,
+        *,
+        animation: bool = True,
+        refresh_per_second: float = 8.0,
+        heartbeat_seconds: float = 0.0,
+        max_terminal_lines: int = 4,
+        clock: "Callable[[], float] | None" = None,
+        wall_clock: "Callable[[], datetime] | None" = None,
+        register_atexit: bool = True,
+    ) -> None:
+        self.renderer = renderer
+        self._lock = threading.RLock()
+        self._records: dict[str, LifecycleRecord] = {}
+        self._order: list[str] = []
+        self._clock = clock or time.monotonic
+        self._wall = wall_clock or utc_now
+        self._live = _LiveStatus(renderer.console, enabled=animation, refresh_per_second=refresh_per_second)
+        self._heartbeat_seconds = max(0.0, heartbeat_seconds)
+        self._last_heartbeat = 0.0
+        self._max_terminal_lines = max(1, max_terminal_lines)
+        self._terminal_lines = 0
+        self._started_monotonic = self._clock()
+        self._closed = False
+        self.counters: dict[str, int] = {
+            "spawned": 0, "started": 0, "completed": 0, "failed": 0,
+            "cancelled": 0, "interrupted": 0, "retries": 0, "merges": 0,
+            "reviews": 0, "reasoning": 0,
+        }
+        if register_atexit:
+            # Last line of defence: a process that exits mid-run still stops the
+            # spinner and closes every open record.
+            atexit.register(self.shutdown)
+
+    # -- internals ---------------------------------------------------------
+
+    def _print(self, renderable: Any, *, stamp: bool = True) -> None:
+        """Print a permanent line without corrupting the live line.
+
+        Lifecycle lines are timestamped like renderer lines so a mixed log reads
+        as one stream rather than two stylistic layers.
+        """
+
+        prefix = ""
+        if stamp and self.renderer.timestamps:
+            prefix = f"[dim]{self._wall().astimezone(timezone.utc).strftime('%H:%M:%S')}[/dim] "
+        self._live.suspend()
+        try:
+            # Indentation belongs after the timestamp, so the time column stays
+            # left-aligned while the tree still steps inwards.
+            text = str(renderable)
+            indent = ""
+            while text.startswith(("│  ", "|  ")):
+                indent += text[:3]
+                text = text[3:]
+            self.renderer.console.print(f"{prefix}{indent}{text}", highlight=False, soft_wrap=False)
+        finally:
+            self._live.resume()
+
+    def _counters_text(self) -> str:
+        active = sum(1 for r in self._records.values() if not r.terminal)
+        done = self.counters["completed"]
+        failed = self.counters["failed"] + self.counters["cancelled"] + self.counters["interrupted"]
+        elapsed = format_elapsed(self._clock() - self._started_monotonic)
+        parts = [f"{active} active", f"{done} done"]
+        if failed:
+            parts.append(f"{failed} failed")
+        parts.append(f"{elapsed} elapsed")
+        return " · ".join(parts)
+
+    def _refresh_live(self, focus: LifecycleRecord | None = None) -> None:
+        if not self._live.enabled:
+            return
+        detail = ""
+        if focus is not None:
+            summary = focus.summary.render() if focus.summary else focus.state.value
+            detail = f" — {focus.label}: {summary}"
+        elif (latest := self._latest_active()) is not None:
+            summary = latest.summary.render() if latest.summary else latest.state.value
+            detail = f" — {latest.label}: {summary}"
+        self._live.update(f"{self._counters_text()}{detail}")
+
+    def _latest_active(self) -> LifecycleRecord | None:
+        for record_id in reversed(self._order):
+            record = self._records[record_id]
+            if not record.terminal:
+                return record
+        return None
+
+    def _maybe_heartbeat(self) -> None:
+        """Emit a periodic progress line, throttled, only when asked for."""
+
+        if self._heartbeat_seconds <= 0:
+            return
+        now = self._clock()
+        if now - self._last_heartbeat < self._heartbeat_seconds:
+            return
+        self._last_heartbeat = now
+        if self._terminal_lines >= self._max_terminal_lines:
+            return
+        self._terminal_lines += 1
+        self._print(f"[dim]… {escape(self._counters_text())}[/dim]", stamp=False)
+
+    def _emit_start(self, record: LifecycleRecord) -> None:
+        """Exactly one start line per record."""
+
+        if record.start_emitted:
+            return
+        record.start_emitted = True
+        record.started_at = self._wall()
+        record.started_monotonic = self._clock()
+        record.state = LifecycleState.RUNNING
+        self.counters["started"] += 1
+        glyph, colour = _LIFECYCLE_GLYPHS[record.kind]
+        detail = f" — {record.summary.render()}" if record.summary else ""
+        self._print(
+            f"{self.renderer._indent(self.renderer.depth_of(record.parent))}"
+            f"[{colour}]{glyph}[/{colour}] [bold]{escape(record.label)}[/bold] "
+            f"[dim]{record.kind.value} started[/dim]{escape(detail)}"
+        )
+
+    def _emit_terminal(self, record: LifecycleRecord, note: str | None = None) -> None:
+        """Exactly one terminal line per record."""
+
+        if record.terminal_emitted:
+            return
+        record.terminal_emitted = True
+        record.finished_at = self._wall()
+        record.finished_monotonic = self._clock()
+        if note:
+            record.note = sanitize_status(note, limit=STATUS_TEXT_LIMIT)
+        elapsed = format_elapsed(record.elapsed_seconds)
+        glyph, colour = _LIFECYCLE_TERMINAL_GLYPHS.get(record.state, ("·", "dim"))
+        suffix = f" [dim]({escape(record.note)})[/dim]" if record.note else ""
+        attempt = f" [dim]attempt {record.attempts}[/dim]" if record.attempts > 1 else ""
+        self._print(
+            f"{self.renderer._indent(self.renderer.depth_of(record.parent))}"
+            f"[{colour}]{glyph}[/{colour}] [bold]{escape(record.label)}[/bold] "
+            f"[{colour}]{record.state.value}[/{colour}] in {elapsed}{attempt}{suffix}"
+        )
+
+    # -- reusable lifecycle methods ---------------------------------------
+
+    def spawn(
+        self,
+        record_id: str,
+        label: str,
+        *,
+        kind: LifecycleKind = LifecycleKind.AGENT,
+        parent: str | None = None,
+        detail: str | None = None,
+        start: bool = True,
+    ) -> LifecycleRecord:
+        """Register and (by default) start an agent, worker or task."""
+
+        with self._lock:
+            if record_id in self._records:
+                return self._records[record_id]
+            summary = StatusSummary(next_action=detail) if detail else None
+            record = LifecycleRecord(
+                id=record_id,
+                kind=kind,
+                label=sanitize_status(label, limit=STATUS_FIELD_LIMIT),
+                parent=parent,
+                summary=summary,
+            )
+            self._records[record_id] = record
+            self._order.append(record_id)
+            self.counters["spawned"] += 1
+            if parent:
+                self.renderer.register_agent(record_id, parent=parent, label=record.label)
+            else:
+                self.renderer.register_agent(record_id, parent="master", label=record.label)
+            if start:
+                self._emit_start(record)
+                self._refresh_live(record)
+            return record
+
+    def delegate(self, actor: str, to: str, objective: str, *, kind: LifecycleKind | None = None) -> LifecycleRecord:
+        """Delegate work: the delegating agent stays active, the target starts."""
+
+        with self._lock:
+            record = self.spawn(to, to, kind=kind or LifecycleKind.TASK, parent=actor, detail=objective)
+            self.renderer.task_assigned(
+                sanitize_status(objective), actor=actor, label=self._label_of(actor)
+            )
+            self._refresh_live(record)
+            return record
+
+    @contextmanager
+    def active_work(
+        self,
+        record_id: str,
+        *,
+        summary: StatusSummary | None = None,
+        detail: str | None = None,
+        label: str | None = None,
+    ) -> Iterator[LifecycleRecord]:
+        """Animate a unit of work, guaranteeing a terminal state.
+
+        Exceptions mark the record ``failed`` (or ``cancelled`` for
+        ``CancelledError``); ``KeyboardInterrupt`` marks it ``interrupted`` and
+        re-raises.  In every path the record reaches a terminal state, the
+        spinner is left stopped and the terminal line is printed exactly once.
+        """
+
+        with self._lock:
+            record = self._records.get(record_id) or self.spawn(
+                record_id, label or record_id, kind=LifecycleKind.TASK,
+                detail=detail or (summary.next_action if summary else None),
+            )
+            if summary is not None:
+                record.summary = summary
+            elif detail:
+                record.summary = StatusSummary(next_action=detail)
+            if not record.start_emitted:
+                self._emit_start(record)
+            record.state = LifecycleState.RUNNING
+            self._refresh_live(record)
+            self._maybe_heartbeat()
+
+        try:
+            yield record
+        except KeyboardInterrupt:
+            self.complete(record_id, LifecycleState.INTERRUPTED, note="operator interrupted")
+            raise
+        except BaseException as exc:
+            cancelled = isinstance(exc, (asyncio.CancelledError, GeneratorExit))
+            state = LifecycleState.CANCELLED if cancelled else LifecycleState.FAILED
+            self.complete(record_id, state, note=f"{type(exc).__name__}: {exc}")
+            raise
+        else:
+            self.complete(record_id, LifecycleState.DONE)
+        finally:
+            # Belt and braces: never leave the spinner attached to a finished unit.
+            with self._lock:
+                if record.terminal:
+                    self._refresh_live()
+
+    def reasoning(
+        self,
+        actor: str,
+        *,
+        decision: str | None = None,
+        criterion: str | None = None,
+        next_action: str | None = None,
+        note: str | None = None,
+        animate: bool = True,
+    ) -> StatusSummary:
+        """Report a *summary* of reasoning — never the reasoning itself.
+
+        Accepts the three operator-relevant facets.  Free-form deliberation is
+        refused by :class:`StatusSummary`, which sanitises each field strictly.
+        """
+
+        with self._lock:
+            summary = StatusSummary(
+                decision=decision, criterion=criterion, next_action=next_action, note=note
+            )
+            if summary.is_empty():
+                raise UnsafeStatusError("reasoning needs a decision, criterion, next action or note")
+            record = self._records.get(actor)
+            if record is not None and not record.terminal:
+                record.summary = summary
+            self.counters["reasoning"] += 1
+            self.renderer.reasoning(summary.render(), actor=actor, label=self._label_of(actor))
+            if animate:
+                self._refresh_live(record)
+            return summary
+
+    def review(self, actor: str, *, verdict: str, criterion: str, note: str | None = None) -> None:
+        """Record a quality review with the criterion that was applied."""
+
+        with self._lock:
+            record = self._records.get(actor)
+            if record is not None:
+                record.state = LifecycleState.REVIEWING
+            self.counters["reviews"] += 1
+            text = f"{sanitize_status(verdict, limit=STATUS_FIELD_LIMIT)} — criterion: {sanitize_status(criterion, limit=STATUS_FIELD_LIMIT)}"
+            if note:
+                text = f"{text} ({sanitize_status(note, limit=STATUS_FIELD_LIMIT)})"
+            self.renderer.quality_review(text, actor=actor, verdict=sanitize_status(verdict, limit=20),
+                                         label=self._label_of(actor))
+            if record is not None and not record.terminal:
+                record.state = LifecycleState.RUNNING
+            self._refresh_live(record)
+
+    def retry_task(self, record_id: str, *, reason: str, attempt: int | None = None) -> LifecycleRecord:
+        """Count and announce a retry; the record stays active."""
+
+        with self._lock:
+            record = self._records.get(record_id)
+            if record is None:
+                record = self.spawn(record_id, record_id, kind=LifecycleKind.TASK, start=True)
+            record.attempts = attempt if attempt is not None else record.attempts + 1
+            record.state = LifecycleState.RETRYING
+            self.counters["retries"] += 1
+            self.renderer.retasking(
+                f"retry {record.attempts}: {sanitize_status(reason)}",
+                actor=record.parent or record_id,
+                label=self._label_of(record.parent or record_id),
+            )
+            record.state = LifecycleState.RUNNING
+            self._refresh_live(record)
+            return record
+
+    def merge(self, actor: str, *, into: str, count: int, note: str | None = None) -> None:
+        """Announce that findings were merged into a synthesis target."""
+
+        with self._lock:
+            self.counters["merges"] += 1
+            text = f"merged {count} item(s) into {sanitize_status(into, limit=STATUS_FIELD_LIMIT)}"
+            if note:
+                text = f"{text} ({sanitize_status(note, limit=STATUS_FIELD_LIMIT)})"
+            self.renderer.subagent_synthesis(text, actor=actor, label=self._label_of(actor))
+            record = self._records.get(actor)
+            if record is not None and not record.terminal:
+                record.state = LifecycleState.MERGING
+                self._refresh_live(record)
+                record.state = LifecycleState.RUNNING
+
+    def complete(
+        self,
+        record_id: str,
+        state: LifecycleState = LifecycleState.DONE,
+        *,
+        note: str | None = None,
+    ) -> LifecycleRecord | None:
+        """Force a terminal state.  Idempotent — never emits two terminal lines."""
+
+        with self._lock:
+            record = self._records.get(record_id)
+            if record is None:
+                return None
+            if record.terminal_emitted:
+                return record
+            if not record.start_emitted:
+                # A record that never visibly started still gets a start line, so
+                # "terminal without start" can never appear in the log.
+                self._emit_start(record)
+            record.state = state if state.terminal else LifecycleState.DONE
+            if record.state is LifecycleState.DONE:
+                self.counters["completed"] += 1
+            elif record.state is LifecycleState.FAILED:
+                self.counters["failed"] += 1
+            elif record.state is LifecycleState.CANCELLED:
+                self.counters["cancelled"] += 1
+            elif record.state is LifecycleState.INTERRUPTED:
+                self.counters["interrupted"] += 1
+            self._emit_terminal(record, note)
+            self._terminal_lines += 1
+            self._refresh_live()
+            return record
+
+    # -- interruption safety ----------------------------------------------
+
+    def interrupt_all(self, reason: str = "run interrupted") -> list[LifecycleRecord]:
+        """Close every open record as ``interrupted``.  Idempotent."""
+
+        with self._lock:
+            closed: list[LifecycleRecord] = []
+            for record in self._records.values():
+                if not record.terminal_emitted:
+                    self.complete(record.id, LifecycleState.INTERRUPTED, note=reason)
+                    closed.append(record)
+            return closed
+
+    def shutdown(self, reason: str = "run ended") -> None:
+        """Stop animation and close anything still open.  Safe to call twice."""
+
+        with self._lock:
+            if self._closed:
+                self._live.stop()
+                return
+            self.interrupt_all(reason)
+            self._live.stop()
+            self._closed = True
+
+    def __enter__(self) -> "LifecycleTracker":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        if exc_type is not None:
+            self.shutdown("run failed")
+        else:
+            self.shutdown("run ended")
+        return False
+
+    # -- inspection -------------------------------------------------------
+
+    def get(self, record_id: str) -> LifecycleRecord | None:
+        with self._lock:
+            return self._records.get(record_id)
+
+    def records(self) -> list[LifecycleRecord]:
+        with self._lock:
+            return [self._records[i] for i in self._order]
+
+    def _label_of(self, agent_id: str | None) -> str | None:
+        if not agent_id:
+            return None
+        record = self._records.get(agent_id)
+        return record.label if record else agent_id
+
+    @property
+    def live_running(self) -> bool:
+        """True while a transient spinner is attached to the terminal."""
+
+        return self._live.running
+
+    def progress(self) -> dict[str, Any]:
+        with self._lock:
+            states: dict[str, int] = {}
+            for record in self._records.values():
+                states[record.state.value] = states.get(record.state.value, 0) + 1
+            active = [r for r in self._records.values() if not r.terminal]
+            return {
+                "total": len(self._records),
+                "active": len(active),
+                "states": states,
+                "counters": dict(self.counters),
+                "elapsed_seconds": round(self._clock() - self._started_monotonic, 3),
+                "elapsed": format_elapsed(self._clock() - self._started_monotonic),
+                "live_running": self._live.running,
+                "animation": self._live.enabled,
+                "all_started": all(r.start_emitted for r in self._records.values()),
+                "all_terminal": all(r.terminal_emitted for r in self._records.values()),
+            }
+
+    def summary_table(self) -> Table:
+        """Balanced per-record start/terminal view for the end of a run."""
+
+        with self._lock:
+            table = Table(box=None, pad_edge=False, header_style="bold")
+            table.add_column("id", style="dim", no_wrap=True)
+            table.add_column("kind", style="cyan", no_wrap=True)
+            table.add_column("label", no_wrap=True)
+            table.add_column("state", no_wrap=True)
+            table.add_column("elapsed", justify="right", no_wrap=True)
+            table.add_column("start", no_wrap=True, justify="center")
+            table.add_column("end", no_wrap=True, justify="center")
+            for record in self.records():
+                colour = "green" if record.state is LifecycleState.DONE else (
+                    "red" if record.state in {LifecycleState.FAILED, LifecycleState.INTERRUPTED} else "yellow"
+                )
+                table.add_row(
+                    escape(record.id),
+                    record.kind.value,
+                    escape(record.label),
+                    f"[{colour}]{record.state.value}[/{colour}]",
+                    format_elapsed(record.elapsed_seconds),
+                    "[green]✔[/green]" if record.start_emitted else "[red]✘[/red]",
+                    "[green]✔[/green]" if record.terminal_emitted else "[red]✘[/red]",
+                )
+            return table
+
+
+#: Start-line glyph/colour per tracked kind.
+_LIFECYCLE_GLYPHS: dict[LifecycleKind, tuple[str, str]] = {
+    LifecycleKind.AGENT: ("◆", "bold cyan"),
+    LifecycleKind.SUBAGENT: ("⬡", "bold magenta"),
+    LifecycleKind.WORKER: ("·", "magenta"),
+    LifecycleKind.TASK: ("→", "blue"),
+}
+
+#: Terminal-line glyph/colour per end state.
+_LIFECYCLE_TERMINAL_GLYPHS: dict[LifecycleState, tuple[str, str]] = {
+    LifecycleState.DONE: ("✔", "green"),
+    LifecycleState.MERGED: ("⊞", "bold green"),
+    LifecycleState.FAILED: ("✘", "bold red"),
+    LifecycleState.CANCELLED: ("⊘", "yellow"),
+    LifecycleState.INTERRUPTED: ("⚠", "bold yellow"),
+}
+
+
+# --------------------------------------------------------------------------
+# 18.1 Demonstration script used by the CLI and the self-test
+# --------------------------------------------------------------------------
+
+
+def _run_lifecycle_demo(tracker: LifecycleTracker, *, tasks: int = 4) -> None:
+    """Exercise every lifecycle method with concise, model-safe summaries."""
+
+    tracker.spawn("master", "master", kind=LifecycleKind.AGENT, detail="plan the mission")
+    tracker.reasoning(
+        "master",
+        decision="3 collection areas are sufficient",
+        criterion="each area maps to a distinct public source type",
+        next_action="spawn passive DNS and certificate transparency subagents",
+    )
+
+    tracker.spawn("sa-dns", "passive-dns", kind=LifecycleKind.SUBAGENT, parent="master",
+                  detail="enumerate published DNS records")
+    tracker.delegate("master", "task-dns", "query public resolvers for A/AAAA/MX")
+
+    with tracker.active_work("task-dns", detail="querying resolvers"):
+        tracker.reasoning(
+            "sa-dns",
+            decision="two conflicting A records are plausible",
+            criterion="a recent migration produces exactly this pattern",
+            next_action="check the archive for the previous value",
+        )
+    tracker.review("sa-dns", verdict="revise", criterion="every observation cites a source",
+                   note="one claim had no source")
+
+    tracker.spawn("task-archive", "archive-lookup", kind=LifecycleKind.TASK, parent="sa-dns",
+                  detail="check archived records")
+    with tracker.active_work("task-archive", detail="reading the 2025-11 archive"):
+        tracker.retry_task("task-archive", reason="archive returned 503")
+
+    tracker.merge("sa-dns", into="subagent report", count=2, note="both observations cited")
+    tracker.complete("sa-dns", LifecycleState.MERGED, note="2 observations, 1 inference")
+
+    for index in range(1, max(1, tasks)):
+        task_id = f"task-ct-{index}"
+        tracker.spawn(task_id, f"cert-log-{index}", kind=LifecycleKind.TASK, parent="master",
+                      detail="read certificate transparency entries")
+        with tracker.active_work(task_id, detail="parsing entries"):
+            pass
+
+    tracker.reasoning(
+        "master",
+        decision="findings stand without attribution",
+        criterion="two independent sources agree on the hostname",
+        next_action="write the final report",
+    )
+    tracker.complete("master", LifecycleState.DONE, note="report ready")
+
+
+@dataclass(frozen=True)
+class LifecycleCheck:
+    name: str
+    ok: bool
+    detail: str
+
+
+def run_lifecycle_self_test(tasks: int = 4) -> list[LifecycleCheck]:
+    """Verify the acceptance criteria for lifecycle animation."""
+
+    checks: list[LifecycleCheck] = []
+
+    def record(name: str, ok: bool, detail: str = "ok") -> None:
+        checks.append(LifecycleCheck(name, ok, detail))
+
+    # --- 1. every entity has exactly one start and one terminal line ------
+    buffer = io.StringIO()
+    renderer = EventRenderer.from_options(stream=buffer, color=False, animation=False)
+    tracker = LifecycleTracker(renderer, animation=False, register_atexit=False)
+    _run_lifecycle_demo(tracker, tasks=tasks)
+    progress = tracker.progress()
+    record(
+        "every entity started",
+        progress["all_started"],
+        f"{progress['total']} record(s)",
+    )
+    record(
+        "every entity reached a terminal state",
+        progress["all_terminal"] and progress["active"] == 0,
+        f"active={progress['active']}, states={progress['states']}",
+    )
+    text = buffer.getvalue()
+    record(
+        "start and terminal lines are balanced",
+        text.count("started") == progress["total"],
+        f"{text.count('started')} start line(s) for {progress['total']} record(s)",
+    )
+    record(
+        "terminal lines carry elapsed time",
+        len(re.findall(r"\bin \d", text)) >= progress["total"] - 1,
+        f"{len(re.findall(r'in [0-9]', text))} timed terminal line(s)",
+    )
+
+    # --- 2. interruption leaves no spinner running ------------------------
+    buffer = io.StringIO()
+    renderer = EventRenderer.from_options(stream=buffer, color=False, animation=False)
+    tracker = LifecycleTracker(renderer, animation=False, register_atexit=False)
+    tracker.spawn("t1", "interruptible-task", kind=LifecycleKind.TASK, detail="long operation")
+    try:
+        with tracker.active_work("t1"):
+            raise KeyboardInterrupt
+    except KeyboardInterrupt:
+        pass
+    record(
+        "KeyboardInterrupt closes the task",
+        tracker.get("t1").state is LifecycleState.INTERRUPTED,
+        tracker.get("t1").state.value,
+    )
+    record("no spinner left running after interrupt", tracker.live_running is False)
+    record(
+        "interrupt emitted a terminal line",
+        tracker.get("t1").terminal_emitted and "interrupted" in buffer.getvalue(),
+        "terminal line present",
+    )
+
+    # A plain exception marks the task failed, not interrupted.
+    buffer = io.StringIO()
+    renderer = EventRenderer.from_options(stream=buffer, color=False, animation=False)
+    tracker2 = LifecycleTracker(renderer, animation=False, register_atexit=False)
+    tracker2.spawn("t2", "failing-task", kind=LifecycleKind.TASK, detail="will fail")
+    try:
+        with tracker2.active_work("t2"):
+            raise RuntimeError("source unavailable")
+    except RuntimeError:
+        pass
+    record("exception closes the task as failed", tracker2.get("t2").state is LifecycleState.FAILED)
+    record("failure note is recorded", "source unavailable" in (tracker2.get("t2").note or ""),
+           tracker2.get("t2").note or "")
+
+    # shutdown() closes anything left open, and is idempotent.
+    buffer = io.StringIO()
+    renderer = EventRenderer.from_options(stream=buffer, color=False, animation=False)
+    tracker3 = LifecycleTracker(renderer, animation=False, register_atexit=False)
+    tracker3.spawn("a", "left-open", kind=LifecycleKind.AGENT)
+    tracker3.shutdown("aborted")
+    tracker3.shutdown("aborted again")
+    record("shutdown closes open records", tracker3.get("a").state is LifecycleState.INTERRUPTED)
+    record("shutdown is idempotent", buffer.getvalue().count("interrupted") == 1,
+           f"{buffer.getvalue().count('interrupted')} terminal line(s)")
+    record("shutdown stops the spinner", tracker3.live_running is False)
+
+    # --- 3. chain-of-thought is refused --------------------------------
+    try:
+        sanitize_status("let me think step by step about this", strict=True)
+        record("strict mode rejects deliberation", False, "accepted")
+    except UnsafeStatusError:
+        record("strict mode rejects deliberation", True, "UnsafeStatusError")
+
+    lenient = sanitize_status("Let me think step by step about whether the record moved")
+    record("lenient mode strips deliberation", "step by step" not in lenient.lower(), lenient)
+
+    long_text = " ".join(f"word{i}" for i in range(80))
+    shortened = sanitize_status(long_text)
+    record("long text is truncated", len(shortened) <= STATUS_TEXT_LIMIT + 1 and len(shortened.split()) <= STATUS_MAX_WORDS + 1,
+           f"{len(shortened)} chars")
+    record("newlines are collapsed", "\n" not in sanitize_status("line one\nline two"))
+    try:
+        StatusSummary(decision="my reasoning: I first consider the tokens")
+        record("summary field rejects deliberation", False, "accepted")
+    except Exception:
+        record("summary field rejects deliberation", True, "refused")
+    try:
+        tracker.reasoning("master")
+        record("reasoning needs at least one facet", False, "accepted")
+    except UnsafeStatusError:
+        record("reasoning needs at least one facet", True, "refused")
+
+    summary = StatusSummary(
+        decision="keep the passive-only scope",
+        criterion="no target interaction is authorised",
+        next_action="collect from public sources",
+    )
+    rendered = summary.render()
+    record(
+        "summary renders decision, criterion and next action",
+        rendered.startswith("keep the passive-only scope")
+        and "criterion:" in rendered and "next:" in rendered,
+        rendered,
+    )
+    record("summary has no narrative field", "thought" not in StatusSummary.model_fields,
+           str(list(StatusSummary.model_fields)))
+
+    # --- 4. counters and elapsed time without flooding ------------------
+    buffer = io.StringIO()
+    renderer = EventRenderer.from_options(stream=buffer, color=False, animation=False)
+    tracker4 = LifecycleTracker(renderer, animation=False, register_atexit=False)
+    for index in range(60):
+        task_id = f"bulk-{index}"
+        tracker4.spawn(task_id, task_id, kind=LifecycleKind.TASK, detail="work")
+        tracker4.reasoning("master", decision=f"step {index} decided", next_action="continue")
+        tracker4.complete(task_id, LifecycleState.DONE)
+    lines = [l for l in buffer.getvalue().splitlines() if l.strip()]
+    record(
+        "60 tasks + 60 reasoning steps stay proportional",
+        len(lines) <= 60 * 2 + 60 + 10,
+        f"{len(lines)} lines",
+    )
+    progress4 = tracker4.progress()
+    record(
+        "counters track completions",
+        progress4["counters"]["completed"] == 60 and progress4["counters"]["started"] == 60,
+        str(progress4["counters"]),
+    )
+    record("elapsed time is reported", re.search(r"\d+(\.\d+)?s", progress4["elapsed"]) is not None, progress4["elapsed"])
+
+    # --- 5. animation is only used on a real terminal ------------------
+    plain = io.StringIO()
+    renderer_plain = EventRenderer.from_options(stream=plain, color=False, animation=True)
+    tracker5 = LifecycleTracker(renderer_plain, animation=True, register_atexit=False)
+    tracker5.spawn("x", "non-tty", kind=LifecycleKind.TASK)
+    record("animation disabled on a non-tty", tracker5.progress()["animation"] is False)
+    record("non-tty emits no ANSI escapes", "\x1b[" not in plain.getvalue())
+    tracker5.shutdown()
+
+    # Forced-terminal console: the live status really does start and stop.
+    terminal_buffer = io.StringIO()
+    terminal_console = Console(file=terminal_buffer, force_terminal=True, width=100, no_color=True)
+    renderer_tty = EventRenderer(terminal_console, color=False, animation=True)
+    tracker6 = LifecycleTracker(renderer_tty, animation=True, refresh_per_second=20, register_atexit=False)
+    tracker6.spawn("live", "animated-task", kind=LifecycleKind.TASK, detail="streaming")
+    with tracker6.active_work("live", detail="receiving data"):
+        started = tracker6.live_running
+        # Rich paints the Status on its own refresh thread, so wait for one tick
+        # before inspecting the buffer — an immediate read races the paint.
+        deadline = time.monotonic() + 2.0
+        while "active" not in terminal_buffer.getvalue() and time.monotonic() < deadline:
+            time.sleep(0.02)
+    tracker6.shutdown()
+    painted = terminal_buffer.getvalue()
+    record("live spinner starts on a terminal", started is True)
+    record(
+        "live spinner carries counters and elapsed time",
+        "active" in painted and "elapsed" in painted,
+        painted[:70].replace("\x1b", "^"),
+    )
+    record("live spinner shows the current summary", "receiving data" in painted, "summary painted")
+    record("cursor is restored on stop", "\x1b[?25h" in painted, "cursor shown")
+    record("live status stopped after shutdown", tracker6.live_running is False)
+
+    # --- 6. concurrency: balanced, untangled output --------------------
+    buffer = io.StringIO()
+    renderer = EventRenderer.from_options(stream=buffer, color=False, animation=False)
+    tracker7 = LifecycleTracker(renderer, animation=False, register_atexit=False)
+    errors: list[str] = []
+
+    def worker(index: int) -> None:
+        try:
+            for n in range(15):
+                task_id = f"w{index}-{n}"
+                tracker7.spawn(task_id, task_id, kind=LifecycleKind.TASK, detail="job")
+                with tracker7.active_work(task_id, detail="running"):
+                    tracker7.reasoning("master", decision=f"{task_id} dispatch", next_action="continue")
+        except Exception as exc:                         # pragma: no cover
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    tracker7.shutdown()
+    p7 = tracker7.progress()
+    record(
+        "concurrent lifecycle: nothing lost",
+        not errors and p7["total"] == 120 and p7["all_terminal"],
+        f"{p7['total']} records, errors={errors[:1]}",
+    )
+    record(
+        "concurrent lifecycle: balanced start/terminal",
+        p7["counters"]["started"] == 120 and p7["counters"]["completed"] == 120,
+        str(p7["counters"]),
+    )
+    record("concurrent lifecycle: no spinner left", tracker7.live_running is False)
+
+    return checks
+
+
+@app.command("lifecycle", help="Animated agent lifecycle messages (spawn → work → review → done).")
+def lifecycle_command(
+    demo: bool = typer.Option(True, "--demo/--no-demo", help="Run the scripted lifecycle demonstration."),
+    tasks: int = typer.Option(4, "--tasks", min=1, max=50, help="Extra tasks in the demonstration."),
+    no_animation: bool = typer.Option(False, "--no-animation", help="Disable the transient spinner."),
+    no_color: bool = typer.Option(False, "--no-color", help="Disable ANSI colour."),
+    heartbeat: float = typer.Option(
+        0.0, "--heartbeat", min=0.0, help="Seconds between throttled progress lines (0 = off)."
+    ),
+    self_test: bool = typer.Option(False, "--self-test", help="Verify the lifecycle guarantees."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Pure local animation: no network, no model, no browser."""
+
+    console = get_console()
+
+    if self_test:
+        results = run_lifecycle_self_test(tasks=tasks)
+        failures = [r for r in results if not r.ok]
+        if as_json:
+            _emit(json.dumps({"ok": not failures, "checks": [asdict(r) for r in results]}, indent=2))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        console.print()
+        table = Table(title="lifecycle self-test", title_justify="left", box=None, pad_edge=False)
+        table.add_column("", width=2)
+        table.add_column("check", style="bold", no_wrap=True)
+        table.add_column("detail", overflow="fold")
+        for result in results:
+            glyph, colour = ("✔", "green") if result.ok else ("✘", "red")
+            table.add_row(f"[{colour}]{glyph}[/{colour}]", escape(result.name), escape(result.detail))
+        console.print(table)
+        console.print(f"[{'green' if not failures else 'red'}]{len(results) - len(failures)} passed[/] · {len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    renderer = EventRenderer.from_options(
+        color=not no_color,
+        animation=not no_animation,
+        stream=sys.stderr if as_json else None,
+    )
+
+    tracker = LifecycleTracker(
+        renderer,
+        animation=not no_animation,
+        heartbeat_seconds=heartbeat,
+        register_atexit=False,   # the context manager below is authoritative
+    )
+
+    # The whole run is guarded: any exit path — success, exception or Ctrl-C —
+    # stops the spinner and closes every open record.
+    interrupted = False
+    try:
+        with tracker:
+            if demo:
+                _run_lifecycle_demo(tracker, tasks=tasks)
+    except KeyboardInterrupt:
+        interrupted = True
+        tracker.shutdown("operator interrupt")
+    finally:
+        tracker.shutdown("run ended")
+
+    progress = tracker.progress()
+    payload = {
+        "ok": progress["all_terminal"] and not interrupted,
+        "interrupted": interrupted,
+        "progress": progress,
+        "records": [r.snapshot() for r in tracker.records()],
+        "events": [json.loads(model_to_json(e)) for e in renderer.trace.events],
+    }
+
+    if as_json:
+        _emit(json.dumps(payload, indent=2))
+        raise typer.Exit(ExitCode.OK if payload["ok"] else ExitCode.INTERNAL)
+
+    console.print()
+    console.print(tracker.summary_table())
+    console.print(
+        f"[green]{progress['counters']['completed']} completed[/green] · "
+        f"{progress['counters']['failed']} failed · "
+        f"{progress['counters']['retries']} retried · "
+        f"{progress['counters']['merges']} merged · "
+        f"{progress['counters']['reviews']} reviewed · "
+        f"[dim]{progress['elapsed']} elapsed[/dim]"
+    )
+    console.print(
+        f"[dim]animation={'on' if progress['animation'] else 'off'} · "
+        f"all started={'yes' if progress['all_started'] else 'NO'} · "
+        f"all terminal={'yes' if progress['all_terminal'] else 'NO'} · "
+        f"spinner running={'yes' if progress['live_running'] else 'no'}[/dim]"
+    )
+    console.print()
+    raise typer.Exit(ExitCode.OK if payload["ok"] else ExitCode.INTERNAL)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 19. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 
