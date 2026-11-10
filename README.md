@@ -8,8 +8,32 @@ python vedant_osint.py version       # version, build phase, roadmap
 python vedant_osint.py config        # interpreter / dependency / env probes
 python vedant_osint.py mission -t example.com -o "map the attack surface"
 python vedant_osint.py config --settings     # merged config, secrets masked
+python vedant_osint.py doctor                # capability health check (CI gate)
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
+
+## Doctor
+
+`doctor` verifies Python, the five required imports (Typer, Rich, LangGraph,
+browser-use, Playwright), browser availability (engine **and** a downloaded
+build), model configuration, output-directory writability, and optional
+forensic utilities.
+
+- **pass** — capability present.
+- **warn** — *optional* capability missing; the feature degrades gracefully, exit `0`.
+- **fail** — *required* capability missing; prints the install command, exit `3`.
+
+`pip install playwright` alone does not download a browser — when no build is
+found the doctor prints:
+
+```bash
+python -m playwright install chromium        # download Chromium
+python -m playwright install-deps chromium   # install its OS libraries
+```
+
+Options: `--json`, `--strict`, `--problems-only`, `--no-hints`,
+`--category {python,imports,browser,model,storage,forensics,configuration}`
+(repeatable), `--create-dirs`, `--probe-launch`. Credentials are never printed.
 
 ## Configuration
 
@@ -43,7 +67,7 @@ Authorised use only — collect from systems you own or are explicitly permitted
 | Phase | Scope | State |
 |-------|-------|-------|
 | 1 | Foundation — CLI skeleton, config probing, version reporting | ✅ done |
-| 2 | Contracts — strict configuration object (CLI > env > default) | ✅ done |
+| 2 | Contracts — strict configuration object + `doctor` capability check | ✅ done |
 | 3 | Orchestration — LangGraph Master Agent + runtime Subagent factory | ⬜ next |
 | 4 | Browser — browser-use / Playwright sessions and capture | ⬜ |
 | 5 | Collection — passive OSINT sources, artefact hashing | ⬜ |

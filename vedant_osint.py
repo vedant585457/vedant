@@ -101,13 +101,38 @@ Usage
     python vedant_osint.py version
     python vedant_osint.py config
     python vedant_osint.py config --settings            # merged, redacted view
+    python vedant_osint.py doctor                       # full capability health check
     python vedant_osint.py mission --target example.com -o "map the attack surface"
     python vedant_osint.py mission -t example.com -o "..." --phase settings --json
 
+Doctor
+------
+``doctor`` checks the interpreter, the five required imports (Typer, Rich,
+LangGraph, browser-use, Playwright), browser availability — engine *and* a
+downloaded build — model configuration, output-directory writability, and the
+optional forensic utilities.  Three outcomes exist:
+
+* ``pass`` — capability present.
+* ``warn``  — an *optional* capability is missing; the affected feature
+  degrades gracefully and the run continues (exit 0).
+* ``fail``  — a *required* capability is missing; an install command is printed
+  and the exit status is non-zero, so ``doctor`` works as a preflight gate.
+
+``pip install playwright`` does not download a browser.  When no build is
+found the doctor prints::
+
+    python -m playwright install chromium        # download Chromium
+    python -m playwright install-deps chromium   # install its OS libraries
+
+Credential values are never printed: the model section reports only a masked
+hint such as ``sk-p…c3f9 (len 51) from OPENAI_API_KEY``.  Set
+``PLAYWRIGHT_BROWSERS_PATH`` to point the browser probe at a custom location.
+
 Exit codes
 ----------
-See :class:`ExitCode`.  ``config`` returns a non-zero code when a *required*
-capability is missing, which makes it usable as a CI/installation gate.
+See :class:`ExitCode`.  ``config`` and ``doctor`` return ``3`` (CONFIG) when a
+*required* capability is missing — usable as CI/installation gates — and ``0``
+when only optional capabilities are absent.
 
 Authorised use only
 -------------------
@@ -128,6 +153,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import sys
 import tempfile
 from dataclasses import asdict, dataclass, field, replace
@@ -165,9 +191,9 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 2
+VERSION_MINOR: int = 3
 VERSION_PATCH: int = 0
-VERSION_STAGE: str = "skeleton"          # skeleton → alpha → beta → stable
+VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
 VERSION_LABEL: str = f"{__version__}-{VERSION_STAGE}"
 
@@ -218,7 +244,7 @@ BUILD_PHASE_NAME: str = "Contracts"
 #: Section banners shared by the banner panel and ``version --json``.
 PHASE_ROADMAP: tuple[tuple[int, str, str], ...] = (
     (1, "Foundation", "CLI skeleton, config probing, version reporting"),
-    (2, "Contracts", "Strict settings object, mission/evidence contracts"),
+    (2, "Contracts", "Strict settings object, contracts and the capability doctor"),
     (3, "Orchestration", "LangGraph Master Agent + runtime Subagent factory"),
     (4, "Browser", "browser-use/Playwright sessions and capture"),
     (5, "Collection", "passive OSINT sources, artefact hashing/chain of custody"),
@@ -333,9 +359,11 @@ DEPENDENCIES: tuple[Dependency, ...] = (
     Dependency("typer", "typer", "CLI framework", 1, required=True),
     Dependency("rich", "rich", "terminal rendering", 1, required=True),
     Dependency("pydantic", "pydantic", "typed mission & evidence models", 2, required=True),
-    Dependency("langgraph", "langgraph", "Master Agent state machine", 3),
-    Dependency("browser_use", "browser-use", "agentic browser sessions", 4),
-    Dependency("playwright", "playwright", "deterministic browsing & screenshots", 4),
+    # Required from the phase that introduces them, and required thereafter —
+    # the same set the doctor treats as blocking.
+    Dependency("langgraph", "langgraph", "Master Agent state machine", 3, required=True),
+    Dependency("browser_use", "browser-use", "agentic browser sessions", 4, required=True),
+    Dependency("playwright", "playwright", "deterministic browsing & screenshots", 4, required=True),
     Dependency("httpx", "httpx", "HTTP/API collection", 5),
     Dependency("dotenv", "python-dotenv", ".env file loading", 7),
 )
@@ -713,14 +741,35 @@ def resolve_default_output_dir() -> Path:
     return Path(override).expanduser() if override else resolve_home_dir() / DEFAULT_OUTPUT_DIRNAME
 
 
-def directory_writable(path: Path) -> bool:
-    """Check writability without creating anything outside the temp sandbox."""
+def _nearest_existing_ancestor(path: Path) -> Path:
+    """First ancestor of *path* that exists (or the cwd as a last resort)."""
 
-    probe_root = path if path.exists() else path.parent if path.parent.exists() else Path(tempfile.gettempdir())
-    if not path.exists():
-        # Report on where writing *would* land; never create the real directory.
-        probe_root = path.parent if path.parent.exists() else probe_root
+    for candidate in (path, *path.parents):
+        try:
+            if candidate.exists():
+                return candidate
+        except OSError:                                  # pragma: no cover - exotic FS
+            continue
+    return Path.cwd()
+
+
+def directory_writable(path: Path) -> bool:
+    """Check writability without creating the real directory.
+
+    For a path that does not exist yet, the check must run against the nearest
+    *existing* ancestor — falling back to the temp directory would report a
+    hostile location such as ``/proc/x`` as writable.
+    """
+
     try:
+        if path.exists():
+            if not path.is_dir():
+                return False
+            probe_root = path
+        else:
+            probe_root = _nearest_existing_ancestor(path.parent)
+            if not probe_root.is_dir():
+                return False
         with tempfile.NamedTemporaryFile(dir=probe_root, prefix=".argus-probe-", delete=True):
             pass
         return True
@@ -1762,7 +1811,753 @@ def config_command(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 12. Command: mission (placeholder — orchestration arrives in Phase 3)
+# 12. Doctor — end-to-end capability health
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class CheckStatus(str, Enum):
+    """Outcome of one doctor probe."""
+
+    PASS = "pass"
+    WARN = "warn"      # optional capability missing — the tool still runs
+    FAIL = "fail"      # required capability missing — the tool cannot run
+    SKIP = "skip"      # not applicable (e.g. browser check without Playwright)
+
+
+class CheckCategory(str, Enum):
+    """Grouping used by the doctor table."""
+
+    PYTHON = "python"
+    IMPORTS = "imports"
+    BROWSER = "browser"
+    MODEL = "model"
+    STORAGE = "storage"
+    FORENSICS = "forensics"
+    CONFIG = "configuration"
+
+
+#: Glyph and colour per status, shared by the table and the summary.
+_STATUS_STYLES: dict[CheckStatus, tuple[str, str]] = {
+    CheckStatus.PASS: ("✔", "green"),
+    CheckStatus.WARN: ("!", "yellow"),
+    CheckStatus.FAIL: ("✘", "red"),
+    CheckStatus.SKIP: ("·", "dim"),
+}
+
+
+@dataclass(frozen=True)
+class DoctorCheck:
+    """One line of the doctor report.
+
+    ``hint`` is the actionable fix (kept out of the table so long commands do
+    not destroy the layout); ``install`` is the exact shell command to run.
+    """
+
+    id: str
+    category: CheckCategory
+    title: str
+    status: CheckStatus
+    detail: str
+    hint: str | None = None
+    install: str | None = None
+    required: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "category": self.category.value,
+            "title": self.title,
+            "status": self.status.value,
+            "detail": redact_text(self.detail, secrets=known_secrets()),
+            "hint": redact_text(self.hint, secrets=known_secrets()) if self.hint else None,
+            "install": self.install,
+            "required": self.required,
+        }
+
+
+#: Imports the agent cannot function without.  Each entry is
+#: ``(module, pip package, what it unlocks, guidance when missing)``.
+REQUIRED_IMPORTS: tuple[tuple[str, str, str, str], ...] = (
+    ("typer", "typer", "CLI framework", "The CLI itself cannot start without Typer."),
+    ("rich", "rich", "terminal reporting", "Diagnostics and reports cannot be rendered without Rich."),
+    ("langgraph", "langgraph", "Master Agent orchestration", "Missions cannot be orchestrated without LangGraph."),
+    ("browser_use", "browser-use", "runtime Subagent browser actions", "Browser-driven collection needs browser-use."),
+    ("playwright", "playwright", "browser automation engine", "browser-use drives Playwright; both are required."),
+)
+
+#: Optional forensic utilities.  Missing ones only degrade specific features.
+#: ``kind`` is "module" (Python import) or "binary" (PATH lookup).
+FORENSIC_TOOLS: tuple[tuple[str, str, str, str | None, str], ...] = (
+    # (id, kind, name, install, unlocks)
+    ("magic", "module", "magic", "python-magic", "file-type sniffing for unknown artefacts"),
+    ("dns", "module", "dns", "dnspython", "passive DNS record enumeration"),
+    ("whois", "module", "whois", "python-whois", "registration and ownership lookups"),
+    ("exiftool", "binary", "exiftool", "exiftool", "image/document metadata extraction"),
+    ("tesseract", "binary", "tesseract", "tesseract-ocr", "OCR of screenshots and scanned documents"),
+    ("pdftotext", "binary", "pdftotext", "poppler-utils", "text extraction from PDF evidence"),
+    ("pefile", "module", "pefile", "pefile", "Windows PE header and import analysis"),
+    ("oletools", "module", "oletools", "oletools", "macro and OLE document inspection"),
+    ("yara", "module", "yara", "yara-python", "signature matching against evidence"),
+    ("ssdeep", "module", "ssdeep", "ssdeep", "fuzzy hashing for similarity clustering"),
+    ("pypdf", "module", "pypdf", "pypdf", "PDF parsing without external binaries"),
+    ("binwalk", "binary", "binwalk", "binwalk", "embedded-file carving in firmware images"),
+    ("strings", "binary", "strings", "binutils", "printable-string extraction from binaries"),
+    ("openssl", "binary", "openssl", "openssl", "local hashing and fingerprint verification"),
+)
+
+#: Guidance shown when no Playwright browser build is installed.  The engine
+#: alone is not enough: the browser build and its OS libraries are separate.
+PLAYWRIGHT_BROWSER_INSTALL: str = "python -m playwright install chromium"
+PLAYWRIGHT_DEPS_INSTALL: str = "python -m playwright install-deps chromium"
+
+
+def _playwright_browser_roots() -> list[Path]:
+    """Candidate directories where Playwright unpacks browser builds."""
+
+    override = env_value("PLAYWRIGHT_BROWSERS_PATH")
+    if override and override != "0":
+        return [Path(override).expanduser()]
+    home = Path.home()
+    roots = [
+        home / ".cache" / "ms-playwright",                  # Linux
+        home / "Library" / "Caches" / "ms-playwright",      # macOS
+        home / "AppData" / "Local" / "ms-playwright",       # Windows
+    ]
+    local_appdata = env_value("LOCALAPPDATA")
+    if local_appdata:
+        roots.append(Path(local_appdata) / "ms-playwright")
+    return roots
+
+
+def find_playwright_browsers() -> list[Path]:
+    """Chromium-family builds already downloaded by Playwright."""
+
+    found: list[Path] = []
+    for root in _playwright_browser_roots():
+        try:
+            if not root.is_dir():
+                continue
+            found.extend(
+                p for p in root.iterdir() if p.is_dir() and p.name.startswith("chromium")
+            )
+        except OSError:
+            continue
+    return sorted(found)
+
+
+def find_system_browsers() -> list[str]:
+    """Browser binaries on PATH that Playwright can use as a channel."""
+
+    names = ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "microsoft-edge")
+    return [name for name in names if shutil.which(name)]
+
+
+# --------------------------------------------------------------------------
+# 12.1 Individual probes
+# --------------------------------------------------------------------------
+
+
+def check_python() -> DoctorCheck:
+    """Interpreter floor from :data:`MIN_PYTHON`, plus a 3.11 recommendation."""
+
+    current = sys.version_info[:2]
+    minimum = f"{MIN_PYTHON[0]}.{MIN_PYTHON[1]}"
+    detail = f"Python {platform.python_version()} on {platform.system() or 'unknown'}"
+    if current < MIN_PYTHON:
+        return DoctorCheck(
+            "python.version",
+            CheckCategory.PYTHON,
+            "Python version",
+            CheckStatus.FAIL,
+            f"{detail} — requires >= {minimum}",
+            hint=f"Install Python {minimum}+ and recreate the virtual environment.",
+            required=True,
+        )
+    if current < (3, 11):
+        return DoctorCheck(
+            "python.version",
+            CheckCategory.PYTHON,
+            "Python version",
+            CheckStatus.WARN,
+            f"{detail} — works, 3.11+ recommended for LangGraph performance",
+            hint="Optional: upgrade to Python 3.11 or newer.",
+            required=True,
+        )
+    return DoctorCheck("python.version", CheckCategory.PYTHON, "Python version", CheckStatus.PASS, detail, required=True)
+
+
+def check_required_imports() -> list[DoctorCheck]:
+    """Probe each hard dependency without importing it."""
+
+    checks: list[DoctorCheck] = []
+    for module, package, unlocks, guidance in REQUIRED_IMPORTS:
+        if module_available(module):
+            checks.append(
+                DoctorCheck(f"import.{module}", CheckCategory.IMPORTS, module, CheckStatus.PASS,
+                            f"importable — {unlocks}", required=True)
+            )
+        else:
+            checks.append(
+                DoctorCheck(
+                    f"import.{module}",
+                    CheckCategory.IMPORTS,
+                    module,
+                    CheckStatus.FAIL,
+                    f"not importable — {unlocks}",
+                    hint=guidance,
+                    install=f"pip install {package}",
+                    required=True,
+                )
+            )
+    return checks
+
+
+def check_browser(settings: Settings, *, probe_launch: bool = False) -> list[DoctorCheck]:
+    """Verify the automation engine *and* that a browser build exists.
+
+    Install guidance is attached whenever a browser is missing, because
+    ``pip install playwright`` alone does not download Chromium.
+    """
+
+    checks: list[DoctorCheck] = []
+
+    if not module_available("playwright"):
+        checks.append(
+            DoctorCheck(
+                "browser.engine",
+                CheckCategory.BROWSER,
+                "Playwright engine",
+                CheckStatus.FAIL,
+                "playwright is not installed — no browser automation possible",
+                hint="Install the engine, then download a browser build.",
+                install="pip install playwright",
+                required=True,
+            )
+        )
+        checks.append(
+            DoctorCheck(
+                "browser.binary",
+                CheckCategory.BROWSER,
+                "browser build",
+                CheckStatus.SKIP,
+                "not checked — the engine is missing",
+                required=True,
+            )
+        )
+        return checks
+
+    checks.append(
+        DoctorCheck(
+            "browser.engine",
+            CheckCategory.BROWSER,
+            "Playwright engine",
+            CheckStatus.PASS,
+            f"installed — headless={ 'yes' if settings.browser_headless else 'no'}",
+            required=True,
+        )
+    )
+
+    builds = find_playwright_browsers()
+    system = find_system_browsers()
+    if builds:
+        newest = builds[-1].name
+        checks.append(
+            DoctorCheck(
+                "browser.binary",
+                CheckCategory.BROWSER,
+                "browser build",
+                CheckStatus.PASS,
+                f"{len(builds)} Playwright build(s) found, newest {newest}",
+                required=True,
+            )
+        )
+    elif system:
+        checks.append(
+            DoctorCheck(
+                "browser.binary",
+                CheckCategory.BROWSER,
+                "browser build",
+                CheckStatus.WARN,
+                f"no Playwright build downloaded; system browser available ({system[0]})",
+                hint="Playwright needs its own build for full compatibility.",
+                install=PLAYWRIGHT_BROWSER_INSTALL,
+                required=True,
+            )
+        )
+    else:
+        checks.append(
+            DoctorCheck(
+                "browser.binary",
+                CheckCategory.BROWSER,
+                "browser build",
+                CheckStatus.FAIL,
+                "playwright is installed but no Chromium build was downloaded",
+                hint="Then install the OS libraries Chromium needs.",
+                install=f"{PLAYWRIGHT_BROWSER_INSTALL}\n{PLAYWRIGHT_DEPS_INSTALL}",
+                required=True,
+            )
+        )
+
+    if probe_launch:
+        ok, message = probe_browser_launch(headless=settings.browser_headless)
+        checks.append(
+            DoctorCheck(
+                "browser.launch",
+                CheckCategory.BROWSER,
+                "browser launch",
+                CheckStatus.PASS if ok else CheckStatus.WARN,
+                message,
+                hint=None if ok else "Run with a downloaded build and the OS libraries it needs.",
+                install=None if ok else PLAYWRIGHT_DEPS_INSTALL,
+                required=False,
+            )
+        )
+    return checks
+
+
+def probe_browser_launch(*, headless: bool, timeout_ms: int = 20_000) -> tuple[bool, str]:
+    """Try a real Chromium launch in a subprocess-free, offline way.
+
+    Deliberately synchronous and guarded: a hung launch must not hang the
+    doctor, so the probe is bounded and every failure is reported, not raised.
+    """
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:                                     # pragma: no cover - env specific
+        return False, f"cannot import playwright.sync_api: {type(exc).__name__}"
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=headless, timeout=timeout_ms)
+            version = browser.version
+            browser.close()
+        return True, f"launched Chromium {version}"
+    except Exception as exc:                                     # pragma: no cover - env specific
+        first_line = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+        return False, f"launch failed: {redact_text(first_line)[:200]}"
+
+
+def check_model(result: SettingsResult) -> list[DoctorCheck]:
+    """Validate provider, model id and credential *state* — never the key."""
+
+    settings = result.settings
+    checks: list[DoctorCheck] = []
+    spec = settings.provider_spec()
+
+    provider_errors = [p for p in result.errors if p.field == "provider"]
+    if provider_errors:
+        checks.append(
+            DoctorCheck(
+                "model.provider",
+                CheckCategory.MODEL,
+                "provider",
+                CheckStatus.FAIL,
+                provider_errors[0].message,
+                hint=f"Set --provider or ARGUS_LLM_PROVIDER to one of: {', '.join(sorted(PROVIDER_REGISTRY))}.",
+                required=True,
+            )
+        )
+        return checks
+
+    checks.append(
+        DoctorCheck(
+            "model.provider",
+            CheckCategory.MODEL,
+            "provider",
+            CheckStatus.PASS,
+            f"{settings.provider}" + (f" — {spec.label}" if spec else ""),
+            required=True,
+        )
+    )
+
+    if settings.model:
+        known = spec.models if spec else ()
+        if known and settings.model not in known:
+            checks.append(
+                DoctorCheck(
+                    "model.id",
+                    CheckCategory.MODEL,
+                    "model id",
+                    CheckStatus.WARN,
+                    f"{settings.model} is not a known {spec.label if spec else settings.provider} model",
+                    hint=f"Known ids include: {', '.join(known[:3])}.",
+                )
+            )
+        else:
+            checks.append(
+                DoctorCheck("model.id", CheckCategory.MODEL, "model id", CheckStatus.PASS, settings.model, required=True)
+            )
+    else:
+        checks.append(
+            DoctorCheck(
+                "model.id",
+                CheckCategory.MODEL,
+                "model id",
+                CheckStatus.WARN,
+                "no model configured",
+                hint="Set ARGUS_LLM_MODEL or pass --model.",
+                install="export ARGUS_LLM_MODEL=gpt-4.1-mini",
+                required=True,
+            )
+        )
+
+    # Credential presence only — the value is masked and never rendered.
+    hint_text = settings.api_key_hint()
+    if settings.requires_credential() and not settings.resolve_api_key()[0]:
+        checks.append(
+            DoctorCheck(
+                "model.credential",
+                CheckCategory.MODEL,
+                "credential",
+                CheckStatus.WARN,
+                f"missing — {hint_text}",
+                hint="Export the key named above; it is read at call time and never printed.",
+                required=True,
+            )
+        )
+    else:
+        checks.append(
+            DoctorCheck("model.credential", CheckCategory.MODEL, "credential", CheckStatus.PASS, hint_text, required=True)
+        )
+    return checks
+
+
+def check_storage(settings: Settings, *, create_dirs: bool = False) -> list[DoctorCheck]:
+    """Verify output paths are writable, optionally creating them."""
+
+    checks: list[DoctorCheck] = []
+    targets: list[tuple[str, Path]] = [("output_dir", settings.output_dir)]
+    if settings.case_dir is not None:
+        targets.append(("case_dir", settings.case_dir))
+
+    for field_name, path in targets:
+        created_note = ""
+        if not path.exists() and create_dirs:
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                created_note = " (created)"
+            except OSError as exc:
+                checks.append(
+                    DoctorCheck(
+                        f"storage.{field_name}",
+                        CheckCategory.STORAGE,
+                        field_name,
+                        CheckStatus.FAIL,
+                        f"cannot create {path}: {type(exc).__name__}",
+                        hint="Choose a writable location with --output-dir or ARGUS_OUTPUT_DIR.",
+                        required=True,
+                    )
+                )
+                continue
+
+        writable = directory_writable(path)
+        if writable:
+            state = "exists" if path.exists() else f"will be created{created_note}"
+            checks.append(
+                DoctorCheck(
+                    f"storage.{field_name}",
+                    CheckCategory.STORAGE,
+                    field_name,
+                    CheckStatus.PASS,
+                    f"{path} — {state}, writable",
+                    required=True,
+                )
+            )
+        else:
+            checks.append(
+                DoctorCheck(
+                    f"storage.{field_name}",
+                    CheckCategory.STORAGE,
+                    field_name,
+                    CheckStatus.FAIL,
+                    f"{path} — not writable",
+                    hint="Pick a writable directory or fix its permissions.",
+                    install="export ARGUS_OUTPUT_DIR=$HOME/argus_output",
+                    required=True,
+                )
+            )
+    return checks
+
+
+def check_forensics() -> list[DoctorCheck]:
+    """Optional utilities: each miss only narrows what a mission can collect."""
+
+    checks: list[DoctorCheck] = []
+    for tool_id, kind, name, install, unlocks in FORENSIC_TOOLS:
+        present = module_available(name) if kind == "module" else bool(shutil.which(name))
+        if present:
+            checks.append(
+                DoctorCheck(f"forensics.{tool_id}", CheckCategory.FORENSICS, name, CheckStatus.PASS,
+                            f"{kind} available — {unlocks}")
+            )
+        else:
+            command = f"pip install {install}" if kind == "module" else f"apt-get install {install}"
+            checks.append(
+                DoctorCheck(
+                    f"forensics.{tool_id}",
+                    CheckCategory.FORENSICS,
+                    name,
+                    CheckStatus.WARN,
+                    f"missing ({kind}) — {unlocks} unavailable",
+                    hint=f"Optional: enables {unlocks}.",
+                    install=command,
+                )
+            )
+    return checks
+
+
+def check_configuration(result: SettingsResult) -> DoctorCheck:
+    """Summarise the strict validation performed by :func:`build_settings`."""
+
+    if result.ok:
+        return DoctorCheck(
+            "config.validation",
+            CheckCategory.CONFIG,
+            "settings validation",
+            CheckStatus.PASS,
+            "all limits and paths valid",
+            required=True,
+        )
+    errors = result.errors
+    preview = "; ".join(f"{p.field}: {p.message}" for p in errors[:3])
+    more = f" (+{len(errors) - 3} more)" if len(errors) > 3 else ""
+    return DoctorCheck(
+        "config.validation",
+        CheckCategory.CONFIG,
+        "settings validation",
+        CheckStatus.FAIL,
+        f"{len(errors)} invalid setting(s) — {preview}{more}",
+        hint="Run 'config --settings' to see every value and its source.",
+        required=True,
+    )
+
+
+def run_doctor(
+    result: SettingsResult,
+    *,
+    create_dirs: bool = False,
+    probe_launch: bool = False,
+) -> list[DoctorCheck]:
+    """Run every probe.  Never raises, never prints, never leaks a secret."""
+
+    checks: list[DoctorCheck] = []
+    checks.append(check_python())
+    checks.extend(check_required_imports())
+    checks.extend(check_browser(result.settings, probe_launch=probe_launch))
+    checks.extend(check_model(result))
+    checks.extend(check_storage(result.settings, create_dirs=create_dirs))
+    checks.extend(check_forensics())
+    checks.append(check_configuration(result))
+    return checks
+
+
+# --------------------------------------------------------------------------
+# 12.2 Rendering
+# --------------------------------------------------------------------------
+
+
+def doctor_guidance(checks: Sequence[DoctorCheck], *, include_warnings: bool = True) -> list[str]:
+    """Ordered, de-duplicated fixes: blocking ones first, optional ones last.
+
+    A check contributes its install command when it has one, otherwise its
+    hint.  Missing *optional* forensics tools are collapsed into a single line
+    so the panel stays readable when nothing is installed yet.
+    """
+
+    def fix_for(check: DoctorCheck) -> str | None:
+        return check.install or check.hint
+
+    blocking = [fix_for(c) for c in checks if c.status is CheckStatus.FAIL]
+    degraded = [
+        fix_for(c)
+        for c in checks
+        if c.status is CheckStatus.WARN and c.category is not CheckCategory.FORENSICS
+    ]
+    optional_tools = [
+        c.title for c in checks if c.status is CheckStatus.WARN and c.category is CheckCategory.FORENSICS
+    ]
+
+    lines: list[str] = []
+    for candidate in blocking + (degraded if include_warnings else []):
+        if candidate and candidate not in lines:
+            lines.append(candidate)
+    if optional_tools and include_warnings:
+        listed = ", ".join(optional_tools)
+        lines.append(f"Optional utilities missing (features degrade gracefully): {listed}")
+    return lines
+
+
+def render_doctor(
+    checks: Sequence[DoctorCheck],
+    *,
+    problems_only: bool = False,
+    show_hints: bool = True,
+) -> Console:
+    """Print the grouped report; returns the console for follow-up output."""
+
+    console = get_console()
+    failures = [c for c in checks if c.status is CheckStatus.FAIL]
+    warnings = [c for c in checks if c.status is CheckStatus.WARN]
+
+    table = Table(
+        title=f"{APP_TITLE} doctor — phase {BUILD_PHASE} ({BUILD_PHASE_NAME})",
+        title_justify="left",
+        box=None,
+        pad_edge=False,
+    )
+    table.add_column("", width=2, no_wrap=True)
+    table.add_column("check", style="bold", no_wrap=True)
+    table.add_column("status", no_wrap=True)
+    table.add_column("detail", overflow="fold")
+
+    for category in CheckCategory:
+        group = [c for c in checks if c.category is category]
+        shown = [c for c in group if not problems_only or c.status is not CheckStatus.PASS]
+        if not shown:
+            continue
+        # Category row: keep the glyph column empty so the label cannot wrap.
+        table.add_row("", f"[bold cyan]{category.value}[/bold cyan]", "", "")
+        for check in shown:
+            glyph, colour = _STATUS_STYLES[check.status]
+            label = "required" if check.required else "optional"
+            table.add_row(
+                f"[{colour}]{glyph}[/{colour}]",
+                escape(check.title),
+                f"[{colour}]{check.status.value}[/{colour}] [dim]{label}[/dim]",
+                escape(check.detail),
+            )
+
+    console.print()
+    console.print(table)
+
+    passed = sum(1 for c in checks if c.status is CheckStatus.PASS)
+    skipped = sum(1 for c in checks if c.status is CheckStatus.SKIP)
+    summary = Text()
+    summary.append(f"{passed} passed", style="green")
+    summary.append("  ·  ")
+    summary.append(f"{len(warnings)} warning(s)", style="yellow" if warnings else "dim")
+    summary.append("  ·  ")
+    summary.append(f"{len(failures)} failure(s)", style="red" if failures else "dim")
+    if skipped:
+        summary.append("  ·  ")
+        summary.append(f"{skipped} skipped", style="dim")
+    console.print(summary)
+
+    if show_hints:
+        guidance = doctor_guidance(checks)
+        if guidance:
+            body = Text()
+            for index, item in enumerate(guidance):
+                if index:
+                    body.append("\n")
+                # Multi-line fixes keep their alignment: first line gets the arrow.
+                for line_number, line in enumerate(item.splitlines()):
+                    if line_number:
+                        body.append("\n")
+                    body.append("→ " if line_number == 0 else "  ", style="cyan")
+                    body.append(line.strip(), style="white")
+            console.print(
+                Panel(
+                    body,
+                    title="how to fix" if failures else "optional improvements",
+                    title_align="left",
+                    border_style="red" if failures else "yellow",
+                )
+            )
+
+    if failures:
+        console.print(
+            f"[red]{len(failures)} required capability failure(s)[/red] — "
+            "missions cannot run until these are installed."
+        )
+    elif warnings:
+        console.print(
+            "[yellow]Required capabilities present.[/yellow] Warnings are optional — "
+            "affected features degrade gracefully and are skipped per mission."
+        )
+    else:
+        console.print("[green]All checks passed.[/green] Ready to run a mission.")
+    console.print()
+    return console
+
+
+@app.command("doctor", help="Diagnose every runtime capability: Python, imports, browser, model, storage, forensics.")
+def doctor_command(
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+    strict: bool = typer.Option(False, "--strict", help="Treat warnings as failures."),
+    problems_only: bool = typer.Option(
+        False, "--problems-only", help="Hide checks that passed."
+    ),
+    show_hints: bool = typer.Option(True, "--hints/--no-hints", help="Show fix commands."),
+    category: list[CheckCategory] | None = typer.Option(
+        None, "--category", help="Restrict to a category. Repeatable."
+    ),
+    create_dirs: bool = typer.Option(
+        False, "--create-dirs", help="Create the output directory if it is missing."
+    ),
+    probe_launch: bool = typer.Option(
+        False, "--probe-launch", help="Also try to launch Chromium (slow, may install nothing)."
+    ),
+) -> None:
+    """Check every capability the agent needs.  Performs no collection.
+
+    Missing *optional* utilities downgrade to warnings and never block a run;
+    missing *required* capabilities fail with an install command and a
+    non-zero exit status, so this doubles as a CI or preflight gate.
+    """
+
+    result = build_settings()
+    checks = run_doctor(result, create_dirs=create_dirs, probe_launch=probe_launch)
+
+    if category:
+        wanted = set(category)
+        checks = [c for c in checks if c.category in wanted]
+
+    failures = [c for c in checks if c.status is CheckStatus.FAIL]
+    warnings = [c for c in checks if c.status is CheckStatus.WARN]
+    failing = bool(failures) or (strict and bool(warnings))
+
+    if as_json:
+        _emit(
+            json.dumps(
+                {
+                    "app": APP_NAME,
+                    "version": __version__,
+                    "build_phase": BUILD_PHASE,
+                    "ok": not failing,
+                    "passed": sum(1 for c in checks if c.status is CheckStatus.PASS),
+                    "warnings": len(warnings),
+                    "failures": len(failures),
+                    "skipped": sum(1 for c in checks if c.status is CheckStatus.SKIP),
+                    "checks": [c.to_dict() for c in checks],
+                    "guidance": [
+                        redact_text(item, secrets=known_secrets())
+                        for item in doctor_guidance(checks)
+                    ],
+                    # Masked model state only — credentials are never serialised.
+                    "model": {
+                        "provider": result.settings.provider,
+                        "model": result.settings.model,
+                        "credential": result.settings.api_key_hint(),
+                    },
+                },
+                indent=2,
+            )
+        )
+    else:
+        console = render_doctor(checks, problems_only=problems_only, show_hints=show_hints)
+        if strict and warnings and not failures:
+            console.print(
+                f"[yellow]--strict:[/yellow] exiting {int(ExitCode.CONFIG)} because "
+                f"{len(warnings)} warning(s) were reported."
+            )
+
+    raise typer.Exit(ExitCode.CONFIG if failing else ExitCode.OK)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 13. Command: mission
 # ══════════════════════════════════════════════════════════════════════════
 
 
@@ -2103,7 +2898,7 @@ def mission_command(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 13. Entry point
+# 14. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 
