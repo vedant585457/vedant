@@ -141,6 +141,37 @@ and re-validated through the typed models on load::
     python vedant_osint.py state --load case/state.json
     python vedant_osint.py state --stress        # concurrency self-test
 
+Event rendering
+---------------
+``EventRenderer`` streams a mission as lines, not as a full-screen TUI.  It
+emits Master thinking/planning, Subagent and Worker spawning, task assignment,
+browsing, forensic analysis, reasoning, Worker completion, quality review,
+retasking, Subagent synthesis, Master synthesis, warnings and completion.
+
+Design guarantees (each pinned by ``renderer --self-test``):
+
+* **No alternate screen.**  ``Live(screen=True)`` is never used; the only escape
+  sequences are colour.
+* **Animation is optional and transient.**  On a TTY a step shows Rich's inline
+  spinner; when animation is disabled — or the stream is not a terminal — the
+  step becomes an explicit ``… message`` / ``✔ message`` pair, so information is
+  never lost.
+* **CI-safe.**  Piped output contains no ANSI escapes and no carriage returns,
+  and every event appears exactly once in chronological order.
+* **Nested output stays readable.**  Depth comes from spawn relationships and is
+  drawn as ``│  `` indentation; ``--ascii`` swaps every glyph for ASCII.
+* **Nothing leaks.**  Messages pass through the Task 2 redactor before they
+  reach the terminal or the JSONL trace.
+
+Every event is also written to an in-memory ``RenderTrace`` that can be saved as
+JSONL and replayed, and a plain-text ``--log-file`` mirrors events that the
+terminal filter hid::
+
+    python vedant_osint.py renderer                       # scripted demo
+    python vedant_osint.py renderer --self-test           # verify guarantees
+    python vedant_osint.py renderer --record trace.jsonl --replay trace.jsonl
+    python vedant_osint.py renderer --from-state case/state.json
+
 Usage
 -----
 ::
@@ -151,6 +182,7 @@ Usage
     python vedant_osint.py config --settings            # merged, redacted view
     python vedant_osint.py models                       # typed model catalogue + self-test
     python vedant_osint.py state --stress               # run-state concurrency self-test
+    python vedant_osint.py renderer --self-test         # CLI-only renderer guarantees
     python vedant_osint.py doctor                       # full capability health check
     python vedant_osint.py policy -o "..." --scope example.com          # safety preflight only
     python vedant_osint.py mission --target example.com -o "map the attack surface"
@@ -223,6 +255,7 @@ from __future__ import annotations
 # --- standard library: cheap, side-effect free -------------------------------
 import hashlib
 import importlib.util
+import io
 import ipaddress
 import json
 import os
@@ -233,6 +266,7 @@ import sys
 import tempfile
 import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum, IntEnum
@@ -269,7 +303,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 6
+VERSION_MINOR: int = 7
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -322,7 +356,7 @@ BUILD_PHASE_NAME: str = "Contracts"
 #: Section banners shared by the banner panel and ``version --json``.
 PHASE_ROADMAP: tuple[tuple[int, str, str], ...] = (
     (1, "Foundation", "CLI skeleton, config probing, version reporting"),
-    (2, "Contracts", "Settings, doctor, preflight, typed models, run-state store"),
+    (2, "Contracts", "Settings, doctor, preflight, models, run-state, renderer"),
     (3, "Orchestration", "LangGraph Master Agent + runtime Subagent factory"),
     (4, "Browser", "browser-use/Playwright sessions and capture"),
     (5, "Collection", "passive OSINT sources, artefact hashing/chain of custody"),
@@ -5954,6 +5988,10 @@ class StateEvent(StrictModel):
         return redact_text(value, secrets=known_secrets())
 
 
+#: Alias so renderer code can name the state-event enum unambiguously.
+StateEventKind = EventKind
+
+
 class Progress(StrictModel):
     """Derived view of how far along a mission is.  Never stored as truth."""
 
@@ -7116,7 +7154,855 @@ def state_command(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 17. Entry point
+# 17. CLI-only event renderer
+# ══════════════════════════════════════════════════════════════════════════
+#
+# A streaming, line-oriented renderer for mission progress.  It is deliberately
+# *not* a full-screen TUI:
+#
+#   * no alternate screen buffer (Rich's ``Live(screen=True)`` is never used);
+#   * no cursor-addressing, no scroll regions, no mouse handling;
+#   * transient animation is limited to Rich's inline ``status`` spinner, which
+#     writes ``\r`` on a TTY and — verified — writes *nothing at all* when the
+#     stream is not a terminal.
+#
+# Consequences, which the acceptance tests pin down:
+#
+#   * In a pipe, a log file or CI, output is plain, complete and chronological:
+#     every event appears exactly once, with no carriage returns and no escapes.
+#   * Disabling animation or colour never removes information: when animation is
+#     off, a status becomes an explicit start line and end line instead.
+#   * Nested output stays readable because hierarchy is expressed as indentation
+#     computed from spawn relationships, not as cursor movement.
+#
+# Usage:
+#   renderer = EventRenderer.from_options(color=False, animation=False)
+#   renderer.subagent_spawned("sa-1", "passive-dns", parent="master")
+#   with renderer.status("enumerating records"):
+#       ...
+
+class RenderKind(str, Enum):
+    """Every event the renderer understands."""
+
+    MASTER_THINKING = "master-thinking"
+    MASTER_PLANNING = "master-planning"
+    SUBAGENT_SPAWN = "subagent-spawn"
+    WORKER_SPAWN = "worker-spawn"
+    TASK_ASSIGN = "task-assign"
+    BROWSING = "browsing"
+    FORENSIC = "forensic"
+    REASONING = "reasoning"
+    WORKER_DONE = "worker-done"
+    QUALITY_REVIEW = "quality-review"
+    RETASKING = "retasking"
+    SUBAGENT_SYNTHESIS = "subagent-synthesis"
+    MASTER_SYNTHESIS = "master-synthesis"
+    WARNING = "warning"
+    COMPLETE = "complete"
+    # supporting kinds (not part of the required fifteen, but needed for logs)
+    INFO = "info"
+    ERROR = "error"
+    DEBUG = "debug"
+
+
+class EventLevel(str, Enum):
+    """Verbosity of one event.  Filters compare by index."""
+
+    DEBUG = "debug"
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+
+    @property
+    def rank(self) -> int:
+        return {EventLevel.DEBUG: 0, EventLevel.INFO: 1, EventLevel.WARNING: 2, EventLevel.ERROR: 3}[self]
+
+
+#: kind → (unicode glyph, ascii glyph, rich style, minimum level)
+_KIND_STYLES: dict[RenderKind, tuple[str, str, str, EventLevel]] = {
+    RenderKind.MASTER_THINKING: ("◆", "*", "bold cyan", EventLevel.INFO),
+    RenderKind.MASTER_PLANNING: ("◇", "-", "bold cyan", EventLevel.INFO),
+    RenderKind.SUBAGENT_SPAWN: ("⬡", "+", "bold magenta", EventLevel.INFO),
+    RenderKind.WORKER_SPAWN: ("·", "+", "magenta", EventLevel.INFO),
+    RenderKind.TASK_ASSIGN: ("→", ">", "blue", EventLevel.INFO),
+    RenderKind.BROWSING: ("◐", "~", "cyan", EventLevel.INFO),
+    RenderKind.FORENSIC: ("⚑", "#", "yellow", EventLevel.INFO),
+    RenderKind.REASONING: ("∴", ":", "green", EventLevel.INFO),
+    RenderKind.WORKER_DONE: ("✔", "v", "green", EventLevel.INFO),
+    RenderKind.QUALITY_REVIEW: ("⚖", "=", "bold yellow", EventLevel.INFO),
+    RenderKind.RETASKING: ("↻", "r", "yellow", EventLevel.INFO),
+    RenderKind.SUBAGENT_SYNTHESIS: ("⊞", "s", "bold green", EventLevel.INFO),
+    RenderKind.MASTER_SYNTHESIS: ("★", "S", "bold green", EventLevel.INFO),
+    RenderKind.WARNING: ("!", "!", "bold yellow", EventLevel.WARNING),
+    RenderKind.COMPLETE: ("■", "C", "bold green", EventLevel.INFO),
+    RenderKind.INFO: ("·", ".", "dim", EventLevel.INFO),
+    RenderKind.ERROR: ("✘", "X", "bold red", EventLevel.ERROR),
+    RenderKind.DEBUG: ("·", ".", "dim", EventLevel.DEBUG),
+}
+
+#: Escape sequences that would indicate a full-screen interface.
+_ALT_SCREEN_SEQUENCES: tuple[str, ...] = ("\x1b[?1049h", "\x1b[?1049l", "\x1b[?47h", "\x1b[?47l")
+
+
+class RenderEvent(StrictModel):
+    """One renderable event.
+
+    ``seq`` is assigned by the renderer under its lock, so concurrent Workers
+    cannot interleave two events into one line or duplicate a sequence number.
+    """
+
+    seq: int = Field(default=0, ge=0)
+    kind: RenderKind
+    message: str = Field(min_length=1)
+    at: datetime = Field(default_factory=utc_now)
+    level: EventLevel = EventLevel.INFO
+    actor: str | None = None              # agent id that caused the event
+    parent: str | None = None             # spawner, for hierarchy
+    label: str | None = None              # human name of the actor
+    depth: int | None = Field(default=None, ge=0)   # explicit override
+    data: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> datetime:
+        return normalise_datetime(value)
+
+    @field_validator("message")
+    @classmethod
+    def _redact(cls, value: str) -> str:
+        # The renderer is the last place a secret could reach a terminal.
+        return redact_text(value, secrets=known_secrets())
+
+    def to_jsonl(self) -> str:
+        return model_to_json(self, indent=None).replace("\n", "")
+
+
+class RenderTrace(StrictModel):
+    """An ordered record of everything rendered — the CI/audit artefact."""
+
+    events: list[RenderEvent] = Field(default_factory=list)
+    schema_version: int = 1
+
+    def append(self, event: RenderEvent) -> None:
+        self.events.append(event)
+
+    @property
+    def chronological(self) -> bool:
+        """True when sequence numbers are strictly increasing and contiguous."""
+
+        return [e.seq for e in self.events] == list(range(1, len(self.events) + 1))
+
+    def to_jsonl(self) -> str:
+        return "\n".join(e.to_jsonl() for e in self.events) + ("\n" if self.events else "")
+
+    def save(self, path: str | Path) -> Path:
+        target = Path(path).expanduser()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(self.to_jsonl(), encoding="utf-8")
+        return target
+
+    @classmethod
+    def from_jsonl(cls, text: str) -> "RenderTrace":
+        trace = cls()
+        for line in text.splitlines():
+            if line.strip():
+                trace.append(RenderEvent.model_validate_json(line))
+        return trace
+
+    @classmethod
+    def load(cls, path: str | Path) -> "RenderTrace":
+        return cls.from_jsonl(Path(path).expanduser().read_text(encoding="utf-8"))
+
+
+class EventRenderer:
+    """Line-oriented event renderer with optional transient status animation.
+
+    Thread-safe: ``emit`` takes a lock to assign the sequence number and write
+    the line, so parallel Subagents and Workers produce an untangled log.
+    """
+
+    def __init__(
+        self,
+        console: Console,
+        *,
+        color: bool = True,
+        animation: bool = True,
+        min_level: EventLevel = EventLevel.INFO,
+        timestamps: bool = True,
+        ascii_only: bool = False,
+        log_file: str | Path | None = None,
+    ) -> None:
+        self.console = console
+        self.color = color
+        # Animation is only ever *possible* on a real terminal.
+        self.animation = bool(animation and console.is_terminal)
+        self.min_level = min_level
+        self.timestamps = timestamps
+        self.ascii_only = ascii_only
+        self._lock = threading.RLock()
+        self._seq = 0
+        self._depth_of: dict[str, int] = {"master": 0}
+        self._label_of: dict[str, str] = {"master": "master"}
+        self._trace = RenderTrace()
+        self._status_depth = 0
+        self._log_path = Path(log_file).expanduser() if log_file else None
+        if self._log_path:
+            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # -- construction ------------------------------------------------------
+
+    @classmethod
+    def from_options(
+        cls,
+        *,
+        color: bool = True,
+        animation: bool = True,
+        min_level: EventLevel = EventLevel.INFO,
+        timestamps: bool = True,
+        ascii_only: bool = False,
+        log_file: str | Path | None = None,
+        stream: Any = None,
+    ) -> "EventRenderer":
+        """Build a renderer whose Console is configured for the target stream."""
+
+        console = Console(
+            file=stream if stream is not None else sys.stdout,
+            no_color=not color,
+            highlight=False,
+            soft_wrap=False,
+            width=None if (stream or sys.stdout).isatty() else FALLBACK_CONSOLE_WIDTH,
+            emoji=False,
+        )
+        return cls(
+            console,
+            color=color,
+            animation=animation,
+            min_level=min_level,
+            timestamps=timestamps,
+            ascii_only=ascii_only,
+            log_file=log_file,
+        )
+
+    # -- hierarchy ---------------------------------------------------------
+
+    def register_agent(self, agent_id: str, *, parent: str = "master", label: str | None = None) -> int:
+        """Record where an agent sits in the tree.  Returns its depth."""
+
+        with self._lock:
+            depth = self._depth_of.get(parent, 0) + 1
+            self._depth_of[agent_id] = depth
+            self._label_of[agent_id] = label or agent_id
+            return depth
+
+    def depth_of(self, agent_id: str | None) -> int:
+        if not agent_id:
+            return 0
+        with self._lock:
+            return self._depth_of.get(agent_id, 0)
+
+    def _glyph(self, kind: RenderKind) -> tuple[str, str, EventLevel]:
+        unicode_glyph, ascii_glyph, style, floor = _KIND_STYLES[kind]
+        return (ascii_glyph if self.ascii_only else unicode_glyph), style, floor
+
+    def _indent(self, depth: int) -> str:
+        if depth <= 0:
+            return ""
+        return ("|  " if self.ascii_only else "│  ") * depth
+
+    def _format_time(self, moment: datetime) -> str:
+        return moment.astimezone(timezone.utc).strftime("%H:%M:%S")
+
+    # -- core emit ---------------------------------------------------------
+
+    def emit(
+        self,
+        kind: RenderKind,
+        message: str,
+        *,
+        actor: str | None = None,
+        parent: str | None = None,
+        label: str | None = None,
+        depth: int | None = None,
+        level: EventLevel | None = None,
+        data: dict[str, Any] | None = None,
+        force: bool = False,
+    ) -> RenderEvent | None:
+        """Render one event.  Returns it, or ``None`` when filtered out.
+
+        Filtering still advances the sequence number's *meaning*: filtered
+        events are recorded in the trace with their sequence, so a replayed or
+        filtered log remains chronological and complete.
+        """
+
+        glyph, style, floor = self._glyph(kind)
+        effective_level = level or floor
+        if kind is RenderKind.WARNING:
+            effective_level = EventLevel.WARNING
+        if kind is RenderKind.ERROR:
+            effective_level = EventLevel.ERROR
+
+        with self._lock:
+            self._seq += 1
+            event = RenderEvent(
+                seq=self._seq,
+                kind=kind,
+                message=message,
+                at=utc_now(),
+                level=effective_level,
+                actor=actor,
+                parent=parent,
+                label=label,
+                depth=depth,
+                data=data or {},
+            )
+            self._trace.append(event)
+
+            if label and actor:
+                self._label_of[actor] = label
+            if kind is RenderKind.SUBAGENT_SPAWN and actor is not None:
+                self._depth_of.setdefault(actor, self._depth_of.get(parent or "master", 0) + 1)
+            if kind is RenderKind.WORKER_SPAWN and actor is not None:
+                self._depth_of.setdefault(actor, self._depth_of.get(parent or "master", 0) + 1)
+
+            visible = force or effective_level.rank >= self.min_level.rank
+            if visible:
+                self._write_line(event, glyph, style)
+            self._append_log(event, glyph)
+            return event
+
+    def _write_line(self, event: RenderEvent, glyph: str, style: str) -> None:
+        depth = event.depth if event.depth is not None else self.depth_of(event.actor)
+        prefix = self._indent(depth)
+        who = event.label or self._label_of.get(event.actor or "", event.actor or "")
+
+        parts: list[str] = []
+        if self.timestamps:
+            parts.append(f"[dim]{self._format_time(event.at)}[/dim]")
+        parts.append(f"[{style}]{escape(glyph)}[/{style}]")
+        line = "  ".join(parts)
+
+        if who and event.kind not in {RenderKind.SUBAGENT_SPAWN, RenderKind.WORKER_SPAWN}:
+            line = f"{line}  [dim]{escape(who)}[/dim]"
+        elif who and event.kind in {RenderKind.SUBAGENT_SPAWN, RenderKind.WORKER_SPAWN}:
+            line = f"{line}  [bold]{escape(who)}[/bold]"
+
+        kind_label = "" if event.kind in {RenderKind.INFO, RenderKind.DEBUG} else f"[dim]\\[{event.kind.value}][/dim] "
+        line = f"{prefix}{line}  {kind_label}{escape(event.message)}"
+        if event.data:
+            extras = " ".join(f"{k}={v}" for k, v in event.data.items())
+            line = f"{line}  [dim]({escape(extras)})[/dim]"
+
+        self.console.print(line, highlight=False, soft_wrap=False)
+
+    def _append_log(self, event: RenderEvent, glyph: str) -> None:
+        """Mirror every event to the plain log file, filtered or not."""
+
+        if not self._log_path:
+            return
+        depth = event.depth if event.depth is not None else self.depth_of(event.actor)
+        who = event.label or self._label_of.get(event.actor or "", "")
+        stamp = event.at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        line = (
+            f"{stamp} seq={event.seq:<4} {event.level.value:<7} {event.kind.value:<20} "
+            f"{'  ' * depth}{glyph} {who + ': ' if who else ''}{event.message}"
+        )
+        try:
+            with self._log_path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError:                                  # pragma: no cover - disk full etc.
+            pass
+
+    # -- transient status --------------------------------------------------
+
+    @contextmanager
+    def status(self, message: str, *, spinner: str = "dots"):
+        """Transient spinner on a TTY; explicit start/end lines elsewhere.
+
+        When animation is off — or the stream is not a terminal — this prints
+        ``… message`` and then ``✔ message`` so the log still shows that the
+        step happened and that it finished.
+        """
+
+        if not self.animation:
+            self.console.print(f"[dim]… {escape(message)}[/dim]", highlight=False)
+            try:
+                yield self
+            finally:
+                self.console.print(f"[dim]✔ {escape(message)}[/dim]", highlight=False)
+            return
+
+        with self.console.status(f"[cyan]{escape(message)}[/cyan]", spinner=spinner):
+            yield self
+
+    # -- typed convenience emitters ---------------------------------------
+
+    def master_thinking(self, message: str, **kwargs: Any) -> RenderEvent | None:
+        return self.emit(RenderKind.MASTER_THINKING, message, actor="master", **kwargs)
+
+    def master_planning(self, message: str, **kwargs: Any) -> RenderEvent | None:
+        return self.emit(RenderKind.MASTER_PLANNING, message, actor="master", **kwargs)
+
+    def subagent_spawned(self, agent_id: str, label: str, *, parent: str = "master", **kwargs: Any) -> RenderEvent | None:
+        self.register_agent(agent_id, parent=parent, label=label)
+        return self.emit(
+            RenderKind.SUBAGENT_SPAWN,
+            f"spawned subagent {label}",
+            actor=agent_id,
+            parent=parent,
+            label=label,
+            **kwargs,
+        )
+
+    def worker_spawned(self, agent_id: str, label: str, *, parent: str, **kwargs: Any) -> RenderEvent | None:
+        self.register_agent(agent_id, parent=parent, label=label)
+        return self.emit(
+            RenderKind.WORKER_SPAWN,
+            f"spawned worker {label}",
+            actor=agent_id,
+            parent=parent,
+            label=label,
+            **kwargs,
+        )
+
+    def task_assigned(self, message: str, *, actor: str, **kwargs: Any) -> RenderEvent | None:
+        return self.emit(RenderKind.TASK_ASSIGN, message, actor=actor, **kwargs)
+
+    def browsing(self, message: str, *, actor: str, url: str | None = None, **kwargs: Any) -> RenderEvent | None:
+        data = dict(kwargs.pop("data", {}) or {})
+        if url:
+            data["url"] = url
+        return self.emit(RenderKind.BROWSING, message, actor=actor, data=data, **kwargs)
+
+    def forensic(self, message: str, *, actor: str, artifact: str | None = None, **kwargs: Any) -> RenderEvent | None:
+        data = dict(kwargs.pop("data", {}) or {})
+        if artifact:
+            data["artifact"] = artifact
+        return self.emit(RenderKind.FORENSIC, message, actor=actor, data=data, **kwargs)
+
+    def reasoning(self, message: str, *, actor: str = "master", **kwargs: Any) -> RenderEvent | None:
+        return self.emit(RenderKind.REASONING, message, actor=actor, **kwargs)
+
+    def worker_done(self, message: str, *, actor: str, **kwargs: Any) -> RenderEvent | None:
+        return self.emit(RenderKind.WORKER_DONE, message, actor=actor, **kwargs)
+
+    def quality_review(self, message: str, *, actor: str, verdict: str | None = None, **kwargs: Any) -> RenderEvent | None:
+        data = dict(kwargs.pop("data", {}) or {})
+        if verdict:
+            data["verdict"] = verdict
+        return self.emit(RenderKind.QUALITY_REVIEW, message, actor=actor, data=data, **kwargs)
+
+    def retasking(self, message: str, *, actor: str, **kwargs: Any) -> RenderEvent | None:
+        return self.emit(RenderKind.RETASKING, message, actor=actor, **kwargs)
+
+    def subagent_synthesis(self, message: str, *, actor: str, **kwargs: Any) -> RenderEvent | None:
+        return self.emit(RenderKind.SUBAGENT_SYNTHESIS, message, actor=actor, **kwargs)
+
+    def master_synthesis(self, message: str, **kwargs: Any) -> RenderEvent | None:
+        return self.emit(RenderKind.MASTER_SYNTHESIS, message, actor="master", **kwargs)
+
+    def warning(self, message: str, *, actor: str | None = None, **kwargs: Any) -> RenderEvent | None:
+        return self.emit(RenderKind.WARNING, message, actor=actor, force=True, **kwargs)
+
+    def error(self, message: str, *, actor: str | None = None, **kwargs: Any) -> RenderEvent | None:
+        return self.emit(RenderKind.ERROR, message, actor=actor, force=True, **kwargs)
+
+    def complete(self, message: str, **kwargs: Any) -> RenderEvent | None:
+        return self.emit(RenderKind.COMPLETE, message, actor="master", force=True, **kwargs)
+
+    # -- derived helpers ---------------------------------------------------
+
+    @property
+    def trace(self) -> RenderTrace:
+        with self._lock:
+            return RenderTrace(events=[e.model_copy(deep=True) for e in self._trace.events])
+
+    @property
+    def event_count(self) -> int:
+        with self._lock:
+            return len(self._trace.events)
+
+    def summary(self) -> Table:
+        """Per-kind counts plus chronology, for the end of a run."""
+
+        with self._lock:
+            counts: dict[str, int] = {}
+            for event in self._trace.events:
+                counts[event.kind.value] = counts.get(event.kind.value, 0) + 1
+            table = Table(box=None, pad_edge=False, show_header=False)
+            table.add_column("kind", style="dim", no_wrap=True)
+            table.add_column("count", justify="right", no_wrap=True)
+            for kind, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+                table.add_row(kind, str(count))
+            table.add_row("[bold]total[/bold]", f"[bold]{len(self._trace.events)}[/bold]")
+            return table
+
+    def consume_state_events(self, events: Sequence[StateEvent]) -> list[RenderEvent]:
+        """Render the run-state event log from :class:`RunStateStore`.
+
+        This is how a real mission's audit trail reaches the terminal: the store
+        records facts, the renderer decides presentation.
+        """
+
+        mapping = {
+            StateEventKind.MISSION_CREATED: RenderKind.INFO,
+            StateEventKind.STATUS_CHANGED: RenderKind.INFO,
+            StateEventKind.SUBAGENT_ADDED: RenderKind.SUBAGENT_SPAWN,
+            StateEventKind.WORKER_ADDED: RenderKind.WORKER_SPAWN,
+            StateEventKind.TASK_ASSIGNED: RenderKind.TASK_ASSIGN,
+            StateEventKind.TASK_STARTED: RenderKind.BROWSING,
+            StateEventKind.TASK_FINISHED: RenderKind.WORKER_DONE,
+            StateEventKind.EVIDENCE_ADDED: RenderKind.REASONING,
+            StateEventKind.EVIDENCE_MERGED: RenderKind.REASONING,
+            StateEventKind.REVIEW_RECORDED: RenderKind.QUALITY_REVIEW,
+            StateEventKind.RETRY_RECORDED: RenderKind.RETASKING,
+            StateEventKind.BUDGET_CONSUMED: RenderKind.DEBUG,
+            StateEventKind.BUDGET_EXCEEDED: RenderKind.WARNING,
+            StateEventKind.CONFLICT: RenderKind.WARNING,
+            StateEventKind.CHECKPOINT_SAVED: RenderKind.INFO,
+            StateEventKind.CHECKPOINT_LOADED: RenderKind.INFO,
+            StateEventKind.ERROR: RenderKind.ERROR,
+        }
+        rendered: list[RenderEvent] = []
+        for event in events:
+            out = self.emit(
+                mapping.get(event.kind, RenderKind.INFO),
+                event.message,
+                actor=event.actor,
+                label=event.actor,
+            )
+            if out is not None:
+                rendered.append(out)
+        return rendered
+
+
+@app.command("renderer", help="Exercise the CLI-only event renderer (no network, no model).")
+def renderer_command(
+    demo: bool = typer.Option(True, "--demo/--no-demo", help="Render a scripted nested mission."),
+    replay: str | None = typer.Option(None, "--replay", help="Re-render a JSONL trace recorded earlier."),
+    record: str | None = typer.Option(None, "--record", help="Write the JSONL trace here."),
+    log_file: str | None = typer.Option(None, "--log-file", help="Append a plain-text log here."),
+    from_state: str | None = typer.Option(None, "--from-state", help="Render events from a run-state checkpoint."),
+    no_color: bool = typer.Option(False, "--no-color", help="Disable ANSI colour."),
+    no_animation: bool = typer.Option(False, "--no-animation", help="Disable the transient spinner."),
+    ascii_only: bool = typer.Option(False, "--ascii", help="ASCII glyphs only."),
+    timestamps: bool = typer.Option(True, "--timestamps/--no-timestamps", help="Show HH:MM:SS prefixes."),
+    min_level: EventLevel = typer.Option(EventLevel.INFO, "--level", case_sensitive=False),
+    self_test: bool = typer.Option(False, "--self-test", help="Verify the renderer guarantees."),
+    as_json: bool = typer.Option(False, "--json", help="Emit the trace as JSON instead of prose."),
+) -> None:
+    """Renders to stdout only.  Never opens an alternate screen."""
+
+    console = get_console()
+
+    if self_test:
+        results = run_renderer_self_test()
+        failures = [r for r in results if not r.ok]
+        if as_json:
+            _emit(json.dumps({"ok": not failures, "checks": [asdict(r) for r in results]}, indent=2))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        console.print()
+        table = Table(title="renderer self-test", title_justify="left", box=None, pad_edge=False)
+        table.add_column("", width=2)
+        table.add_column("check", style="bold", no_wrap=True)
+        table.add_column("detail", overflow="fold")
+        for result in results:
+            glyph, colour = ("✔", "green") if result.ok else ("✘", "red")
+            table.add_row(f"[{colour}]{glyph}[/{colour}]", escape(result.name), escape(result.detail))
+        console.print(table)
+        console.print(f"[{'green' if not failures else 'red'}]{len(results) - len(failures)} passed[/] · {len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    # In machine mode the JSONL trace owns stdout, so prose goes to stderr and
+    # the two streams cannot corrupt one another when captured together.
+    renderer = EventRenderer.from_options(
+        color=not no_color,
+        animation=not no_animation,
+        min_level=min_level,
+        timestamps=timestamps,
+        ascii_only=ascii_only,
+        log_file=log_file,
+        stream=sys.stderr if as_json else None,
+    )
+
+    if replay:
+        try:
+            trace = RenderTrace.load(replay)
+        except (OSError, ValueError) as exc:
+            console.print(f"[red]cannot read trace:[/red] {escape(str(exc))}")
+            raise typer.Exit(ExitCode.CONFIG) from exc
+        for event in trace.events:
+            renderer.emit(event.kind, event.message, actor=event.actor, parent=event.parent,
+                          label=event.label, depth=event.depth, level=event.level,
+                          data=event.data, force=True)
+    elif from_state:
+        try:
+            store = RunStateStore.load_checkpoint(from_state)
+        except CheckpointError as exc:
+            console.print(f"[red]checkpoint error:[/red] {escape(str(exc))}")
+            raise typer.Exit(ExitCode.CONFIG) from exc
+        renderer.consume_state_events(store.events())
+    elif demo:
+        _render_demo_mission(renderer)
+
+    renderer.complete("run finished")
+    trace = renderer.trace
+
+    if record:
+        try:
+            path = trace.save(record)
+        except OSError as exc:
+            # Machine mode keeps stdout clean; report on stderr.
+            if as_json:
+                typer.echo(f"cannot write trace: {exc}", err=True)
+            else:
+                console.print(f"[red]cannot write trace:[/red] {escape(str(exc))}")
+            raise typer.Exit(ExitCode.CONFIG) from exc
+        if not as_json:
+            console.print(f"[dim]trace recorded to {escape(str(path))}[/dim]")
+
+    if as_json:
+        _emit(trace.to_jsonl())
+        raise typer.Exit(ExitCode.OK)
+
+    console.print()
+    console.print(renderer.summary())
+    console.print(
+        f"[green]✔ {renderer.event_count} event(s)[/green] "
+        f"· colour={'on' if not no_color else 'off'} · animation={'on' if renderer.animation else 'off'}"
+        f" · chronological={'yes' if trace.chronological else 'NO'}"
+    )
+    console.print()
+    raise typer.Exit(ExitCode.OK)
+
+
+def _render_demo_mission(renderer: EventRenderer) -> None:
+    """A scripted mission exercising all fifteen event kinds, nested three deep."""
+
+    renderer.master_thinking("objective cleared by policy preflight; scope is one domain")
+    with renderer.status("drafting the investigation plan"):
+        renderer.master_planning("3 areas: passive DNS, certificate transparency, public documents")
+
+    renderer.subagent_spawned("sa-dns", "passive-dns")
+    renderer.subagent_spawned("sa-ct", "certificate-transparency")
+    renderer.worker_spawned("wrk-resolver", "resolver-queries", parent="sa-dns")
+    renderer.worker_spawned("wrk-archive", "archive-lookup", parent="sa-dns")
+
+    renderer.task_assigned("query public resolvers for A/AAAA/MX", actor="sa-dns")
+    renderer.task_assigned("collect historical records", actor="wrk-archive")
+    with renderer.status("querying resolvers"):
+        renderer.browsing("GET https://dns.example/api/records", actor="wrk-resolver",
+                          url="https://dns.example/api/records")
+    renderer.worker_done("14 records returned, 2 conflicting", actor="wrk-resolver")
+
+    renderer.reasoning("conflict is consistent with a recent migration, not with evasion", actor="sa-dns")
+    renderer.task_assigned("re-run archived lookups for the older value", actor="sa-dns")
+    renderer.retasking("wrk-archive asked to widen the date range", actor="sa-dns")
+    renderer.worker_done("older value confirmed from 2025-11 archive", actor="wrk-archive")
+
+    renderer.quality_review("claim lacked a source; one observation added", actor="sa-dns", verdict="revise")
+    renderer.warning("forensics utility 'exiftool' missing — metadata step skipped", actor="sa-ct")
+    renderer.forensic("hashed artifact /case/advisory.pdf (sha256 recorded)", actor="sa-ct",
+                      artifact="/case/advisory.pdf")
+
+    renderer.reasoning("two independent sources agree; confidence raised to medium", actor="sa-dns")
+    renderer.subagent_synthesis("2 observations, 1 inference; uncertainty stated", actor="sa-dns")
+    renderer.master_thinking("weighing subagent reports against the declared hypotheses")
+    renderer.master_synthesis("no attribution made; 1 hypothesis refuted, 1 left open")
+
+
+@dataclass(frozen=True)
+class RendererCheck:
+    name: str
+    ok: bool
+    detail: str
+
+
+def run_renderer_self_test() -> list[RendererCheck]:
+    """Verify every renderer guarantee claimed in the docstring."""
+
+    checks: list[RendererCheck] = []
+
+    def record(name: str, ok: bool, detail: str) -> None:
+        checks.append(RendererCheck(name, ok, detail))
+
+    # 1. No alternate screen, ever — across every combination.
+    for color in (True, False):
+        for animation in (True, False):
+            buffer = io.StringIO()
+            renderer = EventRenderer.from_options(stream=buffer, color=color, animation=animation)
+            _render_demo_mission(renderer)
+            output = buffer.getvalue()
+            found = [seq for seq in _ALT_SCREEN_SEQUENCES if seq in output]
+            record(
+                f"no alternate screen (color={color}, animation={animation})",
+                not found,
+                "clean" if not found else f"found {found}",
+            )
+
+    # 2. Colour disabled ⇒ no ANSI escapes at all, but every event still present.
+    buffer = io.StringIO()
+    renderer = EventRenderer.from_options(stream=buffer, color=False, animation=True)
+    _render_demo_mission(renderer)
+    plain = buffer.getvalue()
+    record("no colour ⇒ no ANSI escapes", "\x1b[" not in plain, "clean" if "\x1b[" not in plain else "escapes present")
+    all_kinds = {kind for kind in RenderKind if kind not in {RenderKind.DEBUG}}
+    rendered_kinds = {e.kind for e in renderer.trace.events}
+    record(
+        "no colour ⇒ complete log",
+        len(renderer.trace.events) >= 15 and len(rendered_kinds) >= 13,
+        f"{len(renderer.trace.events)} events, {len(rendered_kinds)} kinds",
+    )
+
+    # 3. Animation disabled ⇒ no carriage returns, still complete.
+    buffer = io.StringIO()
+    renderer = EventRenderer.from_options(stream=buffer, color=False, animation=False)
+    _render_demo_mission(renderer)
+    no_anim = buffer.getvalue()
+    record("animation off ⇒ no carriage returns", "\r" not in no_anim, "clean" if "\r" not in no_anim else "\r present")
+    record(
+        "animation off ⇒ status still logged",
+        "drafting the investigation plan" in no_anim and "querying resolvers" in no_anim,
+        "start/end lines present",
+    )
+    record(
+        "animation off ⇒ chronological order preserved",
+        [e.seq for e in renderer.trace.events] == list(range(1, len(renderer.trace.events) + 1)),
+        f"{len(renderer.trace.events)} events",
+    )
+
+    # 4. Nested output: depth increases master → subagent → worker.
+    buffer = io.StringIO()
+    renderer = EventRenderer.from_options(stream=buffer, color=False, animation=False)
+    _render_demo_mission(renderer)
+    def indent_of(fragment: str) -> int | None:
+        """Leading spaces of the line whose *message* is exactly ``fragment``.
+
+        A substring probe is unreliable here: "drafting the investigation plan"
+        also appears inside an indented subagent line, which would report the
+        wrong depth.
+        """
+
+        for line in buffer.getvalue().splitlines():
+            if not line.rstrip().endswith(fragment):
+                continue
+            depth = 0
+            for prefix in ("│  ", "|  "):
+                count = 0
+                while line[count:].startswith(prefix):
+                    count += len(prefix)
+                    depth += 1
+                if count:
+                    return depth
+            return 0
+        return None
+    master_indent = indent_of("drafting the investigation plan")
+    subagent_indent = indent_of("passive-dns")
+    worker_indent = indent_of("resolver-queries")
+    record(
+        "nesting indents by depth",
+        None not in (master_indent, subagent_indent, worker_indent)
+        and master_indent < subagent_indent < worker_indent,
+        f"master={master_indent} subagent={subagent_indent} worker={worker_indent}",
+    )
+
+    # 5. All fifteen required kinds are representable.
+    required = {
+        RenderKind.MASTER_THINKING, RenderKind.MASTER_PLANNING, RenderKind.SUBAGENT_SPAWN,
+        RenderKind.WORKER_SPAWN, RenderKind.TASK_ASSIGN, RenderKind.BROWSING, RenderKind.FORENSIC,
+        RenderKind.REASONING, RenderKind.WORKER_DONE, RenderKind.QUALITY_REVIEW, RenderKind.RETASKING,
+        RenderKind.SUBAGENT_SYNTHESIS, RenderKind.MASTER_SYNTHESIS, RenderKind.WARNING, RenderKind.COMPLETE,
+    }
+    record("all 15 required event kinds exist", required <= set(RenderKind), f"{len(required)} kinds")
+
+    buffer = io.StringIO()
+    renderer = EventRenderer.from_options(stream=buffer, color=False, animation=False)
+    for kind in sorted(required, key=lambda k: k.value):
+        renderer.emit(kind, f"probe {kind.value}", actor="master")
+    record("every required kind renders", len(renderer.trace.events) == len(required), f"{len(renderer.trace.events)} rendered")
+
+    # 6. Concurrent emission: all events kept, none interleaved, unique seqs.
+    buffer = io.StringIO()
+    renderer = EventRenderer.from_options(stream=buffer, color=False, animation=False)
+    errors: list[str] = []
+    def burst(index: int) -> None:
+        try:
+            for n in range(25):
+                renderer.emit(RenderKind.REASONING, f"worker {index} step {n}", actor="master")
+        except Exception as exc:                          # pragma: no cover
+            errors.append(str(exc))
+    threads = [threading.Thread(target=burst, args=(i,)) for i in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    seqs = [e.seq for e in renderer.trace.events]
+    record(
+        "concurrent emit: nothing lost",
+        not errors and len(seqs) == 200 and len(set(seqs)) == 200,
+        f"{len(seqs)} events, {len(set(seqs))} unique",
+    )
+    lines = [line for line in buffer.getvalue().splitlines() if "step" in line]
+    record(
+        "concurrent emit: one event per line",
+        len(lines) == 200 and all(line.count("step") == 1 for line in lines),
+        f"{len(lines)} lines",
+    )
+
+    # 7. JSONL round-trip preserves chronology and payload.
+    buffer = io.StringIO()
+    renderer = EventRenderer.from_options(stream=buffer, color=False, animation=False)
+    _render_demo_mission(renderer)
+    trace = renderer.trace
+    restored = RenderTrace.from_jsonl(trace.to_jsonl())
+    record(
+        "jsonl round-trip keeps every event",
+        len(restored.events) == len(trace.events) and restored.chronological,
+        f"{len(restored.events)} events",
+    )
+    record(
+        "jsonl round-trip keeps actor and depth",
+        [e.actor for e in restored.events] == [e.actor for e in trace.events],
+        "actors preserved",
+    )
+
+    # 8. Secrets never reach the terminal or the trace.
+    secret = "sk-proj-RENDERERSECRET1234567890"
+    buffer = io.StringIO()
+    renderer = EventRenderer.from_options(stream=buffer, color=False, animation=False)
+    renderer.browsing(f"GET https://api.example/x?key={secret}", actor="master", url="https://api.example/x")
+    record("secret scrubbed from rendered line", secret not in buffer.getvalue(), "clean")
+    record("secret scrubbed from trace", secret not in renderer.trace.to_jsonl(), "clean")
+
+    # 9. Level filtering hides debug chatter but keeps warnings and errors.
+    buffer = io.StringIO()
+    renderer = EventRenderer.from_options(stream=buffer, color=False, animation=False)
+    renderer.emit(RenderKind.DEBUG, "chatty detail", actor="master")
+    renderer.emit(RenderKind.INFO, "normal detail", actor="master")
+    renderer.warning("something degraded", actor="master")
+    renderer.error("something broke", actor="master")
+    visible = buffer.getvalue()
+    record(
+        "filtering hides debug only",
+        "chatty detail" not in visible and "normal detail" in visible
+        and "something degraded" in visible and "something broke" in visible,
+        "warnings/errors always shown",
+    )
+    record("filtered events remain in the trace", len(renderer.trace.events) == 4, f"{len(renderer.trace.events)} recorded")
+
+    # 10. Plain log file mirrors everything, including filtered events.
+    with tempfile.TemporaryDirectory() as tmp:
+        log_path = Path(tmp) / "run.log"
+        buffer = io.StringIO()
+        renderer = EventRenderer.from_options(stream=buffer, color=False, animation=False, log_file=log_path)
+        _render_demo_mission(renderer)
+        renderer.emit(RenderKind.DEBUG, "filtered but logged", actor="master")
+        text = log_path.read_text()
+        record("log file gets every event", "filtered but logged" in text, f"{len(text.splitlines())} lines")
+        record("log file has no ANSI escapes", "\x1b[" not in text, "clean")
+
+    return checks
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 18. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 

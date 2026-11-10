@@ -26,6 +26,27 @@ excerpt and SHA-256, plus chain-of-custody metadata. Missing data is an explicit
 `UnknownValue(reason=...)`, and `null` keys survive serialisation, so a missing
 key and a null stay distinguishable.
 
+## Event rendering
+
+`EventRenderer` is line-oriented, never a full-screen TUI (no alternate screen).
+It covers Master thinking/planning, spawning, task assignment, browsing,
+forensics, reasoning, completion, review, retasking, both synthesis steps,
+warnings and completion.
+
+```bash
+python vedant_osint.py renderer                  # scripted nested mission
+python vedant_osint.py renderer --self-test      # 22 guarantee checks
+python vedant_osint.py renderer --record t.jsonl --replay t.jsonl
+python vedant_osint.py renderer --from-state case/state.json
+```
+
+On a TTY a step animates with Rich's inline spinner; with `--no-animation`, or
+when piped, it becomes an explicit `… message` / `✔ message` pair. Piped output
+has zero ANSI escapes and zero carriage returns, every event appearing once in
+chronological order. Hierarchical indentation shows the agent tree; `--ascii`
+swaps all glyphs. `--json` writes JSONL to stdout and prose to stderr; a plain
+`--log-file` also captures events the terminal filter hid.
+
 ## Run state
 
 `RunStateStore` is the single source of truth for a mission in flight: objective,
@@ -127,7 +148,7 @@ Authorised use only — collect from systems you own or are explicitly permitted
 | Phase | Scope | State |
 |-------|-------|-------|
 | 1 | Foundation — CLI skeleton, config probing, version reporting | ✅ done |
-| 2 | Contracts — settings, `doctor`, preflight, models, run-state store | ✅ done |
+| 2 | Contracts — settings, `doctor`, preflight, models, run-state, renderer | ✅ done |
 | 3 | Orchestration — LangGraph Master Agent + runtime Subagent factory | ⬜ next |
 | 4 | Browser — browser-use / Playwright sessions and capture | ⬜ |
 | 5 | Collection — passive OSINT sources, artefact hashing | ⬜ |
