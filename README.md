@@ -12,6 +12,20 @@ python vedant_osint.py doctor                # capability health check (CI gate)
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
+## Typed models
+
+```bash
+python vedant_osint.py models                  # catalogue + 20-check self-test
+python vedant_osint.py models -n FinalReport   # fields + JSON schema
+```
+
+Evidence is typed by epistemic status — `observation` (requires a source),
+`inference` (requires reasoning + its inputs), `allegation` (requires the party
+who claimed it). Sources carry URL/path, retrieval time and method, HTTP status,
+excerpt and SHA-256, plus chain-of-custody metadata. Missing data is an explicit
+`UnknownValue(reason=...)`, and `null` keys survive serialisation, so a missing
+key and a null stay distinguishable.
+
 ## Safety & scope
 
 Every mission passes a policy preflight **before** anything is planned.
@@ -94,7 +108,7 @@ Authorised use only — collect from systems you own or are explicitly permitted
 | Phase | Scope | State |
 |-------|-------|-------|
 | 1 | Foundation — CLI skeleton, config probing, version reporting | ✅ done |
-| 2 | Contracts — strict settings, `doctor`, safety & scope preflight | ✅ done |
+| 2 | Contracts — strict settings, `doctor`, preflight, typed models | ✅ done |
 | 3 | Orchestration — LangGraph Master Agent + runtime Subagent factory | ⬜ next |
 | 4 | Browser — browser-use / Playwright sessions and capture | ⬜ |
 | 5 | Collection — passive OSINT sources, artefact hashing | ⬜ |

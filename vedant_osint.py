@@ -26,7 +26,7 @@ Required dependencies
 ---------------------
 Core (imported lazily, checked by ``argus config``)::
 
-    pip install typer rich pydantic python-dotenv
+    pip install typer rich pydantic python-dotenv    # pydantic powers the typed models
 
 Orchestration and collection (Phase 3+)::
 
@@ -93,6 +93,30 @@ CLI option > environment variable > built-in default, applied per field.
 annotations; secrets appear only as ``set``/``unset`` with a masked hint such
 as ``sk-p…c3f9`` and are scrubbed from every error and diagnostic surface.
 
+Typed models
+------------
+The shared contracts live in this file and are inspectable from the CLI::
+
+    python vedant_osint.py models                    # catalogue + self-test
+    python vedant_osint.py models -n EvidenceItem    # one model's fields/schema
+
+``Mission``, ``Scope``, ``SubagentSpec``, ``WorkerSpec``, ``TaskAssignment``,
+``TaskResult``, ``EvidenceItem``, ``SourceReference``, ``QualityReview``,
+``SubagentReport`` and ``FinalReport`` each carry a deterministic id, UTC
+timestamps, a status, and an ``error`` field where failure is possible.
+
+Evidence distinguishes three epistemic kinds — ``observation`` (requires a
+source), ``inference`` (requires reasoning and its inputs) and ``allegation``
+(requires the party who made the claim).  There is no "finding" kind: an
+unverified statement is either our inference or their allegation.  Sources
+record URL or artefact path, retrieval time and method, HTTP status, excerpt
+and SHA-256, plus chain-of-custody metadata (handler, method, storage,
+preservation status, integrity hash, gaps).
+
+Missing data is an explicit ``UnknownValue(reason=...)`` rather than an empty
+string, ``null`` keys are preserved on serialisation (a missing key and a null
+are different claims), and models reject unknown fields so a typo cannot vanish.
+
 Usage
 -----
 ::
@@ -101,6 +125,7 @@ Usage
     python vedant_osint.py version
     python vedant_osint.py config
     python vedant_osint.py config --settings            # merged, redacted view
+    python vedant_osint.py models                       # typed model catalogue + self-test
     python vedant_osint.py doctor                       # full capability health check
     python vedant_osint.py policy -o "..." --scope example.com          # safety preflight only
     python vedant_osint.py mission --target example.com -o "map the attack surface"
@@ -171,6 +196,7 @@ from __future__ import annotations
 # ══════════════════════════════════════════════════════════════════════════
 
 # --- standard library: cheap, side-effect free -------------------------------
+import hashlib
 import importlib.util
 import ipaddress
 import json
@@ -180,6 +206,7 @@ import re
 import shutil
 import sys
 import tempfile
+import uuid
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum, IntEnum
@@ -192,6 +219,7 @@ from typing import Any, Callable, Iterable, Mapping
 # I/O.  Everything heavier (LangGraph, browser-use, Playwright, HTTP clients)
 # is imported lazily inside the functions that need it.
 import typer
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
@@ -215,7 +243,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 4
+VERSION_MINOR: int = 5
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -268,7 +296,7 @@ BUILD_PHASE_NAME: str = "Contracts"
 #: Section banners shared by the banner panel and ``version --json``.
 PHASE_ROADMAP: tuple[tuple[int, str, str], ...] = (
     (1, "Foundation", "CLI skeleton, config probing, version reporting"),
-    (2, "Contracts", "Strict settings, capability doctor, safety & scope preflight"),
+    (2, "Contracts", "Strict settings, doctor, policy preflight, typed models"),
     (3, "Orchestration", "LangGraph Master Agent + runtime Subagent factory"),
     (4, "Browser", "browser-use/Playwright sessions and capture"),
     (5, "Collection", "passive OSINT sources, artefact hashing/chain of custody"),
@@ -612,16 +640,9 @@ class MissionRequest:
         return data
 
     def fingerprint(self) -> str:
-        """Stable, human-readable mission id derived from its content."""
+        """Stable mission id, identical to the typed model's ``Mission.id``."""
 
-        import hashlib
-
-        payload = json.dumps(
-            {"targets": sorted(self.targets), "objective": self.objective, "mode": self.mode.value},
-            sort_keys=True,
-        )
-        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:10]
-        return f"mission-{digest}"
+        return mission_id_for(self.objective, self.targets, self.mode)
 
 
 @dataclass
@@ -3832,7 +3853,10 @@ def _validate_request(request: MissionRequest) -> None:
 
 
 def render_mission_plan(
-    request: MissionRequest, settings: Settings, preflight: PreflightReport | None = None
+    request: MissionRequest,
+    settings: Settings,
+    preflight: PreflightReport | None = None,
+    mission: "Mission | None" = None,
 ) -> None:
     """Show what the Master Agent *would* do.  No collection is performed."""
 
@@ -3897,6 +3921,7 @@ def render_mission_plan(
     table.add_row("network", "allowed" if settings.allow_network else "offline")
     table.add_row("operator", escape(request.operator or "unset (ARGUS_OPERATOR)"))
     table.add_row("created", request.created_at)
+    table.add_row("typed id", f"[dim]{escape(mission.id if mission else request.fingerprint())}[/dim]")
     console.print(table)
 
     if not settings.dry_run:
@@ -4158,6 +4183,15 @@ def mission_command(
     # accusation-framed wording never reaches planning.
     request.objective = preflight.objective
 
+    # 3b. Typed contract for Phase 3.  Built only from a cleared preflight, so an
+    #     uncleared objective cannot acquire a typed representation at all.
+    mission = Mission.from_preflight(
+        request=request,
+        preflight=preflight,
+        settings=settings,
+        operator=request.operator,
+    )
+
     # 4. Render.  ``settings`` phase is a pure configuration view.
     if phase is MissionPhase.SETTINGS:
         if as_json:
@@ -4188,6 +4222,7 @@ def mission_command(
                     "request": request.to_dict(),
                     "settings": settings.to_dict(),
                     "preflight": preflight.to_dict(),
+                    "mission": json.loads(model_to_json(mission)),
                     "warnings": [p.to_dict() for p in result.problems],
                     "plan": {
                         "subagents": f"runtime-created, max {request.max_subagents}",
@@ -4202,7 +4237,7 @@ def mission_command(
             )
         )
     else:
-        render_mission_plan(request, settings, preflight)
+        render_mission_plan(request, settings, preflight, mission)
         if result.problems:
             console.print(render_settings_problems(result.problems, title="configuration notes"))
             console.print()
@@ -4227,7 +4262,1575 @@ def mission_command(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 15. Entry point
+# 15. Typed data models — mission, evidence, results
+# ══════════════════════════════════════════════════════════════════════════
+#
+# These are the shared contracts between the CLI, the Master Agent (Phase 3),
+# the runtime-created Subagents and Workers, and the reporters.  Pydantic is a
+# required dependency because validation must happen at the boundary, not in
+# downstream code.
+#
+# Three rules govern every model here:
+#
+#   1. STABLE IDS.  Every entity carries a deterministic ``id`` derived from
+#      its semantic content, so re-running the same mission produces the same
+#      identifiers.  Retries use ``attempt``, never a new id.
+#   2. EXPLICIT UNKNOWNS.  Missing data is a first-class value
+#      (``UnknownReason``), never an empty string that later reads as fact.
+#      Optional fields default to ``None`` *and* say why they are ``None``.
+#   3. NO INVENTED PROVENANCE.  Evidence records what was observed, where it
+#      came from, when it was retrieved, and how it was preserved — or states
+#      that this is unknown.  A model validator refuses to construct
+#      unprovenanced evidence.
+#
+# Entities (Mission, Scope, SubagentSpec, WorkerSpec, TaskAssignment,
+# TaskResult, EvidenceItem, SourceReference, QualityReview, SubagentReport,
+# FinalReport, ChainOfCustody) all carry a stable ``id``, timestamps, a status
+# or kind, and an ``error`` field where failure is possible.
+#
+# ReviewFinding is also an entity: reviewers cite finding ids when they accept
+# or dispute an objection.
+#
+# Value objects (UnknownValue, HashRecord, ScopeEntry, CapabilityRequirement,
+# ErrorInfo) deliberately have no id: they are embedded components of an
+# entity, never referenced on their own.  They still carry a timestamp where
+# the moment matters (when the unknown was determined, when an error occurred).
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
+
+#: Schema version for the model set below; bump on any breaking change.
+MODEL_SCHEMA_VERSION: int = 1
+
+
+# --------------------------------------------------------------------------
+# 15.1 Primitives: ids, timestamps, status enums, unknowns
+# --------------------------------------------------------------------------
+
+
+def utc_now() -> datetime:
+    """Timezone-aware UTC timestamp.  Never a naive datetime."""
+
+    return datetime.now(timezone.utc)
+
+
+def canonical_json(payload: Any) -> str:
+    """Deterministic JSON for hashing and id derivation."""
+
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def content_id(prefix: str, *parts: Any, length: int = 12) -> str:
+    """Deterministic, human-readable id: ``prefix`` + hash of the parts.
+
+    Re-running an identical mission reproduces identical ids, which makes
+    reports comparable and de-duplication trivial.
+    """
+
+    digest = hashlib.sha256(canonical_json(parts).encode("utf-8")).hexdigest()[:length]
+    return f"{prefix}-{digest}"
+
+
+def mission_id_for(objective: str, targets: Iterable[str], mode: MissionMode, *, length: int = 12) -> str:
+    """The one and only mission-id derivation.
+
+    Used by :meth:`MissionRequest.fingerprint` (CLI planning) and by
+    :class:`Mission` (the typed model) so both always name the same mission.
+    """
+
+    return content_id(
+        "mission",
+        {"objective": objective.strip().lower(), "targets": sorted(t.lower() for t in targets), "mode": mode.value},
+        length=length,
+    )
+
+
+def new_id(prefix: str) -> str:
+    """Random id for run-scoped entities (attempts, captures, review rounds)."""
+
+    return f"{prefix}-{uuid.uuid4().hex[:12]}"
+
+
+def sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def normalise_datetime(value: Any) -> datetime:
+    """Accept naive/aware datetimes, ISO strings and epoch seconds.
+
+    Naive values are interpreted as UTC and made timezone-aware, so a naive
+    timestamp can never silently shift by the host's local offset.
+    """
+
+    if isinstance(value, datetime):
+        moment = value
+    elif isinstance(value, (int, float)):
+        moment = datetime.fromtimestamp(value, tz=timezone.utc)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError("empty timestamp string")
+        try:
+            moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(f"unparseable timestamp {text!r}") from exc
+    else:
+        raise ValueError(f"unsupported timestamp type {type(value).__name__}")
+    return moment.replace(tzinfo=timezone.utc) if moment.tzinfo is None else moment.astimezone(timezone.utc)
+
+
+class StrictModel(BaseModel):
+    """Base model: unknown fields are an error, not silently dropped."""
+
+    model_config = ConfigDict(
+        extra="forbid",              # a typo must not vanish into the void
+        validate_assignment=True,    # catch corruption after construction
+        str_strip_whitespace=True,
+        use_enum_values=False,
+        populate_by_name=True,
+    )
+
+
+class EntityStatus(str, Enum):
+    """Lifecycle of a mission, subagent, worker, task or review."""
+
+    PENDING = "pending"
+    READY = "ready"
+    RUNNING = "running"
+    BLOCKED = "blocked"          # cannot proceed (dependency, scope, policy)
+    PAUSED = "paused"            # needs a human decision
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    SKIPPED = "skipped"          # deliberately not attempted (degraded capability)
+    CANCELLED = "cancelled"
+    BUDGET_EXCEEDED = "budget-exceeded"
+
+    @property
+    def terminal(self) -> bool:
+        return self in _TERMINAL_STATUSES
+
+
+_TERMINAL_STATUSES: frozenset[EntityStatus] = frozenset(
+    {
+        EntityStatus.SUCCEEDED,
+        EntityStatus.FAILED,
+        EntityStatus.SKIPPED,
+        EntityStatus.CANCELLED,
+        EntityStatus.BUDGET_EXCEEDED,
+    }
+)
+
+
+class UnknownReason(str, Enum):
+    """Why a value is missing.  Never left implicit."""
+
+    NOT_YET_OBSERVED = "not-yet-observed"
+    NOT_REQUESTED = "not-requested"
+    WITHHELD = "withheld"
+    REDACTED = "redacted"          # hidden from this audience, exists elsewhere
+    UNAVAILABLE = "unavailable"    # source did not provide it
+    NOT_APPLICABLE = "not-applicable"
+    OUT_OF_SCOPE = "out-of-scope"  # policy/scope prevented collection
+    FAILED = "failed"              # a collection attempt failed
+    UNKNOWN = "unknown"            # genuinely undetermined
+
+
+class EvidenceKind(str, Enum):
+    """The epistemic status of a statement.  This is the core distinction.
+
+    ``OBSERVATION`` — directly seen, retrieved and preserved; verifiable by a
+    third party replaying the source reference.
+    ``INFERENCE`` — a conclusion drawn *by us* from one or more observations,
+    with the reasoning and the inputs recorded.
+    ``ALLEGATION`` — a claim made by a *third party*; unverified by us, and
+    reported as a claim, never as a finding.
+    """
+
+    OBSERVATION = "observation"
+    INFERENCE = "inference"
+    ALLEGATION = "allegation"
+
+
+class SourceKind(str, Enum):
+    """What kind of source a reference points at."""
+
+    PUBLIC_WEB = "public-web"
+    ARCHIVE = "archive"
+    API = "api"
+    SEARCH_ENGINE = "search-engine"
+    DNS = "dns"
+    WHOIS = "whois"
+    CERTIFICATE_LOG = "certificate-log"
+    SOCIAL_MEDIA = "social-media"
+    BREACH_NOTICE = "breach-notice"
+    LOCAL_ARTIFACT = "local-artifact"
+    DOCUMENT = "document"
+    ARTIFACT_IMAGE = "artifact-image"
+    MEMORY_IMAGE = "memory-image"
+    LOG_FILE = "log-file"
+    SCREENSHOT = "screenshot"
+    OTHER = "other"
+
+
+class RetrievalMethod(str, Enum):
+    """How the source was obtained — needed to judge reliability."""
+
+    BROWSER = "browser"
+    HTTP = "http"
+    API_CALL = "api-call"
+    LOCAL_READ = "local-read"
+    OPERATOR_SUPPLIED = "operator-supplied"
+    THIRD_PARTY = "third-party"
+    UNKNOWN = "unknown"
+
+
+class Confidence(str, Enum):
+    """Coarse confidence, with numeric bands documented for the report."""
+
+    UNKNOWN = "unknown"          # no basis to judge
+    LOW = "low"                  # single weak source, or hearsay
+    MEDIUM = "medium"            # corroborated by one independent source
+    HIGH = "high"                # multiple independent, reliable sources
+
+    @property
+    def numeric(self) -> float | None:
+        """Midpoint used for sorting.  ``None`` means "do not invent a number"."""
+
+        return {
+            Confidence.UNKNOWN: None,
+            Confidence.LOW: 0.25,
+            Confidence.MEDIUM: 0.6,
+            Confidence.HIGH: 0.85,
+        }[self]
+
+
+class PreservationStatus(str, Enum):
+    """How well an artefact's integrity is assured.  Never assumed."""
+
+    NOT_ASSESSED = "not-assessed"
+    ACQUIRED = "acquired"                # copied, integrity not yet verified
+    HASHED = "hashed"                    # digest computed and recorded
+    VERIFIED = "verified"                # digest re-checked against the source
+    DEGRADED = "degraded"                # partial capture, known loss
+    UNRECOVERABLE = "unrecoverable"      # artefact is gone or unreadable
+
+
+class RedactionLevel(str, Enum):
+    """How much of an entity may be shown in a rendered report."""
+
+    PUBLIC = "public"
+    RESTRICTED = "restricted"
+    SECRET = "secret"            # never rendered; existence may be noted
+
+
+class UnknownValue(StrictModel):
+    """An explicitly unknown value, with the reason and who decided.
+
+    Use this instead of ``None`` whenever "we do not know" is itself a finding
+    that the reader must see.
+    """
+
+    reason: UnknownReason = UnknownReason.UNKNOWN
+    detail: str | None = None
+    determined_by: str | None = None     # component that established the gap
+    determined_at: datetime = Field(default_factory=utc_now)
+
+    @field_validator("determined_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> datetime:
+        return normalise_datetime(value)
+
+    def describe(self) -> str:
+        base = f"unknown ({self.reason.value})"
+        return f"{base}: {self.detail}" if self.detail else base
+
+
+class HashRecord(StrictModel):
+    """A digest of captured content, so later readers can verify integrity."""
+
+    algorithm: str = "sha256"
+    value: str = Field(min_length=16)
+    size_bytes: int | None = Field(default=None, ge=0)
+    computed_at: datetime = Field(default_factory=utc_now)
+
+    @field_validator("computed_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> datetime:
+        return normalise_datetime(value)
+
+    @field_validator("algorithm")
+    @classmethod
+    def _known_algorithm(cls, value: str) -> str:
+        allowed = {"sha256", "sha512", "sha1", "md5"}
+        lowered = value.lower()
+        if lowered not in allowed:
+            raise ValueError(f"unsupported hash algorithm {value!r}; expected one of {sorted(allowed)}")
+        return lowered
+
+    @field_validator("value")
+    @classmethod
+    def _hex(cls, value: str) -> str:
+        cleaned = value.strip().lower()
+        if not all(c in "0123456789abcdef" for c in cleaned):
+            raise ValueError("hash value must be hexadecimal")
+        return cleaned
+
+    @classmethod
+    def of_bytes(cls, payload: bytes, *, algorithm: str = "sha256") -> "HashRecord":
+        return cls(
+            algorithm=algorithm,
+            value=hashlib.new(algorithm, payload).hexdigest(),
+            size_bytes=len(payload),
+        )
+
+
+# --------------------------------------------------------------------------
+# 15.2 Scope
+# --------------------------------------------------------------------------
+
+
+class ScopeEntry(StrictModel):
+    """One authorised (or excluded) asset in the mission boundary."""
+
+    pattern: str = Field(min_length=1)
+    included: bool = True
+    note: str | None = None
+
+    @property
+    def id(self) -> str:
+        return content_id("scope", self.pattern.lower(), self.included)
+
+
+class Scope(StrictModel):
+    """The typed mirror of the preflight :class:`ScopeDeclaration`.
+
+    ``entries`` are allow-list patterns (domain, host, CIDR, path);
+    ``exclusions`` always win.  ``data_classes`` states what kind of evidence
+    may be touched, so a reviewer can tell web collection from forensic work.
+    """
+
+    id: str = ""
+    status: EntityStatus = EntityStatus.PENDING     # pending → ready once approved
+    mode: MissionMode = MissionMode.PASSIVE
+    entries: list[ScopeEntry] = Field(default_factory=list)
+    data_classes: list[DataClass] = Field(default_factory=list)
+    authorized_by: str | None = None
+    authorization_basis: str | None = None
+    policy_source: str | None = None          # which document/ticket, if any
+    created_at: datetime = Field(default_factory=utc_now)
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True, populate_by_name=True)
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> datetime:
+        return normalise_datetime(value)
+
+    @model_validator(mode="after")
+    def _identify(self) -> "Scope":
+        if not self.id:
+            self.id = content_id(
+                "scope",
+                self.mode.value if isinstance(self.mode, MissionMode) else str(self.mode),
+                sorted(e.pattern.lower() for e in self.entries if e.included),
+                sorted(e.pattern.lower() for e in self.entries if not e.included),
+                sorted(dc.value for dc in self.data_classes),
+            )
+        return self
+
+    @property
+    def includes(self) -> list[str]:
+        return [e.pattern for e in self.entries if e.included]
+
+    @property
+    def excludes(self) -> list[str]:
+        return [e.pattern for e in self.entries if not e.included]
+
+    def covers(self, target: str) -> bool:
+        """Delegate to the policy matcher so one implementation rules them all."""
+
+        if any(scope_covers(pattern, target) for pattern in self.excludes):
+            return False
+        return any(scope_covers(pattern, target) for pattern in self.includes)
+
+    @classmethod
+    def from_declaration(cls, declaration: "ScopeDeclaration") -> "Scope":
+        """Build from the preflight declaration without losing any detail."""
+
+        entries = [ScopeEntry(pattern=p, included=True) for p in declaration.entries]
+        entries += [ScopeEntry(pattern=p, included=False) for p in declaration.exclusions]
+        return cls(
+            mode=declaration.mode,
+            entries=entries,
+            data_classes=list(declaration.data_classes),
+            authorized_by=declaration.authorized_by,
+            authorization_basis=declaration.authorization_basis,
+            policy_source="preflight",
+        )
+
+
+# --------------------------------------------------------------------------
+# 15.3 Source references and chain of custody
+# --------------------------------------------------------------------------
+
+
+class SourceReference(StrictModel):
+    """Where something came from, when, how, and how it was preserved.
+
+    A reference must point at *something* concrete: a URL, an artefact path, or
+    an explicit :class:`UnknownValue` explaining why not.
+    """
+
+    id: str = ""
+    kind: SourceKind = SourceKind.OTHER
+    url: str | None = None
+    artifact_path: str | None = None
+    title: str | None = None
+    publisher: str | None = None
+    author: str | None = None
+    published_at: datetime | None = None
+    retrieved_at: datetime = Field(default_factory=utc_now)
+    retrieval_method: RetrievalMethod = RetrievalMethod.UNKNOWN
+    http_status: int | None = Field(default=None, ge=100, le=599)
+    content_hash: HashRecord | None = None
+    excerpt: str | None = None
+    language: str | None = None
+    access_note: str | None = None
+    missing: UnknownValue | None = None       # set when a field cannot be known
+
+    @field_validator("retrieved_at", "published_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> Any:
+        return normalise_datetime(value) if value is not None else None
+
+    @field_validator("url")
+    @classmethod
+    def _url_shape(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not re.match(r"^(https?|file)://[^\s]+$", value):
+            raise ValueError("source URL must be an absolute http(s):// or file:// URL")
+        return value
+
+    @model_validator(mode="after")
+    def _locatable(self) -> "SourceReference":
+        # Provenance may not be invented: a reference must be locatable, or
+        # explicitly declare that it is not.
+        if not (self.url or self.artifact_path) and self.missing is None:
+            raise ValueError(
+                "SourceReference needs a url or artifact_path; use missing=UnknownValue(...) "
+                "when the location genuinely cannot be determined"
+            )
+        if not self.id:
+            self.id = content_id("src", self.kind.value, self.url or self.artifact_path, self.retrieved_at.isoformat())
+        return self
+
+    @property
+    def locator(self) -> str:
+        return self.url or self.artifact_path or (self.missing.describe() if self.missing else "unknown")
+
+
+class ChainOfCustody(StrictModel):
+    """Who handled an artefact, when, and what they did to it.
+
+    ``preserved`` is deliberately not defaulted to True: an artefact that was
+    merely read is *not* preserved, and claiming otherwise would overstate the
+    evidence.
+    """
+
+    id: str = ""
+    collected_by: str | None = None
+    collected_at: datetime = Field(default_factory=utc_now)
+    collection_method: RetrievalMethod = RetrievalMethod.UNKNOWN
+    original_location: str | None = None
+    storage_location: str | None = None
+    write_protected: bool = False
+    read_only_verified: bool = False
+    preserved: bool = False
+    preservation_status: PreservationStatus = PreservationStatus.NOT_ASSESSED
+    integrity_hash: HashRecord | None = None
+    custody_events: list[str] = Field(default_factory=list)
+    gaps: list[UnknownValue] = Field(default_factory=list)   # explicitly recorded unknowns
+
+    @field_validator("collected_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> datetime:
+        return normalise_datetime(value)
+
+    @model_validator(mode="after")
+    def _identify(self) -> "ChainOfCustody":
+        # A custody record is a document: it needs to be addressable so a
+        # reviewer can cite it ("custody record coc-abc123").
+        if not self.id:
+            self.id = content_id("coc", self.collected_by, self.original_location, self.collected_at.isoformat())
+        return self
+
+    def note(self, event: str, *, at: datetime | None = None) -> None:
+        """Append a custody event; kept simple because it must always succeed."""
+
+        stamp = (at or utc_now()).isoformat(timespec="seconds")
+        self.custody_events.append(f"{stamp} {event}")
+
+
+# --------------------------------------------------------------------------
+# 15.4 Evidence
+# --------------------------------------------------------------------------
+
+class ErrorInfo(StrictModel):
+    """A structured failure: what broke, where, whether it is retryable."""
+
+    code: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+    stage: str | None = None
+    component: str | None = None
+    retryable: bool = False
+    attempt: int = Field(default=1, ge=1)
+    occurred_at: datetime = Field(default_factory=utc_now)
+    cause_type: str | None = None
+    context: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("occurred_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> datetime:
+        return normalise_datetime(value)
+
+    @field_validator("message")
+    @classmethod
+    def _redact(cls, value: str) -> str:
+        # Error text is the most common secret-leak path (URLs with tokens,
+        # headers).  Scrub on construction so it can never escape later.
+        return redact_text(value, secrets=known_secrets())
+
+    @classmethod
+    def from_exception(
+        cls,
+        exc: BaseException,
+        *,
+        code: str | None = None,
+        stage: str | None = None,
+        component: str | None = None,
+        retryable: bool = False,
+        attempt: int = 1,
+    ) -> "ErrorInfo":
+        return cls(
+            code=code or type(exc).__name__.lower(),
+            message=str(exc) or type(exc).__name__,
+            stage=stage,
+            component=component,
+            retryable=retryable,
+            attempt=attempt,
+            cause_type=type(exc).__name__,
+        )
+
+
+
+class EvidenceItem(StrictModel):
+    """A single unit of evidence, typed by epistemic status.
+
+    The ``kind`` field is the important one:
+
+    * ``observation`` — must have at least one source reference.
+    * ``inference`` — must record the reasoning *and* the evidence it rests on.
+    * ``allegation`` — must record who made the claim; never treated as fact.
+
+    ``finding`` intentionally does **not** exist: an unverified statement is
+    either an inference (ours) or an allegation (theirs).
+    """
+
+    id: str = ""
+    kind: EvidenceKind
+    statement: str = Field(min_length=1, description="What is asserted, in neutral language.")
+    sources: list[SourceReference] = Field(default_factory=list)
+    supports: list[str] = Field(default_factory=list)     # evidence ids this relies on
+    contradicts: list[str] = Field(default_factory=list)  # evidence ids this conflicts with
+    confidence: Confidence = Confidence.UNKNOWN
+    confidence_basis: str | None = None
+    reasoning: str | None = None                          # required for INFERENCE
+    allegation_made_by: str | None = None                 # required for ALLEGATION
+    allegation_date: datetime | None = None
+    verified: bool | None = None                          # None = not yet assessed
+    custody: ChainOfCustody | None = None
+    tags: list[str] = Field(default_factory=list)
+    redaction: RedactionLevel = RedactionLevel.PUBLIC
+    collected_by: str | None = None                       # subagent/worker id
+    task_id: str | None = None
+    observed_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    missing: list[UnknownValue] = Field(default_factory=list)
+    error: ErrorInfo | None = None
+
+    @field_validator("created_at", "observed_at", "allegation_date", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> Any:
+        return normalise_datetime(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def _epistemic_rules(self) -> "EvidenceItem":
+        # 1. Stable id from semantic content (kind + statement), not from time.
+        if not self.id:
+            self.id = content_id("ev", self.kind.value, self.statement.lower())
+
+        # 2. Provenance requirements per kind.
+        if self.kind is EvidenceKind.OBSERVATION and not self.sources:
+            raise ValueError(
+                "an observation needs at least one SourceReference; "
+                "if nothing was retrieved, record it as not-yet-observed instead"
+            )
+        if self.kind is EvidenceKind.INFERENCE:
+            if not self.reasoning:
+                raise ValueError("an inference must record reasoning — how the conclusion was reached")
+            if not (self.sources or self.supports):
+                raise ValueError("an inference must rest on sources or on other evidence ids")
+        if self.kind is EvidenceKind.ALLEGATION and not self.allegation_made_by:
+            raise ValueError("an allegation must record who made the claim (allegation_made_by)")
+
+        # 3. Confidence without a basis is not allowed to masquerade as calibrated.
+        if self.confidence is not Confidence.UNKNOWN and not self.confidence_basis:
+            raise ValueError(
+                "state confidence_basis (why this confidence level) or leave confidence unknown"
+            )
+        return self
+
+    @property
+    def is_finding(self) -> bool:
+        """Only corroborated observations count as findings."""
+
+        return (
+            self.kind is EvidenceKind.OBSERVATION
+            and self.verified is True
+            and self.confidence in {Confidence.MEDIUM, Confidence.HIGH}
+        )
+
+    @property
+    def uncorroborated(self) -> bool:
+        return self.kind is not EvidenceKind.OBSERVATION or not self.sources
+
+
+# --------------------------------------------------------------------------
+# 15.4b Errors
+# --------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------
+# 15.6 Agent specifications and assignments
+# --------------------------------------------------------------------------
+
+
+class CapabilityRequirement(StrictModel):
+    """What a task needs in order to run, and whether it is optional."""
+
+    name: str                                          # e.g. "playwright", "exiftool"
+    optional: bool = True
+    purpose: str | None = None
+
+
+class WorkerSpec(StrictModel):
+    """A task-specific Worker definition, created at runtime by a Subagent.
+
+    There is no fixed roster: this is the *schema* a Worker must satisfy, and
+    ``id``/``subagent_id`` tie it to the run that produced it.
+    """
+
+    id: str = ""
+    subagent_id: str = ""
+    name: str = Field(min_length=1, description="Runtime-chosen name, e.g. 'dns-enumeration'.")
+    objective: str = Field(min_length=1)
+    tools: list[str] = Field(default_factory=list)
+    capabilities: list[CapabilityRequirement] = Field(default_factory=list)
+    inputs: list[str] = Field(default_factory=list)     # evidence/assignment ids
+    output_schema: str = "TaskResult"
+    max_attempts: int = Field(default=2, ge=1, le=10)
+    timeout_seconds: int = Field(default=300, ge=5, le=3600)
+    requires_network: bool = False
+    requires_browser: bool = False
+    status: EntityStatus = EntityStatus.PENDING
+    created_at: datetime = Field(default_factory=utc_now)
+    missing: list[UnknownValue] = Field(default_factory=list)
+    error: ErrorInfo | None = None
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> datetime:
+        return normalise_datetime(value)
+
+    @model_validator(mode="after")
+    def _identify(self) -> "WorkerSpec":
+        if not self.id:
+            self.id = content_id("wrk", self.subagent_id, self.name.lower(), self.objective.lower())
+        return self
+
+
+class SubagentSpec(StrictModel):
+    """A task-specific Subagent, created at runtime by the Master Agent."""
+
+    id: str = ""
+    mission_id: str = ""
+    name: str = Field(min_length=1)
+    objective: str = Field(min_length=1)
+    rationale: str | None = None                       # why this subagent exists
+    workers: list[WorkerSpec] = Field(default_factory=list)
+    scope_entries: list[str] = Field(default_factory=list)
+    depends_on: list[str] = Field(default_factory=list)  # other subagent ids
+    max_workers: int = Field(default=4, ge=1, le=16)
+    review_rounds_allowed: int = Field(default=2, ge=0, le=5)
+    status: EntityStatus = EntityStatus.PENDING
+    created_at: datetime = Field(default_factory=utc_now)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    missing: list[UnknownValue] = Field(default_factory=list)
+    error: ErrorInfo | None = None
+
+    @field_validator("created_at", "started_at", "finished_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> Any:
+        return normalise_datetime(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def _identify(self) -> "SubagentSpec":
+        if not self.id:
+            self.id = content_id("sa", self.mission_id, self.name.lower(), self.objective.lower())
+        return self
+
+    @model_validator(mode="after")
+    def _worker_links(self) -> "SubagentSpec":
+        for worker in self.workers:
+            if not worker.subagent_id:
+                worker.subagent_id = self.id
+        return self
+
+
+class TaskAssignment(StrictModel):
+    """Work handed to a Worker: inputs, deadline, and how success is judged."""
+
+    id: str = ""
+    mission_id: str = ""
+    subagent_id: str = ""
+    worker_id: str = ""
+    objective: str = Field(min_length=1)
+    inputs: list[str] = Field(default_factory=list)
+    expected_output: str | None = None
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    deadline: datetime | None = None
+    attempt: int = Field(default=1, ge=1)
+    status: EntityStatus = EntityStatus.READY
+    assigned_at: datetime = Field(default_factory=utc_now)
+    missing: list[UnknownValue] = Field(default_factory=list)
+    error: ErrorInfo | None = None
+
+    @field_validator("assigned_at", "deadline", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> Any:
+        return normalise_datetime(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def _identify(self) -> "TaskAssignment":
+        if not self.id:
+            self.id = content_id("task", self.worker_id, self.objective.lower(), self.attempt)
+        return self
+
+
+class TaskResult(StrictModel):
+    """What a Worker returns.  A failure is a result, never an exception."""
+
+    id: str = ""
+    task_id: str = ""
+    worker_id: str = ""
+    status: EntityStatus = EntityStatus.SUCCEEDED
+    summary: str | None = None
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    artifacts: list[str] = Field(default_factory=list)
+    metrics: dict[str, float | int | str | None] = Field(default_factory=dict)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    duration_seconds: float | None = Field(default=None, ge=0)
+    attempts: int = Field(default=1, ge=1)
+    truncated: bool = False                              # output cut short by a budget
+    missing: list[UnknownValue] = Field(default_factory=list)
+    error: ErrorInfo | None = None
+
+    @field_validator("started_at", "finished_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> Any:
+        return normalise_datetime(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def _identify(self) -> "TaskResult":
+        if not self.id:
+            self.id = content_id("res", self.task_id, self.worker_id, self.attempts)
+        return self
+
+    @model_validator(mode="after")
+    def _consistency(self) -> "TaskResult":
+        # A failure must say why; a success must not be contradictory.
+        if self.status in {EntityStatus.FAILED, EntityStatus.CANCELLED, EntityStatus.BUDGET_EXCEEDED} and self.error is None:
+            raise ValueError(f"status {self.status.value!r} requires an ErrorInfo explaining it")
+        if self.started_at and self.finished_at and self.finished_at < self.started_at:
+            raise ValueError("finished_at precedes started_at")
+        if self.duration_seconds is None and self.started_at and self.finished_at:
+            self.duration_seconds = (self.finished_at - self.started_at).total_seconds()
+        return self
+
+
+# --------------------------------------------------------------------------
+# 15.7 Reviews and reports
+# --------------------------------------------------------------------------
+
+
+class ReviewFinding(StrictModel):
+    """One reviewer objection, tied to the evidence or text it concerns."""
+
+    id: str = ""
+    severity: str = Field(default="minor", pattern="^(info|minor|major|blocking)$")
+    message: str = Field(min_length=1)
+    target_id: str | None = None
+    fix_required: bool = False
+    resolved: bool = False
+    raised_at: datetime = Field(default_factory=utc_now)
+    resolved_at: datetime | None = None
+
+    @field_validator("raised_at", "resolved_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> Any:
+        return normalise_datetime(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def _identify(self) -> "ReviewFinding":
+        if not self.id:
+            self.id = content_id("rf", self.message.lower(), self.target_id)
+        return self
+
+
+class QualityReview(StrictModel):
+    """A Subagent's review of its Workers' output, before reporting upward."""
+
+    id: str = ""
+    subagent_id: str = ""
+    round: int = Field(default=1, ge=1)
+    verdict: str = Field(default="pass", pattern="^(pass|revise|reject|escalate)$")
+    reviewer: str | None = None                          # component/model that reviewed
+    criteria: list[str] = Field(default_factory=list)
+    findings: list[ReviewFinding] = Field(default_factory=list)
+    evidence_reviewed: list[str] = Field(default_factory=list)
+    unsupported_claims: list[str] = Field(default_factory=list)   # evidence ids lacking sources
+    reviewed_at: datetime = Field(default_factory=utc_now)
+    missing: list[UnknownValue] = Field(default_factory=list)
+    error: ErrorInfo | None = None
+
+    @field_validator("reviewed_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> datetime:
+        return normalise_datetime(value)
+
+    @model_validator(mode="after")
+    def _identify(self) -> "QualityReview":
+        if not self.id:
+            self.id = content_id("qr", self.subagent_id, self.round, self.verdict)
+        if self.verdict in {"revise", "reject"} and not self.findings:
+            raise ValueError(f"verdict {self.verdict!r} requires at least one finding explaining why")
+        return self
+
+    @property
+    def blocking(self) -> list[ReviewFinding]:
+        return [f for f in self.findings if f.severity == "blocking" and not f.resolved]
+
+
+class SubagentReport(StrictModel):
+    """What a Subagent hands to the Master Agent: evidence, gaps, uncertainty."""
+
+    id: str = ""
+    mission_id: str = ""
+    subagent_id: str = ""
+    objective: str = Field(min_length=1)
+    status: EntityStatus = EntityStatus.PENDING
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    reviews: list[QualityReview] = Field(default_factory=list)
+    hypotheses_tested: list[str] = Field(default_factory=list)
+    hypotheses_remaining: list[str] = Field(default_factory=list)
+    open_questions: list[str] = Field(default_factory=list)
+    gaps: list[UnknownValue] = Field(default_factory=list)
+    confidence: Confidence = Confidence.UNKNOWN
+    confidence_basis: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    missing: list[UnknownValue] = Field(default_factory=list)
+    error: ErrorInfo | None = None
+
+    @field_validator("started_at", "finished_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> Any:
+        return normalise_datetime(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def _identify(self) -> "SubagentReport":
+        if not self.id:
+            self.id = content_id("sarep", self.subagent_id, self.objective.lower())
+        return self
+
+    @property
+    def observations(self) -> list[EvidenceItem]:
+        return [e for e in self.evidence if e.kind is EvidenceKind.OBSERVATION]
+
+    @property
+    def inferences(self) -> list[EvidenceItem]:
+        return [e for e in self.evidence if e.kind is EvidenceKind.INFERENCE]
+
+    @property
+    def allegations(self) -> list[EvidenceItem]:
+        return [e for e in self.evidence if e.kind is EvidenceKind.ALLEGATION]
+
+
+class FinalReport(StrictModel):
+    """The mission deliverable.  Serialises to JSON without losing provenance.
+
+    ``attributions`` is deliberately separate from ``findings``: naming a party
+    is a distinct, higher-bar step that must cite evidence and state the
+    standard of proof applied — or explicitly say no attribution is made.
+    """
+
+    id: str = ""
+    mission_id: str = ""
+    objective: str = Field(min_length=1)
+    scope: Scope | None = None
+    status: EntityStatus = EntityStatus.PENDING
+    findings: list[EvidenceItem] = Field(default_factory=list)
+    inferences: list[EvidenceItem] = Field(default_factory=list)
+    allegations: list[EvidenceItem] = Field(default_factory=list)
+    attributions: list[str] = Field(default_factory=list)
+    attribution_standard: str | None = None
+    hypotheses_supported: list[str] = Field(default_factory=list)
+    hypotheses_refuted: list[str] = Field(default_factory=list)
+    hypotheses_open: list[str] = Field(default_factory=list)
+    uncertainty_statement: str | None = None
+    limitations: list[str] = Field(default_factory=list)
+    gaps: list[UnknownValue] = Field(default_factory=list)
+    subagent_reports: list[str] = Field(default_factory=list)   # report ids
+    confidence: Confidence = Confidence.UNKNOWN
+    confidence_basis: str | None = None
+    generated_by: str | None = None
+    generated_at: datetime = Field(default_factory=utc_now)
+    started_at: datetime | None = None
+    schema_version: int = MODEL_SCHEMA_VERSION
+    missing: list[UnknownValue] = Field(default_factory=list)
+    error: ErrorInfo | None = None
+
+    @field_validator("generated_at", "started_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> Any:
+        return normalise_datetime(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def _identify(self) -> "FinalReport":
+        if not self.id:
+            self.id = content_id("report", self.mission_id, self.objective.lower())
+        return self
+
+    @model_validator(mode="after")
+    def _attribution_needs_evidence(self) -> "FinalReport":
+        if self.attributions and not (self.findings or self.inferences):
+            raise ValueError(
+                "an attribution without supporting findings or inferences is a bare allegation — "
+                "move it to allegations with allegation_made_by set"
+            )
+        if self.attributions and not self.attribution_standard:
+            raise ValueError("attributions require attribution_standard (what evidence bar was met)")
+        return self
+
+
+# --------------------------------------------------------------------------
+# 15.8 Mission
+# --------------------------------------------------------------------------
+
+
+class Mission(StrictModel):
+    """The top-level typed mission.  Created by the CLI, consumed by Phase 3.
+
+    ``mission_id`` is deterministic (:class:`MissionRequest` computes the same
+    fingerprint), so the CLI plan and the typed model refer to one mission.
+    """
+
+    id: str = ""
+    title: str | None = None
+    objective: str = Field(min_length=1)
+    original_objective: str | None = None            # pre-reframe wording, for audit
+    mode: MissionMode = MissionMode.PASSIVE
+    scope: Scope
+    status: EntityStatus = EntityStatus.PENDING
+    authorised: bool = False
+    policy_verdict: str | None = None
+    policy_rule: str | None = None
+    reframe_adopted: bool = False
+    operator: str | None = None
+    limits: dict[str, Any] = Field(default_factory=dict)
+    subagents: list[SubagentSpec] = Field(default_factory=list)
+    reports: list[str] = Field(default_factory=list)
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    dry_run: bool = True
+    created_at: datetime = Field(default_factory=utc_now)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    schema_version: int = MODEL_SCHEMA_VERSION
+    missing: list[UnknownValue] = Field(default_factory=list)
+    error: ErrorInfo | None = None
+
+    @field_validator("created_at", "started_at", "finished_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> Any:
+        return normalise_datetime(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def _identify(self) -> "Mission":
+        if not self.id:
+            self.id = mission_id_for(self.objective, self.scope.includes, self.mode)
+        return self
+
+    @model_validator(mode="after")
+    def _scope_contains_objective(self) -> "Mission":
+        # Every declared subagent scope entry must sit inside the mission scope,
+        # otherwise a subagent could widen its own authority.
+        for subagent in self.subagents:
+            for entry in subagent.scope_entries:
+                if not self.scope.covers(entry):
+                    raise ValueError(
+                        f"subagent {subagent.id} claims scope {entry!r} which the mission scope does not cover"
+                    )
+        return self
+
+    @classmethod
+    def from_preflight(
+        cls,
+        *,
+        request: "MissionRequest",
+        preflight: "PreflightReport",
+        settings: "Settings",
+        operator: str | None = None,
+    ) -> "Mission":
+        """Build the typed mission from the CLI's validated request + preflight.
+
+        Only cleared missions may be built: this raises if the preflight did not
+        pass, so an un-cleared objective cannot acquire a typed representation.
+        """
+
+        if not preflight.ok or preflight.scope is None:
+            raise ValueError("cannot build a Mission from an uncleared preflight report")
+
+        return cls(
+            id=request.fingerprint(),
+            objective=preflight.objective,
+            original_objective=preflight.original_objective,
+            mode=request.mode,
+            scope=Scope.from_declaration(preflight.scope),
+            authorised=request.authorised,
+            policy_verdict=preflight.verdict.outcome.value,
+            policy_rule=preflight.verdict.rule_id,
+            reframe_adopted=preflight.reframe_adopted,
+            operator=operator or request.operator,
+            dry_run=request.dry_run,
+            limits={
+                "max_subagents": request.max_subagents,
+                "max_workers_per_agent": request.max_workers_per_agent,
+                "max_total_workers": request.max_total_workers,
+                "worker_retries": request.worker_retries,
+                "review_retries": request.review_retries,
+                "mission_budget_seconds": request.mission_budget_seconds,
+                "task_budget_seconds": request.task_budget_seconds,
+                "provider": settings.provider,
+                "model": settings.model,
+            },
+        )
+
+
+# --------------------------------------------------------------------------
+# 15.9 Serialisation and integrity helpers
+# --------------------------------------------------------------------------
+
+
+def model_to_json(model: BaseModel, *, indent: int = 2) -> str:
+    """Serialise any model above to JSON, preserving every field.
+
+    ``mode="json"`` keeps enums as their string values and datetimes as ISO
+    8601, and ``exclude_none=False`` ensures an explicit ``null`` survives — a
+    missing key and a null are different claims.
+    """
+
+    return model.model_dump_json(indent=indent, exclude_none=False)
+
+
+def validate_model_payload(model_cls: type[BaseModel], payload: str | dict[str, Any]) -> BaseModel:
+    """Round-trip check used by ``models --validate`` and by case-file loading."""
+
+    if isinstance(payload, str):
+        data = json.loads(payload)
+    else:
+        data = payload
+    return model_cls.model_validate(data)
+
+
+def model_field_inventory(model_cls: type[BaseModel]) -> list[tuple[str, str, bool]]:
+    """(field, type, required) triples, for documentation and tests."""
+
+    inventory: list[tuple[str, str, bool]] = []
+    for name, info in model_cls.model_fields.items():
+        annotation = getattr(info.annotation, "__name__", str(info.annotation))
+        inventory.append((name, annotation, info.is_required()))
+    return inventory
+
+
+#: Every model in this section, grouped for the ``models`` command.
+MODEL_CATALOGUE: tuple[tuple[str, type[BaseModel], str], ...] = (
+    ("Mission", Mission, "top-level typed mission"),
+    ("Scope", Scope, "authorised asset boundary"),
+    ("SubagentSpec", SubagentSpec, "runtime-created subagent definition"),
+    ("WorkerSpec", WorkerSpec, "runtime-created worker definition"),
+    ("TaskAssignment", TaskAssignment, "work handed to a worker"),
+    ("TaskResult", TaskResult, "worker outcome, success or failure"),
+    ("EvidenceItem", EvidenceItem, "observation / inference / allegation"),
+    ("SourceReference", SourceReference, "where evidence came from"),
+    ("QualityReview", QualityReview, "subagent review of worker output"),
+    ("SubagentReport", SubagentReport, "subagent report to the master"),
+    ("FinalReport", FinalReport, "mission deliverable"),
+    ("ChainOfCustody", ChainOfCustody, "artefact handling trail"),
+    ("ErrorInfo", ErrorInfo, "structured failure"),
+    ("UnknownValue", UnknownValue, "explicit unknown"),
+)
+
+
+# --------------------------------------------------------------------------
+# 15.10 Rendering
+# --------------------------------------------------------------------------
+
+
+def render_model_section(console: Console, model: BaseModel, title: str) -> None:
+    """Flatten a model into a table, showing explicit unknowns as such."""
+
+    table = Table(title=title, title_justify="left", box=None, pad_edge=False)
+    table.add_column("field", style="dim", no_wrap=True)
+    table.add_column("value", overflow="fold")
+
+    data = model.model_dump(mode="json")
+    for key, value in data.items():
+        if value in (None, "", [], {}):
+            rendered = "[dim]—[/dim]" if value is not None else "[yellow]null (explicitly unknown)[/yellow]"
+        elif isinstance(value, list):
+            rendered = f"{len(value)} item(s)"
+        elif isinstance(value, dict):
+            rendered = f"{len(value)} key(s)"
+        else:
+            rendered = escape(str(value))
+        table.add_row(key, rendered)
+    console.print(table)
+
+
+@app.command("models", help="Inspect and validate the typed mission/evidence/result models.")
+def models_command(
+    name: str | None = typer.Option(None, "--name", "-n", help="Show one model's fields."),
+    self_test: bool = typer.Option(
+        True, "--self-test/--no-self-test", help="Exercise every model with a valid and an invalid case."
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Never touches the network: builds and validates models in memory only."""
+
+    console = get_console()
+
+    if name:
+        match = next((entry for entry in MODEL_CATALOGUE if entry[0].lower() == name.lower()), None)
+        if match is None:
+            console.print(f"[red]unknown model[/red] {escape(name)!s}; choose from: "
+                          + ", ".join(entry[0] for entry in MODEL_CATALOGUE))
+            raise typer.Exit(ExitCode.USAGE)
+        label, model_cls, purpose = match
+        if as_json:
+            _emit(
+                json.dumps(
+                    {
+                        "model": label,
+                        "purpose": purpose,
+                        "fields": [
+                            {"name": f, "type": t, "required": r} for f, t, r in model_field_inventory(model_cls)
+                        ],
+                        "json_schema": model_cls.model_json_schema(),
+                    },
+                    indent=2,
+                )
+            )
+            raise typer.Exit(ExitCode.OK)
+        inventory = Table(title=f"{label} — {purpose}", title_justify="left", box=None, pad_edge=False)
+        inventory.add_column("field", style="bold", no_wrap=True)
+        inventory.add_column("type", style="cyan")
+        inventory.add_column("required", no_wrap=True)
+        for field_name, annotation, required in model_field_inventory(model_cls):
+            inventory.add_row(
+                escape(field_name),
+                escape(annotation),
+                "[green]yes[/green]" if required else "[dim]no[/dim]",
+            )
+        console.print()
+        console.print(inventory)
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    results = run_model_self_test() if self_test else []
+
+    if as_json:
+        _emit(
+            json.dumps(
+                {
+                    "schema_version": MODEL_SCHEMA_VERSION,
+                    "models": [
+                        {"name": label, "purpose": purpose, "fields": len(model_cls.model_fields)}
+                        for label, model_cls, purpose in MODEL_CATALOGUE
+                    ],
+                    "self_test": [
+                        {"check": r.name, "ok": r.ok, "detail": r.detail} for r in results
+                    ],
+                    "ok": all(r.ok for r in results) if results else None,
+                },
+                indent=2,
+            )
+        )
+        raise typer.Exit(ExitCode.OK if all(r.ok for r in results) else ExitCode.INTERNAL)
+
+    catalogue = Table(
+        title=f"{APP_TITLE} typed models — schema v{MODEL_SCHEMA_VERSION}",
+        title_justify="left",
+        box=None,
+        pad_edge=False,
+    )
+    catalogue.add_column("model", style="bold", no_wrap=True)
+    catalogue.add_column("fields", justify="right", no_wrap=True)
+    catalogue.add_column("purpose", overflow="fold")
+    for label, model_cls, purpose in MODEL_CATALOGUE:
+        catalogue.add_row(escape(label), str(len(model_cls.model_fields)), escape(purpose))
+    console.print()
+    console.print(catalogue)
+
+    if results:
+        console.print()
+        failures = [r for r in results if not r.ok]
+        checks = Table(title="self-test", title_justify="left", box=None, pad_edge=False)
+        checks.add_column("", width=2)
+        checks.add_column("check", style="bold", no_wrap=True)
+        checks.add_column("detail", overflow="fold")
+        for result in results:
+            glyph, style = ("✔", "green") if result.ok else ("✘", "red")
+            checks.add_row(f"[{style}]{glyph}[/{style}]", escape(result.name), escape(result.detail))
+        console.print(checks)
+        console.print(
+            f"[{'green' if not failures else 'red'}]{len(results) - len(failures)} passed[/] · "
+            f"{len(failures)} failed"
+        )
+        if failures:
+            raise typer.Exit(ExitCode.INTERNAL)
+
+    console.print(
+        "\n[dim]Provenance is preserved by construction: observations require a source, "
+        "inferences require reasoning, allegations require an author, and missing data is an "
+        "explicit UnknownValue rather than an empty string.[/dim]\n"
+    )
+    raise typer.Exit(ExitCode.OK)
+
+
+@dataclass(frozen=True)
+class ModelTestResult:
+    name: str
+    ok: bool
+    detail: str
+
+
+def _sample_source(**overrides: Any) -> SourceReference:
+    payload: dict[str, Any] = {
+        "kind": SourceKind.PUBLIC_WEB,
+        "url": "https://example.com/security/advisory",
+        "title": "Security advisory",
+        "retrieved_at": "2026-03-01T10:00:00Z",
+        "retrieval_method": RetrievalMethod.HTTP,
+        "http_status": 200,
+        "content_hash": {"algorithm": "sha256", "value": "a" * 64, "size_bytes": 1024},
+        "excerpt": "A vulnerability was fixed in version 2.1.4.",
+    }
+    payload.update(overrides)
+    return SourceReference(**payload)
+
+
+def run_model_self_test() -> list[ModelTestResult]:
+    """Valid *and* invalid cases for every rule, executed in memory.
+
+    These are the acceptance criteria expressed as executable checks: unknown
+    data stays unknown, provenance cannot be invented, and JSON round-trips
+    preserve every source.
+    """
+
+    results: list[ModelTestResult] = []
+
+    def case(name: str, fn: Any) -> None:
+        try:
+            fn()
+            results.append(ModelTestResult(name, True, "ok"))
+        except AssertionError as exc:
+            results.append(ModelTestResult(name, False, str(exc) or "assertion failed"))
+        except Exception as exc:                        # unexpected model error
+            results.append(ModelTestResult(name, False, f"{type(exc).__name__}: {exc}"))
+
+    def sample_scope() -> Scope:
+        return Scope(
+            mode=MissionMode.PASSIVE,
+            entries=[ScopeEntry(pattern="example.com"), ScopeEntry(pattern="api.example.com", included=False)],
+            data_classes=[DataClass.PUBLIC_WEB],
+        )
+
+    def sample_observation() -> EvidenceItem:
+        return EvidenceItem(
+            kind=EvidenceKind.OBSERVATION,
+            statement="The advisory lists CVE-2026-0001 as fixed in 2.1.4.",
+            sources=[_sample_source()],
+            confidence=Confidence.MEDIUM,
+            confidence_basis="single first-party advisory, retrieved directly",
+            verified=True,
+        )
+
+    # --- ids and determinism ------------------------------------------------
+    def _stable_ids() -> None:
+        a = EvidenceItem(kind=EvidenceKind.OBSERVATION, statement="Same statement.", sources=[_sample_source()])
+        b = EvidenceItem(kind=EvidenceKind.OBSERVATION, statement="same statement.", sources=[_sample_source(url="https://other.example/x")])
+        assert a.id == b.id, "id must derive from kind+statement, not from source or time"
+        assert a.id.startswith("ev-")
+
+    case("ids: evidence id is deterministic", _stable_ids)
+
+    def _mission_matches_request() -> None:
+        req = MissionRequest(targets=["example.com"], objective="Map the public attack surface.")
+        report = run_preflight(objective=req.objective, targets=req.targets, scope_entries=req.targets)
+        mission = Mission.from_preflight(request=req, preflight=report, settings=build_settings({}, {}).settings)
+        assert mission.id == req.fingerprint(), f"{mission.id} != {req.fingerprint()}"
+        assert mission.id.startswith("mission-")
+        # The same content built directly must derive the same id.
+        direct = Mission(objective=mission.objective, scope=mission.scope, mode=mission.mode)
+        assert direct.id == mission.id, f"{direct.id} != {mission.id}"
+        assert mission.scope.covers("api.example.com")
+
+    case("mission: scope mirrors the preflight declaration", _mission_matches_request)
+
+    def _mission_rejects_uncleared() -> None:
+        req = MissionRequest(targets=["example.com"], objective="steal the credentials")
+        report = run_preflight(objective=req.objective, targets=req.targets, scope_entries=req.targets)
+        try:
+            Mission.from_preflight(request=req, preflight=report, settings=build_settings({}, {}).settings)
+        except ValueError:
+            return
+        raise AssertionError("uncleared preflight produced a Mission")
+
+    case("mission: refuses an uncleared objective", _mission_rejects_uncleared)
+
+    def _scope_widening_blocked() -> None:
+        try:
+            Mission(
+                objective="x",
+                scope=Scope(entries=[ScopeEntry(pattern="example.com")]),
+                subagents=[SubagentSpec(name="s", objective="o", scope_entries=["evil.example.org"])],
+            )
+        except Exception:
+            return
+        raise AssertionError("subagent widened the mission scope")
+
+    case("mission: subagent cannot widen scope", _scope_widening_blocked)
+
+    # --- provenance rules ---------------------------------------------------
+    def _observation_needs_source() -> None:
+        try:
+            EvidenceItem(kind=EvidenceKind.OBSERVATION, statement="Something happened.")
+        except Exception:
+            return
+        raise AssertionError("observation without a source was accepted")
+
+    case("evidence: observation requires a source", _observation_needs_source)
+
+    def _inference_needs_reasoning() -> None:
+        try:
+            EvidenceItem(kind=EvidenceKind.INFERENCE, statement="They are negligent.", sources=[_sample_source()])
+        except Exception:
+            return
+        raise AssertionError("inference without reasoning was accepted")
+
+    case("evidence: inference requires reasoning", _inference_needs_reasoning)
+
+    def _allegation_needs_author() -> None:
+        try:
+            EvidenceItem(kind=EvidenceKind.ALLEGATION, statement="A rival claims a breach.")
+        except Exception:
+            return
+        raise AssertionError("allegation without an author was accepted")
+
+    case("evidence: allegation requires an author", _allegation_needs_author)
+
+    def _confidence_needs_basis() -> None:
+        try:
+            EvidenceItem(
+                kind=EvidenceKind.OBSERVATION,
+                statement="A thing.",
+                sources=[_sample_source()],
+                confidence=Confidence.HIGH,
+            )
+        except Exception:
+            return
+        raise AssertionError("confidence without a basis was accepted")
+
+    case("evidence: confidence requires a basis", _confidence_needs_basis)
+
+    def _source_needs_locator() -> None:
+        try:
+            SourceReference(kind=SourceKind.PUBLIC_WEB)
+        except Exception:
+            return
+        raise AssertionError("a source with no url/path was accepted")
+
+    case("source: cannot be unlocatable", _source_needs_locator)
+
+    def _source_unknown_is_explicit() -> None:
+        ref = SourceReference(
+            kind=SourceKind.SOCIAL_MEDIA,
+            missing=UnknownValue(reason=UnknownReason.UNAVAILABLE, detail="post deleted before capture"),
+        )
+        assert ref.url is None and ref.missing is not None
+        assert "unavailable" in ref.locator
+
+    case("source: unknown location is explicit", _source_unknown_is_explicit)
+
+    # --- JSON round-trip preserves provenance -------------------------------
+    def _round_trip() -> None:
+        original = EvidenceItem(
+            kind=EvidenceKind.INFERENCE,
+            statement="The advisory implies the issue was known internally before release.",
+            sources=[_sample_source()],
+            supports=["ev-123456789abc"],
+            reasoning="The advisory states the fix predates the public report.",
+            confidence=Confidence.LOW,
+            confidence_basis="single source, no independent corroboration",
+            custody=ChainOfCustody(
+                collected_by="sa-1",
+                collected_at="2026-03-01T10:05:00Z",
+                collection_method=RetrievalMethod.HTTP,
+                preserved=True,
+                integrity_hash=HashRecord(algorithm="sha256", value="b" * 64, size_bytes=2048),
+                custody_events=["2026-03-01T10:05:00Z captured by HTTP"],
+            ),
+        )
+        blob = model_to_json(original)
+        restored = validate_model_payload(EvidenceItem, blob)
+        assert restored.sources[0].url == original.sources[0].url, "url lost in round-trip"
+        assert restored.sources[0].retrieved_at == original.sources[0].retrieved_at, "retrieval time lost"
+        assert restored.custody and restored.custody.integrity_hash.value == "b" * 64, "custody lost"
+        assert restored.reasoning == original.reasoning and restored.supports == original.supports
+        assert restored.id == original.id and restored.confidence is Confidence.LOW
+
+    case("json: evidence round-trip keeps every source", _round_trip)
+
+    def _round_trip_mission() -> None:
+        mission = Mission(
+            objective="Map the public attack surface of example.com",
+            scope=sample_scope(),
+            evidence=[sample_observation()],
+            dry_run=True,
+        )
+        restored = validate_model_payload(Mission, model_to_json(mission))
+        assert restored.scope.includes == ["example.com"]
+        assert restored.evidence[0].sources[0].retrieved_at == mission.evidence[0].sources[0].retrieved_at
+        assert restored.created_at == mission.created_at
+
+    case("json: mission round-trip keeps scope and evidence", _round_trip_mission)
+
+    def _nulls_are_preserved() -> None:
+        payload = json.loads(model_to_json(sample_scope()))
+        assert "authorized_by" in payload and payload["authorized_by"] is None, "null key dropped"
+        assert "authorization_basis" in payload
+
+    case("json: explicit nulls are not dropped", _nulls_are_preserved)
+
+    # --- explicit unknowns --------------------------------------------------
+    def _unknown_not_invented() -> None:
+        ev = EvidenceItem(
+            kind=EvidenceKind.OBSERVATION,
+            statement="A post existed at the URL below.",
+            sources=[_sample_source()],
+            missing=[UnknownValue(reason=UnknownReason.NOT_YET_OBSERVED, detail="author identity")],
+        )
+        payload = json.loads(model_to_json(ev))
+        assert payload["missing"][0]["reason"] == "not-yet-observed"
+        assert payload["reasoning"] is None, "absent reasoning must serialise as null, not a guess"
+        assert payload["verified"] is None, "unassessed verification must stay null"
+
+    case("unknowns: gaps are recorded, never guessed", _unknown_not_invented)
+
+    def _failure_requires_error() -> None:
+        try:
+            TaskResult(task_id="task-1", worker_id="wrk-1", status=EntityStatus.FAILED)
+        except Exception:
+            return
+        raise AssertionError("a failed result without ErrorInfo was accepted")
+
+    case("results: failure carries an error", _failure_requires_error)
+
+    def _review_requires_findings() -> None:
+        try:
+            QualityReview(subagent_id="sa-1", verdict="reject")
+        except Exception:
+            return
+        raise AssertionError("a rejection without findings was accepted")
+
+    case("review: rejection explains itself", _review_requires_findings)
+
+    def _attribution_requires_evidence() -> None:
+        try:
+            FinalReport(mission_id="m-1", objective="o", attributions=["Acme Corp"])
+        except Exception:
+            return
+        raise AssertionError("attribution without findings was accepted")
+
+    case("report: attribution needs evidence + standard", _attribution_requires_evidence)
+
+    def _extra_field_rejected() -> None:
+        try:
+            Scope(entries=[ScopeEntry(pattern="example.com")], typo_field="oops")
+        except Exception:
+            return
+        raise AssertionError("unknown field was silently accepted")
+
+    case("models: unknown fields are rejected", _extra_field_rejected)
+
+    def _error_redacted() -> None:
+        secret = "sk-proj-MODELSECRET1234567890"
+        info = ErrorInfo(code="http", message=f"GET failed with key {secret}")
+        assert secret not in info.message, "a secret survived ErrorInfo redaction"
+
+    case("errors: message is redacted on construction", _error_redacted)
+
+    def _full_report() -> None:
+        report = FinalReport(
+            mission_id="mission-1",
+            objective="Map the public attack surface of example.com",
+            scope=sample_scope(),
+            status=EntityStatus.SUCCEEDED,
+            findings=[sample_observation()],
+            uncertainty_statement="Only public sources were consulted; internal state was not assessed.",
+            confidence=Confidence.MEDIUM,
+            confidence_basis="two independent public sources agreed",
+        )
+        blob = model_to_json(report)
+        restored = validate_model_payload(FinalReport, blob)
+        assert restored.findings[0].sources[0].content_hash.value == "a" * 64
+        assert restored.uncertainty_statement == report.uncertainty_statement
+
+    case("report: final report serialises with provenance", _full_report)
+
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 16. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 
