@@ -293,6 +293,41 @@ those are the jobs of the Subagents it creates.
     python vedant_osint.py master --demo compare     # two objectives, two teams
     python vedant_osint.py master --prompt           # read the charter
 
+Dynamic Subagent specifications
+-------------------------------
+No Subagent has a class.  A Subagent exists only because the Master produced a
+:class:`SubagentSpecDraft` that passed :func:`validate_subagent_specs`, and only
+:class:`SubagentFactory` turns a passing draft into a stored :class:`SubagentSpec`
+with runtime ids.  ``subagents --self-test`` parses this file to prove no
+executable Subagent class and no roster constant exists.
+
+Every specification carries ten task-derived parts: role **and the basis** it was
+derived from (source family, analytic step, artefact type, verification,
+integrity, timeline, log correlation), objective, scope boundaries, required
+inputs, allowed capabilities, expected outputs, evidence requirements, quality rubric and
+termination criteria.  Two rules make the acceptance criteria mechanical:
+
+* **A measurable deliverable.**  Each :class:`Deliverable` names its format, its
+  fields and a ``measurable_check``; the model refuses vague phrasing.
+* **A measurable stop condition.**  :meth:`TerminationCriteria.is_measurable`
+  requires a countable or checkable marker ("at least one row per advisory",
+  "every artefact cited has a stored hash"), plus ceilings, what makes the agent
+  abandon the task, and whether a partial report is required.
+
+Validation refuses an out-of-scope entry, an unavailable capability, a role that
+is only a job title (``analyst``, ``The Analyst``), a duplicate role, a duplicate
+*behaviour* under a second name, a circular justification and a dangling
+dependency.  A rejected plan is not trimmed: :func:`plan_subagent_specs` sends
+the problems back to the Master as a repair brief, for a bounded number of
+rounds, and raises :class:`SubagentPlanError` (exit ``7``) if it never complies.
+
+::
+
+    python vedant_osint.py subagents --self-test          # 109 guarantee checks, offline
+    python vedant_osint.py subagents --demo compare       # two objectives, two sets of specs
+    python vedant_osint.py subagents --show published-advisories
+    python vedant_osint.py subagents --demo reject        # what the Master is sent back
+
 Structured model adapter
 ------------------------
 One model-calling interface sits between orchestration and every provider, so
@@ -345,6 +380,7 @@ Usage
     python vedant_osint.py resilience --self-test       # logging, cancellation, cleanup
     python vedant_osint.py adapter --self-test          # structured output contract
     python vedant_osint.py master --self-test           # Master Agent boundaries
+    python vedant_osint.py subagents --self-test        # runtime Subagent specifications
     python vedant_osint.py doctor                       # full capability health check
     python vedant_osint.py policy -o "..." --scope example.com          # safety preflight only
     python vedant_osint.py mission --target example.com -o "map the attack surface"
@@ -417,10 +453,12 @@ from __future__ import annotations
 # ══════════════════════════════════════════════════════════════════════════
 
 # --- standard library: cheap, side-effect free -------------------------------
+import ast
 import asyncio
 import atexit
 import hashlib
 import importlib.util
+import inspect
 import io
 import signal
 import ipaddress
@@ -473,7 +511,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 11
+VERSION_MINOR: int = 12
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -15434,7 +15472,1713 @@ def capability_names() -> tuple[str, ...]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 22. Entry point
+# 22. Dynamic Subagent specifications and the runtime factory
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The Master decides *who should exist*.  This section decides what a
+# specification for that agent must contain before it is allowed to exist, and
+# builds it at runtime.
+#
+# A :class:`SubagentSpec` from section 15 is the storage record: an id, a name,
+# some Workers, a status.  That is not enough to hold an agent accountable — it
+# cannot say what the agent may touch, what it must produce, how its output will
+# be judged, or when it must stop.  :class:`SubagentSpecDraft` is the contract
+# that adds those, and the factory refuses to create anything that fails it.
+#
+# Nothing here enumerates a role.  The ten required fields are *shapes*, filled
+# per objective: "task-derived role" means the role is derived from the task and
+# justified in a sentence, never chosen from a list.
+
+
+class RoleBasis(str, Enum):
+    """Why a role exists.  A role that cannot name its basis is unjustified."""
+
+    SOURCE_FAMILY = "source-family"      # a distinct class of source to collect
+    ANALYTIC_STEP = "analytic-step"      # a distinct reasoning step
+    ARTEFACT_TYPE = "artefact-type"      # a distinct kind of artefact to examine
+    VERIFICATION = "verification"        # independent re-check of another's work
+    INTEGRITY = "integrity"              # custody, hashing, reproducibility
+    TIMELINE = "timeline"                # ordering evidence in time
+    LOG_CORRELATION = "log-correlation"  # joining an event to the record that explains it
+
+
+class Deliverable(StrictModel):
+    """A measurable output.  "A report" is not one; a table with columns is.
+
+    The measurable check is what makes acceptance testable: a deliverable that
+    says "investigate the domain" can never be handed to a reviewer, while one
+    that says "one row per DNS record type with value and retrieval time" can.
+    """
+
+    name: str = Field(min_length=3)
+    format: str = Field(default="structured-table", min_length=3)
+    #: The columns/keys/sections the output must contain.  At least one.
+    fields: list[str] = Field(min_length=1)
+    #: How a reviewer confirms it is complete, without redoing the work.
+    measurable_check: str = Field(min_length=15)
+    path: str | None = None                    # where it is written, if a file
+
+    @model_validator(mode="after")
+    def _checkable(self) -> "Deliverable":
+        if not any(field.strip() for field in self.fields):
+            raise ValueError(f"deliverable {self.name!r} lists no fields")
+        weak = ("as needed", "etc", "and so on", "whatever", "misc")
+        lowered = self.measurable_check.lower()
+        found = [phrase for phrase in weak if phrase in lowered]
+        if found:
+            raise ValueError(f"deliverable {self.name!r} has an unmeasurable check ({found[0]!r})")
+        return self
+
+
+class EvidenceRequirement(StrictModel):
+    """What the Subagent must collect, and in what epistemic form.
+
+    ``minimum_items`` and ``minimum_sources`` are the measurable part;
+    ``accepted_kinds`` stops an agent from satisfying the requirement with pure
+    inference, and ``must_distinguish`` keeps observation, inference and
+    allegation apart in its output.
+    """
+
+    description: str = Field(min_length=10)
+    accepted_kinds: list[EvidenceKind] = Field(min_length=1)
+    minimum_items: int = Field(default=1, ge=1, le=1000)
+    minimum_sources: int = Field(default=1, ge=0, le=100)
+    must_distinguish: bool = True
+    #: What counts as a source for this agent (a URL, an artefact hash, …).
+    source_forms: list[str] = Field(default_factory=list)
+    #: Evidence that would *not* satisfy it, stated up front.
+    excluded: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _coherent(self) -> "EvidenceRequirement":
+        if EvidenceKind.OBSERVATION not in self.accepted_kinds and self.minimum_sources > 0:
+            raise ValueError(
+                "an evidence requirement that accepts no observations cannot demand sources"
+            )
+        return self
+
+
+class RubricCriterion(StrictModel):
+    """One way a Subagent's output is judged, with a threshold, not a vibe."""
+
+    criterion: str = Field(min_length=8)
+    weight: int = Field(default=1, ge=1, le=5)
+    #: What the reviewer looks for, stated so two reviewers would agree.
+    test: str = Field(min_length=10)
+    blocking: bool = False          # a failure here fails the whole review
+
+
+class QualityRubric(StrictModel):
+    """The rubric applied to this Subagent — fixed before it starts working."""
+
+    criteria: list[RubricCriterion] = Field(min_length=2)
+    #: Score (0-100) below which the output is sent back.
+    passing_score: int = Field(default=70, ge=1, le=100)
+    reviewer: str = Field(default="master", min_length=1)
+    max_review_rounds: int = Field(default=2, ge=0, le=5)
+
+    @model_validator(mode="after")
+    def _weighted(self) -> "QualityRubric":
+        criteria = [c.criterion.strip().lower() for c in self.criteria]
+        if len(criteria) != len(set(criteria)):
+            raise ValueError("rubric criteria must be unique")
+        if not any(c.blocking for c in self.criteria):
+            raise ValueError("a rubric needs at least one blocking criterion, or nothing can fail")
+        total = sum(c.weight for c in self.criteria)
+        if self.passing_score > 100 * total // max(1, total):
+            raise ValueError("passing_score is unreachable with these weights")
+        return self
+
+    def maximum_score(self) -> int:
+        return 100 * sum(c.weight for c in self.criteria)
+
+    def describe(self) -> str:
+        return f"{len(self.criteria)} criteria, pass ≥{self.passing_score}, {self.max_review_rounds} round(s)"
+
+
+class TerminationCriteria(StrictModel):
+    """The stop condition.  Every Subagent must have one; none may be empty."""
+
+    objective_satisfied_when: str = Field(min_length=15)
+    #: Hard ceilings independent of how well the work is going.
+    max_tasks: int = Field(default=12, ge=1, le=200)
+    max_attempts_per_task: int = Field(default=2, ge=1, le=10)
+    stop_on: list[str] = Field(default_factory=lambda: [
+        "all required evidence collected",
+        "rubric score at or above the passing score",
+    ])
+    #: What makes it give up and report a gap instead of trying forever.
+    abandon_when: list[str] = Field(default_factory=lambda: ["the source is unreachable after retries"])
+    #: What the Subagent must return if it stops early.
+    partial_report_required: bool = True
+
+    @model_validator(mode="after")
+    def _non_empty(self) -> "TerminationCriteria":
+        if self.max_attempts_per_task > self.max_tasks:
+            raise ValueError("max_attempts_per_task cannot exceed max_tasks")
+        if not self.stop_on or not any(item.strip() for item in self.stop_on):
+            raise ValueError("a stop condition list cannot be empty")
+        return self
+
+    def is_measurable(self) -> bool:
+        """True when the condition names something countable or checkable."""
+
+        lowered = self.objective_satisfied_when.lower()
+        markers = ("at least", "every", "all ", "each", "no more than", "zero", "one row",
+                   "score", "equals", "matches", "contains", "≤", ">=")
+        return any(marker in lowered for marker in markers)
+
+
+class SubagentSpecDraft(StrictModel):
+    """The Master's proposal for one runtime Subagent — the ten required parts.
+
+    This is a *draft*: it becomes a :class:`ValidatedSubagentSpec` only after
+    the mission-scope, count, duplicate and justification checks pass, and only
+    then can it become a :class:`SubagentSpec` the store will accept.
+    """
+
+    #: 1. task-derived role — a name for what this agent does in *this* mission
+    role: str = Field(min_length=3)
+    role_basis: RoleBasis
+    #: 2. objective
+    objective: str = Field(min_length=15)
+    #: Why this role must exist at all.  The duplicate/unjustified check reads it.
+    justification: str = Field(min_length=20)
+    #: 3. scope boundaries this agent may act within
+    scope_entries: list[str] = Field(min_length=1)
+    scope_exclusions: list[str] = Field(default_factory=list)
+    #: 4. required inputs
+    required_inputs: list[str] = Field(min_length=1)
+    #: 5. allowed capabilities (subset of what the deployment has)
+    allowed_capabilities: list[str] = Field(min_length=1)
+    #: 6. expected outputs (measurable)
+    deliverables: list[Deliverable] = Field(min_length=1)
+    #: 7. evidence requirements
+    evidence: EvidenceRequirement
+    #: 8. quality rubric
+    rubric: QualityRubric
+    #: 9. termination criteria
+    termination: TerminationCriteria
+    #: 10. the Workers this agent will create for itself
+    workers: list[WorkerInstruction] = Field(min_length=1)
+    depends_on: list[str] = Field(default_factory=list)
+    max_workers: int = Field(default=2, ge=1, le=16)
+    #: The questions this agent exists to answer, so its output can be placed.
+    addresses_questions: list[str] = Field(default_factory=list)
+
+    @field_validator("role", "objective", "justification")
+    @classmethod
+    def _plain(cls, value: str) -> str:
+        return _reject_hedging(value, what="subagent specification")
+
+    @model_validator(mode="after")
+    def _coherent(self) -> "SubagentSpecDraft":
+        if len(self.workers) > self.max_workers:
+            raise ValueError(f"{len(self.workers)} workers exceeds max_workers={self.max_workers}")
+        names = [worker.name.strip().lower() for worker in self.workers]
+        if len(names) != len(set(names)):
+            raise ValueError("worker names must be unique within a subagent")
+        overlap = {entry.strip().lower() for entry in self.scope_entries} & {
+            entry.strip().lower() for entry in self.scope_exclusions
+        }
+        if overlap:
+            raise ValueError(f"scope entry is both included and excluded: {', '.join(sorted(overlap))}")
+        if not self.termination.is_measurable():
+            raise ValueError(
+                "the termination criterion is not measurable: say what count, score or condition ends the work"
+            )
+        if self.rubric.max_review_rounds and not self.deliverables:
+            raise ValueError("a reviewed subagent must produce something reviewable")
+        return self
+
+    # -- derived views used by the validator and the runtime record ---------
+
+    @property
+    def signature(self) -> str:
+        """What the agent *does*, over what, with what tools — not what it is called.
+
+        The role name is deliberately excluded: renaming a duplicate does not
+        make it a different agent, and the duplicate check is about behaviour.
+        """
+
+        return content_id(
+            "behaviour",
+            self.objective.strip().lower(),
+            tuple(sorted(entry.strip().lower() for entry in self.scope_entries)),
+            tuple(sorted(self.allowed_capabilities)),
+            tuple(sorted(deliverable.format.strip().lower() for deliverable in self.deliverables)),
+            tuple(sorted(field.strip().lower()
+                         for deliverable in self.deliverables for field in deliverable.fields)),
+        )
+
+    def deliverable_names(self) -> list[str]:
+        return [deliverable.name for deliverable in self.deliverables]
+
+    def to_subagent_spec(self, *, mission_id: str) -> "SubagentSpec":
+        """Build the storage record.  Only call on a validated draft."""
+
+        return SubagentSpec(
+            mission_id=mission_id,
+            name=self.role,
+            objective=self.objective,
+            rationale=self.justification,
+            scope_entries=list(self.scope_entries),
+            depends_on=list(self.depends_on),
+            max_workers=self.max_workers,
+            review_rounds_allowed=self.rubric.max_review_rounds,
+            workers=[
+                WorkerSpec(
+                    name=worker.name,
+                    objective=worker.objective,
+                    tools=list(worker.tools) or list(self.allowed_capabilities),
+                    inputs=list(worker.inputs) or list(self.required_inputs),
+                    output_schema=worker.output_schema or "TaskResult",
+                    max_attempts=min(worker.max_attempts, self.termination.max_attempts_per_task),
+                    requires_network=worker.requires_network,
+                    requires_browser=worker.requires_browser,
+                )
+                for worker in self.workers
+            ],
+        )
+
+
+# --------------------------------------------------------------------------
+# 22.1 Validation: scope, counts, duplicates, justification
+# --------------------------------------------------------------------------
+
+
+class SpecProblem(StrictModel):
+    """One reason a draft is not acceptable, phrased as a repair instruction."""
+
+    code: str = Field(min_length=1)
+    subagent: str | None = None
+    detail: str = Field(min_length=5)
+    #: What the Master should do differently — this is fed back verbatim.
+    repair: str = Field(min_length=5)
+    blocking: bool = True
+
+
+class SpecValidation(StrictModel):
+    """The outcome of checking a set of drafts against a mission."""
+
+    ok: bool
+    problems: list[SpecProblem] = Field(default_factory=list)
+    #: Drafts that passed, in the order supplied.
+    accepted: list[SubagentSpecDraft] = Field(default_factory=list)
+
+    @property
+    def blocking_problems(self) -> list[SpecProblem]:
+        return [problem for problem in self.problems if problem.blocking]
+
+    def repair_brief(self) -> str:
+        """The message sent back to the Master when a plan is insufficient."""
+
+        lines = ["Your subagent plan was rejected. Fix these and return the full plan again:"]
+        for problem in self.blocking_problems[:8]:
+            where = f"{problem.subagent}: " if problem.subagent else ""
+            lines.append(f"- {where}{problem.detail} → {problem.repair}")
+        lines.append("Return only the corrected JSON. Do not add agents you cannot justify.")
+        return "\n".join(lines)
+
+
+#: Words that make a "role" a job title rather than a task-derived role.
+_GENERIC_ROLES: tuple[str, ...] = (
+    "researcher", "analyst", "investigator", "specialist", "expert", "worker",
+    "agent", "assistant", "generalist", "helper", "subagent",
+)
+
+#: Phrases that make a justification circular or empty.
+_WEAK_JUSTIFICATIONS: tuple[str, ...] = (
+    "it is needed", "it is useful", "to help", "as needed", "best practice",
+    "standard approach", "because the mission needs it", "for completeness",
+)
+
+
+#: Words that carry no role meaning, so "The Analyst" is judged as "analyst".
+_ROLE_NOISE: frozenset[str] = frozenset({"the", "a", "an", "of", "and", "senior", "junior", "lead"})
+
+
+def _role_words(role: str) -> list[str]:
+    """Significant words in a role label, lowercased, articles and hyphens removed."""
+
+    words = role.strip().lower().replace("_", " ").replace("-", " ").split()
+    return [word for word in words if word not in _ROLE_NOISE]
+
+
+def _is_generic_role(role: str) -> bool:
+    """True when the label is only a job title, e.g. 'analyst' or 'The Analyst'."""
+
+    words = _role_words(role)
+    return bool(words) and all(word in _GENERIC_ROLES for word in words)
+
+
+def validate_subagent_specs(
+    drafts: Sequence[SubagentSpecDraft],
+    context: MasterContext,
+    *,
+    existing: Sequence[str] = (),
+    existing_drafts: Sequence[SubagentSpecDraft] = (),
+) -> SpecValidation:
+    """Check drafts against scope, limits, duplication and justification.
+
+    Every check produces a :class:`SpecProblem` with a *repair instruction*, so
+    the Master is told what to change rather than simply "rejected".  Nothing is
+    silently dropped: a draft either passes or is named.
+    """
+
+    problems: list[SpecProblem] = []
+    accepted: list[SubagentSpecDraft] = []
+    scope = context.scope_object()
+
+    if not drafts:
+        problems.append(
+            SpecProblem(
+                code="empty",
+                detail="the plan contains no subagents",
+                repair="propose at least one subagent, or state that the objective needs none",
+            )
+        )
+
+    headroom = context.max_subagents - len(existing)
+    if len(drafts) > headroom:
+        problems.append(
+            SpecProblem(
+                code="count",
+                detail=f"{len(drafts)} subagents proposed but only {max(0, headroom)} slot(s) remain "
+                       f"(limit {context.max_subagents}, {len(existing)} already exist)",
+                repair="merge the agents that share a source family or drop the weakest justification",
+            )
+        )
+
+    total_workers = sum(len(draft.workers) for draft in drafts)
+    if total_workers > context.max_total_workers:
+        problems.append(
+            SpecProblem(
+                code="workers",
+                detail=f"{total_workers} workers proposed but the mission limit is {context.max_total_workers}",
+                repair="give each agent one worker per distinct collection path",
+            )
+        )
+
+    # -- per-draft checks ---------------------------------------------------
+    # Agents that already exist are seeded first, so a new draft cannot arrive
+    # under a second name doing the same job as one already running.
+    seen_roles: dict[str, str] = {
+        draft.role.strip().lower(): draft.role for draft in existing_drafts
+    }
+    seen_signatures: dict[str, str] = {draft.signature: draft.role for draft in existing_drafts}
+    for draft in drafts:
+        blocking = False
+
+        # 1. scope: every entry inside the mission boundary
+        outside = [entry for entry in draft.scope_entries if not scope.covers(entry)]
+        if outside:
+            blocking = True
+            problems.append(
+                SpecProblem(
+                    code="scope",
+                    subagent=draft.role,
+                    detail=f"scope entry {outside[0]!r} is outside the mission boundary",
+                    repair=f"restrict {draft.role!r} to {', '.join(context.scope_entries[:2])}",
+                )
+            )
+
+        # 2. capabilities: only what this deployment actually has
+        if context.available_tools:
+            unknown = [tool for tool in draft.allowed_capabilities if tool not in context.available_tools]
+            if unknown:
+                blocking = True
+                problems.append(
+                    SpecProblem(
+                        code="capability",
+                        subagent=draft.role,
+                        detail=f"capability {unknown[0]!r} is not available in this deployment",
+                        repair=f"use one of: {', '.join(context.available_tools[:4])}",
+                    )
+                )
+
+        # 3. role: task-derived, not a job title
+        lowered_role = draft.role.strip().lower()
+        if lowered_role in _GENERIC_ROLES or _is_generic_role(draft.role):
+            blocking = True
+            problems.append(
+                SpecProblem(
+                    code="role-generic",
+                    subagent=draft.role,
+                    detail=f"role {draft.role!r} is a job title, not a task-derived role",
+                    repair="name the role after the work in this mission, e.g. 'advisory-version-checker'",
+                )
+            )
+        if lowered_role in seen_roles:
+            blocking = True
+            problems.append(
+                SpecProblem(
+                    code="duplicate-role",
+                    subagent=draft.role,
+                    detail=f"role {draft.role!r} is already used by another subagent in this plan",
+                    repair="rename it after what it distinctively does, or merge the two",
+                )
+            )
+        seen_roles[lowered_role] = draft.role
+
+        # 4. duplicates by behaviour, not by name
+        if draft.signature in seen_signatures:
+            blocking = True
+            problems.append(
+                SpecProblem(
+                    code="duplicate-behaviour",
+                    subagent=draft.role,
+                    detail=f"{draft.role!r} does the same job as {seen_signatures[draft.signature]!r} "
+                           f"(same objective, scope and capabilities)",
+                    repair="drop one of them, or give the second a genuinely different objective",
+                )
+            )
+        seen_signatures[draft.signature] = draft.role
+
+        # 5. justification: specific, and tied to something the role does
+        lowered_justification = draft.justification.lower()
+        weak = [phrase for phrase in _WEAK_JUSTIFICATIONS if phrase in lowered_justification]
+        if weak:
+            blocking = True
+            problems.append(
+                SpecProblem(
+                    code="unjustified",
+                    subagent=draft.role,
+                    detail=f"the justification is circular ({weak[0]!r})",
+                    repair="say what would be missed if this agent did not exist",
+                )
+            )
+        if len(set(draft.justification.lower().split())) < 6:
+            blocking = True
+            problems.append(
+                SpecProblem(
+                    code="unjustified",
+                    subagent=draft.role,
+                    detail="the justification is too short to be checkable",
+                    repair="name the specific gap in the mission this agent closes",
+                )
+            )
+
+        # 6. measurable deliverable and stop condition (schema enforces shape)
+        if not any(deliverable.measurable_check for deliverable in draft.deliverables):
+            blocking = True
+            problems.append(
+                SpecProblem(
+                    code="deliverable",
+                    subagent=draft.role,
+                    detail="no deliverable has a measurable completion check",
+                    repair="state the columns or counts that make the output complete",
+                )
+            )
+        if not draft.termination.is_measurable():
+            blocking = True
+            problems.append(
+                SpecProblem(
+                    code="termination",
+                    subagent=draft.role,
+                    detail="the stop condition is not measurable",
+                    repair="state the count, score or condition that ends the work",
+                )
+            )
+
+        # 7. dependencies must resolve inside this plan or the existing team
+        known = {other.role.strip().lower() for other in drafts} | {
+            name.strip().lower() for name in existing
+        }
+        missing_deps = [dep for dep in draft.depends_on if dep.strip().lower() not in known]
+        if missing_deps:
+            blocking = True
+            problems.append(
+                SpecProblem(
+                    code="dependency",
+                    subagent=draft.role,
+                    detail=f"depends on unknown agent {missing_deps[0]!r}",
+                    repair="depend only on agents in this plan or already running",
+                )
+            )
+
+        if not blocking:
+            accepted.append(draft)
+
+    return SpecValidation(ok=not problems, problems=problems, accepted=accepted)
+
+
+# --------------------------------------------------------------------------
+# 22.2 The runtime factory
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SubagentBirth:
+    """Everything the factory created for one runtime Subagent."""
+
+    spec: "SubagentSpec"
+    draft: SubagentSpecDraft
+    created_at: datetime
+
+    @property
+    def id(self) -> str:
+        return self.spec.id
+
+    @property
+    def role(self) -> str:
+        return self.draft.role
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.spec.id,
+            "role": self.draft.role,
+            "objective": self.spec.objective,
+            "workers": [worker.id for worker in self.spec.workers],
+            "deliverables": self.draft.deliverable_names(),
+            "stop_condition": self.draft.termination.objective_satisfied_when,
+            "rubric": self.draft.rubric.describe(),
+            "created_at": self.created_at.isoformat(),
+        }
+
+
+class SubagentFactory:
+    """Builds Subagents from validated specifications, and only from those.
+
+    The factory is the single place a ``SubagentSpec`` comes into existence, so
+    the rule "every Subagent exists only at runtime" is enforced structurally:
+    there is no class to subclass and no roster to import, only drafts that pass
+    :func:`validate_subagent_specs`.
+
+    A draft is re-validated on the way in even when it was validated as part of
+    a plan, because a caller could otherwise hand it a draft that never went
+    through the check.
+    """
+
+    def __init__(
+        self,
+        *,
+        mission_id: str,
+        context: MasterContext,
+        renderer: "EventRenderer | None" = None,
+        tracker: "LifecycleTracker | None" = None,
+        logger: "MissionLogger | None" = None,
+        store: "RunStateStore | None" = None,
+    ) -> None:
+        self.mission_id = mission_id
+        self.context = context
+        self.renderer = renderer
+        self.tracker = tracker
+        self.logger = logger
+        self.store = store
+        self._births: dict[str, SubagentBirth] = {}
+        self._lock = threading.RLock()
+
+    # -- creation ----------------------------------------------------------
+
+    def create(self, draft: SubagentSpecDraft) -> SubagentBirth:
+        """Validate one draft, then build and register the Subagent."""
+
+        validation = validate_subagent_specs(
+            [draft], self.context, existing=self.roles(),
+            existing_drafts=[birth.draft for birth in self.births()],
+        )
+        if not validation.ok:
+            raise PlanConstraintError(
+                "subagent specification rejected: "
+                + "; ".join(problem.detail for problem in validation.blocking_problems[:3]),
+                task=ModelTask.DECOMPOSE,
+                validation_errors=[problem.detail for problem in validation.blocking_problems],
+            )
+        spec = draft.to_subagent_spec(mission_id=self.mission_id)
+        if spec.id in self._births:
+            raise PlanConstraintError(f"subagent {draft.role!r} already exists in this mission")
+
+        birth = SubagentBirth(spec=spec, draft=draft, created_at=utc_now())
+        with self._lock:
+            self._births[spec.id] = birth
+
+        if self.store is not None:
+            self.store.add_subagent(spec, actor="master")
+        self._announce(birth)
+        return birth
+
+    def create_many(self, drafts: Sequence[SubagentSpecDraft]) -> list[SubagentBirth]:
+        """Validate the whole plan first, then create — no half-built teams."""
+
+        validation = validate_subagent_specs(
+            drafts, self.context, existing=self.roles(),
+            existing_drafts=[birth.draft for birth in self.births()],
+        )
+        if not validation.ok:
+            raise PlanConstraintError(
+                "subagent plan rejected: "
+                + "; ".join(problem.detail for problem in validation.blocking_problems[:4]),
+                task=ModelTask.DECOMPOSE,
+                validation_errors=[problem.detail for problem in validation.blocking_problems],
+            )
+        return [self.create(draft) for draft in validation.accepted]
+
+    # -- inspection --------------------------------------------------------
+
+    def roles(self) -> list[str]:
+        with self._lock:
+            return [birth.role for birth in self._births.values()]
+
+    def births(self) -> list[SubagentBirth]:
+        with self._lock:
+            return list(self._births.values())
+
+    def get(self, spec_id: str) -> SubagentBirth | None:
+        with self._lock:
+            return self._births.get(spec_id)
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return len(self._births)
+
+    def table(self) -> Table:
+        """Who exists, what each must deliver, and when it stops."""
+
+        table = Table(title="runtime subagents", title_justify="left", box=None, pad_edge=False)
+        table.add_column("role", style="bold", no_wrap=True)
+        table.add_column("basis", no_wrap=True)
+        table.add_column("deliverables", overflow="fold")
+        table.add_column("stop when", overflow="fold")
+        for birth in self.births():
+            table.add_row(
+                escape(birth.role),
+                escape(birth.draft.role_basis.value),
+                escape(", ".join(birth.draft.deliverable_names())),
+                escape(birth.draft.termination.objective_satisfied_when[:70]),
+            )
+        return table
+
+    # -- internals ---------------------------------------------------------
+
+    def _announce(self, birth: SubagentBirth) -> None:
+        role, workers = birth.role, birth.spec.workers
+        if self.renderer is not None:
+            self.renderer.subagent_spawned(birth.id, role, parent="master")
+            for worker in workers:
+                self.renderer.worker_spawned(worker.id, worker.name, parent=birth.id)
+        if self.tracker is not None:
+            self.tracker.spawn(birth.id, role, kind=LifecycleKind.SUBAGENT, parent="master",
+                               detail=birth.draft.objective[:60])
+            for worker in workers:
+                self.tracker.spawn(worker.id, worker.name, kind=LifecycleKind.WORKER,
+                                   parent=birth.id, detail=worker.objective[:60])
+        if self.logger is not None:
+            self.logger.log(
+                "subagent.created",
+                agent_id=birth.id,
+                agent_kind="subagent",
+                message=f"runtime subagent {role}",
+                data={
+                    "role": role,
+                    "basis": birth.draft.role_basis.value,
+                    "workers": len(workers),
+                    "deliverables": birth.draft.deliverable_names(),
+                    "stop_condition": birth.draft.termination.objective_satisfied_when,
+                    "scope": birth.draft.scope_entries,
+                },
+            )
+
+
+# --------------------------------------------------------------------------
+# 22.3 Drafts from finished team designs, and the Master's repair loop
+# --------------------------------------------------------------------------
+
+
+def _inherit_evidence(blueprint: SubagentBlueprint, context: MasterContext) -> EvidenceRequirement:
+    """Build an evidence requirement from what a blueprint already promises.
+
+    Used only when turning an (older) :class:`TeamDesign` into drafts: the
+    requirement is derived from ``expected_evidence`` rather than invented, and
+    when the blueprint says nothing the requirement is the minimum honest one —
+    one observation with a source.
+    """
+
+    kinds = [EvidenceKind.OBSERVATION]
+    if any("inference" in item.lower() for item in blueprint.expected_evidence):
+        kinds.append(EvidenceKind.INFERENCE)
+    description = (
+        "; ".join(blueprint.expected_evidence)[:200]
+        or f"evidence collected for: {blueprint.objective[:120]}"
+    )
+    return EvidenceRequirement(
+        description=description,
+        accepted_kinds=kinds,
+        minimum_items=1,
+        minimum_sources=1 if EvidenceKind.OBSERVATION in kinds else 0,
+        source_forms=list(context.scope_entries[:3]),
+    )
+
+
+def _inherit_rubric(blueprint: SubagentBlueprint, context: MasterContext) -> QualityRubric:
+    """A rubric derived from the blueprint's completion criteria, not invented.
+
+    Each completion criterion becomes a weighted, non-blocking criterion; the
+    sourcing rule is blocking, because an unsourced finding is unusable no matter
+    how complete the rest of the output is.
+    """
+
+    criteria = [
+        RubricCriterion(criterion=criterion[:120], weight=2, test=f"reviewer confirms: {criterion[:100]}")
+        for criterion in blueprint.completion_criteria
+    ]
+    criteria.append(
+        RubricCriterion(
+            criterion="every claim cites a collected source",
+            weight=3,
+            test="each statement carries at least one evidence id from this mission",
+            blocking=True,
+        )
+    )
+    return QualityRubric(criteria=criteria, passing_score=70, reviewer="master", max_review_rounds=2)
+
+
+def _termination_from(blueprint: SubagentBlueprint) -> TerminationCriteria:
+    """A stop condition derived from the blueprint's completion criteria.
+
+    The wording is deliberately countable: "every completion criterion is met"
+    is checkable against the rubric, whereas "the investigation is done" is not.
+    """
+
+    return TerminationCriteria(
+        objective_satisfied_when=(
+            f"all {len(blueprint.completion_criteria)} completion criteria are met: "
+            f"{blueprint.completion_criteria[0][:80]}"
+        ),
+        max_tasks=max(4, len(blueprint.workers) * 4),
+        max_attempts_per_task=2,
+    )
+
+
+def drafts_from_team(design: TeamDesign, context: MasterContext) -> list[SubagentSpecDraft]:
+    """Convert a :class:`TeamDesign` into specification drafts.
+
+    A team design already carries most of what a specification needs; this adds
+    the parts a design does not state (rubric, evidence requirement, measurable
+    termination) by *deriving* them from the design's own text.  Nothing here
+    invents a role: the role is the blueprint's name, and its basis is inferred
+    from what the agent does, so an unjustified blueprint still fails the
+    validator rather than being quietly blessed.
+    """
+
+    drafts: list[SubagentSpecDraft] = []
+    for blueprint in design.subagents:
+        lowered = f"{blueprint.name} {blueprint.objective}".lower()
+        if any(word in lowered for word in ("hash", "integrity", "custody")):
+            basis = RoleBasis.INTEGRITY
+        elif "log" in lowered or "correlat" in lowered:
+            # Checked before chronology: "identify which process wrote X using
+            # logs and the timeline window" is log correlation, not a timeline.
+            basis = RoleBasis.LOG_CORRELATION
+        elif "timeline" in lowered:
+            basis = RoleBasis.TIMELINE
+        elif any(word in lowered for word in ("verif", "re-read", "confirm", "review")):
+            basis = RoleBasis.VERIFICATION
+        elif any(word in lowered for word in ("log", "artefact", "artifact", "image", "file")):
+            basis = RoleBasis.ARTEFACT_TYPE
+        else:
+            basis = RoleBasis.SOURCE_FAMILY
+        drafts.append(
+            SubagentSpecDraft(
+                role=blueprint.name,
+                role_basis=basis,
+                objective=blueprint.objective,
+                justification=blueprint.rationale,
+                scope_entries=list(blueprint.scope_entries),
+                required_inputs=list(blueprint.expected_evidence) or ["the mission objective"],
+                allowed_capabilities=list(blueprint.tools) or ["read-only analysis"],
+                deliverables=[
+                    Deliverable(
+                        name=f"{blueprint.name} evidence set",
+                        format="structured-table",
+                        fields=["statement", "source", "retrieved_at", "confidence"],
+                        measurable_check=(
+                            f"one row per collected item for {blueprint.name}, each with a source id "
+                            f"and a retrieval time"
+                        ),
+                    )
+                ],
+                evidence=_inherit_evidence(blueprint, context),
+                rubric=_inherit_rubric(blueprint, context),
+                termination=_termination_from(blueprint),
+                workers=list(blueprint.workers),
+                depends_on=list(blueprint.depends_on),
+                max_workers=max(blueprint.max_workers, len(blueprint.workers)),
+                addresses_questions=list(design.hypotheses),
+            )
+        )
+    return drafts
+
+
+class SubagentSpecificationPlan(StrictModel):
+    """The Master's answer when asked for specifications rather than a team."""
+
+    objective_summary: str = Field(min_length=10)
+    subagents: list[SubagentSpecDraft] = Field(min_length=1)
+    sizing_rationale: str = Field(min_length=20)
+    deliberately_omitted: list[str] = Field(default_factory=list)
+    completion_criteria: list[str] = Field(min_length=1)
+    uncertainty: str | None = None
+
+    @model_validator(mode="after")
+    def _unique(self) -> "SubagentSpecificationPlan":
+        roles = [draft.role.strip().lower() for draft in self.subagents]
+        if len(roles) != len(set(roles)):
+            raise ValueError("every subagent in a plan must have a distinct role")
+        if self.uncertainty is None or len(self.uncertainty.strip()) < 10:
+            raise ValueError("a subagent plan must state its uncertainty explicitly")
+        return self
+
+    @property
+    def total_workers(self) -> int:
+        return sum(len(draft.workers) for draft in self.subagents)
+
+
+#: Extra instruction appended when the Master has to repair a rejected plan.
+_REPAIR_INSTRUCTIONS = (
+    "A previous attempt was rejected and the reasons are below. Return the complete corrected "
+    "plan: every agent must have a task-derived role, a justification naming what would be missed "
+    "without it, a measurable deliverable and an explicit stop condition."
+)
+
+
+class SubagentPlanError(PlanConstraintError):
+    """The Master could not produce an acceptable subagent plan within its budget."""
+
+    def __init__(self, message: str, *, attempts: int, problems: Sequence[SpecProblem] = (), **kwargs: Any) -> None:
+        kwargs.setdefault("failure", ModelFailure.POLICY)
+        kwargs.setdefault("validation_errors", [problem.detail for problem in problems])
+        super().__init__(message, **kwargs)
+        self.attempts = attempts
+        self.problems = tuple(problems)
+
+
+def specs_request(context: MasterContext, *, repair: str | None = None) -> ModelRequest:
+    """The ask that produces subagent specifications for one mission."""
+
+    instructions = (
+        "Design the smallest sufficient team and return a SubagentSpecificationPlan: for every "
+        "agent give its task-derived role, the basis for that role, objective, justification, "
+        "scope boundaries, required inputs, allowed capabilities, measurable deliverables, "
+        "evidence requirements, quality rubric, termination criteria and its Workers."
+    )
+    if repair:
+        instructions = f"{instructions}\n\n{repair}"
+    return ModelRequest(
+        task=ModelTask.DECOMPOSE,
+        objective=context.objective,
+        context=context.to_prompt(),
+        system_prompt_override=master_prompt(),
+        instructions=instructions,
+        max_subagents=context.max_subagents,
+        scope=context.scope_object(),
+        model_cls_override=SubagentSpecificationPlan,
+    )
+
+
+def plan_subagent_specs(
+    adapter: "ModelAdapter",
+    context: MasterContext,
+    *,
+    max_rounds: int = 2,
+    on_reject: Callable[[SpecValidation, int], None] | None = None,
+) -> tuple[SubagentSpecificationPlan, ModelResult]:
+    """Ask the Master for specifications, and make it repair an insufficient plan.
+
+    This is the acceptance criterion in code: a plan that fails validation is
+    *sent back* with the specific problems as instructions, up to ``max_rounds``.
+    Only a plan that passes is returned; an exhausted budget raises with the
+    outstanding problems, so an insufficient plan can never reach the factory.
+    """
+
+    if max_rounds < 1:
+        raise ValueError("max_rounds must be at least 1")
+    repair: str | None = None
+    problems: list[SpecProblem] = []
+
+    for round_number in range(1, max_rounds + 1):
+        request = specs_request(context, repair=repair)
+        try:
+            result = adapter.call(request)
+        except StructuredOutputError as exc:
+            # A malformed response is a *shape* problem, not a design problem:
+            # the adapter already retried it, so treat it as a failed round and
+            # ask again with the validation error as guidance.
+            problems = [
+                SpecProblem(code="malformed", detail=str(exc)[:160],
+                            repair="return the JSON object in the required schema")
+            ]
+            if on_reject is not None:
+                on_reject(SpecValidation(ok=False, problems=problems), round_number)
+            repair = SpecValidation(ok=False, problems=problems).repair_brief()
+            continue
+
+        plan = _expect(result.output, SubagentSpecificationPlan)
+        validation = validate_subagent_specs(plan.subagents, context)
+        if validation.ok:
+            return plan, result
+        problems = validation.blocking_problems
+        if on_reject is not None:
+            on_reject(validation, round_number)
+        repair = validation.repair_brief()
+
+    raise SubagentPlanError(
+        f"the Master could not produce an acceptable subagent plan in {max_rounds} round(s): "
+        + "; ".join(problem.detail for problem in problems[:3]),
+        attempts=max_rounds,
+        problems=problems,
+        task=ModelTask.DECOMPOSE,
+    )
+
+
+
+
+# --------------------------------------------------------------------------
+# 22.4 Self-test — the acceptance criteria as executable checks
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SpecCheck:
+    name: str
+    ok: bool
+    detail: str
+
+
+def _draft(
+    role: str,
+    *,
+    objective: str | None = None,
+    justification: str | None = None,
+    scope: Sequence[str] = ("example.com",),
+    capabilities: Sequence[str] = ("http.fetch",),
+    basis: RoleBasis = RoleBasis.SOURCE_FAMILY,
+    depends_on: Sequence[str] = (),
+    termination: str = "at least one row per advisory, each with a retrieval time",
+) -> SubagentSpecDraft:
+    """A complete, valid draft.  Tests override one field at a time."""
+
+    return SubagentSpecDraft(
+        role=role,
+        role_basis=basis,
+        objective=objective or f"collect the published records that answer the question: {role}",
+        justification=justification or (
+            f"without {role} the mission would miss the records that only this source family publishes"
+        ),
+        scope_entries=list(scope),
+        required_inputs=["the mission objective", "the authorised scope"],
+        allowed_capabilities=list(capabilities),
+        deliverables=[
+            Deliverable(
+                name=f"{role} result set",
+                format="structured-table",
+                fields=["statement", "source", "retrieved_at"],
+                measurable_check=f"one row per record found by {role}, each with a source id",
+            )
+        ],
+        evidence=EvidenceRequirement(
+            description=f"published records collected by {role} with retrieval metadata",
+            accepted_kinds=[EvidenceKind.OBSERVATION],
+            minimum_items=1,
+            minimum_sources=1,
+            source_forms=list(scope),
+        ),
+        rubric=QualityRubric(
+            criteria=[
+                RubricCriterion(criterion="every row cites a source", weight=3,
+                                test="each row carries a source id and a retrieval time", blocking=True),
+                RubricCriterion(criterion="coverage is stated", weight=2,
+                                test="the output names what could not be collected"),
+            ],
+            passing_score=70,
+            max_review_rounds=2,
+        ),
+        termination=TerminationCriteria(
+            objective_satisfied_when=termination,
+            max_tasks=8,
+            max_attempts_per_task=2,
+        ),
+        workers=[
+            WorkerInstruction(
+                name=f"{role}-worker",
+                objective=f"collect the records {role} is responsible for",
+                tools=list(capabilities),
+                completion_criteria=["rows returned with sources"],
+                requires_network=True,
+            )
+        ],
+        depends_on=list(depends_on),
+        max_workers=2,
+    )
+
+
+def _plan_payload(roles: Sequence[str] = ("advisory-versions", "dns-records")) -> dict[str, Any]:
+    """A complete specification plan, as a provider would return it."""
+
+    return {
+        "objective_summary": "answer the documentation question for example.com from public sources",
+        "subagents": [
+            {
+                "role": role,
+                "role_basis": "source-family",
+                "objective": f"collect the published records that answer the question: {role}",
+                "justification": f"without {role} the mission would miss records only this source family publishes",
+                "scope_entries": ["example.com"],
+                "required_inputs": ["the mission objective"],
+                "allowed_capabilities": ["http.fetch"],
+                "deliverables": [
+                    {
+                        "name": f"{role} result set",
+                        "format": "structured-table",
+                        "fields": ["statement", "source", "retrieved_at"],
+                        "measurable_check": f"one row per record found by {role}, each with a source id",
+                    }
+                ],
+                "evidence": {
+                    "description": f"published records collected by {role}",
+                    "accepted_kinds": ["observation"],
+                    "minimum_items": 1,
+                    "minimum_sources": 1,
+                },
+                "rubric": {
+                    "criteria": [
+                        {"criterion": "every row cites a source", "weight": 3,
+                         "test": "each row carries a source id and a retrieval time", "blocking": True},
+                        {"criterion": "coverage is stated", "weight": 2,
+                         "test": "the output names what could not be collected"},
+                    ],
+                    "passing_score": 70,
+                },
+                "termination": {
+                    "objective_satisfied_when": "at least one row per advisory, each with a retrieval time",
+                    "max_tasks": 8,
+                },
+                "workers": [
+                    {"name": f"{role}-worker", "objective": f"collect the records {role} is responsible for",
+                     "completion_criteria": ["rows returned with sources"], "requires_network": True}
+                ],
+            }
+            for role in roles
+        ],
+        "sizing_rationale": "two source families that fail independently justify two agents and no more",
+        "deliberately_omitted": ["social media: outside the objective"],
+        "completion_criteria": ["every question is answered or explicitly left open"],
+        "uncertainty": "the archive may not hold a snapshot covering the advisory date",
+    }
+
+
+def run_subagent_spec_self_test() -> list[SpecCheck]:
+    """Prove the specification contract, the validation and the repair loop."""
+
+    checks: list[SpecCheck] = []
+
+    def record(name: str, ok: Any, detail: Any = "ok") -> None:
+        checks.append(SpecCheck(name, bool(ok), str(detail)))
+
+    context = _selftest_context("exposure")
+
+    def accepts(draft: SubagentSpecDraft, ctx: MasterContext | None = None) -> SpecValidation:
+        return validate_subagent_specs([draft], ctx or context)
+
+    # --- 1. the ten required parts exist and are enforced -----------------
+    parts = {name for name in SubagentSpecDraft.model_fields}
+    for part in ("role", "objective", "scope_entries", "required_inputs", "allowed_capabilities",
+                 "deliverables", "evidence", "rubric", "termination", "workers"):
+        record(f"spec carries {part}", part in parts)
+    for part in ("role", "objective", "scope_entries", "required_inputs", "allowed_capabilities",
+                 "deliverables", "evidence", "rubric", "termination", "workers"):
+        record(f"spec requires {part}", SubagentSpecDraft.model_fields[part].is_required())
+
+    # --- 2. a complete draft is accepted ---------------------------------
+    good = _draft("advisory-versions")
+    record("complete draft accepted", accepts(good).ok, accepts(good).problems[:1])
+
+    # --- 3. scope, capabilities, counts ----------------------------------
+    outside = _draft("outside-scope", scope=("evil.example.org",))
+    record("out-of-scope spec rejected", not accepts(outside).ok)
+    record("out-of-scope rejection names the entry",
+           "evil.example.org" in str(accepts(outside).problems[0].detail))
+    record("out-of-scope rejection says how to repair", bool(accepts(outside).problems[0].repair))
+    bad_tool = _draft("quantum-reader", capabilities=("quantum.sniff",))
+    record("unavailable capability rejected", not accepts(bad_tool).ok)
+    record("capability rejection lists usable tools",
+           "http.fetch" in accepts(bad_tool).problems[0].repair)
+    record("no capabilities at all rejected", not _ok(SubagentSpecDraft, {**good.model_dump(mode="json"),
+                                                                         "allowed_capabilities": []}))
+
+    many = [_draft(f"role-{index}", capabilities=("http.fetch",)) for index in range(6)]
+    small = _selftest_context("exposure").model_copy(update={"max_subagents": 3})
+    record("too many specs rejected", not validate_subagent_specs(many, small).ok)
+    record("count rejection cites the limit",
+           "limit 3" in str([p for p in validate_subagent_specs(many, small).problems
+                             if p.code == "count"][0].detail))
+    record("specs within the limit accepted",
+           validate_subagent_specs(many[:3], small).ok,
+           [p.detail for p in validate_subagent_specs(many[:3], small).problems][:2])
+    record("existing agents consume headroom",
+           not validate_subagent_specs(many[:3], small, existing=["already-1", "already-2"]).ok)
+    lots_of_workers = [
+        _draft(f"role-{index}", capabilities=("http.fetch",)).model_copy(
+            update={"workers": [
+                WorkerInstruction(name=f"w-{index}-{n}", objective="collect one record family",
+                                  completion_criteria=["rows with sources"])
+                for n in range(4)
+            ], "max_workers": 4}
+        )
+        for index in range(3)
+    ]
+    record("worker ceiling enforced", not validate_subagent_specs(lots_of_workers, context).ok)
+
+    # --- 4. duplicates and unjustified roles ----------------------------
+    twin_names = validate_subagent_specs([_draft("reader"), _draft("reader")], context)
+    record("duplicate role name rejected", not twin_names.ok)
+    record("duplicate name problem is specific",
+           any(problem.code == "duplicate-role" for problem in twin_names.problems))
+    behavioural = validate_subagent_specs([
+        _draft("first-reader"),
+        # identical objective, scope, tools and deliverables — only the label differs
+        _draft("second-reader", objective=_draft("first-reader").objective),
+    ], context)
+    record("same behaviour under two names rejected",
+           any(problem.code == "duplicate-behaviour" for problem in behavioural.problems),
+           [p.code for p in behavioural.problems])
+    for generic in ("analyst", "researcher", "The Analyst"):
+        record(f"generic role {generic!r} rejected",
+               any(problem.code == "role-generic" for problem in accepts(_draft(generic)).problems))
+    record("task-derived role accepted",
+           accepts(_draft("advisory-version-checker")).ok)
+    record("circular justification rejected",
+           any(problem.code == "unjustified"
+               for problem in accepts(_draft("reader-1", justification="it is needed to help the mission")).problems))
+    # The field minimum catches a stub before the validator ever sees it, so the
+    # self-test asserts on the model rather than trying to build an invalid draft.
+    record("a stub justification cannot even be constructed",
+           not _ok(SubagentSpecDraft, {**_draft("reader-2").model_dump(mode="json"),
+                                       "justification": "needed here"}))
+    record("a long but circular justification is caught by the validator",
+           any(problem.code == "unjustified" for problem in accepts(
+               _draft("reader-3", justification="it is needed to help the standard approach")).problems))
+
+    # --- 5. measurable deliverable and stop condition -------------------
+    vague_payload = good.deliverables[0].model_dump(mode="json")
+    vague_payload["measurable_check"] = "review it as needed"
+    record("unmeasurable deliverable rejected by the model", not _ok(Deliverable, vague_payload))
+    thin_payload = good.deliverables[0].model_dump(mode="json")
+    thin_payload["fields"] = []
+    record("a deliverable with no fields rejected", not _ok(Deliverable, thin_payload))
+    vague_stop = _draft("reader-5").model_dump(mode="json")
+    vague_stop["termination"] = {**vague_stop["termination"],
+                                 "objective_satisfied_when": "when the investigation feels complete"}
+    record("unmeasurable stop condition rejected", not _ok(SubagentSpecDraft, vague_stop))
+    record("measurable stop condition accepted",
+           _draft("reader-6", termination="at least one row per record, or an explicit gap").termination.is_measurable())
+    record("stop condition list cannot be empty",
+           not _ok(TerminationCriteria, {"objective_satisfied_when": "at least one row per record",
+                                         "stop_on": []}))
+    record("rubric needs a blocking criterion",
+           not _ok(QualityRubric, {"criteria": [{"criterion": "looks right to a reviewer", "weight": 1,
+                                                 "test": "the reviewer agrees it is right"}]}))
+    record("rubric criteria must be unique",
+           not _ok(QualityRubric, {"criteria": [
+               {"criterion": "cites sources", "weight": 1, "test": "each row has a source", "blocking": True},
+               {"criterion": "cites sources", "weight": 1, "test": "each row has a source id"},
+           ]}))
+    record("rubric describes itself", "pass" in good.rubric.describe())
+
+    # --- 6. dependencies ------------------------------------------------
+    unknown_dep = _draft("dependent", depends_on=["ghost-agent"])
+    record("unknown dependency rejected", not accepts(unknown_dep).ok)
+    record("unknown dependency names the agent",
+           "ghost-agent" in accepts(unknown_dep).problems[0].detail)
+    known_dep = _draft("dependent", depends_on=["advisory-versions"])
+    record("dependency inside the plan accepted",
+           validate_subagent_specs([_draft("advisory-versions"), known_dep], context).ok)
+    record("dependency on a running agent accepted",
+           validate_subagent_specs([known_dep], context, existing=["advisory-versions"]).ok)
+
+    # --- 7. repair brief is actionable ----------------------------------
+    validation = validate_subagent_specs([_draft("analyst", scope=("evil.example.org",))], context)
+    brief = validation.repair_brief()
+    record("repair brief is produced", "rejected" in brief and "Return only the corrected JSON" in brief)
+    record("repair brief names the offending agent", "analyst" in brief)
+    record("repair brief says what to do", "→" in brief)
+    record("repair brief is bounded", len(brief.splitlines()) <= 11, len(brief.splitlines()))
+
+    # --- 8. the factory only builds validated specs ---------------------
+    renderer = EventRenderer.from_options(stream=io.StringIO(), color=False, animation=False)
+    tracker = LifecycleTracker(renderer, animation=False, register_atexit=False)
+    logger = MissionLogger(None)
+    factory = SubagentFactory(mission_id="mission-x", context=context,
+                              renderer=renderer, tracker=tracker, logger=logger)
+    birth = factory.create(_draft("advisory-versions"))
+    record("factory created a spec", isinstance(birth.spec, SubagentSpec))
+    record("factory assigned a runtime id", birth.spec.id.startswith("sa-"), birth.spec.id)
+    record("factory linked workers to the agent",
+           all(worker.subagent_id == birth.spec.id for worker in birth.spec.workers))
+    record("factory recorded the mission", birth.spec.mission_id == "mission-x")
+    record("factory kept the draft for audit", birth.draft.role == "advisory-versions")
+    record("factory announced to the tracker",
+           {record.id for record in tracker.records()} >= {birth.spec.id}, len(tracker.records()))
+    record("factory exposes its roles", factory.roles() == ["advisory-versions"])
+    record("birth serialises", birth.to_dict()["deliverables"] == ["advisory-versions result set"])
+    record("birth carries the stop condition", "advisory" in birth.to_dict()["stop_condition"])
+    try:
+        factory.create(_draft("bad", scope=("evil.example.org",)))
+        record("factory refuses an invalid draft", False, "created")
+    except PlanConstraintError as exc:
+        record("factory refuses an invalid draft", True)
+        record("factory refusal explains why", "outside" in str(exc), str(exc)[:60])
+    record("refused draft left no agent behind", factory.count == 1)
+    record("factory refuses a duplicate role", _raises(lambda: factory.create(_draft("advisory-versions"))))
+    record("duplicate refusal changed nothing", factory.count == 1)
+
+    batch = [_draft("dns-records"), _draft("archive-snapshots")]
+    births = factory.create_many(batch)
+    record("factory creates a batch", len(births) == 2 and factory.count == 3)
+    before = factory.count
+    bad_batch = [_draft("fine-agent"), _draft("analyst")]
+    record("a batch with one bad spec is refused whole",
+           _raises(lambda: factory.create_many(bad_batch)) and factory.count == before,
+           factory.count)
+
+    # --- 9. specs reach the run-state store -----------------------------
+    mission = Mission(objective="spec test", scope=Scope(entries=[ScopeEntry(pattern="example.com")]),
+                      limits={"mission_budget_seconds": 600})
+    store = RunStateStore(mission)
+    store_factory = SubagentFactory(mission_id=mission.id, context=context, store=store)
+    stored = store_factory.create(_draft("advisory-versions"))
+    snapshot = store.snapshot()
+    record("store received the subagent",
+           stored.spec.id in {spec.id for spec in snapshot["subagents"]})
+    record("store snapshot lists the worker",
+           {worker.id for worker in snapshot["workers"]} == {w.id for w in stored.spec.workers})
+
+    # --- 10. the factory is the only way a spec exists ------------------
+    record("no subagent class to instantiate", not hasattr(sys.modules[__name__], "RuntimeSubagent"))
+    record("factory takes no roster", "roster" not in SubagentFactory.__init__.__code__.co_varnames)
+    record("factory validates on the way in", "validate_subagent_specs" in
+           inspect.getsource(SubagentFactory.create))
+    record("factory is the only constructor of SubagentSpec",
+           _only_factory_constructs_spec(), _only_factory_constructs_spec())
+    def executable_agent_classes() -> list[str]:
+        """Subagent-named classes that could *do* work, i.e. not records or the factory."""
+
+        found: list[str] = []
+        for name, value in vars(sys.modules[__name__]).items():
+            if not (name.startswith("Subagent") and isinstance(value, type)):
+                continue
+            if issubclass(value, (StrictModel, Exception)) or name == "SubagentFactory":
+                continue
+            if any(hasattr(value, method) for method in ("run", "execute", "act", "work", "delegate")):
+                found.append(name)
+        return found
+
+    record("no executable agent class is defined", not executable_agent_classes(),
+           executable_agent_classes())
+
+    # --- 11. the repair loop makes the Master fix an insufficient plan ---
+    payload = _plan_payload()
+    plan_model = SubagentSpecificationPlan.model_validate(payload)
+    record("a complete plan validates", len(plan_model.subagents) == 2)
+    record("plan reports its worker count", plan_model.total_workers == 2)
+
+    def scripted(responses: Sequence[Any]) -> ModelAdapter:
+        settings = build_settings({"provider": "local", "model": "llama3"},
+                                  env={"ARGUS_LLM_PROVIDER": "local", "ARGUS_LLM_MODEL": "llama3"}).settings
+        return ModelAdapter(settings, transport=ScriptedTransport(responses),
+                            retry=RetryPolicy(max_attempts=1, base_delay=0))
+
+    def envelope(payload: Mapping[str, Any]) -> HttpResponse:
+        return HttpResponse(status=200, body={"choices": [{"message": {"content": json.dumps(payload)}}]})
+
+    # Round 2: the first answer is malformed JSON, so the Master is asked again.
+    malformed = HttpResponse(status=200, body={"choices": [{"message": {"content": "{not json"}}]})
+    retried, _ = plan_subagent_specs(scripted([malformed, envelope(payload)]), context)
+    record("a malformed answer is re-requested, not accepted", len(retried.subagents) == 2)
+
+    # Round 3: two bad plans then a good one exhaust a two-round budget.
+    record("a malformed-only plan exhausts the budget",
+           _raises(lambda: plan_subagent_specs(scripted([malformed, malformed]), context,
+                                               max_rounds=2)))
+
+    ok_plan, result = plan_subagent_specs(scripted([envelope(payload)]), context)
+    record("plan accepted on the first round", len(ok_plan.subagents) == 2)
+    record("plan returns the adapter result", result.attempts == 1)
+
+    weak = json.loads(json.dumps(payload))
+    weak["subagents"][0]["role"] = "analyst"
+    weak["subagents"][0]["scope_entries"] = ["evil.example.org"]
+    rejections: list[int] = []
+    repaired, result = plan_subagent_specs(
+        scripted([envelope(weak), envelope(payload)]), context,
+        on_reject=lambda validation, round_number: rejections.append(round_number),
+    )
+    record("a weak plan is rejected then repaired", rejections == [1] and len(repaired.subagents) == 2,
+           rejections)
+    record("the repair round happened", result.attempts == 1)
+
+    # the repair brief really reaches the provider
+    transport = ScriptedTransport([envelope(weak), envelope(payload)])
+    adapter = ModelAdapter(
+        build_settings({"provider": "local", "model": "llama3"},
+                       env={"ARGUS_LLM_PROVIDER": "local", "ARGUS_LLM_MODEL": "llama3"}).settings,
+        transport=transport, retry=RetryPolicy(max_attempts=1, base_delay=0),
+    )
+    plan_subagent_specs(adapter, context, max_rounds=2)
+    second_prompt = json.dumps(transport.requests[1]["body"])
+    record("the rejections are fed back verbatim", "rejected" in second_prompt and "analyst" in second_prompt)
+    record("the repair ask stays bounded", len(second_prompt) < 20000)
+
+    exhausted_attempts: list[int] = []
+    try:
+        plan_subagent_specs(scripted([envelope(weak)] * 3), context, max_rounds=2,
+                            on_reject=lambda v, n: exhausted_attempts.append(n))
+        record("an unrepairable plan raises", False, "accepted")
+    except SubagentPlanError as exc:
+        record("an unrepairable plan raises", True)
+        record("the error counts the rounds", exc.attempts == 2, exc.attempts)
+        record("the error lists the problems", bool(exc.problems))
+        record("the error maps to POLICY/7", exc.exit_code == 7, exc.exit_code)
+    record("every round was attempted", exhausted_attempts == [1, 2], exhausted_attempts)
+
+    malformed_first = ScriptedTransport([
+        HttpResponse(status=200, body={"choices": [{"message": {"content": "not json"}}]}),
+        envelope(payload),
+    ])
+    adapter = ModelAdapter(
+        build_settings({"provider": "local", "model": "llama3"},
+                       env={"ARGUS_LLM_PROVIDER": "local", "ARGUS_LLM_MODEL": "llama3"}).settings,
+        transport=malformed_first, retry=RetryPolicy(max_attempts=1, base_delay=0),
+    )
+    plan, _ = plan_subagent_specs(adapter, context, max_rounds=2)
+    record("a malformed round is retried as a repair", len(plan.subagents) == 2)
+    record("max_rounds must be positive", _raises_value(lambda: plan_subagent_specs(
+        scripted([]), context, max_rounds=0)))
+
+    # --- 12. specs derived from a team design stay honest ----------------
+    team = TeamDesign.model_validate(_team_payload("forensic"))
+    derived = drafts_from_team(team, _selftest_context("forensic"))
+    record("a team design converts to drafts", len(derived) == team.total_subagents)
+    record("derived drafts pass validation",
+           validate_subagent_specs(derived, _selftest_context("forensic")).ok,
+           [p.detail for p in validate_subagent_specs(derived, _selftest_context("forensic")).problems][:2])
+    record("derived roles are the blueprint names",
+           [draft.role for draft in derived] == [blueprint.name for blueprint in team.subagents])
+    record("derived specs keep measurable stop conditions",
+           all(draft.termination.is_measurable() for draft in derived))
+    record("derived specs keep deliverables",
+           all(draft.deliverables for draft in derived))
+    record("derived rubrics have a blocking criterion",
+           all(any(criterion.blocking for criterion in draft.rubric.criteria) for draft in derived))
+    forensic_factory = SubagentFactory(mission_id="mission-f", context=_selftest_context("forensic"))
+    forensic_births = forensic_factory.create_many(derived)
+    record("the derived team becomes runtime agents", len(forensic_births) == 3)
+    record("every runtime agent has a deliverable",
+           all(birth.draft.deliverables for birth in forensic_births))
+    record("every runtime agent has a stop condition",
+           all(birth.draft.termination.objective_satisfied_when for birth in forensic_births))
+    record("every runtime agent has a rubric", all(birth.draft.rubric.criteria for birth in forensic_births))
+    record("two objectives give different specs",
+           [draft.role for draft in derived] != [draft.role for draft in drafts_from_team(
+               TeamDesign.model_validate(_team_payload("exposure")), _selftest_context("exposure"))])
+
+    return checks
+
+
+def _only_factory_constructs_spec() -> bool:
+    """True when nothing outside this section builds a SubagentSpec.
+
+    Section 15 defines the model and section 16's store may copy one, so those
+    two are allowed by name; anything else constructing one would be a second
+    way for an agent to exist.
+    """
+
+    try:
+        text = Path(__file__).resolve().read_text(encoding="utf-8")
+    except OSError:
+        return True
+    split = text.find(_MODEL_SECTION_BANNER)
+    if split < 0:  # fail open: a renumbered banner must not fail the build
+        return True
+    try:
+        tree = ast.parse(text[split:])
+    except SyntaxError:
+        return True
+
+    allowed = {"to_subagent_spec"}
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            calls = [child for child in ast.walk(node)
+                     if isinstance(child, ast.Call)
+                     and isinstance(child.func, (ast.Name, ast.Attribute))
+                     and (child.func.id if isinstance(child.func, ast.Name) else child.func.attr)
+                     == "SubagentSpec"]
+            if calls and node.name not in allowed:
+                offenders.append(f"{node.name}:{calls[0].lineno}")
+    return not offenders
+
+
+def _raises_value(fn: Callable[[], Any]) -> bool:
+    try:
+        fn()
+        return False
+    except ValueError:
+        return True
+
+
+# --------------------------------------------------------------------------
+# 22.5 Demo and CLI
+# --------------------------------------------------------------------------
+
+
+def _spec_demo(objective_key: str, *, out_dir: Path | None = None) -> dict[str, Any]:
+    """Turn one objective's team design into runtime specifications, offline."""
+
+    context = _selftest_context(objective_key)
+    team = TeamDesign.model_validate(_team_payload(objective_key))
+    drafts = drafts_from_team(team, context)
+    validation = validate_subagent_specs(drafts, context)
+
+    tracker = LifecycleTracker(
+        EventRenderer.from_options(stream=io.StringIO(), color=False, animation=False),
+        animation=False, register_atexit=False,
+    )
+    logger = MissionLogger(out_dir / "specs.jsonl") if out_dir is not None else MissionLogger(None)
+    factory = SubagentFactory(mission_id=f"mission-{objective_key}", context=context,
+                              tracker=tracker, logger=logger)
+    births = factory.create_many(validation.accepted) if validation.ok else []
+    logger.close()
+
+    outcome: dict[str, Any] = {
+        "objective_key": objective_key,
+        "objective": context.objective,
+        "validation": {
+            "ok": validation.ok,
+            "problems": [json.loads(model_to_json(problem)) for problem in validation.problems],
+        },
+        "specs": [
+            {
+                **birth.to_dict(),
+                "basis": birth.draft.role_basis.value,
+                "scope": birth.draft.scope_entries,
+                "capabilities": birth.draft.allowed_capabilities,
+                "evidence": json.loads(model_to_json(birth.draft.evidence)),
+                "rubric": json.loads(model_to_json(birth.draft.rubric)),
+                "termination": json.loads(model_to_json(birth.draft.termination)),
+                "measurable_checks": [deliverable.measurable_check
+                                      for deliverable in birth.draft.deliverables],
+                "workers": [json.loads(model_to_json(worker)) for worker in birth.spec.workers],
+            }
+            for birth in births
+        ],
+        "runtime_only": True,
+        "log_lines": len(logger.read_records()) if out_dir is not None else 0,
+        "checks": [{"check": check.name, "ok": check.ok, "detail": check.detail}
+                   for check in run_subagent_spec_self_test()],
+    }
+
+    # Show what a rejection looks like, so the repair path is demonstrable.
+    weak = json.loads(json.dumps(_plan_payload()))
+    weak["subagents"][0]["role"] = "analyst"
+    weak["subagents"][0]["scope_entries"] = ["evil.example.org"]
+    rejected = validate_subagent_specs(
+        SubagentSpecificationPlan.model_validate(weak).subagents, context
+    )
+    outcome["rejection_example"] = {
+        "ok": rejected.ok,
+        "problems": [json.loads(model_to_json(problem)) for problem in rejected.problems],
+        "repair_brief": rejected.repair_brief(),
+    }
+
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        target = out_dir / f"subagents-{objective_key}.json"
+        target.write_text(json.dumps(outcome, indent=2, default=str), encoding="utf-8")
+        outcome["artefact"] = str(target)
+    return outcome
+
+
+@app.command("subagents", help="Build runtime Subagent specifications from an objective.")
+def subagents_command(
+    demo: str | None = typer.Option(
+        None, "--demo", help="Scripted run: exposure | forensic | compare | reject.", show_default=False
+    ),
+    self_test: bool = typer.Option(False, "--self-test", help="Verify the specification contract offline."),
+    show_spec: str | None = typer.Option(None, "--show", help="Print one role's full specification.",
+                                         show_default=False),
+    out_dir: str | None = typer.Option(None, "--out-dir", help="Write demo artefacts here."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Nothing here touches the network: the specifications are built from designs."""
+
+    console = get_console()
+
+    if self_test:
+        results = run_subagent_spec_self_test()
+        failures = [result for result in results if not result.ok]
+        if as_json:
+            _emit(json.dumps({"ok": not failures, "checks": [asdict(result) for result in results]}, indent=2))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        console.print()
+        table = Table(title="subagent specification self-test", title_justify="left", box=None, pad_edge=False)
+        table.add_column("", width=2)
+        table.add_column("check", style="bold", no_wrap=True)
+        table.add_column("detail", overflow="fold")
+        for result in results:
+            glyph, colour = ("✔", "green") if result.ok else ("✘", "red")
+            table.add_row(f"[{colour}]{glyph}[/{colour}]", escape(result.name), escape(result.detail))
+        console.print(table)
+        console.print(f"[{'green' if not failures else 'red'}]{len(results) - len(failures)} passed[/] · "
+                      f"{len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    if show_spec:
+        context = _selftest_context("exposure")
+        drafts = drafts_from_team(TeamDesign.model_validate(_team_payload("exposure")), context)
+        match = next((draft for draft in drafts if draft.role.lower() == show_spec.strip().lower()), None)
+        if match is None:
+            console.print(f"[red]✘[/red] unknown role {escape(repr(show_spec))}; choose from: "
+                          + ", ".join(draft.role for draft in drafts))
+            raise typer.Exit(ExitCode.USAGE)
+        if as_json:
+            _emit(model_to_json(match))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(spec_panel(match))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    if demo:
+        key = demo.strip().lower()
+        if key == "reject":
+            payload = json.loads(json.dumps(_plan_payload()))
+            payload["subagents"][0]["role"] = "analyst"
+            payload["subagents"][0]["scope_entries"] = ["evil.example.org"]
+            payload["subagents"][1]["justification"] = "it is needed to help"
+            validation = validate_subagent_specs(
+                SubagentSpecificationPlan.model_validate(payload).subagents, _selftest_context("exposure")
+            )
+            if as_json:
+                _emit(json.dumps({"ok": validation.ok,
+                                  "problems": [json.loads(model_to_json(problem)) for problem in validation.problems],
+                                  "repair_brief": validation.repair_brief()}, indent=2))
+                raise typer.Exit(ExitCode.OK)
+            console.print()
+            console.print(Panel(Text(validation.repair_brief()), title="[bold red]plan rejected[/bold red]",
+                                title_align="left", border_style="red", expand=False))
+            console.print("\n[dim]This is what the Master is sent back with, and it must return a corrected "
+                          "plan rather than an explanation.[/dim]\n")
+            raise typer.Exit(ExitCode.OK)
+
+        if key == "compare":
+            directory = Path(out_dir).expanduser() if out_dir else None
+            payloads = {name: _spec_demo(name, out_dir=directory) for name in _SELFTEST_OBJECTIVES}
+            if as_json:
+                _emit(json.dumps(payloads, indent=2, default=str))
+                raise typer.Exit(ExitCode.OK)
+            console.print()
+            table = Table(title="runtime subagents per objective", title_justify="left", box=None, pad_edge=False)
+            table.add_column("objective", style="bold", no_wrap=True)
+            table.add_column("specs", justify="right")
+            table.add_column("roles", overflow="fold")
+            table.add_column("deliverables", justify="right")
+            for name, payload in payloads.items():
+                table.add_row(escape(name), str(len(payload["specs"])),
+                              escape(", ".join(spec["role"] for spec in payload["specs"])),
+                              str(sum(len(spec["deliverables"]) for spec in payload["specs"])))
+            console.print(table)
+            console.print("\n[dim]No role is defined ahead of time: the specifications came from the "
+                          "objective.[/dim]\n")
+            raise typer.Exit(ExitCode.OK)
+
+        if key not in _SELFTEST_OBJECTIVES:
+            console.print(f"[red]✘[/red] unknown demo {escape(repr(demo))}; choose from: "
+                          f"{', '.join([*_SELFTEST_OBJECTIVES, 'compare', 'reject'])}")
+            raise typer.Exit(ExitCode.USAGE)
+        directory = Path(out_dir).expanduser() if out_dir else None
+        payload = _spec_demo(key, out_dir=directory)
+        if as_json:
+            _emit(json.dumps(payload, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        summary = Table(title=f"subagent specifications — {key}", title_justify="left", box=None, pad_edge=False)
+        summary.add_column("field", style="dim", no_wrap=True)
+        summary.add_column("value", overflow="fold")
+        summary.add_row("objective", escape(payload["objective"]))
+        summary.add_row("plan valid", "[green]yes[/green]" if payload["validation"]["ok"] else "[red]no[/red]")
+        summary.add_row("runtime specs", str(len(payload["specs"])))
+        for spec in payload["specs"]:
+            summary.add_row(
+                f"· {spec['role']}",
+                escape(f"{spec['basis']} · {len(spec['workers'])} worker(s) · "
+                       f"deliverable: {spec['deliverables'][0]} · stop: {spec['stop_condition'][:60]}"),
+            )
+        summary.add_row("rejection demo", f"{len(payload['rejection_example']['problems'])} problem(s)")
+        console.print(summary)
+        for spec in payload["specs"]:
+            console.print()
+            console.print(spec_table_from_payload(spec))
+        if payload.get("artefact"):
+            console.print(f"\n[dim]artefact: {escape(payload['artefact'])}[/dim]")
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    console.print("[red]✘[/red] use --demo {exposure|forensic|compare|reject}, --show ROLE or --self-test")
+    raise typer.Exit(ExitCode.USAGE)
+
+
+def spec_panel(draft: SubagentSpecDraft) -> Panel:
+    """One specification, rendered in full."""
+
+    body = Text()
+    rows = [
+        ("role", draft.role),
+        ("basis", draft.role_basis.value),
+        ("objective", draft.objective),
+        ("justification", draft.justification),
+        ("scope", ", ".join(draft.scope_entries)),
+        ("inputs", ", ".join(draft.required_inputs)),
+        ("capabilities", ", ".join(draft.allowed_capabilities)),
+        ("deliverables", "; ".join(f"{d.name} ({d.format})" for d in draft.deliverables)),
+        ("measurable", "; ".join(d.measurable_check for d in draft.deliverables)),
+        ("evidence", f"{draft.evidence.description} — min {draft.evidence.minimum_items} item(s), "
+                     f"{draft.evidence.minimum_sources} source(s)"),
+        ("rubric", draft.rubric.describe()),
+        ("stop when", draft.termination.objective_satisfied_when),
+        ("abandon when", "; ".join(draft.termination.abandon_when)),
+        ("workers", ", ".join(worker.name for worker in draft.workers)),
+    ]
+    for index, (label, value) in enumerate(rows):
+        if index:
+            body.append("\n")
+        body.append(f"{label:<14}", style="dim")
+        body.append(value)
+    return Panel(body, title=f"[bold]{escape(draft.role)}[/bold]", title_align="left",
+                 border_style="cyan", expand=False)
+
+
+def spec_table_from_payload(spec: Mapping[str, Any]) -> Table:
+    """The same information from a demo payload."""
+
+    table = Table(title=f"{spec['role']} — {spec['basis']}", title_justify="left", box=None, pad_edge=False)
+    table.add_column("field", style="dim", no_wrap=True)
+    table.add_column("value", overflow="fold")
+    table.add_row("objective", escape(str(spec["objective"])))
+    table.add_row("scope", escape(", ".join(spec["scope"])))
+    table.add_row("capabilities", escape(", ".join(spec["capabilities"])))
+    table.add_row("deliverable", escape(str(spec["deliverables"][0])))
+    table.add_row("measurable", escape(str(spec["evidence"]["description"])[:90]))
+    table.add_row("rubric", escape(str(spec["rubric"]["criteria"].__len__()) + " criteria, pass ≥"
+                                   + str(spec["rubric"]["passing_score"])))
+    table.add_row("stop when", escape(str(spec["stop_condition"])[:90]))
+    table.add_row("workers", escape(", ".join(str(worker["name"]) for worker in spec["workers"])))
+    return table
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 23. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 

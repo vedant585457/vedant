@@ -12,6 +12,7 @@ python vedant_osint.py doctor                # capability health check (CI gate)
 python vedant_osint.py resilience --self-test # logging, cancellation, cleanup
 python vedant_osint.py adapter --self-test    # structured model output contract
 python vedant_osint.py master --self-test     # Master Agent boundaries
+python vedant_osint.py subagents --self-test  # runtime Subagent specifications
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -135,6 +136,42 @@ python vedant_osint.py master -t example.com -o "map the attack surface"
   conflict pauses the mission rather than letting the Master conclude.
 - **Stopping is deterministic** — budget floor, diminishing returns, unresolved
   conflict and "nothing left open", with the most cautious rule winning.
+
+## Dynamic Subagent specifications
+
+No Subagent has a class. A Subagent exists only because the Master returned a
+`SubagentSpecDraft` that passed `validate_subagent_specs`, and only
+`SubagentFactory` turns a passing draft into a stored `SubagentSpec` with runtime
+ids — the self-test parses the file to prove no executable Subagent class and no
+roster constant exists.
+
+```bash
+python vedant_osint.py subagents --self-test      # 109 guarantee checks, offline
+python vedant_osint.py subagents --demo compare   # two objectives, two sets of specs
+python vedant_osint.py subagents --show published-advisories
+python vedant_osint.py subagents --demo reject    # what the Master is sent back
+```
+
+- **Ten task-derived parts** — role *and the basis* it was derived from (source
+  family, analytic step, artefact type, verification, integrity, timeline, log
+  correlation),
+  objective, scope boundaries, required inputs, allowed capabilities, expected
+  outputs, evidence requirements, quality rubric, termination criteria.
+- **A measurable deliverable** — each `Deliverable` names its format, its fields
+  and a `measurable_check`; vague phrasing is refused by the model.
+- **A measurable stop condition** — `TerminationCriteria.is_measurable` requires
+  a countable or checkable marker ("at least one row per advisory"), plus
+  ceilings, abandon conditions and whether a partial report is required.
+- **Refusal, not trimming** — out-of-scope entries, unavailable capabilities, job
+  titles (`analyst`, `The Analyst`), duplicate roles, duplicate *behaviour* under
+  a second name, circular justifications and dangling dependencies are all
+  rejected, with a repair instruction per problem.
+- **The Master repairs its own plan** — `plan_subagent_specs` sends the problems
+  back as a bounded repair brief and raises `SubagentPlanError` (exit `7`) if the
+  plan never becomes acceptable.
+- **Two objectives, two sets of specs** — exposure produced 2 runtime Subagents
+  with different roles, tools, deliverables and stop conditions from forensic's
+  3, with no code change.
 
 ## Structured model adapter
 
@@ -272,7 +309,7 @@ Authorised use only — collect from systems you own or are explicitly permitted
 |-------|-------|-------|
 | 1 | Foundation — CLI skeleton, config probing, version reporting | ✅ done |
 | 2 | Contracts — settings, `doctor`, preflight, models, state, renderer, lifecycle, resilience, model adapter | ✅ done |
-| 3 | Orchestration — Master Agent (only fixed agent) + runtime Subagent factory | 🟡 started |
+| 3 | Orchestration — Master Agent (only fixed agent) + runtime Subagent factory | 🟡 started (Master Agent, Subagent specifications) |
 | 4 | Browser — browser-use / Playwright sessions and capture | ⬜ |
 | 5 | Collection — passive OSINT sources, artefact hashing | ⬜ |
 | 6 | Synthesis — cross-source correlation and reporting | ⬜ |
