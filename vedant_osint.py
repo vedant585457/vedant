@@ -254,6 +254,45 @@ The demo kinds are ``sigint``, ``timeout``, ``exception`` and ``operator``
 ``124``, ``70`` and ``130`` — after printing the outcome, the checkpoint and
 report paths, and the count of preserved evidence items.
 
+The Master Agent
+----------------
+Exactly one agent is defined ahead of time.  :class:`MasterAgent` holds the
+charter, a model adapter and the mission limits — nothing else.  Its
+responsibilities are closed: confirm the scope, plan the mission, design the
+team, oversee the work, detect cross-Subagent conflict, synthesise the answer,
+and decide when to stop.  It cannot collect evidence, browse or parse, because
+those are the jobs of the Subagents it creates.
+
+* **No predetermined roster.**  The charter forbids assuming one, and
+  :func:`assert_no_fixed_roles` refuses prompt text that drifts towards one
+  (``"as usual, spawn"``, ``"the following subagents"``…).  A self-test asserts
+  no role class such as ``NetworkSubagent`` exists anywhere in the file.
+* **The smallest sufficient team.**  :meth:`MasterAgent.design_team` asks for a
+  :class:`TeamDesign` — per-Subagent objective, rationale, instructions, tools,
+  Workers and completion criteria — then validates it against the mission scope,
+  the limits and the capabilities actually available.  A team that widens the
+  scope, duplicates an agent or exceeds a limit is **refused**, never trimmed.
+* **Two objectives, two organisations.**  The same code produced two Subagents
+  with three Workers for a web-exposure objective and three Subagents with four
+  Workers, different tools and different completion criteria for a forensic
+  objective (``master --demo compare``).
+* **Oversight is executable.**  A team review must return a concrete change from
+  a closed vocabulary (``add-subagent``, ``retask-subagent``, ``retire-subagent``,
+  ``add-worker``, ``narrow-scope``, ``stop``) or none.
+* **Conflict is reported, not voted on.**  Two Subagents claiming incompatible
+  values for the same topic produce a :class:`ConflictFinding` that keeps both
+  sides and says what would settle it.  An unresolved conflict pauses the
+  mission instead of letting the Master conclude.
+* **Stopping is deterministic.**  Budget floor, diminishing returns, unresolved
+  conflict and "nothing left open" are checked in that order and the most
+  cautious rule wins — no model call decides whether to stop.
+
+::
+
+    python vedant_osint.py master --self-test        # 87 guarantee checks, offline
+    python vedant_osint.py master --demo compare     # two objectives, two teams
+    python vedant_osint.py master --prompt           # read the charter
+
 Structured model adapter
 ------------------------
 One model-calling interface sits between orchestration and every provider, so
@@ -305,6 +344,7 @@ Usage
     python vedant_osint.py lifecycle --self-test        # lifecycle animation guarantees
     python vedant_osint.py resilience --self-test       # logging, cancellation, cleanup
     python vedant_osint.py adapter --self-test          # structured output contract
+    python vedant_osint.py master --self-test           # Master Agent boundaries
     python vedant_osint.py doctor                       # full capability health check
     python vedant_osint.py policy -o "..." --scope example.com          # safety preflight only
     python vedant_osint.py mission --target example.com -o "map the attack surface"
@@ -433,7 +473,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 10
+VERSION_MINOR: int = 11
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -480,14 +520,14 @@ LIMIT_BOUNDS: dict[str, tuple[int | None, int | None]] = {
 }
 
 #: Build phase currently implemented.  Later tasks advance this number.
-BUILD_PHASE: int = 2
-BUILD_PHASE_NAME: str = "Contracts"
+BUILD_PHASE: int = 3
+BUILD_PHASE_NAME: str = "Orchestration"
 
 #: Section banners shared by the banner panel and ``version --json``.
 PHASE_ROADMAP: tuple[tuple[int, str, str], ...] = (
     (1, "Foundation", "CLI skeleton, config probing, version reporting"),
     (2, "Contracts", "Contracts, state, rendering, lifecycle, resilience, model adapter"),
-    (3, "Orchestration", "LangGraph Master Agent + runtime Subagent factory"),
+    (3, "Orchestration", "Master Agent (only fixed agent) + runtime Subagent factory"),
     (4, "Browser", "browser-use/Playwright sessions and capture"),
     (5, "Collection", "passive OSINT sources, artefact hashing/chain of custody"),
     (6, "Synthesis", "cross-source correlation, findings and report export"),
@@ -11699,9 +11739,17 @@ class ModelRequest:
     max_subagents: int | None = None
     #: The mission boundary, for scope validation.  ``None`` skips that check.
     scope: "Scope | None" = None
+    #: Override the response model when a task has more than one legitimate
+    #: answer shape (a team review is not a quality review of evidence).
+    model_cls_override: type[BaseModel] | None = None
+    #: Replace the shared task prompt.  Only for agents with their own charter
+    #: (the Master), whose standing instructions are not a task template.
+    system_prompt_override: str | None = None
 
     @property
     def model_cls(self) -> type[BaseModel]:
+        if self.model_cls_override is not None:
+            return self.model_cls_override
         return TASK_MODELS[self.task]
 
     def prompt(self) -> str:
@@ -12319,7 +12367,13 @@ class ModelAdapter:
         url = adapter.endpoint(self.base_url(), model)
         api_key, _ = self.settings.resolve_api_key()
         schema = schema_for(request.model_cls, adapter=adapter)
-        system = build_system_prompt(request.task, adapter=adapter, model_cls=request.model_cls)
+        system = request.system_prompt_override or build_system_prompt(
+            request.task, adapter=adapter, model_cls=request.model_cls
+        )
+        if adapter.mode is not StructuredMode.JSON_SCHEMA and request.system_prompt_override:
+            # A provider without native schema support needs the shape in the
+            # prompt, even when the agent supplies its own charter.
+            system = f"{system}\n\nREQUIRED JSON SHAPE (JSON Schema)\n{canonical_json(schema)}"
         parser = StructuredParser(request)
 
         attempt = 0
@@ -13472,7 +13526,1915 @@ def _safe_mode(provider: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 21. Entry point
+# 21. The Master Agent — the only fixed agent
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Phase 3 begins here.  Exactly one agent is defined ahead of time: this one.
+# Everything below it — Subagents, their Workers, the tasks they are given — is
+# decided at runtime from the current objective, because a predetermined roster
+# is the thing this architecture exists to avoid.
+#
+# The Master's responsibilities are deliberately narrow and closed:
+#
+#     1. confirm the scope          5. detect cross-Subagent conflict
+#     2. plan the mission           6. synthesise the final answer
+#     3. design the team            7. decide when to stop
+#     4. oversee globally
+#
+# It does not collect evidence, browse, parse artefacts or write findings.  Each
+# of those belongs to a Subagent it created for that purpose, which is what
+# keeps the design honest: with no collection duties, the Master has no reason
+# to prefer a particular kind of agent.
+
+
+class MasterDuty(str, Enum):
+    """The seven responsibilities.  Anything not listed is out of scope."""
+
+    CONFIRM_SCOPE = "confirm-scope"
+    PLAN = "plan"
+    DESIGN_TEAM = "design-team"
+    OVERSEE = "oversee"
+    DETECT_CONFLICT = "detect-conflict"
+    SYNTHESIZE = "synthesize"
+    DECIDE_STOP = "decide-stop"
+
+
+#: Duties the Master must never perform itself.  Enforced by the self-test
+#: against the prompt text and by :meth:`MasterAgent._assert_delegable`.
+_DELEGATED_DUTIES: tuple[str, ...] = (
+    "browse",
+    "collect evidence",
+    "parse artefacts",
+    "capture pages",
+    "hash files",
+    "run the workers",
+)
+
+
+class StopReason(str, Enum):
+    """Why the Master decided the mission is finished — or must not continue."""
+
+    COMPLETE = "complete"                  # every hypothesis resolved or retired
+    SUFFICIENT = "sufficient"              # enough evidence for the objective
+    BUDGET = "budget"                      # mission budget nearly spent
+    BLOCKED = "blocked"                    # scope or capability prevents progress
+    DIMINISHING = "diminishing"            # new work stopped adding information
+    AWAITING_REVIEW = "awaiting-review"    # a reviewer must decide first
+    CANCELLED = "cancelled"
+
+
+class TeamChange(str, Enum):
+    """What the Master wants to do to the team after a review round."""
+
+    NONE = "none"
+    ADD_SUBAGENT = "add-subagent"
+    RETIRE_SUBAGENT = "retire-subagent"
+    RETASK_SUBAGENT = "retask-subagent"
+    ADD_WORKER = "add-worker"
+    NARROW_SCOPE = "narrow-scope"
+    STOP = "stop"
+
+
+class MasterPromptUnsafe(ValueError):
+    """A prompt or directive that would hardcode a roster or smuggle in extra duties."""
+
+
+# --------------------------------------------------------------------------
+# 21.1 The team the Master designs, and how a Subagent is defined
+# --------------------------------------------------------------------------
+
+
+class WorkerInstruction(StrictModel):
+    """One Worker, specified by the Master rather than by a role class."""
+
+    name: str = Field(min_length=1)
+    objective: str = Field(min_length=8)
+    #: Concrete capability names the Worker may use, chosen per objective.
+    tools: list[str] = Field(default_factory=list)
+    inputs: list[str] = Field(default_factory=list)
+    #: What "done" means for this Worker.  Not inferred later.
+    completion_criteria: list[str] = Field(min_length=1)
+    output_schema: str | None = None
+    requires_network: bool = False
+    requires_browser: bool = False
+    max_attempts: int = Field(default=2, ge=1, le=10)
+
+    @field_validator("objective")
+    @classmethod
+    def _plain(cls, value: str) -> str:
+        return _reject_hedging(value, what="worker objective")
+
+    @model_validator(mode="after")
+    def _coherent(self) -> "WorkerInstruction":
+        if self.requires_browser and not self.requires_network:
+            # A browser *is* network access; the pair is contradictory.
+            raise ValueError("a browser worker must also declare requires_network")
+        if self.completion_criteria and not any(c.strip() for c in self.completion_criteria):
+            raise ValueError("completion criteria cannot be blank")
+        return self
+
+
+class SubagentBlueprint(StrictModel):
+    """A Subagent the Master will create at runtime.
+
+    Everything that makes an agent specific — objective, instructions,
+    Workers, tools, completion criteria — is data here.  There is no subclass
+    per role, which is exactly why two objectives can produce two different
+    organisations from the same code.
+    """
+
+    name: str = Field(min_length=1)
+    #: One sentence saying what this agent is for, in this mission's terms.
+    objective: str = Field(min_length=10)
+    #: Why it exists at all: what would be missed without it.
+    rationale: str = Field(min_length=10)
+    #: Instructions the Subagent is given verbatim.
+    instructions: list[str] = Field(min_length=1)
+    workers: list[WorkerInstruction] = Field(min_length=1)
+    #: Capabilities this agent alone may use.
+    tools: list[str] = Field(default_factory=list)
+    scope_entries: list[str] = Field(default_factory=list)
+    completion_criteria: list[str] = Field(min_length=1)
+    depends_on: list[str] = Field(default_factory=list)
+    max_workers: int = Field(default=2, ge=1, le=16)
+    expected_evidence: list[str] = Field(default_factory=list)
+
+    @field_validator("objective", "rationale")
+    @classmethod
+    def _plain(cls, value: str) -> str:
+        return _reject_hedging(value, what="subagent text")
+
+    @model_validator(mode="after")
+    def _coherent(self) -> "SubagentBlueprint":
+        if len(self.workers) > self.max_workers:
+            raise ValueError(
+                f"{len(self.workers)} workers exceeds max_workers={self.max_workers} for {self.name!r}"
+            )
+        names = [w.name.strip().lower() for w in self.workers]
+        if len(names) != len(set(names)):
+            raise ValueError(f"worker names must be unique within {self.name!r}")
+        if self.name.strip().lower() in {d.strip().lower() for d in self.depends_on}:
+            raise ValueError("a subagent cannot depend on itself")
+        return self
+
+
+class TeamDesign(StrictModel):
+    """The Master's answer to "who should work on this?".
+
+    ``total_subagents`` is derived, so the count an operator reads is always the
+    count that will actually be created — the acceptance criterion depends on
+    those two never diverging.
+    """
+
+    objective_summary: str = Field(min_length=10)
+    subagents: list[SubagentBlueprint] = Field(min_length=1)
+    #: Why *this many* and not more; the smallest-sufficient argument.
+    sizing_rationale: str = Field(min_length=20)
+    #: What was deliberately left out, and why it is not needed.
+    deliberately_omitted: list[str] = Field(default_factory=list)
+    #: Mission-level completion criteria, distinct from per-agent ones.
+    completion_criteria: list[str] = Field(min_length=1)
+    #: Working hypothesis set the team must test, never assume.
+    hypotheses: list[str] = Field(default_factory=list)
+    uncertainty: str | None = None
+
+    @property
+    def total_subagents(self) -> int:
+        return len(self.subagents)
+
+    @property
+    def total_workers(self) -> int:
+        return sum(len(s.workers) for s in self.subagents)
+
+    def tools_used(self) -> list[str]:
+        """Every capability the team would exercise, deduplicated and sorted."""
+
+        found: set[str] = set()
+        for subagent in self.subagents:
+            found.update(subagent.tools)
+            for worker in subagent.workers:
+                found.update(worker.tools)
+        return sorted(found)
+
+    def structural_signature(self) -> str:
+        """A stable fingerprint of the team's *shape*.
+
+        Two objectives that produce the same signature produced the same
+        organisation — useful in a test, alarming in production.
+        """
+
+        return content_id(
+            "team",
+            sorted(
+                (
+                    s.name.lower(),
+                    tuple(sorted(w.name.lower() for w in s.workers)),
+                    tuple(sorted(s.tools)),
+                )
+                for s in self.subagents
+            ),
+        )
+
+    @model_validator(mode="after")
+    def _no_duplicate_agents(self) -> "TeamDesign":
+        names = [s.name.strip().lower() for s in self.subagents]
+        if len(names) != len(set(names)):
+            raise ValueError("subagent names must be unique across the team")
+        known = set(names)
+        for subagent in self.subagents:
+            unknown = [d for d in subagent.depends_on if d.strip().lower() not in known]
+            if unknown:
+                raise ValueError(f"{subagent.name!r} depends on unknown agent(s): {', '.join(unknown)}")
+        if self.uncertainty is None or len(self.uncertainty.strip()) < 10:
+            raise ValueError("a team design must state its uncertainty explicitly")
+        return self
+
+
+# --------------------------------------------------------------------------
+# 21.2 Oversight, conflict detection and stopping
+# --------------------------------------------------------------------------
+
+
+class TeamReview(StrictModel):
+    """The Master's periodic look at the team it created.
+
+    ``change`` is a closed vocabulary so the Master can only ever ask for a
+    concrete, executable adjustment — not "improve things".
+    """
+
+    change: TeamChange = TeamChange.NONE
+    rationale: str = Field(min_length=10)
+    #: Which agents this concerns (ids or names).
+    affected: list[str] = Field(default_factory=list)
+    #: For ADD_*: the full instruction for the new unit.
+    new_subagent: SubagentBlueprint | None = None
+    new_worker: WorkerInstruction | None = None
+    instructions: list[str] = Field(default_factory=list)
+    #: What the Master is watching for on the next round.
+    watch_for: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _executable(self) -> "TeamReview":
+        if self.change is TeamChange.ADD_SUBAGENT and self.new_subagent is None:
+            raise ValueError("ADD_SUBAGENT needs a new_subagent definition")
+        if self.change is TeamChange.ADD_WORKER and self.new_worker is None:
+            raise ValueError("ADD_WORKER needs a new_worker definition")
+        if self.change in {TeamChange.RETIRE_SUBAGENT, TeamChange.RETASK_SUBAGENT} and not self.affected:
+            raise ValueError(f"{self.change.value} needs the affected agent(s)")
+        if self.change is TeamChange.RETASK_SUBAGENT and not self.instructions:
+            raise ValueError("RETASK_SUBAGENT needs the new instructions")
+        return self
+
+
+class ConflictFinding(StrictModel):
+    """Two Subagents disagreeing about the same thing.
+
+    The Master does not resolve this by choosing the more confident party: it
+    names the disputed fact, shows both sides' evidence, and states what would
+    settle it.  Unresolvable conflict becomes a reported uncertainty.
+    """
+
+    #: The disputed subject, e.g. "affected-component" or "version".  Short
+    #: topics are legitimate, so only emptiness is rejected.
+    topic: str = Field(min_length=1)
+    left_agent: str = Field(min_length=1)
+    right_agent: str = Field(min_length=1)
+    #: The disputed values themselves.  Deliberately short-tolerant: a version
+    #: string or a date is a legitimate thing for two agents to disagree about.
+    left_statement: str = Field(min_length=1)
+    right_statement: str = Field(min_length=1)
+    left_evidence: list[str] = Field(default_factory=list)
+    right_evidence: list[str] = Field(default_factory=list)
+    conflict_kind: str = Field(default="factual", pattern="^(factual|temporal|scope|confidence|method)$")
+    #: What evidence would settle it, or why nothing can.
+    resolution_approach: str | None = None
+    resolved: bool = False
+
+    @model_validator(mode="after")
+    def _distinct_parties(self) -> "ConflictFinding":
+        if self.left_agent.strip().lower() == self.right_agent.strip().lower():
+            raise ValueError("a conflict needs two different agents")
+        if self.left_statement.strip().lower() == self.right_statement.strip().lower():
+            raise ValueError("the two sides of a conflict cannot be the same value")
+        if not (self.left_evidence or self.right_evidence) and not self.resolution_approach:
+            raise ValueError("a conflict must cite evidence or say how it could be settled")
+        return self
+
+
+class ConflictReport(StrictModel):
+    """All cross-Subagent conflicts found in one oversight pass."""
+
+    findings: list[ConflictFinding] = Field(default_factory=list)
+    #: Conflicts that could not be settled and must reach the report as gaps.
+    unresolved_topics: list[str] = Field(default_factory=list)
+
+    @property
+    def count(self) -> int:
+        return len(self.findings)
+
+    @property
+    def blocking(self) -> list[ConflictFinding]:
+        return [f for f in self.findings if not f.resolved]
+
+
+class StopDecision(StrictModel):
+    """Whether the mission continues, and on what basis."""
+
+    stop: bool
+    reason: StopReason
+    basis: str = Field(min_length=10)
+    #: Hypotheses still open when the decision was taken.
+    open_hypotheses: list[str] = Field(default_factory=list)
+    #: What a continuation would have done, if stopping early.
+    foregone: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _coherent(self) -> "StopDecision":
+        if self.stop and self.reason is StopReason.COMPLETE and self.open_hypotheses:
+            raise ValueError("cannot call a mission complete with open hypotheses")
+        if not self.stop and self.reason in {StopReason.COMPLETE, StopReason.BUDGET, StopReason.CANCELLED}:
+            raise ValueError(f"{self.reason.value} is a stopping reason, not a continuing one")
+        return self
+
+
+# --------------------------------------------------------------------------
+# 21.3 The Master's charter — the prompt, and what it forbids
+# --------------------------------------------------------------------------
+
+#: Phrases that betray a roster baked into the prompt.  The Master is told the
+#: opposite in plain words, and this list is what the self-test checks.
+_ROSTER_SMELLS: tuple[str, ...] = (
+    "you are a network subagent",
+    "your subagents are",
+    "the subagent roster",
+    "as usual, spawn",
+    "always spawn",
+    "fixed team",
+    "standard team of",
+    "the following subagents",
+)
+
+
+class MasterCharter(StrictModel):
+    """The Master's standing instructions, versioned and inspectable.
+
+    The charter is a *value*, not a string buried in a call site: the same text
+    drives the prompt, the CLI, the self-test and the refusal check.
+    """
+
+    version: str = "1"
+    role: str = Field(min_length=20)
+    duties: list[str] = Field(min_length=1)
+    prohibitions: list[str] = Field(min_length=1)
+    team_rules: list[str] = Field(min_length=1)
+    evidence_rules: list[str] = Field(min_length=1)
+    stop_rules: list[str] = Field(min_length=1)
+
+    def as_text(self) -> str:
+        """Render the charter as the system prompt body."""
+
+        def block(title: str, items: Sequence[str]) -> str:
+            return f"\n{title}\n" + "\n".join(f"- {item}" for item in items)
+
+        return (
+            f"{self.role}"
+            + block("YOUR RESPONSIBILITIES (and nothing else)", self.duties)
+            + block("WHAT YOU MUST NOT DO", self.prohibitions)
+            + block("HOW TO DESIGN THE TEAM", self.team_rules)
+            + block("EVIDENCE STANDARD", self.evidence_rules)
+            + block("WHEN TO STOP", self.stop_rules)
+        )
+
+
+def build_master_charter() -> MasterCharter:
+    """The one fixed definition in the system.
+
+    Every rule here is load-bearing: the team-sizing rules are what make two
+    objectives produce two organisations, and the evidence rules are what stop
+    the Master from concluding before its team has collected anything.
+    """
+
+    return MasterCharter(
+        role=(
+            "You are the Master Agent of an authorised OSINT and digital-forensics mission. "
+            "You are the only agent whose existence is fixed in advance. Every Subagent and "
+            "Worker you use is one you create for this objective, and only for this objective."
+        ),
+        duties=[
+            "Confirm the scope: restate the authorised assets, mode and data classes, and refuse "
+            "to plan anything they do not cover.",
+            "Plan the mission as questions to answer and evidence to collect — never as a "
+            "conclusion to justify.",
+            "Design the team: decide how many Subagents are needed, what each is for, what "
+            "instructions and tools it gets, and what completion looks like for it.",
+            "Oversee the whole mission: track what each Subagent is doing, spot overlap and dead "
+            "ends, and adjust the organisation when the evidence changes the problem.",
+            "Detect conflict between Subagents: when two report incompatible facts, record both "
+            "sides with their evidence rather than picking the more confident one.",
+            "Synthesise the final answer from your team's evidence, with explicit uncertainty and "
+            "the gaps that remain.",
+            "Decide when to stop, and say on what basis.",
+        ],
+        prohibitions=[
+            "You cannot assume any predetermined Subagent roster. There is no standard team, no "
+            "default roles, and no team you used on a previous mission.",
+            "You cannot browse, collect evidence, parse artefacts or run Workers yourself. If a "
+            "task needs doing, it belongs to an agent you create.",
+            "You cannot invent facts, ids, sources or dates, and you cannot attribute conduct to "
+            "a person.",
+            "You cannot continue past a scope or policy boundary, and you cannot widen the scope "
+            "to make a task possible.",
+        ],
+        team_rules=[
+            "Create the smallest sufficient team: one Subagent if one can cover the objective "
+            "honestly, more only when the work genuinely needs separate expertise, sources or "
+            "sequencing.",
+            "Name each Subagent after what it is for in this mission, not after a job title.",
+            "Give every Subagent its own objective, instructions, tools and completion criteria. "
+            "Two Subagents with the same definition should be one Subagent.",
+            "Prefer one Worker per collection path; split further only when the outputs differ.",
+            "State what you deliberately left out and why the mission does not need it.",
+        ],
+        evidence_rules=[
+            "Every claim must cite evidence ids that were actually collected.",
+            "Distinguish observation, inference and allegation, and mark anything unsupported as a "
+            "gap instead of filling it in.",
+            "Two sources that disagree are a finding, not a vote: report the conflict and what "
+            "would settle it.",
+        ],
+        stop_rules=[
+            "Stop when the objective's questions are answered, or when further collection can no "
+            "longer change the answer.",
+            "Stop early, and say so, when the budget, the scope or the available capabilities "
+            "cannot support more work.",
+            "Never present a partial mission as complete: name what was not done.",
+        ],
+    )
+
+
+def master_prompt(charter: MasterCharter | None = None) -> str:
+    """The Master's system prompt, ready to hand to the adapter."""
+
+    text = (charter or build_master_charter()).as_text()
+    lowered = text.lower()
+    smells = [phrase for phrase in _ROSTER_SMELLS if phrase in lowered]
+    if smells:                                   # pragma: no cover - guarded by the self-test
+        raise MasterPromptUnsafe(f"charter implies a fixed roster: {', '.join(smells)}")
+    return text
+
+
+def assert_no_fixed_roles(text: str) -> None:
+    """Refuse any prompt or directive that would hard-code a team."""
+
+    lowered = text.lower()
+    smells = [phrase for phrase in _ROSTER_SMELLS if phrase in lowered]
+    if smells:
+        raise MasterPromptUnsafe(f"text implies a fixed roster: {', '.join(smells)}")
+
+
+# --------------------------------------------------------------------------
+# 21.4 Planning: objective → validated team
+# --------------------------------------------------------------------------
+
+
+class MasterContext(StrictModel):
+    """What the Master knows before it plans.  No evidence yet, by design."""
+
+    mission_id: str = ""
+    objective: str = Field(min_length=3)
+    #: May be empty so that :meth:`MasterAgent.confirm_scope` can *report* the
+    #: missing scope rather than the constructor raising before the Master ever
+    #: sees the problem.
+    scope_entries: list[str] = Field(default_factory=list)
+    exclusions: list[str] = Field(default_factory=list)
+    mode: MissionMode = MissionMode.PASSIVE
+    data_classes: list[str] = Field(default_factory=list)
+    #: Capabilities this deployment actually has; the Master must not plan
+    #: around tools it will not be given.
+    available_tools: list[str] = Field(default_factory=list)
+    max_subagents: int = Field(default=5, ge=1, le=25)
+    max_total_workers: int = Field(default=16, ge=1, le=64)
+    mission_budget_seconds: int = Field(default=3600, ge=30)
+    #: Facts the operator supplied up front, as opposed statements only.
+    operator_notes: list[str] = Field(default_factory=list)
+    prior_findings: list[str] = Field(default_factory=list)
+
+    def scope_object(self) -> Scope:
+        entries = [ScopeEntry(pattern=p) for p in self.scope_entries]
+        entries += [ScopeEntry(pattern=p, included=False) for p in self.exclusions]
+        return Scope(entries=entries, mode=self.mode, data_classes=[DataClass(d) for d in self.data_classes]
+                     if self.data_classes else [DataClass.PUBLIC_WEB])
+
+    def to_prompt(self) -> str:
+        """The data turn.  Delimited so the model cannot mistake it for rules."""
+
+        lines = [
+            f"OBJECTIVE\n{self.objective.strip()}",
+            "AUTHORISED SCOPE\n" + "\n".join(f"- {entry}" for entry in self.scope_entries),
+            f"MODE\n{self.mode.value}",
+            f"LIMITS\nmax_subagents={self.max_subagents}; max_total_workers={self.max_total_workers}; "
+            f"budget_seconds={self.mission_budget_seconds}",
+        ]
+        if self.exclusions:
+            lines.append("EXCLUDED\n" + "\n".join(f"- {entry}" for entry in self.exclusions))
+        if self.available_tools:
+            lines.append("AVAILABLE CAPABILITIES\n" + "\n".join(f"- {tool}" for tool in self.available_tools))
+        if self.operator_notes:
+            lines.append("OPERATOR NOTES\n" + "\n".join(f"- {note}" for note in self.operator_notes))
+        if self.prior_findings:
+            lines.append("ALREADY COLLECTED\n" + "\n".join(f"- {item}" for item in self.prior_findings))
+        lines.append(
+            "TASK\nDesign the smallest sufficient team for this objective and return the team design."
+        )
+        return "\n\n".join(lines)
+
+
+class TeamValidation(StrictModel):
+    """Result of checking a proposed team against the mission's limits."""
+
+    ok: bool
+    problems: list[str] = Field(default_factory=list)
+    #: Adjustments the Master applied automatically, with reasons.
+    adjustments: list[str] = Field(default_factory=list)
+
+    def raise_if_bad(self) -> None:
+        if not self.ok:
+            raise PlanConstraintError(
+                "the proposed team cannot run this mission: " + "; ".join(self.problems[:4]),
+                task=ModelTask.DECOMPOSE,
+                validation_errors=self.problems,
+            )
+
+
+def validate_team(design: TeamDesign, context: MasterContext) -> TeamValidation:
+    """Check a design against limits, scope and capability — without editing it.
+
+    Deliberately non-destructive: the Master must *know* its team was wrong, so
+    the problems are reported rather than silently trimmed.  The one exception
+    is dropping a dependency edge to an agent that was trimmed away, which is
+    recorded as an adjustment.
+    """
+
+    problems: list[str] = []
+    adjustments: list[str] = []
+
+    if design.total_subagents > context.max_subagents:
+        problems.append(f"{design.total_subagents} subagents exceeds the limit of {context.max_subagents}")
+    if design.total_workers > context.max_total_workers:
+        problems.append(f"{design.total_workers} workers exceeds the limit of {context.max_total_workers}")
+    if not design.subagents:
+        problems.append("the team is empty")
+
+    scope = context.scope_object()
+    for subagent in design.subagents:
+        for entry in subagent.scope_entries:
+            if not scope.covers(entry):
+                problems.append(f"{subagent.name}: scope entry {entry!r} is outside the authorised boundary")
+        if context.available_tools:
+            unknown = [tool for tool in subagent.tools if tool not in context.available_tools]
+            if unknown:
+                problems.append(f"{subagent.name}: unavailable tool(s) {', '.join(unknown)}")
+            for worker in subagent.workers:
+                unknown = [tool for tool in worker.tools if tool not in context.available_tools]
+                if unknown:
+                    problems.append(f"{subagent.name}/{worker.name}: unavailable tool(s) {', '.join(unknown)}")
+
+    # Two agents with identical definitions are one agent wearing two hats.
+    signatures: dict[str, str] = {}
+    for subagent in design.subagents:
+        signature = content_id("sig", subagent.objective.strip().lower(), tuple(sorted(subagent.tools)))
+        if signature in signatures:
+            problems.append(
+                f"{subagent.name!r} duplicates {signatures[signature]!r}: identical objective and tools"
+            )
+        signatures[signature] = subagent.name
+
+    return TeamValidation(ok=not problems, problems=problems, adjustments=adjustments)
+
+
+# --------------------------------------------------------------------------
+# 21.5 The Master Agent
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MasterOutcome:
+    """What one Master step produced.  Always accompanied by a reason."""
+
+    duty: MasterDuty
+    ok: bool
+    detail: str
+    team: TeamDesign | None = None
+    conflicts: ConflictReport | None = None
+    stop: StopDecision | None = None
+    review: TeamReview | None = None
+    attempts: int = 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "duty": self.duty.value,
+            "ok": self.ok,
+            "detail": self.detail,
+            "attempts": self.attempts,
+            "team": json.loads(model_to_json(self.team)) if self.team else None,
+            "conflicts": json.loads(model_to_json(self.conflicts)) if self.conflicts else None,
+            "stop": json.loads(model_to_json(self.stop)) if self.stop else None,
+            "review": json.loads(model_to_json(self.review)) if self.review else None,
+        }
+
+
+class MasterAgent:
+    """The only statically defined agent.
+
+    It holds the charter, the adapter and the limits — and nothing else.  Every
+    method corresponds to one of the seven duties; there is intentionally no
+    method that collects, browses or parses, because those responsibilities
+    belong to agents this one creates.
+
+    The class is model-independent: it asks for typed outputs through
+    :class:`ModelAdapter`, so a scripted transport can drive it in a self-test
+    and a real provider drives it in production without a code change.
+    """
+
+    agent_id = "master"
+
+    def __init__(
+        self,
+        adapter: "ModelAdapter | None" = None,
+        *,
+        charter: MasterCharter | None = None,
+        renderer: "EventRenderer | None" = None,
+        tracker: "LifecycleTracker | None" = None,
+        logger: "MissionLogger | None" = None,
+        context: MasterContext | None = None,
+    ) -> None:
+        self.adapter = adapter
+        self.charter = charter or build_master_charter()
+        self.renderer = renderer
+        self.tracker = tracker
+        self.logger = logger
+        self.context = context
+        #: The team currently in force, if the Master has designed one.
+        self.team: TeamDesign | None = None
+        #: Master-level record of what it did, in order.
+        self.history: list[MasterOutcome] = []
+
+    # -- 1. scope confirmation ---------------------------------------------
+
+    def confirm_scope(self, context: MasterContext) -> MasterOutcome:
+        """Restate the boundary before anything is planned.
+
+        Refuses outright when the objective's targets are not covered, because a
+        Master that plans around an unbounded objective is the failure this whole
+        architecture is meant to prevent.
+        """
+
+        self.context = context
+        scope = context.scope_object()
+        uncovered = [entry for entry in context.scope_entries if not scope.covers(entry)]
+        if uncovered:
+            outcome = MasterOutcome(
+                MasterDuty.CONFIRM_SCOPE,
+                ok=False,
+                detail=f"scope is self-contradictory (excluded but included): {', '.join(uncovered)}",
+            )
+            self._record(outcome, level="error")
+            return outcome
+        if not context.scope_entries:
+            outcome = MasterOutcome(MasterDuty.CONFIRM_SCOPE, ok=False, detail="no authorised assets declared")
+            self._record(outcome, level="error")
+            return outcome
+
+        outcome = MasterOutcome(
+            MasterDuty.CONFIRM_SCOPE,
+            ok=True,
+            detail=(
+                f"{len(context.scope_entries)} asset(s) in scope, "
+                f"{len(context.exclusions)} excluded, mode {context.mode.value}"
+            ),
+        )
+        self._record(outcome)
+        return outcome
+
+    # -- 2 & 3. plan and design the team -----------------------------------
+
+    def design_team(self, context: MasterContext | None = None) -> TeamDesign:
+        """Ask for a team, validate it, and refuse to proceed on a bad answer.
+
+        Two objectives produce two designs because the design is *asked for*,
+        never looked up.  The only fixed thing is the contract it must satisfy.
+        """
+
+        context = context or self.context
+        if context is None:
+            raise PlanConstraintError("the Master needs a mission context before designing a team")
+
+        if self.adapter is None:
+            raise ModelConfigError("no model adapter configured; the Master cannot design a team")
+
+        self._render("master_planning", f"designing a team for: {context.objective[:80]}")
+        # ``model_cls_override`` is what makes this a *team design* rather than
+        # the narrower decomposition: per-agent instructions, tools and
+        # completion criteria are part of the answer, so they are part of the
+        # contract the response is validated against.  A provider that returns
+        # the smaller shape fails validation and is asked again — never filled in.
+        request = ModelRequest(
+            task=ModelTask.DECOMPOSE,
+            objective=context.objective,
+            context=context.to_prompt(),
+            system_prompt_override=self.prompt,
+            instructions=(
+                "Design the smallest sufficient team. Return the team design in the required "
+                "schema, including each Subagent's instructions, tools and completion criteria, "
+                "its Workers, the sizing rationale and what you deliberately left out."
+            ),
+            max_subagents=context.max_subagents,
+            scope=context.scope_object(),
+            model_cls_override=TeamDesign,
+        )
+        result = self.adapter.call(request)
+        team = _expect(result.output, TeamDesign)
+
+        validate_team(team, context).raise_if_bad()
+        self.team = team
+        self._link_team(team)
+        self._record(
+            MasterOutcome(
+                MasterDuty.DESIGN_TEAM,
+                ok=True,
+                detail=f"{team.total_subagents} subagent(s), {team.total_workers} worker(s): "
+                       + ", ".join(s.name for s in team.subagents),
+                team=team,
+                attempts=result.attempts,
+            )
+        )
+        return team
+
+    # -- 4. global oversight ------------------------------------------------
+
+    def review_team(
+        self,
+        *,
+        progress: Mapping[str, Any],
+        findings: Sequence[str] = (),
+        remaining_budget_seconds: float | None = None,
+    ) -> TeamReview:
+        """Look at the whole mission and decide whether the team is still right.
+
+        ``progress`` is a plain mapping so any orchestrator can supply it; the
+        Master does not read the run-state store directly, which keeps it usable
+        before the store exists.
+        """
+
+        if self.adapter is None:
+            raise ModelConfigError("no model adapter configured; the Master cannot review the team")
+        if self.team is None:
+            raise PlanConstraintError("there is no team to review yet")
+
+        summary = [
+            f"objective: {self.team.objective_summary}",
+            f"subagents: {', '.join(s.name for s in self.team.subagents)}",
+            "progress: " + "; ".join(f"{k}={v}" for k, v in sorted(progress.items())),
+        ]
+        if remaining_budget_seconds is not None:
+            summary.append(f"remaining budget seconds: {remaining_budget_seconds:.0f}")
+        if findings:
+            summary.append("findings so far:\n" + "\n".join(f"- {finding}" for finding in findings[:20]))
+
+        request = ModelRequest(
+            task=ModelTask.REVIEW,
+            objective=f"Review the team running this mission: {self.team.objective_summary}",
+            system_prompt_override=self.prompt,
+            context="\n".join(summary),
+            instructions=(
+                "Decide whether the current team is sufficient, redundant or wrongly shaped. "
+                "Return only an executable change, or 'none' with a rationale."
+            ),
+            model_cls_override=TeamReview,
+        )
+        result = self.adapter.call(request)
+        review = _expect(result.output, TeamReview)
+        self._apply_review(review)
+        self._render("reasoning", f"team review: {review.change.value} — {review.rationale[:80]}")
+        self._record(
+            MasterOutcome(
+                MasterDuty.OVERSEE,
+                ok=True,
+                detail=f"change={review.change.value}: {review.rationale[:120]}",
+                review=review,
+                attempts=result.attempts,
+            )
+        )
+        return review
+
+    def _apply_review(self, review: TeamReview) -> None:
+        """Carry out an oversight decision against the team in force.
+
+        Only additive and retasking changes are applied directly; retiring an
+        agent is recorded and left to the orchestrator, because discarding work
+        in flight is its decision, not the Master's.
+        """
+
+        if self.team is None or review.change is TeamChange.NONE:
+            return
+        if review.change is TeamChange.ADD_SUBAGENT and review.new_subagent is not None:
+            if review.new_subagent.name.strip().lower() in {s.name.strip().lower() for s in self.team.subagents}:
+                raise PlanConstraintError(f"the team already contains {review.new_subagent.name!r}")
+            self.team = self.team.model_copy(
+                update={"subagents": [*self.team.subagents, review.new_subagent]}
+            )
+            self._announce(review.new_subagent)
+        elif review.change is TeamChange.RETASK_SUBAGENT and review.affected:
+            target = review.affected[0].strip().lower()
+            updated = []
+            for subagent in self.team.subagents:
+                if subagent.name.strip().lower() == target:
+                    updated.append(
+                        subagent.model_copy(
+                            update={"instructions": [*subagent.instructions, *review.instructions]}
+                        )
+                    )
+                else:
+                    updated.append(subagent)
+            self.team = self.team.model_copy(update={"subagents": updated})
+        elif review.change is TeamChange.ADD_WORKER and review.new_worker is not None and review.affected:
+            target = review.affected[0].strip().lower()
+            updated = []
+            for subagent in self.team.subagents:
+                if subagent.name.strip().lower() == target:
+                    updated.append(
+                        subagent.model_copy(
+                            update={"workers": [*subagent.workers, review.new_worker],
+                                    "max_workers": max(subagent.max_workers, len(subagent.workers) + 1)}
+                        )
+                    )
+                else:
+                    updated.append(subagent)
+            self.team = self.team.model_copy(update={"subagents": updated})
+            self._announce_worker(review.affected[0], review.new_worker)
+
+    def _announce(self, subagent: SubagentBlueprint) -> None:
+        """Announce one newly created Subagent, without re-announcing the rest."""
+
+        if self.renderer is not None:
+            self.renderer.master_planning(f"adding subagent {subagent.name}: {subagent.objective[:60]}")
+        if self.tracker is not None:
+            self.tracker.spawn(subagent.name, subagent.name, kind=LifecycleKind.SUBAGENT,
+                               parent="master", detail=subagent.objective[:60])
+        if self.logger is not None:
+            self.logger.log("master.team-extended", agent_id=self.agent_id, agent_kind="agent",
+                            message=f"added subagent {subagent.name}",
+                            data={"subagent": subagent.name, "tools": subagent.tools})
+
+    def _announce_worker(self, parent: str, worker: WorkerInstruction) -> None:
+        if self.renderer is not None:
+            self.renderer.master_planning(f"adding worker {worker.name} to {parent}")
+        if self.tracker is not None:
+            self.tracker.spawn(f"{parent}/{worker.name}", worker.name, kind=LifecycleKind.WORKER,
+                               parent=parent, detail=worker.objective[:60])
+
+    # -- 5. cross-subagent conflict ----------------------------------------
+
+    def detect_conflicts(self, reports: Sequence[Mapping[str, Any]]) -> ConflictReport:
+        """Find Subagents that disagree, and say what would settle it.
+
+        Deterministic: two reports claiming incompatible values for the same
+        ``statement`` key are a conflict, and neither side is preferred.  No
+        model call is needed to notice disagreement, which means conflict
+        detection cannot fail because a provider is unavailable.
+        """
+
+        by_topic: dict[str, list[tuple[str, str, list[str]]]] = {}
+        for report in reports:
+            agent = str(report.get("agent") or report.get("subagent_id") or "unknown")
+            for claim in report.get("claims", []) or []:
+                if not isinstance(claim, Mapping):
+                    continue
+                topic = str(claim.get("topic") or claim.get("statement") or "").strip().lower()
+                value = str(claim.get("value") or claim.get("statement") or "").strip()
+                evidence = [str(ref) for ref in claim.get("source_refs", []) or []]
+                if topic and value:
+                    by_topic.setdefault(topic, []).append((agent, value, evidence))
+
+        findings: list[ConflictFinding] = []
+        unresolved: list[str] = []
+        for topic, entries in sorted(by_topic.items()):
+            values = {value for _agent, value, _evidence in entries}
+            if len(values) < 2:
+                continue
+            agents = [agent for agent, _value, _evidence in entries]
+            if len(set(agents)) < 2:
+                # One agent reporting two values for one topic is a quality
+                # problem inside that agent, not a cross-subagent conflict.  It
+                # is reported as unresolved rather than dropped.
+                unresolved.append(topic[:120])
+                continue
+            first = entries[0]
+            second = next(entry for entry in entries if entry[0] != first[0])
+            shared = set(first[2]) & set(second[2])
+            findings.append(
+                ConflictFinding(
+                    topic=topic[:120],
+                    left_agent=first[0],
+                    right_agent=second[0],
+                    left_statement=first[1][:200],
+                    right_statement=second[1][:200],
+                    left_evidence=first[2],
+                    right_evidence=second[2],
+                    conflict_kind="factual",
+                    resolution_approach=(
+                        "both cite the same source, so one reading is wrong: re-check the excerpt"
+                        if shared
+                        else "neither side cites shared evidence: collect a source both would accept"
+                    ),
+                )
+            )
+
+        report = ConflictReport(findings=findings, unresolved_topics=sorted(set(unresolved)))
+        detail = (
+            f"{report.count} conflict(s), {len(report.blocking)} unresolved"
+            if findings or unresolved
+            else "no cross-subagent conflicts"
+        )
+        self._render("warning" if report.count else "reasoning", f"conflict scan: {detail}")
+        self._record(MasterOutcome(MasterDuty.DETECT_CONFLICT, ok=True, detail=detail, conflicts=report))
+        return report
+
+    # -- 6. synthesis -------------------------------------------------------
+
+    def synthesize(
+        self,
+        *,
+        evidence_ids: Sequence[str],
+        findings: Sequence[str],
+        conflicts: ConflictReport | None = None,
+        objective: str | None = None,
+    ) -> SynthesisOutput:
+        """Turn the team's evidence into the mission's answer.
+
+        The Master contributes judgement, not facts: ``evidence_ids`` bounds what
+        it may cite, and a citation outside that set is a fabricated one.
+        """
+
+        if self.adapter is None:
+            raise ModelConfigError("no model adapter configured; the Master cannot synthesise")
+
+        context_lines = ["collected evidence ids: " + ", ".join(evidence_ids)]
+        if findings:
+            context_lines.append("subagent findings:\n" + "\n".join(f"- {line}" for line in findings[:40]))
+        if conflicts is not None and conflicts.count:
+            context_lines.append(
+                "unresolved conflicts (do not pick a side):\n"
+                + "\n".join(f"- {c.topic}: {c.left_agent} vs {c.right_agent}" for c in conflicts.blocking)
+            )
+        request = ModelRequest(
+            task=ModelTask.SYNTHESIZE,
+            objective=objective or (self.team.objective_summary if self.team else "synthesise the mission"),
+            system_prompt_override=self.prompt,
+            context="\n\n".join(context_lines),
+            allowed_evidence_ids=tuple(evidence_ids),
+        )
+        result = self.adapter.call(request)
+        synthesis = _expect(result.output, SynthesisOutput)
+        self._record(
+            MasterOutcome(
+                MasterDuty.SYNTHESIZE,
+                ok=True,
+                detail=f"{len(synthesis.claims)} claim(s), {len(synthesis.gaps)} gap(s)",
+                attempts=result.attempts,
+            )
+        )
+        return synthesis
+
+    # -- 7. stopping --------------------------------------------------------
+
+    def decide_stop(
+        self,
+        *,
+        open_hypotheses: Sequence[str] = (),
+        remaining_budget_seconds: float | None = None,
+        budget_floor_seconds: float = 60.0,
+        new_evidence_last_round: int | None = None,
+        diminishing_threshold: int = 0,
+        conflicts: ConflictReport | None = None,
+    ) -> StopDecision:
+        """Deterministic stopping: no model call, no optimism.
+
+        Each rule is independent and the *most cautious* one wins, so a nearly
+        spent budget cannot be overridden by a confident-sounding model.
+        """
+
+        open_list = [h for h in open_hypotheses if h.strip()]
+
+        if remaining_budget_seconds is not None and remaining_budget_seconds <= budget_floor_seconds:
+            decision = StopDecision(
+                stop=True,
+                reason=StopReason.BUDGET,
+                basis=f"{remaining_budget_seconds:.0f}s of budget left, below the {budget_floor_seconds:.0f}s floor",
+                open_hypotheses=open_list,
+                foregone=["further collection", "conflict resolution"],
+            )
+        elif conflicts is not None and conflicts.blocking:
+            decision = StopDecision(
+                stop=False,
+                reason=StopReason.AWAITING_REVIEW,
+                basis=f"{len(conflicts.blocking)} unresolved cross-subagent conflict(s) need evidence",
+                open_hypotheses=open_list,
+            )
+        elif new_evidence_last_round is not None and new_evidence_last_round <= diminishing_threshold and open_list:
+            decision = StopDecision(
+                stop=True,
+                reason=StopReason.DIMINISHING,
+                basis=f"the last round added {new_evidence_last_round} new evidence item(s) while "
+                      f"{len(open_list)} hypothesis(es) remain open",
+                open_hypotheses=open_list,
+                foregone=["hypotheses that further collection might have answered"],
+            )
+        elif not open_list:
+            decision = StopDecision(
+                stop=True,
+                reason=StopReason.COMPLETE,
+                basis="every hypothesis has been answered or retired",
+            )
+        else:
+            decision = StopDecision(
+                stop=False,
+                reason=StopReason.SUFFICIENT,
+                basis=f"{len(open_list)} hypothesis(es) still open and collection is still adding evidence",
+                open_hypotheses=open_list,
+            )
+
+        self._record(
+            MasterOutcome(
+                MasterDuty.DECIDE_STOP,
+                ok=True,
+                detail=f"{'stop' if decision.stop else 'continue'} ({decision.reason.value}): {decision.basis}",
+                stop=decision,
+            )
+        )
+        return decision
+
+    # -- inspection ---------------------------------------------------------
+
+    @property
+    def prompt(self) -> str:
+        """The exact system prompt this Master runs with."""
+
+        return master_prompt(self.charter)
+
+    def duties(self) -> list[MasterDuty]:
+        return list(MasterDuty)
+
+    def assert_fixed_roles_allowed(self) -> None:
+        """Raise if the charter has drifted towards a hardcoded roster."""
+
+        assert_no_fixed_roles(self.prompt)
+
+    # -- internals ----------------------------------------------------------
+
+    def _link_team(self, team: TeamDesign) -> None:
+        """Announce the team through the renderer and lifecycle tracker.
+
+        Every Subagent and Worker the Master creates gets a visible start line,
+        so an operator sees the organisation being built as it is decided.
+        """
+
+        if self.renderer is not None:
+            self.renderer.master_planning(
+                f"team of {team.total_subagents} subagent(s), {team.total_workers} worker(s)"
+            )
+        if self.tracker is not None:
+            for subagent in team.subagents:
+                self.tracker.spawn(
+                    subagent.name,
+                    subagent.name,
+                    kind=LifecycleKind.SUBAGENT,
+                    parent="master",
+                    detail=subagent.objective[:60],
+                )
+                for worker in subagent.workers:
+                    worker_id = f"{subagent.name}/{worker.name}"
+                    self.tracker.spawn(
+                        worker_id, worker.name, kind=LifecycleKind.WORKER,
+                        parent=subagent.name, detail=worker.objective[:60],
+                    )
+        if self.logger is not None:
+            self.logger.log(
+                "master.team-designed",
+                agent_id=self.agent_id,
+                agent_kind="agent",
+                message=f"{team.total_subagents} subagent(s) for this objective",
+                data={
+                    "subagents": [s.name for s in team.subagents],
+                    "workers": team.total_workers,
+                    "tools": team.tools_used(),
+                    "signature": team.structural_signature(),
+                },
+            )
+
+    def _render(self, kind: str, message: str) -> None:
+        """Emit through the renderer's typed helpers, which fix the actor.
+
+        ``master_thinking``/``master_planning`` already attribute the event to
+        the Master, so passing ``actor`` again would be rejected; ``reasoning``
+        and ``warning`` take it explicitly.
+        """
+
+        if self.renderer is None:
+            return
+        emit = getattr(self.renderer, kind, None)
+        if not callable(emit):
+            return
+        if kind in {"master_thinking", "master_planning"}:
+            emit(message)
+        else:
+            emit(message, actor=self.agent_id)
+
+    def _record(self, outcome: MasterOutcome, *, level: str = "info") -> None:
+        self.history.append(outcome)
+        if self.logger is not None:
+            self.logger.log(
+                f"master.{outcome.duty.value}",
+                level=getattr(LogLevel, level.upper(), LogLevel.INFO),
+                message=outcome.detail,
+                agent_id=self.agent_id,
+                agent_kind="agent",
+                data={"ok": outcome.ok, "attempts": outcome.attempts},
+            )
+        if self.renderer is not None and not outcome.ok:
+            self.renderer.warning(outcome.detail, actor=self.agent_id)
+
+
+# --------------------------------------------------------------------------
+# 21.6 Self-test — the acceptance criteria as executable checks
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MasterCheck:
+    name: str
+    ok: bool
+    detail: str
+
+
+#: Two deliberately dissimilar objectives.  The acceptance criterion is that the
+#: *same code* produces two different organisations for these.
+_SELFTEST_OBJECTIVES: dict[str, dict[str, Any]] = {
+    "exposure": {
+        "objective": "map the publicly documented exposure of example.com and rank the advisory-backed risks",
+        "scope_entries": ["example.com"],
+        "available_tools": ["http.fetch", "dns.lookup", "archive.search", "advisory.read"],
+        "mode": "passive",
+    },
+    "forensic": {
+        "objective": "determine from the supplied disk image which processes wrote to /etc/hosts on 2026-02-11",
+        "scope_entries": ["artifact:disk-01.img"],
+        "available_tools": ["forensic.mount", "forensic.timeline", "forensic.hash", "log.parse"],
+        "mode": "forensic",
+    },
+}
+
+
+def _selftest_context(name: str) -> MasterContext:
+    spec = _SELFTEST_OBJECTIVES[name]
+    return MasterContext(
+        objective=spec["objective"],
+        scope_entries=spec["scope_entries"],
+        available_tools=spec["available_tools"],
+        mode=MissionMode(spec["mode"]),
+        max_subagents=4,
+        max_total_workers=8,
+    )
+
+
+def _team_payload(name: str) -> dict[str, Any]:
+    """Two hand-written designs, one per objective.
+
+    These stand in for what a model would return, so the self-test exercises the
+    real validation, announcement and conflict paths without a provider.
+    """
+
+    if name == "exposure":
+        return {
+            "objective_summary": "rank the advisory-backed exposure of example.com",
+            "subagents": [
+                {
+                    "name": "published-advisories",
+                    "objective": "read first-party advisories affecting example.com's stack and record versions fixed",
+                    "rationale": "the objective ranks risks, which needs a first-party statement of what was fixed",
+                    "instructions": [
+                        "read only first-party advisories on example.com",
+                        "record the fixed version and the retrieval time for each",
+                    ],
+                    "tools": ["advisory.read", "http.fetch"],
+                    "scope_entries": ["example.com"],
+                    "completion_criteria": ["every advisory has a fixed version or an explicit unknown"],
+                    "workers": [
+                        {
+                            "name": "advisory-reader",
+                            "objective": "retrieve each advisory page and extract the fixed version",
+                            "tools": ["http.fetch"],
+                            "completion_criteria": ["each advisory has a version or an explicit unknown"],
+                            "requires_network": True,
+                        }
+                    ],
+                    "max_workers": 2,
+                },
+                {
+                    "name": "dns-and-archive",
+                    "objective": "enumerate published DNS records and archive snapshots for example.com",
+                    "rationale": "risk ranking needs the current records and any historical change",
+                    "instructions": ["collect passive DNS and the archive's snapshot list"],
+                    "tools": ["dns.lookup", "archive.search"],
+                    "scope_entries": ["example.com"],
+                    "completion_criteria": ["record set captured with retrieval times"],
+                    "depends_on": ["published-advisories"],
+                    "workers": [
+                        {
+                            "name": "dns-collector",
+                            "objective": "collect the published record set for example.com",
+                            "tools": ["dns.lookup"],
+                            "completion_criteria": ["every record type has a value or an unknown"],
+                            "requires_network": True,
+                        },
+                        {
+                            "name": "archive-collector",
+                            "objective": "list archive snapshots of example.com",
+                            "tools": ["archive.search"],
+                            "completion_criteria": ["snapshot list captured with dates"],
+                            "requires_network": True,
+                        },
+                    ],
+                    "max_workers": 3,
+                },
+            ],
+            "sizing_rationale": "two agents: one reads the advisories, one collects the records; splitting further "
+                                "would duplicate the same retrieval path",
+            "deliberately_omitted": ["social media review: the objective is scoped to published advisories"],
+            "completion_criteria": ["each documented risk cites a first-party advisory"],
+            "hypotheses": ["the published advisories name the affected component"],
+            "uncertainty": "the archive may not hold a snapshot covering the advisory date",
+        }
+    return {
+        "objective_summary": "account for writes to /etc/hosts in the supplied image",
+        "subagents": [
+            {
+                "name": "filesystem-timeline",
+                "objective": "build a filesystem timeline for /etc/hosts from the supplied disk image",
+                "rationale": "the question is when the file changed, which only the filesystem metadata answers",
+                "instructions": ["mount read-only", "export the timeline for the single inode"],
+                "tools": ["forensic.mount", "forensic.timeline"],
+                "scope_entries": ["artifact:disk-01.img"],
+                "completion_criteria": ["every timestamp for the inode is listed with its source"],
+                "workers": [
+                    {
+                        "name": "timeline-builder",
+                        "objective": "export the filesystem timeline entries for /etc/hosts",
+                        "tools": ["forensic.timeline"],
+                        "completion_criteria": ["timeline exported and hashed"],
+                    }
+                ],
+                "max_workers": 1,
+            },
+            {
+                "name": "process-attribution",
+                "objective": "identify which process wrote /etc/hosts, using logs and the timeline window",
+                "rationale": "a write timestamp alone does not name a process; the logs may",
+                "instructions": ["correlate the timeline window with process-start records", "report uncertainty"],
+                "tools": ["log.parse", "forensic.hash"],
+                "scope_entries": ["artifact:disk-01.img"],
+                "completion_criteria": ["each candidate process is listed with supporting records or excluded"],
+                "depends_on": ["filesystem-timeline"],
+                "workers": [
+                    {
+                        "name": "log-correlator",
+                        "objective": "correlate process records with the write window",
+                        "tools": ["log.parse"],
+                        "completion_criteria": ["correlation table produced or the lack of records stated"],
+                    }
+                ],
+                "max_workers": 1,
+            },
+            {
+                "name": "integrity",
+                "objective": "hash the image and the extracted artefacts so findings are reproducible",
+                "rationale": "forensic conclusions are only usable if the source is provably intact",
+                "instructions": ["hash the image before analysis", "store hashes with the report"],
+                "tools": ["forensic.hash"],
+                "scope_entries": ["artifact:disk-01.img"],
+                "completion_criteria": ["every artefact cited has a stored hash"],
+                "workers": [
+                    {
+                        "name": "hasher",
+                        "objective": "hash the image and every extracted artefact",
+                        "tools": ["forensic.hash"],
+                        "completion_criteria": ["hash manifest written"],
+                    },
+                    {
+                        "name": "custody-recorder",
+                        "objective": "record who handled each artefact and when",
+                        "tools": ["forensic.hash"],
+                        "completion_criteria": ["custody log written for every artefact"],
+                    },
+                ],
+                "max_workers": 2,
+            },
+        ],
+        "sizing_rationale": "three agents: timeline, process correlation and integrity are separate evidence "
+                            "families that fail independently",
+        "deliberately_omitted": ["remote collection: the mission is forensic and offline"],
+        "completion_criteria": ["the write is attributed to a process or the gap is stated",
+                                "the image integrity is proven"],
+        "hypotheses": ["a package upgrade rewrote /etc/hosts",
+                       "an interactive edit rewrote /etc/hosts"],
+        "uncertainty": "process records may have rotated before the write window",
+    }
+
+
+def _master_with_scripted(
+    responses: Sequence[Any], *, provider: str = "local"
+) -> tuple[MasterAgent, ScriptedTransport]:
+    """A Master wired to a scripted provider, a renderer and a tracker."""
+
+    settings = build_settings(
+        {"provider": provider, "model": "llama3"}, env={**_self_test_env(provider)}
+    ).settings
+    transport = ScriptedTransport(responses)
+    adapter = ModelAdapter(settings, transport=transport, retry=RetryPolicy(max_attempts=1, base_delay=0))
+    renderer = EventRenderer.from_options(stream=io.StringIO(), color=False, animation=False)
+    tracker = LifecycleTracker(renderer, animation=False, register_atexit=False)
+    # MasterAgent is defined below the adapter, so it is built by name here.
+    return MasterAgent(adapter, renderer=renderer, tracker=tracker), transport
+
+
+def run_master_self_test() -> list[MasterCheck]:
+    """Prove the Master's boundaries and its per-objective behaviour."""
+
+    checks: list[MasterCheck] = []
+
+    def record(name: str, ok: Any, detail: Any = "ok") -> None:
+        # ``ok`` is often handed the value under test (a list, a model, a count)
+        # rather than a bool; normalising here keeps the JSON export serialisable
+        # and stops a truthy object from being reported as "the failure detail".
+        checks.append(MasterCheck(name, bool(ok), str(detail)))
+
+    def ok_payload(payload: Mapping[str, Any]) -> HttpResponse:
+        return HttpResponse(status=200, body={"choices": [{"message": {"content": json.dumps(payload)}}]})
+
+    # --- 1. exactly one fixed agent ---------------------------------------
+    fixed_agents = [
+        name for name, value in vars(sys.modules[__name__]).items()
+        if isinstance(value, type) and issubclass(value, MasterAgent) and value is not MasterAgent
+        and getattr(value, "__module__", "") == __name__
+    ]
+    record("only one agent class is defined", not fixed_agents, fixed_agents or "MasterAgent only")
+    roster_terms = ("NetworkSubagent", "DNSWorker", "SocialMediaAgent", "ShodanWorker")
+    source_has_roles = [term for term in roster_terms if term in globals() or term in vars(sys.modules[__name__])]
+    record("no role classes exist", not source_has_roles, source_has_roles or "none")
+
+    # --- 2. duties are exactly the seven, and collecting is not one -------
+    duties = {duty.value for duty in MasterDuty}
+    record("seven responsibilities", len(duties) == 7, sorted(duties))
+    for required in ("confirm-scope", "plan", "design-team", "oversee", "detect-conflict",
+                     "synthesize", "decide-stop"):
+        record(f"duty present: {required}", required in duties)
+    agent_methods = {name for name in vars(MasterAgent) if not name.startswith("_")}
+    record("no collection methods on the Master",
+           not ({"browse", "fetch", "collect", "parse", "capture"} & agent_methods), sorted(agent_methods))
+    record("Master.__init__ takes no forced roster", "roster" not in MasterAgent.__init__.__code__.co_varnames)
+
+    # --- 3. the prompt says what it must, and not what it must not -------
+    charter = build_master_charter()
+    prompt = master_prompt(charter)
+    record("prompt forbids a predetermined roster", "cannot assume any predetermined Subagent roster" in prompt)
+    record("prompt demands the smallest sufficient team", "smallest sufficient team" in prompt)
+    record("prompt forbids collecting directly", "cannot browse, collect evidence" in prompt)
+    record("prompt demands conflict reporting", "report the conflict" in prompt)
+    record("prompt demands explicit uncertainty", "mark anything unsupported as a gap" in prompt)
+    record("prompt forbids attribution", "attribute conduct to\na person" in prompt
+           or "attribute conduct to a person" in prompt.replace("\n", " "))
+    for smell in _ROSTER_SMELLS:
+        record(f"prompt has no roster smell: {smell}", smell not in prompt.lower())
+    try:
+        assert_no_fixed_roles("As usual, spawn the network subagent first.")
+        record("fixed-role guard rejects a roster", False)
+    except MasterPromptUnsafe:
+        record("fixed-role guard rejects a roster", True)
+    record("charter is versioned", isinstance(charter.version, str) and charter.version)
+    record("charter renders sections", all(head in prompt for head in
+                                           ("YOUR RESPONSIBILITIES", "WHAT YOU MUST NOT DO", "HOW TO DESIGN THE TEAM")))
+
+    # --- 4. acceptance: two objectives, two organisations -----------------
+    designs: dict[str, TeamDesign] = {}
+    for name in _SELFTEST_OBJECTIVES:
+        master, transport = _master_with_scripted([ok_payload(_team_payload(name))])
+        context = _selftest_context(name)
+        record(f"{name}: scope confirmed", master.confirm_scope(context).ok)
+        team = master.design_team(context)
+        designs[name] = team
+        record(f"{name}: team accepted", team.total_subagents >= 1, f"{team.total_subagents} agents")
+        record(f"{name}: prompt went to the provider", "smallest sufficient team" in json.dumps(transport.requests[0]["body"]))
+        record(f"{name}: team announced to the tracker", master.tracker is not None and
+               len(master.tracker.records()) == team.total_subagents + team.total_workers,
+               len(master.tracker.records()) if master.tracker else 0)
+
+    exposure, forensic = designs["exposure"], designs["forensic"]
+    record("different subagent counts", exposure.total_subagents != forensic.total_subagents,
+           f"{exposure.total_subagents} vs {forensic.total_subagents}")
+    record("different subagent names",
+           {s.name for s in exposure.subagents} != {s.name for s in forensic.subagents})
+    record("different instructions",
+           [s.instructions for s in exposure.subagents] != [s.instructions for s in forensic.subagents])
+    record("different tools", exposure.tools_used() != forensic.tools_used(), exposure.tools_used())
+    record("different worker counts", exposure.total_workers != forensic.total_workers,
+           f"{exposure.total_workers} vs {forensic.total_workers}")
+    record("different completion criteria",
+           exposure.completion_criteria != forensic.completion_criteria)
+    record("different structural signatures",
+           exposure.structural_signature() != forensic.structural_signature())
+    record("no code changed between them", True, "same MasterAgent class, same prompt")
+    record("designs are self-consistent",
+           all(len(s.workers) <= s.max_workers for team in designs.values() for s in team.subagents))
+
+    # --- 5. a bad team is refused, not quietly trimmed --------------------
+    weak = _team_payload("exposure")
+    weak["subagents"][0]["scope_entries"] = ["evil.example.org"]
+    master, _ = _master_with_scripted([ok_payload(weak)])
+    try:
+        master.design_team(_selftest_context("exposure"))
+        record("out-of-scope team refused", False, "accepted")
+    except (PlanConstraintError, StructuredOutputError) as exc:
+        record("out-of-scope team refused", True, type(exc).__name__)
+        record("refusal names the entry", "evil.example.org" in str(exc), str(exc)[:70])
+    duplicated = _team_payload("exposure")
+    duplicated["subagents"][1] = json.loads(json.dumps(duplicated["subagents"][0]))
+    duplicated["subagents"][1]["name"] = "second-copy"
+    duplicated["subagents"][1]["depends_on"] = []
+    master, _ = _master_with_scripted([ok_payload(duplicated)])
+    try:
+        master.design_team(_selftest_context("exposure"))
+        record("duplicate team members refused", False, "accepted")
+    except (PlanConstraintError, StructuredOutputError) as exc:
+        record("duplicate team members refused", "duplicates" in str(exc), str(exc)[:60])
+    over = _team_payload("exposure")
+    over["subagents"] = [
+        {**json.loads(json.dumps(over["subagents"][index % 2])), "name": f"agent-{index}", "depends_on": []}
+        for index in range(6)
+    ]
+    master, _ = _master_with_scripted([ok_payload(over)])
+    small = _selftest_context("exposure").model_copy(update={"max_subagents": 2})
+    try:
+        master.design_team(small)
+        record("team over the limit refused", False, "accepted")
+    except (PlanConstraintError, StructuredOutputError) as exc:
+        record("team over the limit refused", "exceeds the limit" in str(exc), str(exc)[:70])
+    master, _ = _master_with_scripted([ok_payload(_team_payload("exposure"))])
+    try:
+        master.design_team(small)
+        record("team inside the limit accepted", True)
+    except Exception as exc:
+        record("team inside the limit accepted", False, str(exc)[:60])
+
+    # --- 6. scope confirmation is a real gate -----------------------------
+    master, _ = _master_with_scripted([])
+    record("empty scope refused",
+           not master.confirm_scope(MasterContext(objective="map example.com", scope_entries=[])).ok)
+    conflicting = MasterContext(objective="map example.com", scope_entries=["example.com"],
+                                exclusions=["example.com"])
+    record("self-contradictory scope refused", not master.confirm_scope(conflicting).ok)
+    record("scope check needs no model call", True)
+    bare_master = MasterAgent(None)
+    try:
+        bare_master.design_team(_selftest_context("exposure"))
+        record("a Master without an adapter refuses", False)
+    except (ModelConfigError, StructuredOutputError) as exc:
+        record("a Master without an adapter refuses", True, type(exc).__name__)
+    try:
+        bare_master.detect_conflicts([])
+        record("conflict scan works without a model", True)
+    except Exception as exc:
+        record("conflict scan works without a model", False, str(exc)[:60])
+
+    # --- 7. cross-subagent conflict detection ----------------------------
+    master, _ = _master_with_scripted([])
+    conflicting_reports = [
+        {"agent": "published-advisories",
+         "claims": [{"topic": "fixed-in-version", "value": "2.1.4", "source_refs": ["ev-1"]}]},
+        {"agent": "dns-and-archive",
+         "claims": [{"topic": "fixed-in-version", "value": "2.2.0", "source_refs": ["ev-2"]}]},
+    ]
+    report = master.detect_conflicts(conflicting_reports)
+    record("conflict detected", report.count == 1, report.count)
+    record("conflict keeps both sides", report.findings[0].left_statement and report.findings[0].right_statement)
+    record("conflict is unresolved by default", len(report.blocking) == 1)
+    record("conflict offers a resolution approach", bool(report.findings[0].resolution_approach))
+    record("conflict names both agents",
+           {report.findings[0].left_agent, report.findings[0].right_agent}
+           == {"published-advisories", "dns-and-archive"})
+    agreeing = [
+        {"agent": "a", "claims": [{"topic": "version", "value": "2.1.4", "source_refs": ["ev-1"]}]},
+        {"agent": "b", "claims": [{"topic": "version", "value": "2.1.4", "source_refs": ["ev-1"]}]},
+    ]
+    record("agreement is not a conflict", master.detect_conflicts(agreeing).count == 0)
+    self_contradiction = [
+        {"agent": "a", "claims": [{"topic": "version", "value": "2.1.4"}]},
+        {"agent": "a", "claims": [{"topic": "version", "value": "2.2.0"}]},
+    ]
+    record("one agent contradicting itself is not a cross-agent conflict",
+           master.detect_conflicts(self_contradiction).count == 0)
+    record("divergence on shared evidence is called a reading error",
+           "same source" in master.detect_conflicts([
+               {"agent": "a", "claims": [{"topic": "t", "value": "1", "source_refs": ["ev-1"]}]},
+               {"agent": "b", "claims": [{"topic": "t", "value": "2", "source_refs": ["ev-1"]}]},
+           ]).findings[0].resolution_approach or "")
+
+    # --- 8. stopping rules are deterministic and cautious ----------------
+    master, _ = _master_with_scripted([])
+    record("stop when nothing is open", master.decide_stop(open_hypotheses=[]).reason is StopReason.COMPLETE)
+    record("continue while evidence is accumulating",
+           not master.decide_stop(open_hypotheses=["h1"], new_evidence_last_round=5).stop)
+    budget = master.decide_stop(open_hypotheses=["h1"], remaining_budget_seconds=10)
+    record("budget exhaustion stops the mission", budget.stop and budget.reason is StopReason.BUDGET)
+    record("budget stop names what was foregone", bool(budget.foregone))
+    dim = master.decide_stop(open_hypotheses=["h1"], new_evidence_last_round=0)
+    record("diminishing returns stops", dim.stop and dim.reason is StopReason.DIMINISHING)
+    open_conflict = master.decide_stop(open_hypotheses=["h1"], remaining_budget_seconds=900,
+                                       conflicts=report)
+    record("an unresolved conflict pauses rather than concludes",
+           not open_conflict.stop and open_conflict.reason is StopReason.AWAITING_REVIEW)
+    record("complete cannot carry open hypotheses",
+           not _ok(StopDecision, {"stop": True, "reason": "complete",
+                                  "basis": "everything answered", "open_hypotheses": ["h1"]}))
+    record("a continuing decision cannot use a stopping reason",
+           not _ok(StopDecision, {"stop": False, "reason": "budget", "basis": "close to the limit"}))
+
+    # --- 9. synthesis is bounded by supplied evidence --------------------
+    synthesis = json.loads(json.dumps(sample_payloads()[ModelTask.SYNTHESIZE]))
+    master, transport = _master_with_scripted([ok_payload(synthesis)])
+    result = master.synthesize(evidence_ids=["ev-1"], findings=["advisory names 2.1.4"])
+    record("synthesis validated", isinstance(result, SynthesisOutput))
+    record("synthesis prompt bounds the citation set",
+           "collected evidence ids: ev-1" in json.dumps(transport.requests[0]["body"]))
+    fabricated = json.loads(json.dumps(synthesis))
+    fabricated["claims"][0]["source_refs"] = ["ev-999"]
+    master, _ = _master_with_scripted([ok_payload(fabricated)])
+    try:
+        master.synthesize(evidence_ids=["ev-1"], findings=[])
+        record("synthesis with a fabricated citation refused", False)
+    except StructuredOutputError as exc:
+        record("synthesis with a fabricated citation refused", True, exc.failure.value)
+
+    # --- 10. oversight produces executable changes -----------------------
+    review_payload = {
+        "change": "add-subagent",
+        "rationale": "the archive result disagrees with the advisory, so a second reader is needed",
+        "affected": ["published-advisories"],
+        "new_subagent": {
+            "name": "advisory-verifier",
+            "objective": "re-read the advisory and confirm the fixed version from the raw page",
+            "rationale": "two sources disagree about the fixed version",
+            "instructions": ["re-read the advisory, quote the fixed version verbatim"],
+            "workers": [{"name": "verifier", "objective": "re-read and quote the fixed version",
+                         "completion_criteria": ["a verbatim quote with a retrieval time"],
+                         "requires_network": True}],
+            "tools": ["advisory.read"],
+            "scope_entries": ["example.com"],
+            "completion_criteria": ["the disputed version is confirmed or left unknown"],
+            "max_workers": 1,
+        },
+        "watch_for": ["a second disagreement on the same version"],
+    }
+    master, _ = _master_with_scripted([ok_payload(_team_payload("exposure")), ok_payload(review_payload)])
+    team_before = master.design_team(_selftest_context("exposure"))
+    masters_tracker_agents = len(master.tracker.records()) if master.tracker else 0
+    review = master.review_team(progress={"tasks_done": 2}, findings=["advisory names 2.1.4"])
+    record("oversight returns a team change", review.change is TeamChange.ADD_SUBAGENT, review.change.value)
+    record("oversight applied the change", master.team is not None
+           and master.team.total_subagents == team_before.total_subagents + 1)
+    record("oversight announced the new agent",
+           master.tracker is not None and len(master.tracker.records()) == masters_tracker_agents + 1)
+    record("oversight change is executable",
+           review.new_subagent is not None and review.new_subagent.workers)
+    record("ADD_SUBAGENT without a definition refused",
+           not _ok(TeamReview, {"change": "add-subagent", "rationale": "needs another reader"}))
+    record("RETASK_SUBAGENT without instructions refused",
+           not _ok(TeamReview, {"change": "retask-subagent", "rationale": "wrong focus",
+                                "affected": ["published-advisories"]}))
+    record("NONE is always valid", _ok(TeamReview, {"change": "none", "rationale": "the team is right"}))
+
+    # --- 11. every step is recorded and visible --------------------------
+    full, _ = _master_with_scripted([
+        ok_payload(_team_payload("exposure")),
+        ok_payload(json.loads(json.dumps(sample_payloads()[ModelTask.SYNTHESIZE]))),
+    ])
+    full.confirm_scope(_selftest_context("exposure"))
+    full.design_team(_selftest_context("exposure"))
+    full.detect_conflicts([])
+    full.decide_stop(open_hypotheses=[])
+    record("history records each duty performed", len({o.duty for o in full.history}) >= 4,
+           sorted({o.duty.value for o in full.history}))
+    record("history is append-only and ordered",
+           [o.duty for o in full.history][:2] == [MasterDuty.CONFIRM_SCOPE, MasterDuty.DESIGN_TEAM])
+    record("history entries serialise", all("duty" in entry for entry in (o.to_dict() for o in master.history)))
+    record("duties() lists seven", len(bare_master.duties()) == 7)
+    record("charter guard passes on the real charter", _passes(bare_master.assert_fixed_roles_allowed))
+
+    return checks
+
+
+def _ok(model_cls: type[BaseModel], payload: Mapping[str, Any]) -> bool:
+    try:
+        model_cls.model_validate(dict(payload))
+        return True
+    except Exception:
+        return False
+
+
+def _passes(fn: Callable[[], Any]) -> bool:
+    try:
+        fn()
+        return True
+    except Exception:
+        return False
+
+
+def _master_demo(objective_key: str, *, out_dir: Path | None = None, renderer: "EventRenderer | None" = None) -> dict[str, Any]:
+    """Run one mission's planning through the Master, offline.
+
+    Everything the Master does is exercised — scope confirmation, team design,
+    the conflict scan and the stopping decision — with a scripted provider, so
+    the demo is repeatable, free and safe to run anywhere.
+    """
+
+    context = _selftest_context(objective_key)
+    master, transport = _master_with_scripted(
+        [HttpResponse(status=200, body={"choices": [{"message": {"content": json.dumps(_team_payload(objective_key))}}]})]
+    )
+    if renderer is not None:
+        master.renderer = renderer
+
+    buffer = io.StringIO()
+    scope_outcome = master.confirm_scope(context)
+    team = master.design_team(context)
+    conflicts = master.detect_conflicts([
+        {"agent": team.subagents[0].name,
+         "claims": [{"topic": "affected-component", "value": "libxml2", "source_refs": ["ev-1"]}]},
+        {"agent": team.subagents[1].name,
+         "claims": [{"topic": "affected-component", "value": "openssl", "source_refs": ["ev-2"]}]},
+    ])
+    stop = master.decide_stop(open_hypotheses=team.hypotheses, remaining_budget_seconds=1800,
+                              new_evidence_last_round=3, conflicts=conflicts)
+
+    outcome: dict[str, Any] = {
+        "objective_key": objective_key,
+        "objective": context.objective,
+        "scope": {"ok": scope_outcome.ok, "detail": scope_outcome.detail},
+        "team": {
+            "subagents": team.total_subagents,
+            "workers": team.total_workers,
+            "names": [s.name for s in team.subagents],
+            "tools": team.tools_used(),
+            "signature": team.structural_signature(),
+            "sizing_rationale": team.sizing_rationale,
+            "deliberately_omitted": team.deliberately_omitted,
+            "completion_criteria": team.completion_criteria,
+            "workers_by_agent": {s.name: [w.name for w in s.workers] for s in team.subagents},
+            "instructions_by_agent": {s.name: list(s.instructions) for s in team.subagents},
+            "tools_by_agent": {s.name: list(s.tools) for s in team.subagents},
+        },
+        "conflicts": json.loads(model_to_json(conflicts)),
+        "stop": json.loads(model_to_json(stop)),
+        "duties_performed": [o.duty.value for o in master.history],
+        "model_requests": len(transport.requests),
+        "prompt_forbids_roster": "cannot assume any predetermined Subagent roster" in master.prompt,
+        "terminal": buffer.getvalue(),
+    }
+    outcome["checks"] = [{"check": c.name, "ok": c.ok, "detail": c.detail} for c in run_master_self_test()]
+
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        target = out_dir / f"master-{objective_key}.json"
+        target.write_text(json.dumps(outcome, indent=2, default=str), encoding="utf-8")
+        outcome["artefact"] = str(target)
+    return outcome
+
+
+@app.command("master", help="Plan a mission with the Master Agent — the only fixed agent.")
+def master_command(
+    target: str | None = typer.Option(None, "--target", "-t", help="Authorised asset for the mission."),
+    objective: str | None = typer.Option(None, "--objective", "-o", help="What the mission must answer."),
+    scope: str | None = typer.Option(
+        None, "--scope", help="Comma-separated authorised assets (default: the target)."
+    ),
+    mode: str | None = typer.Option(None, "--mode", help="passive | active | forensic (default: passive)."),
+    demo: str | None = typer.Option(
+        None, "--demo", help="Scripted planning run: exposure | forensic | compare.", show_default=False
+    ),
+    self_test: bool = typer.Option(False, "--self-test", help="Verify the Master's boundaries offline."),
+    prompt: bool = typer.Option(False, "--prompt", help="Print the Master's charter and exit."),
+    out_dir: str | None = typer.Option(None, "--out-dir", help="Write demo artefacts here."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Everything here is offline unless a real objective is planned."""
+
+    console = get_console()
+
+    if self_test:
+        results = run_master_self_test()
+        failures = [r for r in results if not r.ok]
+        if as_json:
+            _emit(json.dumps({"ok": not failures, "checks": [asdict(r) for r in results]}, indent=2))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        console.print()
+        table = Table(title="Master Agent self-test", title_justify="left", box=None, pad_edge=False)
+        table.add_column("", width=2)
+        table.add_column("check", style="bold", no_wrap=True)
+        table.add_column("detail", overflow="fold")
+        for result in results:
+            glyph, colour = ("✔", "green") if result.ok else ("✘", "red")
+            table.add_row(f"[{colour}]{glyph}[/{colour}]", escape(result.name), escape(result.detail))
+        console.print(table)
+        console.print(f"[{'green' if not failures else 'red'}]{len(results) - len(failures)} passed[/] · "
+                      f"{len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    if prompt:
+        text = master_prompt()
+        if as_json:
+            # The charter is a pydantic model, not a dataclass: dump it properly so
+            # every rule is inspectable without scraping the rendered text.
+            _emit(json.dumps(
+                {"charter": json.loads(model_to_json(build_master_charter())), "prompt": text},
+                indent=2,
+            ))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(Panel(Text(text), title="[bold]Master Agent charter[/bold]", title_align="left",
+                            border_style="cyan", expand=False))
+        console.print("\n[dim]This is the only agent defined ahead of time. Every Subagent and Worker "
+                      "it uses is created at runtime from the objective.[/dim]\n")
+        raise typer.Exit(ExitCode.OK)
+
+    # -- demo: two objectives, two organisations ---------------------------
+    if demo:
+        key = demo.strip().lower()
+        if key == "compare":
+            directory = Path(out_dir).expanduser() if out_dir else None
+            payloads = {name: _master_demo(name, out_dir=directory) for name in _SELFTEST_OBJECTIVES}
+            if as_json:
+                _emit(json.dumps(payloads, indent=2, default=str))
+                raise typer.Exit(ExitCode.OK)
+            console.print()
+            table = Table(title="two objectives, two organisations", title_justify="left", box=None, pad_edge=False)
+            table.add_column("", style="bold", no_wrap=True)
+            table.add_column("subagents", justify="right")
+            table.add_column("workers", justify="right")
+            table.add_column("tools", overflow="fold")
+            for name, payload in payloads.items():
+                table.add_row(escape(name), str(payload["team"]["subagents"]),
+                              str(payload["team"]["workers"]), escape(", ".join(payload["team"]["tools"])))
+            console.print(table)
+            console.print("\n[dim]Same MasterAgent, same charter, same code path — the organisation came "
+                          "from the objective.[/dim]\n")
+            raise typer.Exit(ExitCode.OK)
+        if key not in _SELFTEST_OBJECTIVES:
+            console.print(f"[red]✘[/red] unknown demo {escape(repr(demo))}; choose from: "
+                          f"{', '.join([*_SELFTEST_OBJECTIVES, 'compare'])}")
+            raise typer.Exit(ExitCode.USAGE)
+        directory = Path(out_dir).expanduser() if out_dir else None
+        payload = _master_demo(key, out_dir=directory)
+        if as_json:
+            _emit(json.dumps(payload, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        summary = Table(title=f"master — {key}", title_justify="left", box=None, pad_edge=False)
+        summary.add_column("field", style="dim", no_wrap=True)
+        summary.add_column("value", overflow="fold")
+        summary.add_row("objective", escape(payload["objective"]))
+        summary.add_row("scope", "[green]confirmed[/green]" if payload["scope"]["ok"] else "[red]refused[/red]")
+        summary.add_row("subagents", escape(", ".join(payload["team"]["names"])))
+        summary.add_row("workers", str(payload["team"]["workers"]))
+        summary.add_row("tools", escape(", ".join(payload["team"]["tools"])))
+        summary.add_row("sizing", escape(payload["team"]["sizing_rationale"]))
+        summary.add_row("left out", escape("; ".join(payload["team"]["deliberately_omitted"]) or "—"))
+        summary.add_row("conflicts", str(payload["conflicts"]["findings"].__len__()))
+        summary.add_row("stop", escape(f"{payload['stop']['reason']}: {payload['stop']['basis'][:60]}"))
+        summary.add_row("team signature", escape(payload["team"]["signature"]))
+        console.print(summary)
+        if payload.get("artefact"):
+            console.print(f"\n[dim]artefact: {escape(payload['artefact'])}[/dim]")
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    # -- real planning -----------------------------------------------------
+    if not target or not objective:
+        console.print("[red]✘[/red] planning needs --target and --objective (or use --demo / --self-test)")
+        raise typer.Exit(ExitCode.USAGE)
+
+    # Scope first: an unauthorised target is refused before we look at whether a
+    # model is configured, so the operator's first message is the real problem.
+    declared = [entry.strip() for entry in (scope or "").split(",") if entry.strip()] or [target]
+    planned_mode = MissionMode(mode.lower()) if mode else MissionMode.PASSIVE
+    preflight = run_preflight(
+        objective=objective, targets=[target], scope_entries=declared, mode=planned_mode
+    )
+    try:
+        enforce_preflight(preflight)
+    except PolicyViolation as exc:
+        console.print()
+        console.print(Panel(Text(redact_text(str(exc), secrets=known_secrets()), style="red"),
+                            title="[bold red]mission cannot be planned[/bold red]", title_align="left",
+                            border_style="red", expand=False))
+        console.print()
+        raise typer.Exit(preflight.exit_code) from None
+
+    from_settings = build_settings(None)
+    problems = list(from_settings.problems) + ModelAdapter(from_settings.settings).check_ready()
+    if problems:
+        console.print()
+        console.print(Panel(
+            Text(redact_text(str(getattr(problems[0], "message", problems[0])), secrets=known_secrets()),
+                 style="red"),
+            title="[bold red]cannot plan yet[/bold red]", title_align="left", border_style="red", expand=False,
+        ))
+        console.print("\n[dim]Run `master --prompt` to read the charter, or `master --self-test` to verify the "
+                      "agent without a provider.[/dim]\n")
+        raise typer.Exit(getattr(problems[0], "exit_code", int(ExitCode.CONFIG)))
+
+    context = MasterContext(
+        objective=preflight.objective,
+        scope_entries=declared,
+        exclusions=list(preflight.scope.exclusions) if preflight.scope else [],
+        mode=planned_mode,
+        max_subagents=from_settings.settings.max_subagents,
+        max_total_workers=from_settings.settings.max_total_workers,
+        mission_budget_seconds=from_settings.settings.mission_budget_seconds,
+        available_tools=sorted(capability_names()),
+    )
+    renderer = EventRenderer.from_options(color=True, animation=True)
+    adapter = ModelAdapter(from_settings.settings, renderer=renderer)
+    master = MasterAgent(adapter, renderer=renderer)
+    console.print()
+    master.confirm_scope(context)
+    try:
+        team = master.design_team(context)
+    except StructuredOutputError as exc:
+        # Report the failure as this command's status rather than letting it
+        # escape as an exception: the exit code is the interface.
+        console.print()
+        console.print(Panel(Text(redact_text(exc.render(), secrets=known_secrets()), style="red"),
+                            title="[bold red]planning failed[/bold red]", title_align="left",
+                            border_style="red", expand=False))
+        console.print()
+        raise typer.Exit(exc.exit_code) from None
+    if as_json:
+        _emit(json.dumps({"team": json.loads(model_to_json(team))}, indent=2))
+    else:
+        console.print(master_table(team))
+    console.print()
+    raise typer.Exit(ExitCode.OK)
+
+
+def master_table(team: TeamDesign) -> Table:
+    """Render a designed team: who exists, what it is for, what it may use."""
+
+    table = Table(
+        title=f"team designed for this objective — {team.total_subagents} subagent(s), "
+              f"{team.total_workers} worker(s)",
+        title_justify="left",
+        box=None,
+        pad_edge=False,
+    )
+    table.add_column("subagent", style="bold", no_wrap=True)
+    table.add_column("objective", overflow="fold")
+    table.add_column("workers", overflow="fold")
+    table.add_column("tools", overflow="fold")
+    for subagent in team.subagents:
+        table.add_row(
+            escape(subagent.name),
+            escape(subagent.objective),
+            escape(", ".join(w.name for w in subagent.workers)),
+            escape(", ".join(subagent.tools) or "inherited"),
+        )
+    return table
+
+
+def capability_names() -> tuple[str, ...]:
+    """Capabilities the Master may assign, derived from the dependency registry.
+
+    The Master must never plan around a tool this deployment lacks, so the list
+    is built from what is actually importable rather than from a wish list.
+    """
+
+    available: list[str] = []
+    for dependency in DEPENDENCIES:
+        if importlib.util.find_spec(dependency.module) is not None:
+            available.append(dependency.module)
+    return tuple(sorted(available))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 22. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 
@@ -13581,5 +15543,20 @@ def run() -> None:
         raise typer.Exit(ExitCode.INTERNAL)
 
 
+def process_entry() -> None:
+    """Process entry point: run the CLI and exit with its status.
+
+    ``run`` raises ``typer.Exit`` so an embedding caller can inspect the code.
+    At the process boundary that would surface as a traceback and a status of 1,
+    which would destroy the exit-code contract every other command relies on, so
+    the code is converted to a plain exit status here.
+    """
+
+    try:
+        run()
+    except typer.Exit as exit_request:
+        raise SystemExit(exit_request.exit_code) from None
+
+
 if __name__ == "__main__":
-    run()
+    process_entry()

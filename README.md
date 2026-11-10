@@ -11,6 +11,7 @@ python vedant_osint.py config --settings     # merged config, secrets masked
 python vedant_osint.py doctor                # capability health check (CI gate)
 python vedant_osint.py resilience --self-test # logging, cancellation, cleanup
 python vedant_osint.py adapter --self-test    # structured model output contract
+python vedant_osint.py master --self-test     # Master Agent boundaries
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -99,6 +100,41 @@ python vedant_osint.py resilience --demo exception        # recursive failure
 
 Exit status follows convention: `130` interrupted, `124` timeout, `70` internal
 error.
+
+## The Master Agent
+
+`MasterAgent` is the **only** agent defined ahead of time. Its duties are closed:
+confirm the scope, plan the mission, design the team, oversee the work, detect
+cross-Subagent conflict, synthesise the answer, and decide when to stop. It has
+no method that collects, browses or parses — those belong to the agents it
+creates.
+
+```bash
+python vedant_osint.py master --self-test      # 87 guarantee checks, offline
+python vedant_osint.py master --demo compare   # two objectives, two teams
+python vedant_osint.py master --prompt         # read the charter
+python vedant_osint.py master -t example.com -o "map the attack surface"
+```
+
+- **No predetermined roster** — the charter forbids assuming one, and
+  `assert_no_fixed_roles` rejects prompt text drifting towards one. A self-test
+  asserts no role class such as `NetworkSubagent` exists in the file.
+- **The smallest sufficient team** — `design_team` asks for a `TeamDesign`
+  (per-Subagent objective, rationale, instructions, tools, Workers, completion
+  criteria) and validates it against the mission scope, the limits and the
+  capabilities actually available. A team that widens the scope, duplicates an
+  agent or exceeds a limit is **refused**, never silently trimmed.
+- **Two objectives, two organisations** — the same code produced 2 Subagents /
+  3 Workers for a web-exposure objective and 3 Subagents / 4 Workers with
+  different tools and completion criteria for a forensic one.
+- **Oversight is executable** — a team review returns a concrete change
+  (`add-subagent`, `retask-subagent`, `retire-subagent`, `add-worker`,
+  `narrow-scope`, `stop`) or `none`.
+- **Conflict is reported, not voted on** — incompatible claims on the same topic
+  keep both sides and state what would settle the dispute; an unresolved
+  conflict pauses the mission rather than letting the Master conclude.
+- **Stopping is deterministic** — budget floor, diminishing returns, unresolved
+  conflict and "nothing left open", with the most cautious rule winning.
 
 ## Structured model adapter
 
@@ -236,7 +272,7 @@ Authorised use only — collect from systems you own or are explicitly permitted
 |-------|-------|-------|
 | 1 | Foundation — CLI skeleton, config probing, version reporting | ✅ done |
 | 2 | Contracts — settings, `doctor`, preflight, models, state, renderer, lifecycle, resilience, model adapter | ✅ done |
-| 3 | Orchestration — LangGraph Master Agent + runtime Subagent factory | ⬜ next |
+| 3 | Orchestration — Master Agent (only fixed agent) + runtime Subagent factory | 🟡 started |
 | 4 | Browser — browser-use / Playwright sessions and capture | ⬜ |
 | 5 | Collection — passive OSINT sources, artefact hashing | ⬜ |
 | 6 | Synthesis — cross-source correlation and reporting | ⬜ |
