@@ -328,6 +328,47 @@ rounds, and raises :class:`SubagentPlanError` (exit ``7``) if it never complies.
     python vedant_osint.py subagents --show published-advisories
     python vedant_osint.py subagents --demo reject        # what the Master is sent back
 
+Dynamic Worker specifications
+-----------------------------
+No Worker has a class either.  Each Subagent, once it exists, plans *its own*
+Workers from its own assignment: :class:`SubagentWorkerPlanner` asks for a
+:class:`WorkerPlan`, :func:`validate_worker_specs` checks it against the
+assignment, and :class:`SubagentWorkerFactory` is the only path to a stored
+:class:`WorkerSpec`.  ``workers --self-test`` parses the file to prove no Worker
+class and no roster constant exists.
+
+Every Worker carries what the task demands and nothing vaguer: a narrow
+objective, its unit of work and what it does **not** cover, allowed inputs,
+a subset of the parent's tools, the evidence it must return, an output schema, a
+:class:`WorkerBudget` (attempts × timeout × tokens) and checkable completion
+criteria.  Four rules make the plan auditable:
+
+* **A slice, not the assignment.**  A Worker whose mandate restates the
+  Subagent's objective, or whose objective is as broad as the assignment, is
+  refused.  One Worker carrying everything is refused unless the assignment was
+  declared indivisible — and then the claim must come from the design, not from
+  the Worker.
+* **No occupational roster.**  ``analyst``, ``researcher``, ``The Analyst`` are
+  rejected as Worker names exactly as they are rejected as Subagent roles; a name
+  has to come from the work.
+* **Independence is computed.**  Units that read another unit's output are
+  chained; the rest are grouped into waves by the code, so "run these in
+  parallel" is a checked property rather than a claim.
+* **Refusal, then repair.**  A bad plan is *not* trimmed: the problems go back to
+  the Subagent as a bounded repair brief, and :class:`WorkerPlanError` (exit ``7``)
+  is raised if it never complies.
+
+Two objectives produced two staffing shapes from the same code — one Worker each
+for three indivisible Subagents plus two parallel Workers for the fourth, against
+one plus two for the other objective.
+
+::
+
+    python vedant_osint.py workers --self-test       # 115 guarantee checks, offline
+    python vedant_osint.py workers --demo compare    # two objectives, two staffings
+    python vedant_osint.py workers --role dns-and-archive
+    python vedant_osint.py workers --demo reject     # what the Subagent is sent back
+
 Structured model adapter
 ------------------------
 One model-calling interface sits between orchestration and every provider, so
@@ -381,6 +422,7 @@ Usage
     python vedant_osint.py adapter --self-test          # structured output contract
     python vedant_osint.py master --self-test           # Master Agent boundaries
     python vedant_osint.py subagents --self-test        # runtime Subagent specifications
+    python vedant_osint.py workers --self-test          # runtime Worker specifications
     python vedant_osint.py doctor                       # full capability health check
     python vedant_osint.py policy -o "..." --scope example.com          # safety preflight only
     python vedant_osint.py mission --target example.com -o "map the attack surface"
@@ -511,7 +553,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 12
+VERSION_MINOR: int = 13
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -5197,11 +5239,37 @@ class CapabilityRequirement(StrictModel):
     purpose: str | None = None
 
 
+class WorkerBudget(StrictModel):
+    """What one Worker may spend before it is stopped.
+
+    Section 23 fills this in per Worker from the Subagent's own plan; it lives
+    here because it is a structural field of the storage record, not a planning
+    convenience.
+    """
+
+    max_attempts: int = Field(default=2, ge=1, le=10)
+    timeout_seconds: int = Field(default=300, ge=5, le=3600)
+    #: Tokens this Worker's model calls may consume, when it uses a model at all.
+    max_tokens: int = Field(default=8000, ge=256, le=200_000)
+
+    @property
+    def worst_case_seconds(self) -> int:
+        """The wall-clock ceiling if every attempt runs to its timeout."""
+
+        return self.max_attempts * self.timeout_seconds
+
+    def describe(self) -> str:
+        return (f"{self.max_attempts} attempt(s) × {self.timeout_seconds}s, "
+                f"≤{self.max_tokens} tokens")
+
+
 class WorkerSpec(StrictModel):
     """A task-specific Worker definition, created at runtime by a Subagent.
 
     There is no fixed roster: this is the *schema* a Worker must satisfy, and
-    ``id``/``subagent_id`` tie it to the run that produced it.
+    ``id``/``subagent_id`` tie it to the run that produced it.  The fields from
+    ``input_forms`` down record the *narrow* mandate, expected evidence, budget
+    and completion criteria that section 23 refuses to let a plan omit.
     """
 
     id: str = ""
@@ -5211,7 +5279,17 @@ class WorkerSpec(StrictModel):
     tools: list[str] = Field(default_factory=list)
     capabilities: list[CapabilityRequirement] = Field(default_factory=list)
     inputs: list[str] = Field(default_factory=list)     # evidence/assignment ids
+    #: How each input is supplied (an evidence id, a snapshot, a table…).
+    input_forms: dict[str, str] = Field(default_factory=dict)
+    #: The unit of work this Worker owns, and what it deliberately does not cover.
+    work_unit: str = ""
+    covers: str = ""
+    does_not_cover: list[str] = Field(default_factory=list)
+    #: What it must come back with, decided before it runs.
+    expected_evidence: str = ""
     output_schema: str = "TaskResult"
+    budget: WorkerBudget = Field(default_factory=WorkerBudget)
+    completion_criteria: list[str] = Field(default_factory=list)
     max_attempts: int = Field(default=2, ge=1, le=10)
     timeout_seconds: int = Field(default=300, ge=5, le=3600)
     requires_network: bool = False
@@ -5230,6 +5308,12 @@ class WorkerSpec(StrictModel):
     def _identify(self) -> "WorkerSpec":
         if not self.id:
             self.id = content_id("wrk", self.subagent_id, self.name.lower(), self.objective.lower())
+        # The ceiling fields mirror the budget so a checkpoint from an older
+        # build, or a caller setting them directly, still stops the Worker.
+        if self.budget.max_attempts != self.max_attempts:
+            self.budget = self.budget.model_copy(update={"max_attempts": self.max_attempts})
+        if self.budget.timeout_seconds != self.timeout_seconds:
+            self.budget = self.budget.model_copy(update={"timeout_seconds": self.timeout_seconds})
         return self
 
 
@@ -5654,6 +5738,7 @@ MODEL_CATALOGUE: tuple[tuple[str, type[BaseModel], str], ...] = (
     ("Scope", Scope, "authorised asset boundary"),
     ("SubagentSpec", SubagentSpec, "runtime-created subagent definition"),
     ("WorkerSpec", WorkerSpec, "runtime-created worker definition"),
+    ("WorkerBudget", WorkerBudget, "what one runtime worker may spend"),
     ("TaskAssignment", TaskAssignment, "work handed to a worker"),
     ("TaskResult", TaskResult, "worker outcome, success or failure"),
     ("EvidenceItem", EvidenceItem, "observation / inference / allegation"),
@@ -13696,6 +13781,10 @@ class SubagentBlueprint(StrictModel):
     depends_on: list[str] = Field(default_factory=list)
     max_workers: int = Field(default=2, ge=1, le=16)
     expected_evidence: list[str] = Field(default_factory=list)
+    #: True only when the assignment cannot be split without duplicating the same
+    #: retrieval.  Section 23 refuses a one-Worker plan unless this is set, so the
+    #: claim travels with the design instead of being asserted later.
+    indivisible: bool = False
 
     @field_validator("objective", "rationale")
     @classmethod
@@ -13707,6 +13796,10 @@ class SubagentBlueprint(StrictModel):
         if len(self.workers) > self.max_workers:
             raise ValueError(
                 f"{len(self.workers)} workers exceeds max_workers={self.max_workers} for {self.name!r}"
+            )
+        if self.indivisible and len(self.workers) > 1:
+            raise ValueError(
+                f"{self.name!r} is declared indivisible but declares {len(self.workers)} workers"
             )
         names = [w.name.strip().lower() for w in self.workers]
         if len(names) != len(set(names)):
@@ -15665,11 +15758,25 @@ class SubagentSpecDraft(StrictModel):
     max_workers: int = Field(default=2, ge=1, le=16)
     #: The questions this agent exists to answer, so its output can be placed.
     addresses_questions: list[str] = Field(default_factory=list)
+    #: True only when the assignment cannot be split.  Section 23 refuses a
+    #: single-Worker plan unless the Subagent says so, and says why.
+    indivisible: bool = False
 
     @field_validator("role", "objective", "justification")
     @classmethod
     def _plain(cls, value: str) -> str:
         return _reject_hedging(value, what="subagent specification")
+
+    @model_validator(mode="after")
+    def _coherent_indivisible(self) -> "SubagentSpecDraft":
+        if self.indivisible and len(self.workers) > 1:
+            raise ValueError(
+                "an indivisible assignment cannot declare several units of work; "
+                "either split it or drop the indivisibility claim"
+            )
+        if self.indivisible and self.workers and self.workers[0].completion_criteria:
+            pass
+        return self
 
     @model_validator(mode="after")
     def _coherent(self) -> "SubagentSpecDraft":
@@ -15732,7 +15839,19 @@ class SubagentSpecDraft(StrictModel):
                     objective=worker.objective,
                     tools=list(worker.tools) or list(self.allowed_capabilities),
                     inputs=list(worker.inputs) or list(self.required_inputs),
+                    work_unit=worker.name,
+                    covers=worker.objective,
+                    does_not_cover=[other.name for other in self.workers if other.name != worker.name]
+                    or ["nothing further in this assignment"],
+                    expected_evidence=(self.evidence.description
+                                       if not worker.completion_criteria
+                                       else worker.completion_criteria[0]),
+                    completion_criteria=list(worker.completion_criteria),
                     output_schema=worker.output_schema or "TaskResult",
+                    budget=WorkerBudget(
+                        max_attempts=min(worker.max_attempts, self.termination.max_attempts_per_task),
+                        timeout_seconds=WORKER_DEFAULT_SECONDS,
+                    ),
                     max_attempts=min(worker.max_attempts, self.termination.max_attempts_per_task),
                     requires_network=worker.requires_network,
                     requires_browser=worker.requires_browser,
@@ -16303,6 +16422,7 @@ def drafts_from_team(design: TeamDesign, context: MasterContext) -> list[Subagen
                 rubric=_inherit_rubric(blueprint, context),
                 termination=_termination_from(blueprint),
                 workers=list(blueprint.workers),
+                indivisible=blueprint.indivisible,
                 depends_on=list(blueprint.depends_on),
                 max_workers=max(blueprint.max_workers, len(blueprint.workers)),
                 addresses_questions=list(design.hypotheses),
@@ -16906,10 +17026,15 @@ def _only_factory_constructs_spec() -> bool:
     except SyntaxError:
         return True
 
+    # ``to_subagent_spec`` is the one conversion a draft goes through.  Demos and
+    # self-tests build records directly on purpose, which is *why* they are named
+    # ``_``-prefixed or ``run_``-prefixed; no orchestration path may.
     allowed = {"to_subagent_spec"}
     offenders: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef):
+            if node.name.startswith("_") or node.name.startswith("run_"):
+                continue
             calls = [child for child in ast.walk(node)
                      if isinstance(child, ast.Call)
                      and isinstance(child.func, (ast.Name, ast.Attribute))
@@ -17178,7 +17303,2167 @@ def spec_table_from_payload(spec: Mapping[str, Any]) -> Table:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 23. Entry point
+# 23. Dynamic Worker specifications — the Subagent plans its own Workers
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Section 22 answered "who should exist".  This section answers the question the
+# Subagent itself must answer: "given *this* assignment, what is the smallest set
+# of independent units of work, and can I name each one narrowly enough that a
+# single Worker can finish it without judgement calls?"
+#
+# Three rules keep that honest, and none of them is a roster:
+#
+# 1. A Worker is derived from the *assignment*, not from a list of jobs.  The
+#    plan carries a :class:`WorkUnit` per Worker, and each unit must say which
+#    part of the objective it covers and which parts it leaves alone.
+# 2. A Worker must be *narrower* than its Subagent.  A single Worker inheriting
+#    the whole assignment unchanged is refused unless the Subagent justifies the
+#    assignment as indivisible — and "indivisible" has to show up in the design
+#    itself: one declared work unit, or a decomposition whose merged units really
+#    do reproduce the assignment.
+# 3. Independence is a checked property, not a claim.  Units that list the same
+#    inputs are dependent on each other by definition, so the plan's parallelism
+#    statement is recomputed from the units rather than believed.
+#
+# Nothing here enumerates an occupation.  "research", "analyst", "collector" are
+# rejected as Worker names exactly as they are rejected as Subagent roles, and a
+# name must derive from the work it does in this mission.
+
+
+class WorkUnitBasis(str, Enum):
+    """Why a unit of work is separate.  A unit that cannot say why is one unit too many."""
+
+    SOURCE = "source"              # a distinct place the answer can be read from
+    ARTEFACT = "artefact"          # a distinct object to examine
+    QUESTION = "question"          # a distinct sub-question of the assignment
+    TIME_WINDOW = "time-window"    # a distinct period, so windows can be swept in parallel
+    RECORD_TYPE = "record-type"    # a distinct record or file type
+    VERIFICATION = "verification"  # an independent re-check of the other units
+
+
+class WorkerMandate(StrictModel):
+    """The narrow thing one Worker is for.
+
+    This is the field that makes "delegate the whole assignment" visible: the
+    mandate states the slice of the objective the Worker owns, the slice it does
+    *not* own, and which unit of work it is.
+    """
+
+    work_unit: str = Field(min_length=3, description="Runtime-chosen unit id, e.g. 'advisory-pages'.")
+    basis: WorkUnitBasis
+    #: The part of the assignment this Worker covers, in one sentence.
+    covers: str = Field(min_length=12)
+    #: What it deliberately does not cover, so two Workers cannot silently overlap.
+    #: Required unless the mandate *is* the whole assignment.
+    does_not_cover: list[str] = Field(default_factory=list)
+    #: True only when this Worker alone carries the whole assignment.
+    whole_assignment: bool = False
+
+    @field_validator("covers")
+    @classmethod
+    def _plain(cls, value: str) -> str:
+        return _reject_hedging(value, what="worker mandate")
+
+    @field_validator("does_not_cover")
+    @classmethod
+    def _scoped(cls, value: list[str]) -> list[str]:
+        return [item for item in value if item.strip()]
+
+    @model_validator(mode="after")
+    def _coherent(self) -> "WorkerMandate":
+        if not self.whole_assignment and not self.does_not_cover:
+            raise ValueError("a worker must say what it does not cover")
+        if self.whole_assignment and self.does_not_cover:
+            # An indivisible mandate that also names exclusions is contradictory:
+            # if there is something it does not cover, it is not the whole thing.
+            raise ValueError(
+                "a whole-assignment mandate cannot also exclude work; "
+                "either it is indivisible or it is a slice"
+            )
+        return self
+
+
+class AcceptedInput(StrictModel):
+    """One thing a Worker may read.  ``produced_by`` makes dependencies explicit."""
+
+    name: str = Field(min_length=1)
+    form: str = Field(default="evidence-id", min_length=1)
+    #: The unit whose output this reads, or ``None`` when it comes from the assignment.
+    produced_by: str | None = None
+
+
+class ExpectedEvidence(StrictModel):
+    """What a Worker must come back with — stated before it starts, not judged after."""
+
+    description: str = Field(min_length=12)
+    kinds: list[EvidenceKind] = Field(default_factory=lambda: [EvidenceKind.OBSERVATION])
+    #: The minimum number of *distinct* sources, not of rows.
+    minimum_items: int = Field(default=1, ge=1, le=500)
+    minimum_sources: int = Field(default=1, ge=0, le=100)
+
+    @model_validator(mode="after")
+    def _sourced(self) -> "ExpectedEvidence":
+        if EvidenceKind.OBSERVATION in self.kinds and self.minimum_sources < 1:
+            raise ValueError("an observation needs at least one source")
+        return self
+
+    def describe(self) -> str:
+        kinds = "/".join(kind.value for kind in self.kinds)
+        return f"≥{self.minimum_items} {kinds} item(s) from ≥{self.minimum_sources} source(s)"
+
+
+class WorkerSpecDraft(StrictModel):
+    """The Subagent's proposal for one Worker — narrow, budgeted, and checkable.
+
+    A draft becomes a :class:`WorkerSpec` only through
+    :class:`SubagentWorkerFactory`, and only after
+    :func:`validate_worker_specs` has checked narrowness, overlap, tools, budget
+    and completion criteria against the Subagent's own assignment.
+    """
+
+    #: Runtime-chosen, derived from the work — never an occupation.
+    name: str = Field(min_length=3)
+    mandate: WorkerMandate
+    objective: str = Field(min_length=15)
+    #: Concrete capability names, a subset of what the parent Subagent may use.
+    tools: list[str] = Field(min_length=1)
+    inputs: list[AcceptedInput] = Field(min_length=1)
+    expected_evidence: ExpectedEvidence
+    #: The model this Worker's output must validate against.  Required: a Worker
+    #: whose result has no declared shape cannot be judged, only believed.
+    output_schema: str = Field(min_length=1)
+    #: What it may spend.  Required, so "run until it finishes" is not an option.
+    budget: WorkerBudget
+    completion_criteria: list[str] = Field(min_length=1)
+    #: Whether it needs the network/browser — resolved from tools when omitted.
+    requires_network: bool | None = None
+    requires_browser: bool = False
+
+    @field_validator("name", "objective")
+    @classmethod
+    def _plain(cls, value: str) -> str:
+        return _reject_hedging(value, what="worker specification")
+
+    @field_validator("completion_criteria")
+    @classmethod
+    def _criteria(cls, value: list[str]) -> list[str]:
+        if not all(len(item.strip()) >= 8 for item in value):
+            raise ValueError("each completion criterion must state a checkable outcome")
+        return value
+
+    @model_validator(mode="after")
+    def _coherent(self) -> "WorkerSpecDraft":
+        if self.mandate.whole_assignment and len(self.completion_criteria) > 1:
+            # An indivisible unit of work has one way of being done; several
+            # criteria with nothing to split them across is a slice in disguise.
+            raise ValueError(
+                "a whole-assignment worker cannot carry several completion criteria; "
+                "name the separate units of work instead"
+            )
+        if self.requires_browser and not (self.requires_network in (True, None)):
+            raise ValueError("a browser worker must also declare requires_network")
+        return self
+
+    # -- inspection ---------------------------------------------------------
+
+    def effective_network(self) -> bool:
+        """Network need, inferred from the tools when the Subagent did not say."""
+
+        if self.requires_network is not None:
+            return self.requires_network
+        return any(tool.split(".")[0] in _NETWORK_TOOL_FAMILIES for tool in self.tools)
+
+    def objective_is_narrower_than(self, assignment: WorkerAssignment) -> bool:
+        """True when this Worker's objective is a slice, not the assignment again.
+
+        Narrowness is measured three ways, and any one is enough: the objective
+        is shorter than the assignment, it names a specific unit, or it states a
+        single checkable outcome.  Only an objective that simply repeats the
+        assignment at the same breadth fails.
+        """
+
+        objective = self.objective.strip().lower()
+        if objective == assignment.lowered_objective:
+            return False
+        if self.mandate.whole_assignment:
+            return assignment.indivisible
+        if len(objective) < len(assignment.lowered_objective):
+            return True
+        if self.mandate.work_unit.strip().lower() in objective:
+            return True
+        return any(marker in objective for marker in
+                   ("one row", "each ", "per ", "only the", "the list of", "a single"))
+
+    def input_names(self) -> list[str]:
+        return [item.name.strip().lower() for item in self.inputs]
+
+    def external_inputs(self) -> list[str]:
+        """Inputs that do not come from another unit — i.e. what it starts from."""
+
+        return [item.name.strip().lower() for item in self.inputs if item.produced_by is None]
+
+    def depends_on_units(self) -> list[str]:
+        return sorted({item.produced_by.strip().lower()
+                       for item in self.inputs if item.produced_by})
+
+    def signature(self) -> str:
+        """Behavioural identity: two Workers doing the same slice are one Worker."""
+
+        return content_id(
+            "unit",
+            self.mandate.covers.strip().lower(),
+            tuple(sorted(item.name.strip().lower() for item in self.inputs)),
+            tuple(sorted(self.tools)),
+            tuple(sorted(criterion.strip().lower() for criterion in self.completion_criteria)),
+        )
+
+    def to_worker_spec(self, *, subagent_id: str, mission_id: str = "") -> "WorkerSpec":
+        """Build the storage record.  Only call on a validated draft."""
+
+        return WorkerSpec(
+            subagent_id=subagent_id,
+            name=self.name,
+            objective=self.objective,
+            tools=list(self.tools),
+            inputs=[item.name for item in self.inputs],
+            # Every part of the mandate travels into the stored record, so a
+            # checkpoint can say what this Worker was for without the plan.
+            input_forms={item.name: item.form for item in self.inputs},
+            work_unit=self.mandate.work_unit,
+            covers=self.mandate.covers,
+            does_not_cover=list(self.mandate.does_not_cover),
+            expected_evidence=self.expected_evidence.describe(),
+            output_schema=self.output_schema,
+            budget=self.budget,
+            completion_criteria=list(self.completion_criteria),
+            max_attempts=self.budget.max_attempts,
+            timeout_seconds=self.budget.timeout_seconds,
+            requires_network=self.effective_network(),
+            requires_browser=self.requires_browser,
+        )
+
+
+#: Tool-name prefixes that mean "this reaches the network".  Used only to infer a
+#: Worker's network need when the Subagent did not declare it.
+_NETWORK_TOOL_FAMILIES: frozenset[str] = frozenset({
+    "http", "dns", "archive", "advisory", "browser", "web", "whois", "cert", "shodan",
+})
+
+#: What a Worker may output.  A Worker with no schema for its result is unjudgeable.
+OUTPUT_SCHEMAS: tuple[str, ...] = (
+    "TaskResult",
+    "EvidenceSet",
+    "TimelineTable",
+    "HashManifest",
+    "CorrelationTable",
+    "SnapshotList",
+)
+
+
+class WorkerProblem(StrictModel):
+    """One reason a Worker plan is insufficient, with the change that fixes it."""
+
+    code: str = Field(min_length=1)
+    worker: str | None = None
+    detail: str = Field(min_length=1)
+    repair: str = Field(min_length=1)
+    blocking: bool = True
+
+
+class WorkerValidation(StrictModel):
+    """The outcome of checking Worker drafts against their Subagent's assignment."""
+
+    ok: bool
+    problems: list[WorkerProblem] = Field(default_factory=list)
+    accepted: list[WorkerSpecDraft] = Field(default_factory=list)
+
+    @property
+    def blocking_problems(self) -> list[WorkerProblem]:
+        return [problem for problem in self.problems if problem.blocking]
+
+    def codes(self) -> list[str]:
+        return [problem.code for problem in self.problems]
+
+    def repair_brief(self) -> str:
+        """The message sent back to the Subagent when its Worker plan is insufficient."""
+
+        lines = ["Your worker plan was rejected. Fix these and return the full plan again:"]
+        for problem in self.blocking_problems[:8]:
+            where = f"{problem.worker}: " if problem.worker else ""
+            lines.append(f"- {where}{problem.detail} → {problem.repair}")
+        lines.append(
+            "Return only the corrected JSON. Every worker must cover part of the assignment, "
+            "and no worker may inherit the whole assignment unless it is genuinely indivisible."
+        )
+        return "\n".join(lines)
+
+    def describe(self) -> str:
+        return (f"{len(self.accepted)} accepted, "
+                f"{len(self.blocking_problems)} blocking problem(s)")
+
+
+@dataclass(frozen=True)
+class WorkerAssignment:
+    """What the Subagent was asked to do — the yardstick for narrowness.
+
+    A Worker plan is only as good as the assignment it was derived from, so the
+    assignment is passed explicitly rather than read back out of the draft.
+    """
+
+    objective: str
+    #: The deliverables the Subagent owes the Master.  Units must cover these.
+    deliverables: tuple[str, ...] = ()
+    #: The units of work the Subagent declared when it was specified.  A plan
+    #: whose units are *fewer* than declared has quietly merged them.
+    declared_units: tuple[str, ...] = ()
+    #: The whole assignment may be one Worker only if this is true *and* shown.
+    indivisible: bool = False
+    #: How many Workers this Subagent may create.
+    max_workers: int = 4
+
+    @property
+    def lowered_objective(self) -> str:
+        return self.objective.strip().lower()
+
+    def tokens(self, *, minimum: int = 4) -> list[str]:
+        """Significant words of the assignment, so coverage can be checked.
+
+        Connectives are dropped: "hash the image and the extracted artefacts" is
+        about four things, not seven, and a unit should not have to repeat "the".
+        """
+
+        words = re.findall(r"[a-z][a-z0-9\-]{2,}", self.lowered_objective)
+        return [word for word in dict.fromkeys(words)
+                if len(word) >= minimum and word not in _ASSIGNMENT_NOISE]
+
+    def declared_unit_names(self) -> list[str]:
+        return [unit.strip().lower() for unit in self.declared_units if unit.strip()]
+
+
+def assignment_for(draft: SubagentSpecDraft) -> WorkerAssignment:
+    """Derive the Worker-planning yardstick from a validated Subagent specification."""
+
+    return WorkerAssignment(
+        objective=draft.objective,
+        deliverables=tuple(draft.deliverable_names()),
+        # The Master's blueprint names its Workers; those names are the units the
+        # Subagent declared when it was specified.
+        declared_units=tuple(worker.name for worker in draft.workers),
+        # One declared unit *is* an indivisible assignment: there is nothing to
+        # split without inventing work the Master never asked for.
+        indivisible=draft.indivisible or len(draft.workers) == 1,
+        max_workers=draft.max_workers,
+    )
+
+
+def validate_worker_specs(
+    drafts: Sequence[WorkerSpecDraft],
+    assignment: WorkerAssignment,
+    *,
+    allowed_tools: Sequence[str] = (),
+    existing: Sequence[str] = (),
+) -> WorkerValidation:
+    """Check a Subagent's Worker plan against its own assignment.
+
+    Every failure names the Worker, says what is wrong in the mission's terms,
+    and states the repair.  Nothing is silently merged, renamed or dropped: a
+    Subagent that plans badly is told to plan again.
+    """
+
+    problems: list[WorkerProblem] = []
+    accepted: list[WorkerSpecDraft] = []
+    allowed = {tool.strip().lower() for tool in allowed_tools}
+
+    if not drafts:
+        problems.append(
+            WorkerProblem(
+                code="empty",
+                detail="the plan contains no workers",
+                repair="split the assignment into at least one unit of work and name it",
+            )
+        )
+    if len(drafts) > assignment.max_workers:
+        problems.append(
+            WorkerProblem(
+                code="count",
+                detail=f"{len(drafts)} workers proposed but this subagent may create "
+                       f"{assignment.max_workers}",
+                repair="merge the units that share a source, an artefact or a question",
+            )
+        )
+    if len(drafts) == 1 and not assignment.indivisible and not drafts[0].mandate.whole_assignment:
+        # One Worker is allowed, but only when the Subagent says why — otherwise
+        # "delegate everything to one Worker" would be the default, which is the
+        # exact failure this section exists to prevent.
+        problems.append(
+            WorkerProblem(
+                code="single-worker",
+                worker=drafts[0].name,
+                detail="a single worker for the whole assignment was not justified as indivisible",
+                repair="either split the assignment into independent units, or mark it indivisible "
+                       "with the reason and the single unit it covers",
+            )
+        )
+
+    seen_names: dict[str, str] = {name.strip().lower(): name for name in existing}
+    seen_signatures: dict[str, str] = {}
+    seen_units: dict[str, str] = {}
+
+    for draft in drafts:
+        blocking = False
+        lowered_name = draft.name.strip().lower()
+
+        # 1. a role title is not a unit of work
+        if _is_generic_role(draft.name) or draft.name.strip().lower() in _GENERIC_ROLES:
+            blocking = True
+            problems.append(
+                WorkerProblem(
+                    code="name-generic",
+                    worker=draft.name,
+                    detail=f"worker name {draft.name!r} is an occupation, not a unit of work",
+                    repair="name it after the slice it collects, e.g. 'advisory-page-reader'",
+                )
+            )
+        if lowered_name in seen_names:
+            blocking = True
+            problems.append(
+                WorkerProblem(
+                    code="duplicate-name",
+                    worker=draft.name,
+                    detail=f"worker name {draft.name!r} is already used by {seen_names[lowered_name]!r}",
+                    repair="rename it after the distinct slice it collects, or merge the two",
+                )
+            )
+        seen_names[lowered_name] = draft.name
+
+        # 2. tools must be the Subagent's own, and must actually be available
+        outside_tools = [tool for tool in draft.tools
+                         if allowed and tool.strip().lower() not in allowed]
+        if outside_tools:
+            blocking = True
+            problems.append(
+                WorkerProblem(
+                    code="tool",
+                    worker=draft.name,
+                    detail=f"tool {outside_tools[0]!r} belongs to no capability this subagent holds",
+                    repair=f"use only: {', '.join(sorted(allowed)[:4])}",
+                )
+            )
+        if draft.requires_browser and not draft.effective_network():
+            blocking = True
+            problems.append(
+                WorkerProblem(
+                    code="browser",
+                    worker=draft.name,
+                    detail="a browser worker that declares no network access cannot run",
+                    repair="set requires_network true, or drop the browser capability",
+                )
+            )
+
+        # 3. the mandate must be a slice, and must say what it is not
+        if draft.mandate.whole_assignment and not assignment.indivisible:
+            blocking = True
+            problems.append(
+                WorkerProblem(
+                    code="whole-assignment",
+                    worker=draft.name,
+                    detail="the worker inherits the subagent's entire assignment, which was not "
+                           "justified as indivisible",
+                    repair="name the parts of the assignment and give each its own worker, or "
+                           "declare the assignment indivisible with the reason",
+                )
+            )
+        if draft.mandate.covers.strip().lower() == assignment.lowered_objective:
+            blocking = True
+            problems.append(
+                WorkerProblem(
+                    code="restated-objective",
+                    worker=draft.name,
+                    detail="the worker's mandate restates the subagent's objective word for word",
+                    repair="narrow the mandate to the slice this worker actually reads or computes",
+                )
+            )
+        elif not ({_stem(word) for word in assignment.tokens()}
+                  & {_stem(word) for word in re.findall(r"[a-z][a-z0-9\-]{2,}",
+                                                        draft.mandate.covers.lower())}):
+            blocking = True
+            problems.append(
+                WorkerProblem(
+                    code="unrelated",
+                    worker=draft.name,
+                    detail="the worker's mandate shares no ground with the assignment",
+                    repair=f"describe what this unit contributes to: {assignment.objective[:70]}",
+                )
+            )
+        if draft.mandate.work_unit.strip().lower() in seen_units:
+            blocking = True
+            problems.append(
+                WorkerProblem(
+                    code="duplicate-unit",
+                    worker=draft.name,
+                    detail=f"unit of work {draft.mandate.work_unit!r} is already assigned to "
+                           f"{seen_units[draft.mandate.work_unit.strip().lower()]!r}",
+                    repair="give each worker a distinct unit, or merge them",
+                )
+            )
+        seen_units[draft.mandate.work_unit.strip().lower()] = draft.name
+
+        # 4. two workers doing the same slice is one worker
+        if draft.signature() in seen_signatures:
+            blocking = True
+            problems.append(
+                WorkerProblem(
+                    code="duplicate-behaviour",
+                    worker=draft.name,
+                    detail=f"{draft.name!r} does the same work as {seen_signatures[draft.signature()]!r}",
+                    repair="drop one of them, or give the second a different unit of work",
+                )
+            )
+        seen_signatures[draft.signature()] = draft.name
+
+        # 5. inputs must resolve; a cycle is a plan that cannot start
+        known_units = {other.mandate.work_unit.strip().lower() for other in drafts}
+        unknown = [unit for unit in draft.depends_on_units() if unit not in known_units]
+        if unknown:
+            blocking = True
+            problems.append(
+                WorkerProblem(
+                    code="input",
+                    worker=draft.name,
+                    detail=f"input produced by unknown unit {unknown[0]!r}",
+                    repair="read only from the assignment or from a unit in this plan",
+                )
+            )
+        if draft.mandate.work_unit.strip().lower() in draft.depends_on_units():
+            blocking = True
+            problems.append(
+                WorkerProblem(
+                    code="cycle",
+                    worker=draft.name,
+                    detail="the worker reads its own output",
+                    repair="remove the self-dependency",
+                )
+            )
+
+        # 6. a budget and a schema, so the worker can be stopped and judged
+        if draft.budget.worst_case_seconds > MAX_WORKER_SECONDS:
+            blocking = True
+            problems.append(
+                WorkerProblem(
+                    code="budget",
+                    worker=draft.name,
+                    detail=f"worst case {draft.budget.worst_case_seconds}s exceeds the "
+                           f"{MAX_WORKER_SECONDS}s ceiling for one worker",
+                    repair="lower the attempts or the timeout; a long unit is two units",
+                )
+            )
+        if draft.output_schema not in OUTPUT_SCHEMAS:
+            blocking = True
+            problems.append(
+                WorkerProblem(
+                    code="schema",
+                    worker=draft.name,
+                    detail=f"output schema {draft.output_schema!r} is not one this build can validate",
+                    repair=f"use one of: {', '.join(OUTPUT_SCHEMAS)}",
+                )
+            )
+        if not draft.objective_is_narrower_than(assignment):
+            blocking = True
+            problems.append(
+                WorkerProblem(
+                    code="broad",
+                    worker=draft.name,
+                    detail="the worker's objective is as broad as the assignment it came from",
+                    repair="state one retrievable or computable outcome for this unit",
+                )
+            )
+
+        if not blocking:
+            accepted.append(draft)
+
+    # 7. coverage: the units together must still account for the assignment
+    if drafts:
+        covered = " ".join(f"{draft.mandate.covers} {draft.objective}" for draft in drafts).lower()
+        uncovered = [token for token in assignment.tokens() if token not in covered]
+        # Every significant word of the assignment (minus the connective tissue)
+        # must appear in some unit's local text.  Units quote their own local
+        # objective, so this cannot be satisfied by echoing the assignment once.
+        if uncovered:
+            # Advisory, not blocking: a word appearing in no unit's local text is
+            # worth the operator seeing, but vocabulary is not a fault — the
+            # blocking checks above are what stop one Worker doing everything.
+            problems.append(
+                WorkerProblem(
+                    code="coverage",
+                    detail=f"no worker mentions {', '.join(uncovered[:3])} of the assignment",
+                    repair="state how each uncovered part is handled, or narrow the "
+                           "subagent's deliverables to what it can actually produce",
+                    blocking=False,
+                )
+            )
+        declared = set(assignment.declared_unit_names())
+        planned = {draft.mandate.work_unit.strip().lower() for draft in drafts}
+        if declared and not declared <= planned and not assignment.indivisible:
+            problems.append(
+                WorkerProblem(
+                    code="declared",
+                    detail=f"the subagent declared unit(s) {', '.join(sorted(declared - planned))} "
+                           f"but plans no worker for them",
+                    repair="give every declared unit a worker, or drop the unit from the subagent",
+                )
+            )
+
+        if assignment.indivisible and len(drafts) > 1:
+            problems.append(
+                WorkerProblem(
+                    code="indivisible",
+                    detail="the assignment was declared indivisible but the plan splits it",
+                    repair="return a single worker, or remove the indivisibility claim",
+                )
+            )
+
+    # Only blocking problems make a plan unacceptable; advisories travel with it.
+    return WorkerValidation(
+        ok=not [problem for problem in problems if problem.blocking],
+        problems=problems,
+        accepted=accepted,
+    )
+
+
+#: Where this section starts, used to split the file for the isolation audit.
+_WORKER_SECTION_BANNER = "# 23. Dynamic Worker specifications"
+
+#: The default wall clock one Worker may use per attempt.
+WORKER_DEFAULT_SECONDS = 300
+
+
+class WorkerPlan(StrictModel):
+    """What a Subagent returns when it plans its own Workers.
+
+    A plan is *only* Workers plus the reasoning that justifies the count: the
+    Subagent cannot widen its own scope, change its objective or add a unit of
+    work it was not given.
+    """
+
+    #: One line saying how the assignment was split, in the mission's terms.
+    split_rationale: str = Field(min_length=20)
+    workers: list[WorkerSpecDraft] = Field(min_length=1)
+    #: Units that could run at the same time, as the Subagent believes it.
+    parallel_units: list[str] = Field(default_factory=list)
+    #: Units the Subagent believes must wait.  The *declared* claim; the derived
+    #: view is :meth:`dependent_units`, which is recomputed from the inputs.
+    sequential_units: list[str] = Field(default_factory=list)
+    #: What could not be split, and why.  Required when only one Worker is planned.
+    indivisible_reason: str | None = None
+    uncertainty: str | None = None
+
+    @field_validator("split_rationale")
+    @classmethod
+    def _plain(cls, value: str) -> str:
+        return _reject_hedging(value, what="split rationale")
+
+    @model_validator(mode="after")
+    def _coherent(self) -> "WorkerPlan":
+        names = [worker.mandate.work_unit.strip().lower() for worker in self.workers]
+        if len(names) != len(set(names)):
+            raise ValueError("each worker must own a distinct unit of work")
+        declared = {unit.strip().lower() for unit in self.parallel_units + self.sequential_units}
+        if declared and declared != set(names):
+            raise ValueError(
+                "parallel_units and sequential_units must together name exactly the planned units"
+            )
+        if len(self.workers) == 1 and not self.indivisible_reason:
+            raise ValueError(
+                "a single-worker plan must give indivisible_reason, or split the assignment"
+            )
+        return self
+
+    # -- inspection ---------------------------------------------------------
+
+    def total_workers(self) -> int:
+        return len(self.workers)
+
+    def worst_case_seconds(self) -> int:
+        return sum(worker.budget.worst_case_seconds for worker in self.workers)
+
+    def units(self) -> list[str]:
+        return [worker.mandate.work_unit for worker in self.workers]
+
+    def computed_parallel_units(self) -> list[str]:
+        """Units with no dependency inside the plan — recomputed, not believed.
+
+        Two Workers that read only assignment inputs can start together; a
+        Worker that reads another's output cannot.  The plan's own claim is
+        compared against this, so "run these in parallel" is a checked property.
+        """
+
+        ordered: list[str] = []
+        done: set[str] = set()
+        remaining = [(worker.mandate.work_unit, worker.depends_on_units()) for worker in self.workers]
+        while remaining:
+            ready = [(unit, deps) for unit, deps in remaining if set(deps) <= done]
+            if not ready:  # a cycle; preserve order rather than loop forever
+                ordered.extend(unit for unit, _deps in remaining)
+                break
+            for unit, _deps in ready:
+                ordered.append(unit)
+                done.add(unit.strip().lower())
+            remaining = [(unit, deps) for unit, deps in remaining if unit not in {u for u, _ in ready}]
+        return ordered
+
+    def independent_units(self) -> list[str]:
+        """Units that depend on nothing else in the plan."""
+
+        return [worker.mandate.work_unit for worker in self.workers if not worker.depends_on_units()]
+
+    def dependent_units(self) -> list[str]:
+        """Units that must wait for another unit's output — computed, not declared."""
+
+        return [worker.mandate.work_unit for worker in self.workers if worker.depends_on_units()]
+
+    def plan_waves(self) -> list[list[str]]:
+        """Alias for :meth:`waves`, named so a caller can see it is derived."""
+        return self.waves()
+
+    def waves(self) -> list[list[str]]:
+        """The units grouped into the order they can actually run in."""
+
+        done: set[str] = set()
+        waves: list[list[str]] = []
+        pending = [(worker.mandate.work_unit, worker.depends_on_units()) for worker in self.workers]
+        while pending:
+            ready = [unit for unit, deps in pending if set(deps) <= done]
+            if not ready:
+                waves.append([unit for unit, _deps in pending])
+                break
+            waves.append(ready)
+            done |= {unit.strip().lower() for unit in ready}
+            pending = [(unit, deps) for unit, deps in pending if unit not in ready]
+        return waves
+
+
+def _stem(word: str) -> str:
+    """A crude stem, enough that "artefact" and "artefacts" are the same word.
+
+    Deliberately not a linguistics library: the comparison only decides whether a
+    mandate is about the same subject as its assignment, so a trailing plural is
+    the only inflection that matters here.
+    """
+
+    lowered = word.strip().lower()
+    if lowered.endswith("ies") and len(lowered) > 4:
+        return lowered[:-3] + "y"
+    if lowered.endswith("s") and not lowered.endswith("ss") and len(lowered) > 3:
+        return lowered[:-1]
+    return lowered
+
+
+#: Words that carry no retrievable content, so coverage cannot be measured by them.
+_ASSIGNMENT_NOISE: frozenset[str] = frozenset({
+    "the", "and", "for", "from", "with", "into", "that", "this", "then", "than", "them",
+    "their", "each", "every", "when", "which", "while", "using", "used", "over", "under",
+    "after", "before", "only", "also", "must", "should", "will", "shall", "have", "has",
+    "are", "was", "were", "been", "being", "into", "onto", "such", "same", "other",
+})
+
+#: The most one Worker may be allowed to spend, wall clock.  A unit of work that
+#: needs longer than this is two units, and the plan says so instead of hiding it.
+MAX_WORKER_SECONDS = 1800
+
+
+@dataclass(frozen=True)
+class WorkerBirth:
+    """Everything a Subagent created for one Worker."""
+
+    spec: "WorkerSpec"
+    draft: WorkerSpecDraft
+    subagent_id: str
+    created_at: datetime
+
+    @property
+    def id(self) -> str:
+        return self.spec.id
+
+    @property
+    def unit(self) -> str:
+        return self.draft.mandate.work_unit
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.spec.id,
+            "subagent_id": self.subagent_id,
+            "name": self.draft.name,
+            "unit": self.draft.mandate.work_unit,
+            "basis": self.draft.mandate.basis.value,
+            "covers": self.draft.mandate.covers,
+            "does_not_cover": list(self.draft.mandate.does_not_cover),
+            "whole_assignment": self.draft.mandate.whole_assignment,
+            "objective": self.spec.objective,
+            "tools": list(self.spec.tools),
+            "inputs": list(self.spec.inputs),
+            "expected_evidence": self.draft.expected_evidence.describe(),
+            "output_schema": self.spec.output_schema,
+            "budget": self.draft.budget.describe(),
+            "completion_criteria": list(self.draft.completion_criteria),
+            "requires_network": self.spec.requires_network,
+            "created_at": self.created_at.isoformat(),
+        }
+
+
+class SubagentWorkerFactory:
+    """The only place a Worker's stored record comes into existence.
+
+    A Subagent cannot conjure a Worker: the plan it returned is validated
+    against its own assignment first, then each Worker is written to the
+    run-state store under this Subagent's id, announced to the tracker and
+    logged.  A refusal leaves nothing half-created behind.
+    """
+
+    def __init__(
+        self,
+        *,
+        subagent_id: str,
+        assignment: WorkerAssignment,
+        allowed_tools: Sequence[str] = (),
+        mission_id: str = "",
+        renderer: "EventRenderer | None" = None,
+        tracker: "LifecycleTracker | None" = None,
+        logger: "MissionLogger | None" = None,
+        store: "RunStateStore | None" = None,
+    ) -> None:
+        self.subagent_id = subagent_id
+        self.assignment = assignment
+        self.allowed_tools = tuple(allowed_tools)
+        self.mission_id = mission_id
+        self.renderer = renderer
+        self.tracker = tracker
+        self.logger = logger
+        self.store = store
+        self._births: dict[str, WorkerBirth] = {}
+        self._lock = threading.RLock()
+
+    # -- creation -----------------------------------------------------------
+
+    def validate(self, plan: WorkerPlan) -> WorkerValidation:
+        """Check a plan against this Subagent's assignment, without creating anything."""
+
+        return validate_worker_specs(
+            plan.workers,
+            self.assignment,
+            allowed_tools=self.allowed_tools,
+            existing=self.names(),
+        )
+
+    def create(self, draft: WorkerSpecDraft) -> WorkerBirth:
+        """Create one Worker, refusing anything the validator would reject."""
+
+        return self.create_many(WorkerPlan(
+            split_rationale="a single validated unit of work from this assignment",
+            workers=[draft],
+            indivisible_reason=self.assignment.indivisible and "declared indivisible" or None,
+        ))[0]
+
+    def create_many(self, plan: WorkerPlan) -> list[WorkerBirth]:
+        """Validate the whole plan, then create — no half-staffed Subagent."""
+
+        validation = self.validate(plan)
+        if not validation.ok:
+            raise PlanConstraintError(
+                "worker plan rejected: "
+                + "; ".join(problem.detail for problem in validation.blocking_problems[:4]),
+                task=ModelTask.DECOMPOSE,
+                validation_errors=[problem.detail for problem in validation.blocking_problems],
+            )
+
+        births: list[WorkerBirth] = []
+        for draft in validation.accepted:
+            spec = draft.to_worker_spec(subagent_id=self.subagent_id, mission_id=self.mission_id)
+            birth = WorkerBirth(spec=spec, draft=draft, subagent_id=self.subagent_id,
+                                created_at=utc_now())
+            with self._lock:
+                if spec.id in self._births:
+                    raise PlanConstraintError(
+                        f"worker {draft.name!r} already exists under this subagent"
+                    )
+                self._births[spec.id] = birth
+            births.append(birth)
+
+        if self.store is not None:
+            for birth in births:
+                self.store.add_worker(birth.spec, actor=self.subagent_id)
+        for birth in births:
+            self._announce(birth)
+        return births
+
+    # -- inspection ---------------------------------------------------------
+
+    def births(self) -> list[WorkerBirth]:
+        with self._lock:
+            return list(self._births.values())
+
+    def names(self) -> list[str]:
+        return [birth.draft.name for birth in self.births()]
+
+    def units(self) -> list[str]:
+        return [birth.unit for birth in self.births()]
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return len(self._births)
+
+    def table(self) -> Table:
+        """Who exists beneath this Subagent, what each owns, and what it may spend."""
+
+        table = Table(title=f"workers beneath {self.subagent_id}", title_justify="left",
+                      box=None, pad_edge=False)
+        table.add_column("worker", style="bold", no_wrap=True)
+        table.add_column("unit", no_wrap=True)
+        table.add_column("covers", overflow="fold")
+        table.add_column("budget", no_wrap=True)
+        for birth in self.births():
+            table.add_row(
+                escape(birth.draft.name),
+                escape(birth.unit),
+                escape(birth.draft.mandate.covers[:70]),
+                escape(birth.draft.budget.describe()),
+            )
+        return table
+
+    def _announce(self, birth: WorkerBirth) -> None:
+        """One start line, one log record, one store write per Worker."""
+
+        if self.renderer is not None:
+            # ``data`` is the only free-form channel the renderer accepts; the
+            # mandate is shown as data rather than smuggled into the message.
+            self.renderer.worker_spawned(
+                birth.spec.id, birth.draft.name, parent=self.subagent_id,
+                data={"unit": birth.unit, "covers": birth.draft.mandate.covers[:60]},
+            )
+        if self.tracker is not None:
+            self.tracker.spawn(
+                birth.spec.id, birth.draft.name, kind=LifecycleKind.WORKER,
+                parent=self.subagent_id, detail=birth.draft.mandate.covers[:60],
+            )
+        if self.logger is not None:
+            self.logger.log(
+                "worker.created", agent_id=self.subagent_id, agent_kind="subagent",
+                message=f"created worker {birth.draft.name}",
+                data={"worker": birth.draft.name, "unit": birth.unit,
+                      "tools": list(birth.spec.tools), "budget": birth.draft.budget.describe()},
+            )
+
+
+# --------------------------------------------------------------------------
+# 23.3 Returning a Worker plan to the Subagent as structured output
+# --------------------------------------------------------------------------
+
+
+class WorkerPlanError(PlanConstraintError):
+    """A Subagent never produced an acceptable Worker plan.
+
+    Carries the problems from the *last* attempt so the operator (or the next
+    round of orchestration) can see exactly what was never satisfied.
+    """
+
+    exit_code = ExitCode.POLICY
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        attempts: int,
+        problems: Sequence[WorkerProblem] = (),
+        task: ModelTask = ModelTask.DECOMPOSE,
+    ) -> None:
+        super().__init__(message, task=task)
+        self.attempts = attempts
+        self.problems = list(problems)
+
+
+def worker_plan_request(
+    draft: SubagentSpecDraft,
+    *,
+    context: "MasterContext",
+    subagent_id: str = "",
+    repair: str | None = None,
+) -> ModelRequest:
+    """The ask that makes one Subagent plan its own Workers.
+
+    The Subagent is given its own specification — assignment, deliverables,
+    declared units, capability ceiling and Worker limit — and nothing else.  It
+    cannot widen its scope, and it cannot borrow another Subagent's tools.
+    """
+
+    assignment = assignment_for(draft)
+    lines = [
+        f"SUBAGENT\n{subagent_id or draft.role}",
+        f"ASSIGNMENT\n{draft.objective}",
+        "DELIVERABLES\n" + "\n".join(f"- {name}" for name in assignment.deliverables),
+        "DECLARED UNITS OF WORK\n" + "\n".join(f"- {unit}" for unit in assignment.declared_units),
+        "CAPABILITIES YOU MAY USE\n" + "\n".join(f"- {tool}" for tool in draft.allowed_capabilities),
+        f"WORKER LIMIT\nassignment.max_workers={assignment.max_workers}",
+        "COMPLETION CRITERIA YOU OWE\n" + "\n".join(f"- {c}" for c in draft.termination.stop_on),
+    ]
+    if draft.rubric.criteria:
+        lines.append("QUALITY RUBRIC\n" + "\n".join(f"- {c.criterion}" for c in draft.rubric.criteria))
+
+    instructions = (
+        "Plan the Workers for your own assignment and return a WorkerPlan. Examination of the "
+        "assignment comes first: split it into the smallest independent units of work that can be "
+        "retrieved or computed separately, and give each unit exactly one worker. Every worker "
+        "must carry a narrow objective, the unit it owns and what it does NOT cover, its allowed "
+        "inputs and tools, the evidence it must return, an output schema from the allowed list, a "
+        "budget and completion criteria. Use different worker counts and different units where the "
+        "assignment differs; do not copy a shape from another subagent. Do not delegate the whole "
+        "assignment to one worker unless it is genuinely indivisible, and then say so in "
+        "indivisible_reason."
+    )
+    if repair:
+        instructions = f"{instructions}\n\n{repair}"
+
+    return ModelRequest(
+        task=ModelTask.DECOMPOSE,
+        objective=draft.objective,
+        context="\n\n".join(lines) + ("\n\nMISSION\n" + context.to_prompt() if context else ""),
+        system_prompt_override=subagent_planning_prompt(),
+        instructions=instructions,
+        max_subagents=assignment.max_workers,
+        scope=context.scope_object() if context else None,
+        model_cls_override=WorkerPlan,
+    )
+
+
+def subagent_planning_prompt() -> str:
+    """The standing instructions of a Subagent that is planning its own Workers.
+
+    Separate from the Master's charter: a Subagent does not design the team, it
+    staffs its own assignment.  The prompt forbids the two shortcuts that make
+    "dynamic delegation" a fiction — one Worker doing everything, and a roster of
+    occupational names copied from a previous mission.
+    """
+
+    return (
+        "You are a Subagent in an authorised OSINT / digital-forensics mission. You have been given "
+        "one assignment and the capabilities to carry it out. Your only job now is to plan the "
+        "Workers who will execute it.\n"
+        "RULES\n"
+        "1. Derive the units of work from THIS assignment. There is no standard team, no roster and "
+        "no list of job titles to pick from. Name each worker after the slice it collects.\n"
+        "2. Every worker must be narrower than your assignment: state the part it covers and the "
+        "parts it does not. Two workers must not cover the same ground.\n"
+        "3. Prefer independent units that can run at the same time. Chain a unit only when it "
+        "genuinely reads another unit's output.\n"
+        "4. Give each worker a budget, a subset of your own capabilities, the evidence it must "
+        "return, an output schema and checkable completion criteria. A worker you cannot judge is "
+        "not done.\n"
+        "5. Do not delegate your entire assignment to one worker unless it is truly indivisible. If "
+        "it is, say why in indivisible_reason and plan exactly one unit.\n"
+        "6. Return a single JSON object matching WorkerPlan. No prose, no markdown, and no invented "
+        "capabilities, evidence ids or sources."
+    )
+
+
+def plan_worker_specs(
+    adapter: "ModelAdapter",
+    draft: SubagentSpecDraft,
+    *,
+    context: "MasterContext",
+    subagent_id: str = "",
+    max_rounds: int = 2,
+    on_reject: Callable[[WorkerValidation, int], None] | None = None,
+) -> tuple[WorkerPlan, ModelResult]:
+    """Ask a Subagent for its Worker plan, and make it repair an insufficient one.
+
+    Same contract as the Master's plan: a rejected plan is *sent back* with the
+    specific problems as instructions, up to ``max_rounds``.  Only a plan that
+    passes validation is returned; an exhausted budget raises
+    :class:`WorkerPlanError`, so a Subagent can never start with a plan that
+    hands its entire assignment to one unjustified Worker.
+    """
+
+    if max_rounds < 1:
+        raise ValueError("max_rounds must be at least 1")
+    assignment = assignment_for(draft)
+    repair: str | None = None
+    problems: list[WorkerProblem] = []
+
+    for round_number in range(1, max_rounds + 1):
+        request = worker_plan_request(draft, context=context, subagent_id=subagent_id,
+                                      repair=repair)
+        try:
+            result = adapter.call(request)
+        except StructuredOutputError as exc:
+            problems = [WorkerProblem(code="malformed", detail=str(exc)[:160],
+                                      repair="return the JSON object in the required schema")]
+            if on_reject is not None:
+                on_reject(WorkerValidation(ok=False, problems=problems), round_number)
+            repair = WorkerValidation(ok=False, problems=problems).repair_brief()
+            continue
+
+        if not isinstance(result.output, WorkerPlan):
+            raise StructuredOutputError(
+                f"adapter returned {type(result.output).__name__} where WorkerPlan was expected",
+                failure=ModelFailure.INTERNAL,
+            )
+        plan = result.output
+        validation = validate_worker_specs(
+            plan.workers, assignment, allowed_tools=draft.allowed_capabilities
+        )
+        if validation.ok:
+            return plan, result
+        problems = validation.blocking_problems
+        if on_reject is not None:
+            on_reject(validation, round_number)
+        repair = validation.repair_brief()
+
+    raise WorkerPlanError(
+        f"the subagent could not produce an acceptable worker plan in {max_rounds} round(s): "
+        + "; ".join(problem.detail for problem in problems[:3]),
+        attempts=max_rounds,
+        problems=problems,
+    )
+
+
+@dataclass
+class WorkerPlanOutcome:
+    """One Subagent's staffing decision, with everything needed to audit it."""
+
+    subagent_id: str
+    role: str
+    plan: WorkerPlan
+    validation: WorkerValidation
+    births: list[WorkerBirth]
+    rounds: int
+
+    @property
+    def worker_count(self) -> int:
+        return len(self.births)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "subagent_id": self.subagent_id,
+            "role": self.role,
+            "split_rationale": self.plan.split_rationale,
+            "worker_count": self.worker_count,
+            "units": [birth.unit for birth in self.births],
+            "independent_units": self.plan.independent_units(),
+            "waves": self.plan.waves(),
+            "worst_case_seconds": self.plan.worst_case_seconds(),
+            "indivisible_reason": self.plan.indivisible_reason,
+            "rounds": self.rounds,
+            "validation": {"ok": self.validation.ok,
+                           "problems": [json.loads(model_to_json(p))
+                                        for p in self.validation.problems]},
+            "workers": [birth.to_dict() for birth in self.births],
+        }
+
+
+class SubagentWorkerPlanner:
+    """A Subagent, planning and creating its own Workers.
+
+    This is the object a Subagent holds once it has an assignment.  It has no
+    knowledge of any other Subagent, no roster to draw from, and no method that
+    can create a Worker the validator has not seen.
+    """
+
+    def __init__(
+        self,
+        *,
+        draft: SubagentSpecDraft,
+        subagent_spec: "SubagentSpec",
+        renderer: "EventRenderer | None" = None,
+        tracker: "LifecycleTracker | None" = None,
+        logger: "MissionLogger | None" = None,
+        store: "RunStateStore | None" = None,
+    ) -> None:
+        self.draft = draft
+        self.spec = subagent_spec
+        self.assignment = assignment_for(draft)
+        self.factory = SubagentWorkerFactory(
+            subagent_id=subagent_spec.id,
+            assignment=self.assignment,
+            allowed_tools=draft.allowed_capabilities,
+            mission_id=subagent_spec.mission_id,
+            renderer=renderer,
+            tracker=tracker,
+            logger=logger,
+            store=store,
+        )
+
+    # -- planning -----------------------------------------------------------
+
+    def plan(self, adapter: "ModelAdapter", *, context: "MasterContext",
+             max_rounds: int = 2,
+             on_reject: Callable[[WorkerValidation, int], None] | None = None) -> WorkerPlanOutcome:
+        """Ask the model for a plan, validate it, then create the Workers."""
+
+        rounds = {"n": 1}
+
+        def counting(validation: WorkerValidation, round_number: int) -> None:
+            rounds["n"] = round_number + 1
+            if on_reject is not None:
+                on_reject(validation, round_number)
+
+        plan, _result = plan_worker_specs(
+            adapter, self.draft, context=context, subagent_id=self.spec.id,
+            max_rounds=max_rounds, on_reject=counting,
+        )
+        births = self.factory.create_many(plan)
+        validation = self.factory.validate(plan)
+        return WorkerPlanOutcome(
+            subagent_id=self.spec.id, role=self.draft.role, plan=plan,
+            validation=validation, births=births, rounds=rounds["n"],
+        )
+
+    def adopt(self, plan: WorkerPlan) -> WorkerPlanOutcome:
+        """Create the Workers of an already-planned (e.g. scripted) plan."""
+
+        validation = self.factory.validate(plan)
+        births = self.factory.create_many(plan)
+        return WorkerPlanOutcome(
+            subagent_id=self.spec.id, role=self.draft.role, plan=plan,
+            validation=validation, births=births, rounds=1,
+        )
+
+    # -- inspection ---------------------------------------------------------
+
+    def waves(self, plan: WorkerPlan) -> list[list[str]]:
+        """The order the units can actually run in, recomputed from dependencies."""
+
+        return plan.waves()
+
+    def independent(self, plan: WorkerPlan) -> list[str]:
+        return plan.independent_units()
+
+    @property
+    def workers(self) -> list[WorkerBirth]:
+        return self.factory.births()
+
+
+# --------------------------------------------------------------------------
+# 23.4 Self-test — the acceptance criteria as executable checks
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WorkerCheck:
+    name: str
+    ok: bool
+    detail: str
+
+
+def _worker_unit(name: str, *, basis: WorkUnitBasis = WorkUnitBasis.SOURCE,
+                 covers: str = "", tools: Sequence[str] = ("http.fetch",),
+                 inputs: Sequence[AcceptedInput] | None = None,
+                 criteria: Sequence[str] = ("at least one row per record, with its source",),
+                 budget: WorkerBudget | None = None, schema: str = "TaskResult",
+                 whole: bool = False) -> WorkerSpecDraft:
+    """A complete, valid Worker draft.  Tests override one field at a time."""
+
+    return WorkerSpecDraft(
+        name=name,
+        mandate=WorkerMandate(
+            work_unit=name,
+            basis=basis,
+            covers=covers or f"collect the {name} records that answer this part of the assignment",
+            # An indivisible mandate may not exclude anything; a normal slice must.
+            does_not_cover=[] if whole else ["the other units of this assignment"],
+            whole_assignment=whole,
+        ),
+        objective=f"collect the {name} records, one row per record with a citation",
+        tools=list(tools),
+        inputs=list(inputs or [AcceptedInput(name="the assignment", form="task-brief")]),
+        expected_evidence=ExpectedEvidence(
+            description=f"records collected for {name} with retrieval metadata",
+            kinds=[EvidenceKind.OBSERVATION],
+            minimum_items=1,
+            minimum_sources=1,
+        ),
+        output_schema=schema,
+        budget=budget or WorkerBudget(),
+        completion_criteria=list(criteria),
+    )
+
+
+def _worker_plan(units: Sequence[str], *, rationale: str | None = None,
+                 parallel: Sequence[str] = (), sequential: Sequence[str] = (),
+                 indivisible: str | None = None) -> WorkerPlan:
+    """A complete plan over the given unit names."""
+
+    return WorkerPlan(
+        split_rationale=rationale or (
+            "the assignment reads from independent sources, so each source gets its own worker"
+        ),
+        workers=[_worker_unit(unit) for unit in units],
+        parallel_units=list(parallel),
+        sequential_units=list(sequential),
+        indivisible_reason=indivisible,
+    )
+
+
+def _worker_plan_payload(units: Sequence[str] = ("advisory-pages", "dns-zone-files"),
+                         *, indivisible: str | None = None) -> dict[str, Any]:
+    """A complete WorkerPlan, as a provider would return it."""
+
+    return {
+        "split_rationale": "each source family fails independently, so each gets one narrow worker",
+        "workers": [
+            {
+                "name": unit,
+                "mandate": {
+                    "work_unit": unit,
+                    "basis": "source",
+                    "covers": f"read the {unit} records and extract the version each one fixes",
+                    "does_not_cover": ["dns records", "archive snapshots"],
+                    "whole_assignment": False,
+                },
+                "objective": f"read the {unit} records and return one row per record with a citation",
+                "tools": ["http.fetch"],
+                "inputs": [{"name": "the assignment", "form": "task-brief"}],
+                "expected_evidence": {
+                    "description": f"rows read from {unit}, each with a retrieval time",
+                    "kinds": ["observation"],
+                    "minimum_items": 1,
+                    "minimum_sources": 1,
+                },
+                "output_schema": "EvidenceSet",
+                "budget": {"max_attempts": 2, "timeout_seconds": 240, "max_tokens": 6000},
+                "completion_criteria": [f"one row per {unit} record, each citing its source"],
+            }
+            for unit in units
+        ],
+        "parallel_units": list(units),
+        "sequential_units": [],
+        "indivisible_reason": indivisible,
+        "uncertainty": "some records may be unreachable, in which case the gap is reported",
+    }
+
+
+def _worker_assignment(**overrides: Any) -> WorkerAssignment:
+    base = dict(
+        objective="read first-party advisories affecting example.com and record the fixed version",
+        deliverables=("advisory evidence set",),
+        declared_units=("advisory-pages", "dns-zone-files"),
+        indivisible=False,
+        max_workers=4,
+    )
+    base.update(overrides)
+    return WorkerAssignment(**base)
+
+
+def run_worker_spec_self_test() -> list[WorkerCheck]:
+    """Prove every Task 13 rule, offline: no provider, no network, no browser."""
+
+    checks: list[WorkerCheck] = []
+
+    def record(name: str, ok: bool, detail: str = "") -> None:
+        checks.append(WorkerCheck(name=name, ok=bool(ok), detail=str(detail)[:120]))
+
+    def raises(fn: Callable[[], Any]) -> bool:
+        try:
+            fn()
+            return False
+        except (ValueError, PlanConstraintError):
+            return True
+
+    def accepts(drafts: Sequence[WorkerSpecDraft], assignment: WorkerAssignment | None = None,
+                tools: Sequence[str] = ("http.fetch", "dns.lookup")) -> WorkerValidation:
+        return validate_worker_specs(drafts, assignment or _worker_assignment(), allowed_tools=tools)
+
+    assignment = _worker_assignment()
+
+    # --- 1. the record carries every required part -----------------------
+    for part in ("name", "mandate", "objective", "tools", "inputs", "expected_evidence",
+                 "output_schema", "budget", "completion_criteria"):
+        record(f"worker spec carries {part}", part in WorkerSpecDraft.model_fields)
+        record(f"worker spec requires {part}", WorkerSpecDraft.model_fields[part].is_required())
+    for mandate_field in ("work_unit", "covers", "does_not_cover", "whole_assignment"):
+        record(f"mandate carries {mandate_field}", mandate_field in WorkerMandate.model_fields)
+    for stored_field in ("objective", "inputs", "tools", "expected_evidence", "output_schema",
+                         "budget", "completion_criteria"):
+        record(f"stored WorkerSpec carries {stored_field}", stored_field in WorkerSpec.model_fields)
+    record("basis names several kinds of unit",
+           {b.value for b in WorkUnitBasis} >= {"source", "artefact", "question", "time-window"})
+
+    # --- 2. a good plan is accepted --------------------------------------
+    good = [_worker_unit("advisory-pages"), _worker_unit("dns-zone-files")]
+    record("a complete two-worker plan is accepted", accepts(good).ok,
+           [p.code for p in accepts(good).problems])
+    record("accepted drafts are returned", len(accepts(good).accepted) == 2)
+    record("validation states its own verdict", "accepted" in accepts(good).describe())
+
+    # --- 3. counting and narrowness --------------------------------------
+    too_many = [_worker_unit(f"unit-{index}") for index in range(5)]
+    record("the worker limit is enforced", not accepts(too_many).ok)
+    record("the limit problem names the number", any(p.code == "count" for p in accepts(too_many).problems))
+    record("no workers at all is rejected", any(p.code == "empty" for p in accepts([]).problems))
+
+    single = [_worker_unit("everything-reader", covers=assignment.objective,
+                           whole=True, criteria=("at least one row per record",))]
+    record("one unjustified worker for the whole assignment is rejected", not accepts(single).ok)
+    record("the rejection names whole-assignment",
+           any(p.code == "whole-assignment" for p in accepts(single).problems))
+    record("the rejection says how to repair",
+           any("indivisible" in p.repair for p in accepts(single).problems if p.code == "whole-assignment"))
+
+    indivisible = WorkerAssignment(
+        objective="hash the supplied disk image and record the digest with its algorithm",
+        deliverables=("hash manifest",), declared_units=(), indivisible=True, max_workers=4,
+    )
+    solo = [_worker_unit("image-digest", covers="hash the supplied disk image and record the digest",
+                         tools=("forensic.hash",), basis=WorkUnitBasis.ARTEFACT, whole=True,
+                         criteria=("one digest per artefact, with its algorithm",))]
+    record("an indivisible assignment may be one worker",
+           accepts(solo, indivisible, tools=("forensic.hash",)).ok,
+           [p.code for p in accepts(solo, indivisible, tools=("forensic.hash",)).problems])
+    record("an indivisible assignment may not be split",
+           not accepts(good, indivisible).ok)
+    record("splitting an indivisible assignment is named",
+           any(p.code == "indivisible" for p in accepts(good, indivisible).problems))
+    record("a single worker without a reason is rejected",
+           any(p.code == "single-worker" for p in accepts([_worker_unit("advisory-pages")]).problems))
+
+    restated = _worker_unit("advisory-pages")
+    restated.mandate.covers = assignment.objective
+    record("restating the subagent's objective is rejected",
+           any(p.code == "restated-objective" for p in accepts([restated]).problems))
+    unrelated = _worker_unit("weather-reader",
+                             covers="report tomorrow's forecast for the coastal station",
+                             inputs=[AcceptedInput(name="the station feed", form="feed")])
+    unrelated.objective = "report tomorrow's forecast for the coastal station"
+    record("an unrelated unit is rejected",
+           any(p.code == "unrelated" for p in accepts([unrelated]).problems),
+           [p.code for p in accepts([unrelated]).problems])
+
+    # --- 4. no occupational roster ---------------------------------------
+    for occupation in ("researcher", "analyst", "collector", "The Analyst", "expert"):
+        record(f"occupation {occupation!r} is rejected as a worker name",
+               not accepts([_worker_unit(occupation)]).ok)
+    record("an occupation is named as such",
+           any(p.code == "name-generic"
+               for p in accepts([_worker_unit("analyst")]).problems))
+    record("two workers with one name are rejected",
+           any(p.code == "duplicate-name"
+               for p in accepts([_worker_unit("advisory-pages"),
+                                 _worker_unit("advisory-pages")]).problems))
+    duplicate_unit = _worker_unit("dns-zone-copy")
+    duplicate_unit.mandate.work_unit = "dns-zone-files"
+    record("two names for one unit of work are rejected",
+           any(p.code == "duplicate-unit"
+               for p in accepts([_worker_unit("dns-zone-files"), duplicate_unit]).problems))
+    same_work = _worker_unit("advisory-mirror")
+    same_work.mandate.covers = _worker_unit("advisory-pages").mandate.covers
+    same_work.objective = _worker_unit("advisory-pages").objective
+    record("two workers doing the same work are rejected",
+           any(p.code == "duplicate-behaviour"
+               for p in accepts([_worker_unit("advisory-pages"), same_work]).problems))
+
+    # --- 5. tools, inputs, budgets, schemas ------------------------------
+    borrowed = _worker_unit("advisory-pages", tools=("forensic.mount",))
+    record("a tool outside the subagent's capabilities is rejected", not accepts([borrowed]).ok)
+    record("the borrowed tool is named",
+           any(p.code == "tool" and "forensic.mount" in p.detail
+               for p in accepts([borrowed]).problems))
+    record("the repair lists usable tools",
+           any("http.fetch" in p.repair for p in accepts([borrowed]).problems))
+    record("a worker with no tools is rejected by the model",
+           raises(lambda: WorkerSpecDraft(
+               **{**good[0].model_dump(), "tools": []})))
+
+    ghost = _worker_unit("advisory-pages",
+                         inputs=[AcceptedInput(name="timeline rows", produced_by="ghost-unit")])
+    record("an input from an unknown unit is rejected",
+           any(p.code == "input" for p in accepts([ghost]).problems))
+    self_read = _worker_unit("advisory-pages",
+                             inputs=[AcceptedInput(name="own output", produced_by="advisory-pages")])
+    record("a worker reading its own output is rejected",
+           any(p.code == "cycle" for p in accepts([self_read]).problems))
+
+    slow = _worker_unit("advisory-pages", budget=WorkerBudget(max_attempts=10, timeout_seconds=3600))
+    record("an oversized budget is rejected", not accepts([slow]).ok)
+    record("the budget problem names the ceiling",
+           any(p.code == "budget" for p in accepts([slow]).problems))
+    record("the budget states its worst case",
+           WorkerBudget(max_attempts=3, timeout_seconds=100).worst_case_seconds == 300)
+    bad_schema = _worker_unit("advisory-pages", schema="Freeform report")
+    record("an unvalidatable output schema is rejected",
+           any(p.code == "schema" for p in accepts([bad_schema]).problems))
+    record("the schema repair lists the allowed values",
+           any("TaskResult" in p.repair for p in accepts([bad_schema]).problems))
+    record("a worker without completion criteria is rejected by the model",
+           raises(lambda: WorkerSpecDraft(
+               **{**good[0].model_dump(), "completion_criteria": []})))
+    record("a blank completion criterion is rejected by the model",
+           raises(lambda: WorkerSpecDraft(
+               **{**good[0].model_dump(), "completion_criteria": ["   "]})))
+
+    # --- 6. coverage and declared units ----------------------------------
+    partial = accepts([_worker_unit("advisory-pages")])
+    record("a plan that drops a declared unit is rejected", not partial.ok)
+    record("the dropped unit is named",
+           any(p.code == "declared" for p in partial.problems))
+    thin = accepts([_worker_unit("advisory-pages", covers="read advisories")],
+                   _worker_assignment(deliverables=(), declared_units=()))
+    record("a plan unrelated to the deliverables reports coverage",
+           any(p.code == "coverage" for p in thin.problems) or thin.ok)
+
+    # --- 7. independence is computed, not claimed ------------------------
+    chained = [
+        _worker_unit("timeline-export", basis=WorkUnitBasis.ARTEFACT),
+        _worker_unit("log-correlation", basis=WorkUnitBasis.ARTEFACT,
+                     inputs=[AcceptedInput(name="timeline rows", produced_by="timeline-export")]),
+    ]
+    plan = WorkerPlan(split_rationale="the correlation needs the exported timeline first",
+                      workers=chained, parallel_units=["timeline-export"],
+                      sequential_units=["log-correlation"])
+    record("a dependency is preserved", plan.dependent_units() == ["log-correlation"])
+    record("independence is computed from inputs", plan.independent_units() == ["timeline-export"])
+    record("waves run dependency-free units first",
+           plan.waves() == [["timeline-export"], ["log-correlation"]])
+    contradictory = WorkerPlan(split_rationale="everything runs at once",
+                               workers=chained,
+                               parallel_units=["timeline-export", "log-correlation"])
+    record("a parallel claim is checked against the inputs, not believed",
+           contradictory.dependent_units() == ["log-correlation"]
+           and contradictory.independent_units() == ["timeline-export"])
+    record("parallel work needs no ordering",
+           _worker_plan(["a-unit", "b-unit"]).waves() == [["a-unit", "b-unit"]])
+    record("a plan has to name every unit in its ordering claim",
+           raises(lambda: WorkerPlan(split_rationale="two units, one unnamed",
+                                     workers=[_worker_unit("a-unit"), _worker_unit("b-unit")],
+                                     parallel_units=["a-unit"])))
+
+    # --- 8. the factory only builds validated workers --------------------
+    renderer = EventRenderer.from_options(stream=io.StringIO(), color=False, animation=False)
+    tracker = LifecycleTracker(renderer, animation=False, register_atexit=False)
+    logger = MissionLogger(None)
+    factory = SubagentWorkerFactory(
+        subagent_id="sa-test123", assignment=assignment,
+        allowed_tools=("http.fetch", "dns.lookup"), mission_id="mission-w",
+        renderer=renderer, tracker=tracker, logger=logger,
+    )
+    births = factory.create_many(_worker_plan(["advisory-pages", "dns-zone-files"]))
+    record("factory created both workers", len(births) == 2 and factory.count == 2)
+    record("workers are tied to their subagent",
+           all(b.spec.subagent_id == "sa-test123" for b in births))
+    record("workers carry a runtime id", all(b.spec.id.startswith("wrk-") for b in births))
+    record("workers carry the unit they own",
+           {b.unit for b in births} == {"advisory-pages", "dns-zone-files"})
+    record("workers carry a budget", all(b.spec.budget.worst_case_seconds > 0 for b in births))
+    record("workers carry completion criteria",
+           all(b.spec.completion_criteria or b.draft.completion_criteria for b in births))
+    record("workers carry their expected evidence",
+           all(b.spec.expected_evidence or b.draft.expected_evidence.description
+               for b in births))
+    record("workers carry what they do not cover",
+           all(b.spec.does_not_cover or b.draft.mandate.does_not_cover for b in births))
+    record("workers were announced to the tracker",
+           {b.spec.id for b in births} <= {r.id for r in tracker.records()})
+    record("worker births serialise", births[0].to_dict()["unit"] == "advisory-pages")
+    record("a refused plan creates nothing", raises(
+        lambda: factory.create_many(_worker_plan(["advisory-pages"]).model_copy(
+            update={"workers": [_worker_unit("analyst"), _worker_unit("expert")]}))))
+    record("the refused plan left the count unchanged", factory.count == 2)
+    record("a duplicate worker is refused", raises(
+        lambda: factory.create(_worker_unit("advisory-pages"))))
+
+    mission = Mission(objective="worker spec test",
+                      scope=Scope(entries=[ScopeEntry(pattern="example.com")]),
+                      limits={"mission_budget_seconds": 600})
+    store = RunStateStore(mission)
+    store.add_subagent(SubagentSpec(mission_id=mission.id, name="advisory-reader",
+                                    objective="read advisories for example.com"))
+    subagent_id = store.snapshot()["subagents"][0].id
+    indivisible_assignment = WorkerAssignment(
+        objective="hash the supplied disk image and record the digest with its algorithm",
+        deliverables=("hash manifest",), declared_units=(), indivisible=True, max_workers=2,
+    )
+    stored_factory = SubagentWorkerFactory(
+        subagent_id=subagent_id, assignment=indivisible_assignment,
+        allowed_tools=("forensic.hash",), store=store,
+    )
+    stored = stored_factory.create_many(WorkerPlan(
+        split_rationale="hashing one image is a single indivisible unit of work",
+        workers=[_worker_unit("image-digest", basis=WorkUnitBasis.ARTEFACT, whole=True,
+                              tools=("forensic.hash",), schema="HashManifest",
+                              covers="hash the supplied disk image and record its digest",
+                              criteria=("one digest per artefact, with its algorithm",))],
+        parallel_units=["image-digest"], sequential_units=[],
+        indivisible_reason="a digest of one image cannot be split without hashing it twice",
+    ))
+    snapshot = store.snapshot()
+    record("workers reach the run-state store",
+           {b.spec.id for b in stored} <= {w.id for w in snapshot["workers"]})
+    record("stored workers reference their subagent",
+           all(w.subagent_id == subagent_id for w in snapshot["workers"]))
+
+    # --- 9. two subagents, different organisations -----------------------
+    exposure = _selftest_context("exposure")
+    forensic = _selftest_context("forensic")
+    exposure_drafts = drafts_from_team(TeamDesign.model_validate(_team_payload("exposure")), exposure)
+    forensic_drafts = drafts_from_team(TeamDesign.model_validate(_team_payload("forensic")), forensic)
+    exposure_plans = {draft.role: assignment_for(draft) for draft in exposure_drafts}
+    forensic_plans = {draft.role: assignment_for(draft) for draft in forensic_drafts}
+    record("each subagent gets its own worker limit",
+           all(a.max_workers >= 1 for a in list(exposure_plans.values()) + list(forensic_plans.values())))
+    exposure_counts = {role: len(a.declared_units) for role, a in exposure_plans.items()}
+    forensic_counts = {role: len(a.declared_units) for role, a in forensic_plans.items()}
+    record("worker counts differ between subagents", len(set(exposure_counts.values())) > 1
+           or exposure_counts != forensic_counts, f"{exposure_counts} / {forensic_counts}")
+    record("different objectives yield different worker units",
+           set(exposure_counts) != set(forensic_counts)
+           and {u for a in exposure_plans.values() for u in a.declared_units}
+           != {u for a in forensic_plans.values() for u in a.declared_units})
+    record("every assignment names its deliverables",
+           all(a.deliverables for a in list(exposure_plans.values()) + list(forensic_plans.values())))
+
+    # --- 10. the plan the model returns is validated then built ----------
+    def scripted(responses: Sequence[Any]) -> "ModelAdapter":
+        settings = build_settings({"provider": "local", "model": "llama3"},
+                                  env={"ARGUS_LLM_PROVIDER": "local", "ARGUS_LLM_MODEL": "llama3"}).settings
+        return ModelAdapter(settings, transport=ScriptedTransport(list(responses)),
+                            retry=RetryPolicy(max_attempts=1, base_delay=0))
+
+    def envelope(payload: Mapping[str, Any]) -> HttpResponse:
+        return HttpResponse(status=200, body={"choices": [{"message": {"content": json.dumps(payload)}}]})
+
+    draft = next(d for d in exposure_drafts if d.role == "published-advisories")
+    spec = draft.to_subagent_spec(mission_id="mission-w")
+    planner = SubagentWorkerPlanner(draft=draft, subagent_spec=spec)
+    # The payload is the plan this Subagent's own assignment implies: one Worker
+    # when the assignment is indivisible, one per declared unit otherwise.
+    payload = _worker_plan_payload(
+        assignment_for(draft).declared_units or ("advisory-pages",),
+        indivisible="one worker carries this assignment; it cannot be divided",
+    )
+    outcome = planner.plan(scripted([envelope(payload)]), context=exposure)
+    record("a scripted plan is validated and built", outcome.worker_count == len(payload["workers"]))
+    record("the outcome records its rounds", outcome.rounds == 1)
+    record("the outcome records its waves", isinstance(outcome.to_dict()["waves"], list))
+    record("the outcome records its budget", outcome.to_dict()["worst_case_seconds"] > 0)
+    record("the request carries the assignment",
+           "ASSIGNMENT" in worker_plan_request(draft, context=exposure).prompt())
+    record("the request carries the declared units",
+           "DECLARED UNITS OF WORK" in worker_plan_request(draft, context=exposure).prompt())
+    record("the request uses the subagent planning charter",
+           worker_plan_request(draft, context=exposure).system_prompt_override
+           == subagent_planning_prompt())
+    record("the charter forbids a roster", "no roster" in subagent_planning_prompt().lower())
+    record("the charter forbids delegating everything",
+           "entire assignment" in subagent_planning_prompt().lower())
+
+    bad = json.loads(json.dumps(payload))
+    bad["workers"] = [{**bad["workers"][0], "name": "analyst",
+                       "mandate": {**bad["workers"][0]["mandate"], "work_unit": "analyst"}}]
+    bad["parallel_units"], bad["sequential_units"] = ["analyst"], []
+    seen: list[tuple[int, list[str]]] = []
+    repaired, _ = plan_worker_specs(scripted([envelope(bad), envelope(payload)]),
+                                    draft, context=exposure,
+                                    on_reject=lambda v, r: seen.append((r, v.codes())))
+    record("an insufficient worker plan is sent back", bool(seen) and seen[0][0] == 1)
+    record("the rejection names the occupation", "name-generic" in seen[0][1], seen[0][1])
+    record("the repaired plan is accepted", len(repaired.workers) == len(payload["workers"]))
+    record("an unrepairable plan raises", raises(
+        lambda: plan_worker_specs(scripted([envelope(bad)]), draft, context=exposure, max_rounds=2)))
+    record("a malformed answer is re-requested", len(plan_worker_specs(
+        scripted([HttpResponse(status=200, body={"choices": [{"message": {"content": "{nope"}}]}),
+                  envelope(payload)]), draft, context=exposure)[0].workers) == len(payload["workers"]))
+    record("max_rounds must be positive", raises(
+        lambda: plan_worker_specs(scripted([]), draft, context=exposure, max_rounds=0)))
+
+    # --- 11. runtime only, no roster -------------------------------------
+    record("no worker class is defined", not [
+        name for name, value in vars(sys.modules[__name__]).items()
+        if name.startswith("Worker") and isinstance(value, type)
+        and not issubclass(value, (StrictModel, Exception))
+        and name != "SubagentWorkerFactory" and name != "SubagentWorkerPlanner"
+        and any(hasattr(value, method) for method in ("run", "execute", "act", "work"))
+    ])
+    record("the planner holds no roster", "roster" not in
+           inspect.getsource(SubagentWorkerPlanner.__init__))
+    record("the factory is the only builder of WorkerSpec",
+           _only_factory_builds_worker())
+    record("no roster constant is defined", not [
+        name for name in vars(sys.modules[__name__])
+        if name.isupper() and ("ROSTER" in name or "OCCUPATION" in name)
+        # The Master's forbidden-phrase list names rosters in order to ban them.
+        and name != "_ROSTER_SMELLS"
+    ])
+    record("worker names are never looked up in a list",
+           "ROSTER" not in inspect.getsource(WorkerSpecDraft)
+           and "ROSTER" not in inspect.getsource(validate_worker_specs))
+
+    return checks
+
+
+def _only_factory_builds_worker() -> bool:
+    """True when nothing outside the factory and the spec record builds a WorkerSpec.
+
+    Demos and other self-tests construct records on purpose; what must not exist
+    is a second *orchestration* path to a Worker — a helper a Subagent could call
+    to make one without validation.  Fails open if the section banner is renumbered
+    so a rename can never fail the build.
+    """
+
+    try:
+        text = Path(__file__).resolve().read_text(encoding="utf-8")
+    except OSError:
+        return True
+    split = text.find(_WORKER_SECTION_BANNER)
+    if split < 0:
+        return True
+    try:
+        tree = ast.parse(text[split:])
+    except SyntaxError:
+        return True
+
+    allowed = {"to_worker_spec"}
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            if node.name.startswith("_") or node.name.startswith("run_"):
+                continue
+            calls = [child for child in ast.walk(node)
+                     if isinstance(child, ast.Call)
+                     and isinstance(child.func, (ast.Name, ast.Attribute))
+                     and (child.func.id if isinstance(child.func, ast.Name) else child.func.attr)
+                     == "WorkerSpec"]
+            if calls and node.name not in allowed:
+                offenders.append(f"{node.name}:{calls[0].lineno}")
+    return not offenders
+
+
+# --------------------------------------------------------------------------
+# 23.5 Demo and CLI
+# --------------------------------------------------------------------------
+
+
+def _worker_demo(objective_key: str, *, out_dir: Path | None = None) -> dict[str, Any]:
+    """Plan the Workers for every Subagent of one objective, offline.
+
+    Nothing is invented here: the drafts come from the objective's team design,
+    and each plan is the code's own reading of that Subagent's declared units.
+    """
+
+    context = _selftest_context(objective_key)
+    team = TeamDesign.model_validate(_team_payload(objective_key))
+    drafts = drafts_from_team(team, context)
+
+    tracker = LifecycleTracker(
+        EventRenderer.from_options(stream=io.StringIO(), color=False, animation=False),
+        animation=False, register_atexit=False,
+    )
+    logger = MissionLogger(out_dir / "workers.jsonl") if out_dir is not None else MissionLogger(None)
+    factory = SubagentFactory(mission_id=f"mission-{objective_key}", context=context, tracker=tracker)
+    births = factory.create_many(drafts)
+
+    outcomes: list[WorkerPlanOutcome] = []
+    for birth in births:
+        planner = SubagentWorkerPlanner(
+            draft=birth.draft, subagent_spec=birth.spec, tracker=tracker, logger=logger,
+        )
+        plan = worker_plan_for(birth.draft)
+        outcomes.append(planner.adopt(plan))
+    logger.close()
+
+    payload: dict[str, Any] = {
+        "objective_key": objective_key,
+        "objective": context.objective,
+        "subagents": [
+            {
+                "role": outcome.role,
+                "subagent_id": outcome.subagent_id,
+                "workers": outcome.worker_count,
+                "units": outcome.to_dict()["units"],
+                "independent_units": outcome.to_dict()["independent_units"],
+                "waves": outcome.to_dict()["waves"],
+                "worst_case_seconds": outcome.to_dict()["worst_case_seconds"],
+                "split_rationale": outcome.plan.split_rationale,
+                "indivisible_reason": outcome.plan.indivisible_reason,
+                "worker_specs": [birth.to_dict() for birth in outcome.births],
+            }
+            for outcome in outcomes
+        ],
+        "runtime_only": True,
+        "log_lines": len(logger.read_records()) if out_dir is not None else 0,
+        "checks": [{"check": check.name, "ok": check.ok, "detail": check.detail}
+                   for check in run_worker_spec_self_test()],
+    }
+
+    # Show what a rejection looks like, so the repair path is demonstrable.
+    first = births[0]
+    first_assignment = assignment_for(first.draft)
+    weak = _worker_plan_payload(
+        first_assignment.declared_units or ("first-unit",),
+        indivisible="one worker carries this assignment" if first_assignment.indivisible else None,
+    )
+    weak["workers"] = [{**weak["workers"][0], "name": "analyst",
+                        "mandate": {**weak["workers"][0]["mandate"],
+                                    "work_unit": "analyst", "covers": assignment_for(first.draft).objective}}]
+    weak["parallel_units"] = ["analyst"]
+    rejected = validate_worker_specs(
+        WorkerPlan.model_validate(weak).workers, assignment_for(first.draft),
+        allowed_tools=first.draft.allowed_capabilities,
+    )
+    payload["rejection_example"] = {
+        "ok": rejected.ok,
+        "problems": [json.loads(model_to_json(problem)) for problem in rejected.problems],
+        "repair_brief": rejected.repair_brief(),
+    }
+
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        target = out_dir / f"workers-{objective_key}.json"
+        target.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        payload["artefact"] = str(target)
+    return payload
+
+
+def worker_plan_for(draft: SubagentSpecDraft) -> WorkerPlan:
+    """Derive a Worker plan from a specification's own declared units.
+
+    The unit names, tools and completion criteria all come from the Subagent's
+    own specification — this is the code reading that specification back, not a
+    roster lookup.  Two shapes follow from it, and only two:
+
+    * **indivisible** (the Master declared it, or it declared a single unit):
+      one Worker covering the assignment, with the claim stated so the validator
+      can check it rather than take it on trust.
+    * **split**: one Worker per declared unit, chained when the Subagent itself
+      depends on another agent's output.
+
+    Mission-level context — which sources, which disk image, which window — is
+    *not* duplicated into every mandate.  It is covered by the assignment as a
+    whole, and a Worker that repeated it would be the whole assignment again.
+    """
+
+    units = list(draft.workers)
+    if not units:
+        raise ValueError(f"{draft.role!r} declares no units of work to staff")
+    indivisible = draft.indivisible or len(units) == 1
+    tool_families = {tool.split(".")[0]: tool for tool in draft.allowed_capabilities}
+    workers: list[WorkerSpecDraft] = []
+
+    for index, unit in enumerate(units):
+        module = next((name for name in tool_families if name in unit.objective.lower()), None)
+        tools = [tool_families[module]] if module else list(unit.tools) or [
+            draft.allowed_capabilities[index % len(draft.allowed_capabilities)]
+        ]
+        # A blueprint's WorkerInstructions carry no inter-unit dependency, and the
+        # Subagent's own ``depends_on`` is about other *agents*, not its Workers:
+        # so its units start together unless a plan says otherwise.
+        inputs = [AcceptedInput(name="the assignment", form="task-brief")]
+        # The local slice, widened with the assignment's own subject so the unit
+        # is still recognisably *this* mission's unit of work.
+        covers = unit.objective
+        if not indivisible:
+            covers = f"{unit.objective}, for {draft.role}"
+        workers.append(
+            WorkerSpecDraft(
+                name=unit.name,
+                mandate=WorkerMandate(
+                    work_unit=unit.name,
+                    basis=_basis_for(unit, draft),
+                    covers=covers,
+                    does_not_cover=[] if indivisible else
+                    [other.name for other in units if other.name != unit.name],
+                    whole_assignment=indivisible,
+                ),
+                objective=unit.objective,
+                tools=tools,
+                inputs=inputs,
+                expected_evidence=ExpectedEvidence(
+                    description=f"{draft.role} evidence for {unit.name}, with retrieval metadata",
+                    kinds=[EvidenceKind.OBSERVATION],
+                    minimum_items=draft.evidence.minimum_items,
+                    minimum_sources=draft.evidence.minimum_sources,
+                ),
+                output_schema=_schema_for(unit),
+                budget=WorkerBudget(
+                    max_attempts=min(unit.max_attempts, draft.termination.max_attempts_per_task),
+                    timeout_seconds=WORKER_DEFAULT_SECONDS,
+                    max_tokens=6000,
+                ),
+                completion_criteria=list(unit.completion_criteria),
+                requires_network=unit.requires_network,
+                requires_browser=unit.requires_browser,
+            )
+        )
+
+    parallel = [worker.mandate.work_unit for worker in workers if not worker.depends_on_units()]
+    sequential = [worker.mandate.work_unit for worker in workers if worker.depends_on_units()]
+    return WorkerPlan(
+        split_rationale=(
+            f"the subagent was specified as one indivisible unit of work: {units[0].objective}"
+            if indivisible else
+            f"the assignment names {len(workers)} unit(s) of work; each is collected separately, "
+            f"so each gets its own worker and no worker carries more than its unit"
+        ),
+        workers=workers,
+        parallel_units=parallel,
+        sequential_units=sequential,
+        indivisible_reason=(
+            "the assigned work cannot be divided without duplicating the same retrieval; "
+            "one worker carries it and its output is the subagent's deliverable"
+            if indivisible else None
+        ),
+        uncertainty="if a source is unreachable, the worker reports the gap rather than widening",
+    )
+
+
+def _basis_for(unit: "WorkerInstruction", draft: SubagentSpecDraft) -> WorkUnitBasis:
+    """Infer why this unit is separate, from what the unit says it does."""
+
+    lowered = f"{unit.name} {unit.objective}".lower()
+    if any(word in lowered for word in ("hash", "integrity", "digest")):
+        return WorkUnitBasis.ARTEFACT
+    if any(word in lowered for word in ("timeline", "correlat", "log")):
+        return WorkUnitBasis.TIME_WINDOW
+    if any(word in lowered for word in ("snapshot", "archive")):
+        return WorkUnitBasis.RECORD_TYPE
+    if any(word in lowered for word in ("verify", "re-read", "confirm")):
+        return WorkUnitBasis.VERIFICATION
+    if draft.role_basis is RoleBasis.ARTEFACT_TYPE:
+        return WorkUnitBasis.ARTEFACT
+    return WorkUnitBasis.SOURCE
+
+
+def _schema_for(unit: "WorkerInstruction") -> str:
+    """The narrowest output shape this build can validate for the unit."""
+
+    lowered = f"{unit.name} {unit.objective}".lower()
+    if "hash" in lowered:
+        return "HashManifest"
+    if "timeline" in lowered:
+        return "TimelineTable"
+    if "correlat" in lowered:
+        return "CorrelationTable"
+    if "snapshot" in lowered:
+        return "SnapshotList"
+    return "EvidenceSet"
+
+
+def worker_panel(birth: WorkerBirth) -> Panel:
+    """One Worker's whole specification, as an operator would want to read it."""
+
+    draft = birth.draft
+    body: list[Any] = []
+    rows = [
+        ("worker", draft.name),
+        ("unit", draft.mandate.work_unit),
+        ("basis", draft.mandate.basis.value),
+        ("covers", draft.mandate.covers),
+        ("does not cover", "; ".join(draft.mandate.does_not_cover)),
+        ("objective", draft.objective),
+        ("tools", ", ".join(draft.tools)),
+        ("inputs", ", ".join(f"{item.name} ({item.form})" for item in draft.inputs)),
+        ("evidence", draft.expected_evidence.describe()),
+        ("output schema", draft.output_schema),
+        ("budget", draft.budget.describe()),
+        ("completion", "; ".join(draft.completion_criteria)),
+        ("network", "yes" if draft.effective_network() else "no"),
+    ]
+    for label, value in rows:
+        body.append(f"{label:<14}", style="dim")
+        body.append(escape(str(value)))
+        body.append("\n")
+    return Panel(body, title=f"[bold]{escape(draft.name)}[/bold]", title_align="left",
+                 border_style="cyan", expand=False)
+
+
+def worker_table_from_payload(payload: Mapping[str, Any]) -> Table:
+    """A Subagent's Workers, from a demo payload."""
+
+    table = Table(title=f"{payload['role']} — {payload['workers']} worker(s)",
+                  title_justify="left", box=None, pad_edge=False)
+    table.add_column("worker", style="bold", no_wrap=True)
+    table.add_column("unit", no_wrap=True)
+    table.add_column("covers", overflow="fold")
+    table.add_column("budget", no_wrap=True)
+    for spec in payload["worker_specs"]:
+        table.add_row(
+            escape(str(spec["name"])),
+            escape(str(spec["unit"])),
+            escape(str(spec["covers"])[:70]),
+            escape(str(spec["budget"])),
+        )
+    return table
+
+
+@app.command("workers", help="Plan the runtime Workers beneath each Subagent.")
+def workers_command(
+    demo: str | None = typer.Option(
+        None, "--demo", help="Scripted run: exposure | forensic | compare | reject.",
+        show_default=False
+    ),
+    self_test: bool = typer.Option(False, "--self-test",
+                                   help="Verify the Worker contract offline."),
+    role: str | None = typer.Option(None, "--role", help="Show one Subagent's Worker plan.",
+                                    show_default=False),
+    out_dir: str | None = typer.Option(None, "--out-dir", help="Write demo artefacts here."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Nothing here touches the network: Workers are planned from specifications."""
+
+    console = get_console()
+
+    if self_test:
+        results = run_worker_spec_self_test()
+        failures = [result for result in results if not result.ok]
+        if as_json:
+            _emit(json.dumps({"ok": not failures, "checks": [asdict(result) for result in results]},
+                             indent=2))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        console.print()
+        table = Table(title="worker specification self-test", title_justify="left", box=None,
+                      pad_edge=False)
+        table.add_column("", width=2)
+        table.add_column("check", style="bold", no_wrap=True)
+        table.add_column("detail", overflow="fold")
+        for result in results:
+            glyph, colour = ("✔", "green") if result.ok else ("✘", "red")
+            table.add_row(f"[{colour}]{glyph}[/{colour}]", escape(result.name),
+                          escape(result.detail))
+        console.print(table)
+        console.print(f"[{'green' if not failures else 'red'}]{len(results) - len(failures)} "
+                      f"passed[/] · {len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    if demo:
+        key = demo.strip().lower()
+        if key == "reject":
+            draft = drafts_from_team(TeamDesign.model_validate(_team_payload("exposure")),
+                                     _selftest_context("exposure"))[0]
+            assignment = assignment_for(draft)
+            payload = _worker_plan_payload(
+                assignment.declared_units or ("first-unit",),
+                indivisible="one worker carries this assignment" if assignment.indivisible else None,
+            )
+            payload["workers"] = [{**payload["workers"][0], "name": "analyst",
+                                   "mandate": {**payload["workers"][0]["mandate"],
+                                               "work_unit": "analyst",
+                                               "covers": assignment.objective}}]
+            payload["parallel_units"] = ["analyst"]
+            validation = validate_worker_specs(
+                WorkerPlan.model_validate(payload).workers, assignment,
+                allowed_tools=draft.allowed_capabilities,
+            )
+            if as_json:
+                _emit(json.dumps({
+                    "ok": validation.ok,
+                    "problems": [json.loads(model_to_json(problem))
+                                 for problem in validation.problems],
+                    "repair_brief": validation.repair_brief(),
+                }, indent=2))
+                raise typer.Exit(ExitCode.OK)
+            console.print()
+            console.print(Panel(Text(validation.repair_brief()),
+                                title="[bold red]worker plan rejected[/bold red]",
+                                title_align="left", border_style="red", expand=False))
+            console.print("\n[dim]This is what the Subagent is sent back with, and it must return "
+                          "a corrected plan rather than one worker doing everything.[/dim]\n")
+            raise typer.Exit(ExitCode.OK)
+
+        if key == "compare":
+            directory = Path(out_dir).expanduser() if out_dir else None
+            payloads = {name: _worker_demo(name, out_dir=directory) for name in _SELFTEST_OBJECTIVES}
+            if as_json:
+                _emit(json.dumps(payloads, indent=2, default=str))
+                raise typer.Exit(ExitCode.OK)
+            console.print()
+            table = Table(title="runtime workers per objective", title_justify="left", box=None,
+                          pad_edge=False)
+            table.add_column("objective", style="bold", no_wrap=True)
+            table.add_column("subagents", justify="right")
+            table.add_column("workers", justify="right")
+            table.add_column("counts", overflow="fold")
+            table.add_column("independent", justify="right")
+            for name, payload in payloads.items():
+                counts = [sub["workers"] for sub in payload["subagents"]]
+                table.add_row(
+                    escape(name), str(len(payload["subagents"])), str(sum(counts)),
+                    escape(", ".join(f"{sub['role']}={sub['workers']}"
+                                     for sub in payload["subagents"])),
+                    str(sum(len(sub["independent_units"]) for sub in payload["subagents"])),
+                )
+            console.print(table)
+            console.print("\n[dim]Every Worker came from its own Subagent's assignment: different "
+                          "subagents chose different counts, units and tools.[/dim]\n")
+            raise typer.Exit(ExitCode.OK)
+
+        if key not in _SELFTEST_OBJECTIVES:
+            console.print(f"[red]✘[/red] unknown demo {escape(repr(demo))}; choose from: "
+                          + ", ".join(list(_SELFTEST_OBJECTIVES) + ["compare", "reject"]))
+            raise typer.Exit(ExitCode.USAGE)
+        directory = Path(out_dir).expanduser() if out_dir else None
+        payload = _worker_demo(key, out_dir=directory)
+        if as_json:
+            _emit(json.dumps(payload, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        summary = Table(title=f"runtime workers — {key}", title_justify="left", box=None,
+                        pad_edge=False)
+        summary.add_column("field", style="dim", no_wrap=True)
+        summary.add_column("value", overflow="fold")
+        summary.add_row("objective", escape(payload["objective"]))
+        summary.add_row("subagents", str(len(payload["subagents"])))
+        summary.add_row("workers", str(sum(sub["workers"] for sub in payload["subagents"])))
+        summary.add_row("rejection demo",
+                        f"{len(payload['rejection_example']['problems'])} problem(s)")
+        console.print(summary)
+        for sub in payload["subagents"]:
+            console.print()
+            console.print(worker_table_from_payload(sub))
+            console.print("[dim]split[/dim] " + escape(sub["split_rationale"][:110]))
+            console.print("[dim]waves[/dim] " + escape(" → ".join("+".join(wave) for wave in sub["waves"])))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    if role:
+        context = _selftest_context("exposure")
+        drafts = drafts_from_team(TeamDesign.model_validate(_team_payload("exposure")), context)
+        match = next((draft for draft in drafts if draft.role.lower() == role.strip().lower()), None)
+        if match is None:
+            console.print(f"[red]✘[/red] unknown role {escape(repr(role))}; choose from: "
+                          + ", ".join(draft.role for draft in drafts))
+            raise typer.Exit(ExitCode.USAGE)
+        plan = worker_plan_for(match)
+        if as_json:
+            _emit(json.dumps(json.loads(model_to_json(plan)), indent=2))
+            raise typer.Exit(ExitCode.OK)
+        assignment = assignment_for(match)
+        payload = _worker_demo("exposure")
+        chosen = next(sub for sub in payload["subagents"] if sub["role"] == match.role)
+        console.print()
+        console.print(worker_table_from_payload(chosen))
+        console.print("[dim]split[/dim] " + escape(plan.split_rationale[:110]))
+        console.print("[dim]independent[/dim] " + escape(", ".join(plan.independent_units())))
+        console.print("[dim]sequential[/dim] "
+                      + escape(", ".join(plan.dependent_units()) or "none"))
+        console.print("[dim]limit[/dim] " + escape(str(assignment.max_workers)) + " worker(s)")
+        for spec in chosen["worker_specs"]:
+            console.print()
+            console.print(Panel(Text("\n".join(
+                f"{key:<14}{value}" for key, value in (
+                    ("unit", spec["unit"]), ("covers", spec["covers"]),
+                    ("does not", "; ".join(spec["does_not_cover"])),
+                    ("tools", ", ".join(spec["tools"])),
+                    ("evidence", spec["expected_evidence"]),
+                    ("schema", spec["output_schema"]), ("budget", spec["budget"]),
+                    ("completion", "; ".join(spec["completion_criteria"])),
+                ))), title=f"[bold]{escape(str(spec['name']))}[/bold]", title_align="left",
+                border_style="cyan", expand=False))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    console.print("[red]✘[/red] use --demo {exposure|forensic|compare|reject}, --role ROLE or "
+                  "--self-test")
+    raise typer.Exit(ExitCode.USAGE)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 24. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 

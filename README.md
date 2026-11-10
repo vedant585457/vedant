@@ -13,6 +13,7 @@ python vedant_osint.py resilience --self-test # logging, cancellation, cleanup
 python vedant_osint.py adapter --self-test    # structured model output contract
 python vedant_osint.py master --self-test     # Master Agent boundaries
 python vedant_osint.py subagents --self-test  # runtime Subagent specifications
+python vedant_osint.py workers --self-test    # runtime Worker specifications
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -173,6 +174,39 @@ python vedant_osint.py subagents --demo reject    # what the Master is sent back
   with different roles, tools, deliverables and stop conditions from forensic's
   3, with no code change.
 
+## Dynamic Worker specifications
+
+No Worker has a class either. Each Subagent plans *its own* Workers from its own
+assignment: `SubagentWorkerPlanner` asks for a `WorkerPlan`, `validate_worker_specs`
+checks it against the assignment, and `SubagentWorkerFactory` is the only path to
+a stored `WorkerSpec` — the self-test parses the file to prove it.
+
+```bash
+python vedant_osint.py workers --self-test      # 115 guarantee checks, offline
+python vedant_osint.py workers --demo compare   # two objectives, two staffings
+python vedant_osint.py workers --role dns-and-archive
+python vedant_osint.py workers --demo reject    # what the Subagent is sent back
+```
+
+- **Every Worker carries** a narrow objective, the unit of work and what it does
+  *not* cover, allowed inputs, a subset of the parent's tools, the evidence it
+  must return, an output schema, a `WorkerBudget` (attempts × timeout × tokens)
+  and checkable completion criteria.
+- **A slice, not the assignment** — a mandate that restates the Subagent's
+  objective, or an objective as broad as the assignment, is refused. One Worker
+  carrying everything is refused unless the assignment was declared indivisible,
+  and the claim has to come from the design rather than from the Worker.
+- **No occupational roster** — `analyst`, `researcher`, `The Analyst` are refused
+  as Worker names exactly as they are refused as Subagent roles.
+- **Independence is computed** — units that read another unit's output are
+  chained and the rest are grouped into waves by the code, so "run these in
+  parallel" is a checked property rather than a claim.
+- **Refusal, then repair** — a bad plan is sent back as a bounded repair brief,
+  and `WorkerPlanError` (exit `7`) is raised if the Subagent never complies.
+- **Different Subagents, different shapes** — from the same code, one objective
+  produced three single-Worker Subagents plus one with two parallel Workers, the
+  other one plus two.
+
 ## Structured model adapter
 
 One interface between orchestration and every provider. `ModelAdapter` returns a
@@ -309,7 +343,7 @@ Authorised use only — collect from systems you own or are explicitly permitted
 |-------|-------|-------|
 | 1 | Foundation — CLI skeleton, config probing, version reporting | ✅ done |
 | 2 | Contracts — settings, `doctor`, preflight, models, state, renderer, lifecycle, resilience, model adapter | ✅ done |
-| 3 | Orchestration — Master Agent (only fixed agent) + runtime Subagent factory | 🟡 started (Master Agent, Subagent specifications) |
+| 3 | Orchestration — Master Agent (only fixed agent) + runtime Subagent/Worker factories | 🟡 started (Master Agent, Subagent and Worker specifications) |
 | 4 | Browser — browser-use / Playwright sessions and capture | ⬜ |
 | 5 | Collection — passive OSINT sources, artefact hashing | ⬜ |
 | 6 | Synthesis — cross-source correlation and reporting | ⬜ |
