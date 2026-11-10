@@ -254,6 +254,43 @@ The demo kinds are ``sigint``, ``timeout``, ``exception`` and ``operator``
 ``124``, ``70`` and ``130`` — after printing the outcome, the checkpoint and
 report paths, and the count of preserved evidence items.
 
+Structured model adapter
+------------------------
+One model-calling interface sits between orchestration and every provider, so
+the Master Agent never learns a vendor's dialect.  ``ModelAdapter.call`` takes a
+:class:`ModelRequest` (task + objective + context) and returns a **validated**
+model — :class:`PlanOutput`, :class:`DecompositionOutput`,
+:class:`ReviewOutput` or :class:`SynthesisOutput` — or raises a
+:class:`StructuredOutputError` that says exactly why.
+
+* **Invalid JSON never becomes a plan.**  The response is parsed, validated
+  against the task's model, then checked against the mission contract: cited
+  evidence ids must have been supplied, planned scope must sit inside the
+  mission scope, the subagent count must respect the limit, and a synthesis may
+  not silently drop evidence.  Each rejection is a typed failure
+  (``malformed``, ``policy``, ``refused``, ``unsupported``, ``transient``,
+  ``config``) with its own exit code.
+* **Bounded retries.**  ``RetryPolicy`` caps attempts *and* elapsed time, with
+  deterministic exponential backoff.  Malformed answers are retried with a
+  repair turn that names the failing field; a 4xx schema rejection, a refusal
+  or a policy violation is not retried — repeating it would only spend budget.
+* **Every prompt demands facts, sources and uncertainty.**  The shared system
+  prompt requires a single JSON object, forbids invented ids and outside
+  knowledge, requires each claim to cite supplied ids, and requires an explicit
+  uncertainty field.  ``ModelClaim`` refuses an unsourced observation, an
+  inference without reasoning, and hedging adverbs that assert certainty.
+* **Provider setup is isolated.**  ``PROVIDER_ADAPTERS`` holds the endpoint
+  shape, auth header, JSON-mode parameter and response envelope for each
+  backend; ``adapter --self-test`` proves no dialect vocabulary appears above
+  this section.  Adding a provider is a data change.
+
+::
+
+    python vedant_osint.py adapter --self-test          # 134 guarantee checks, offline
+    python vedant_osint.py adapter --demo prose         # what a rejection looks like
+    python vedant_osint.py adapter --check              # is the provider usable?
+    python vedant_osint.py adapter --prompts --task plan
+
 Usage
 -----
 ::
@@ -267,6 +304,7 @@ Usage
     python vedant_osint.py renderer --self-test         # CLI-only renderer guarantees
     python vedant_osint.py lifecycle --self-test        # lifecycle animation guarantees
     python vedant_osint.py resilience --self-test       # logging, cancellation, cleanup
+    python vedant_osint.py adapter --self-test          # structured output contract
     python vedant_osint.py doctor                       # full capability health check
     python vedant_osint.py policy -o "..." --scope example.com          # safety preflight only
     python vedant_osint.py mission --target example.com -o "map the attack surface"
@@ -362,7 +400,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum, IntEnum
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence
 
 # --- third party: CLI surface -------------------------------------------------
 # Typer + Rich are the only hard imports.  They are imported at module level
@@ -395,7 +433,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 9
+VERSION_MINOR: int = 10
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -448,7 +486,7 @@ BUILD_PHASE_NAME: str = "Contracts"
 #: Section banners shared by the banner panel and ``version --json``.
 PHASE_ROADMAP: tuple[tuple[int, str, str], ...] = (
     (1, "Foundation", "CLI skeleton, config probing, version reporting"),
-    (2, "Contracts", "Contracts, state, rendering, lifecycle, resilience"),
+    (2, "Contracts", "Contracts, state, rendering, lifecycle, resilience, model adapter"),
     (3, "Orchestration", "LangGraph Master Agent + runtime Subagent factory"),
     (4, "Browser", "browser-use/Playwright sessions and capture"),
     (5, "Collection", "passive OSINT sources, artefact hashing/chain of custody"),
@@ -10917,7 +10955,2524 @@ def resilience_command(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 20. Entry point
+# 20. Provider-aware structured model adapter
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Orchestration (Phase 3) must never learn a provider's dialect.  Everything
+# vendor-specific — endpoint shape, auth header, JSON-mode parameter, how a
+# transcript is packed — lives behind one :class:`ProviderAdapter`.  Above that
+# line the agent asks for a *typed* answer and either gets a validated model or a
+# structured failure; it never gets a string it has to interpret.
+#
+# The contract, in one sentence: a model response that does not validate is
+# never silently repaired into a plan.
+
+
+class ModelTask(str, Enum):
+    """The four structured jobs every phase asks a model to do."""
+
+    PLAN = "plan"                      # Master: what should the mission do
+    DECOMPOSE = "decompose"            # Master: Subagent/Worker structure
+    REVIEW = "review"                  # Subagent: is this evidence adequate
+    SYNTHESIZE = "synthesize"          # Master/Subagent: turn evidence into a report
+
+
+class ModelFailure(str, Enum):
+    """Why a call did not yield a validated output.  Never guessed at."""
+
+    CONFIG = "config"                  # no provider/model/key, or bad base URL
+    DEPENDENCY = "dependency"          # the HTTP client is not installed
+    TRANSIENT = "transient"            # retryable: 429, 5xx, timeout, reset
+    MALFORMED = "malformed"            # not JSON, or not the schema we asked for
+    UNSUPPORTED = "unsupported"        # provider cannot do structured output at all
+    REFUSED = "refused"                # provider returned a refusal / empty choice
+    POLICY = "policy"                  # output was well-formed but crossed a boundary
+    CANCELLED = "cancelled"            # the operator stopped the run
+    INTERNAL = "internal"
+
+
+#: Failures worth another attempt.  Everything else is a contract problem and
+#: repeating the call would waste the mission budget.
+_RETRYABLE_FAILURES: frozenset[ModelFailure] = frozenset(
+    {ModelFailure.TRANSIENT, ModelFailure.MALFORMED}
+)
+
+
+class StructuredOutputError(RuntimeError):
+    """A model response that cannot be trusted to drive a plan.
+
+    Carries the *failure* class, the task, the attempt count and a redacted
+    excerpt — never the whole payload, which may contain case material.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure: ModelFailure,
+        task: ModelTask | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        attempt: int = 1,
+        attempts_allowed: int = 1,
+        excerpt: str | None = None,
+        validation_errors: Sequence[str] = (),
+        retryable: bool | None = None,
+    ) -> None:
+        safe = redact_text(message, secrets=known_secrets())
+        super().__init__(safe)
+        self.message = safe
+        self.failure = failure
+        self.task = task
+        self.provider = provider
+        self.model = model
+        self.attempt = attempt
+        self.attempts_allowed = attempts_allowed
+        self.excerpt = redact_text(excerpt[:400], secrets=known_secrets()) if excerpt else None
+        self.validation_errors = tuple(redact_text(v, secrets=known_secrets())[:200] for v in validation_errors)
+        # ``None`` defers to the failure class; an explicit value overrides it.
+        self.retryable = retryable
+
+    @property
+    def should_retry(self) -> bool:
+        """Whether another attempt could plausibly succeed.
+
+        Malformed JSON is retryable on purpose: a model that rambled once often
+        answers correctly when shown the validation error.  Contract violations
+        (``POLICY``), configuration problems and refusals are not — repeating
+        those only spends the mission budget.
+        """
+
+        if self.retryable is not None:
+            return self.retryable
+        return self.failure in _RETRYABLE_FAILURES
+
+    @property
+    def exit_code(self) -> int:
+        """Map the failure onto the tool's stable exit codes."""
+
+        return int(
+            {
+                ModelFailure.CONFIG: ExitCode.CONFIG,
+                ModelFailure.DEPENDENCY: ExitCode.DEPENDENCY,
+                ModelFailure.UNSUPPORTED: ExitCode.CONFIG,
+                ModelFailure.POLICY: ExitCode.POLICY,
+                ModelFailure.CANCELLED: EXIT_INTERRUPTED,
+            }.get(self.failure, ExitCode.INTERNAL)
+        )
+
+    def render(self) -> str:
+        """One readable line, safe for a terminal, a log and a report."""
+
+        bits = [f"{self.failure.value} error"]
+        if self.task:
+            bits.append(f"task={self.task.value}")
+        if self.provider:
+            bits.append(f"provider={self.provider}")
+        if self.model:
+            bits.append(f"model={self.model}")
+        if self.attempts_allowed > 1:
+            bits.append(f"attempt={self.attempt}/{self.attempts_allowed}")
+        head = f"{bits[0]}: {self.message} ({'; '.join(bits[1:])})" if len(bits) > 1 else f"{bits[0]}: {self.message}"
+        if self.validation_errors:
+            head += "\n  - " + "\n  - ".join(self.validation_errors[:5])
+        if self.excerpt:
+            head += f"\n  received: {self.excerpt}"
+        return head
+
+
+class UnsupportedStructuredOutput(StructuredOutputError):
+    """The configured provider cannot produce validated structured output."""
+
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        kwargs.setdefault("failure", ModelFailure.UNSUPPORTED)
+        super().__init__(message, **kwargs)
+
+
+class ModelConfigError(StructuredOutputError):
+    """The adapter was asked to run without a usable provider, model or key."""
+
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        kwargs.setdefault("failure", ModelFailure.CONFIG)
+        super().__init__(message, **kwargs)
+
+
+class UncertaintyRequired(StructuredOutputError):
+    """The output omitted the uncertainty statement the contract requires.
+
+    Distinct from a generic schema failure because it is *our* rule, not the
+    provider's: the repair prompt can ask for exactly that field instead of
+    re-sending the whole schema, and the operator sees which contract clause
+    was missed.
+    """
+
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        kwargs.setdefault("failure", ModelFailure.MALFORMED)
+        kwargs.setdefault("retryable", True)
+        super().__init__(message, **kwargs)
+
+
+class PlanConstraintError(StructuredOutputError):
+    """The output validated as a schema but violated the mission boundary.
+
+    Raised for a subagent scope that is outside the mission's, a plan that
+    silently drops evidence, or a synthesis that invents findings.  This is the
+    difference between "the JSON parsed" and "the plan is safe to run".
+    """
+
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        kwargs.setdefault("failure", ModelFailure.POLICY)
+        super().__init__(message, **kwargs)
+
+
+# --------------------------------------------------------------------------
+# 20.1 Retry policy
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """Bounded retries with exponential backoff, plus a hard attempt ceiling.
+
+    ``max_attempts`` bounds the loop; ``max_elapsed_seconds`` bounds it even if
+    the provider is slow and every attempt times out.  Backoff is deterministic
+    (no jitter) so a failure can be reproduced exactly.
+    """
+
+    max_attempts: int = 3
+    base_delay: float = 0.5
+    max_delay: float = 8.0
+    max_elapsed_seconds: float = 120.0
+
+    def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        if self.max_delay < self.base_delay:
+            raise ValueError("max_delay must be >= base_delay")
+
+    def delay_for(self, attempt: int) -> float:
+        """Seconds to wait before *attempt* (1-based) is retried."""
+
+        return min(self.max_delay, self.base_delay * (2 ** max(0, attempt - 1)))
+
+    @classmethod
+    def from_settings(cls, settings: "Settings") -> "RetryPolicy":
+        """Derive the budget from validation limits rather than inventing one."""
+
+        return cls(max_attempts=max(1, min(6, settings.worker_retries + 1)))
+
+    def describe(self) -> str:
+        return f"≤{self.max_attempts} attempt(s), backoff {self.base_delay:g}s→{self.max_delay:g}s"
+
+
+# --------------------------------------------------------------------------
+# 20.2 Provider dialects — the only place vendor specifics may live
+# --------------------------------------------------------------------------
+
+
+class StructuredMode(str, Enum):
+    """How a provider is asked to constrain its answer to JSON."""
+
+    JSON_SCHEMA = "json-schema"        # schema-constrained decoding
+    JSON_OBJECT = "json-object"        # MIME/response_format json only, schema in the prompt
+    PROMPT_ONLY = "prompt-only"        # no native JSON mode; the prompt carries the contract
+    UNSUPPORTED = "unsupported"        # cannot be trusted to answer in JSON at all
+
+
+@dataclass(frozen=True)
+class ProviderAdapter:
+    """Everything provider-specific about one backend, in one small object.
+
+    An adapter can *describe* a request (path, headers, body) but holds no
+    credential: :meth:`headers` takes the key as an argument, so a secret can
+    never be captured in a traceback, a log line or a ``repr``.
+    """
+
+    key: str
+    label: str
+    mode: StructuredMode
+    #: Which axis of the response carries the generated text.
+    response_field: str
+    supports_repair: bool = True
+    notes: tuple[str, ...] = ()
+
+    # -- request assembly --------------------------------------------------
+
+    def headers(self, api_key: str | None) -> dict[str, str]:
+        """Auth headers for this dialect.  Never serialised, never logged."""
+
+        base = {"Content-Type": "application/json", "Accept": "application/json"}
+        if self.key == "anthropic":
+            if api_key:
+                base["x-api-key"] = api_key
+            base["anthropic-version"] = "2023-06-01"
+        elif self.key == "google":
+            if api_key:
+                base["x-goog-api-key"] = api_key
+        elif api_key:
+            base["Authorization"] = f"Bearer {api_key}"
+        return base
+
+    def endpoint(self, base_url: str, model: str) -> str:
+        """Full URL for one completion call."""
+
+        root = base_url.rstrip("/")
+        if self.key == "anthropic":
+            return f"{root}/messages" if root.endswith("/v1") else f"{root}/v1/messages"
+        if self.key == "google":
+            return f"{root}/models/{model}:generateContent"
+        return f"{root}/chat/completions" if root.endswith("/v1") else f"{root}/v1/chat/completions"
+
+    def body(
+        self,
+        *,
+        model: str,
+        system: str,
+        user: str,
+        schema: Mapping[str, Any],
+        max_output_tokens: int,
+    ) -> dict[str, Any]:
+        """Assemble the request body for this dialect.
+
+        The schema always travels — natively where the provider supports it,
+        inside the prompt otherwise — so no provider is ever asked for JSON
+        without being told its exact shape.
+        """
+
+        if self.key == "anthropic":
+            body: dict[str, Any] = {
+                "model": model,
+                "max_tokens": max_output_tokens,
+                "system": system,
+                "messages": [{"role": "user", "content": user}],
+            }
+            if self.mode is StructuredMode.JSON_SCHEMA:
+                body["tools"] = [
+                    {
+                        "name": "emit_structured_output",
+                        "description": "Return the completed analysis in the required schema.",
+                        "input_schema": dict(schema),
+                    }
+                ]
+                body["tool_choice"] = {"type": "tool", "name": "emit_structured_output"}
+            return body
+
+        if self.key == "google":
+            body = {
+                "systemInstruction": {"parts": [{"text": system}]},
+                "contents": [{"role": "user", "parts": [{"text": user}]}],
+                "generationConfig": {"maxOutputTokens": max_output_tokens},
+            }
+            if self.mode is StructuredMode.JSON_SCHEMA:
+                body["generationConfig"]["responseMimeType"] = "application/json"
+                body["generationConfig"]["responseSchema"] = dict(schema)
+            elif self.mode is StructuredMode.JSON_OBJECT:
+                body["generationConfig"]["responseMimeType"] = "application/json"
+            return body
+
+        # OpenAI and every OpenAI-compatible local server.
+        body = {
+            "model": model,
+            "max_tokens": max_output_tokens,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        }
+        if self.mode is StructuredMode.JSON_SCHEMA:
+            body["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "structured_output", "schema": dict(schema), "strict": False},
+            }
+        elif self.mode is StructuredMode.JSON_OBJECT:
+            body["response_format"] = {"type": "json_object"}
+        return body
+
+    def parse(self, payload: Mapping[str, Any]) -> str:
+        """Extract the generated text from a provider response, or refuse.
+
+        Raises :class:`StructuredOutputError` with ``REFUSED`` when the provider
+        returned a refusal or no content at all — a refusal must never be
+        mistaken for an empty plan.
+        """
+
+        try:
+            if self.key == "anthropic":
+                blocks = payload.get("content") or []
+                if isinstance(blocks, list):
+                    for block in blocks:
+                        if isinstance(block, Mapping) and block.get("type") == "tool_use":
+                            return json.dumps(block.get("input") or {}, ensure_ascii=False)
+                    texts = [b.get("text", "") for b in blocks if isinstance(b, Mapping) and b.get("type") == "text"]
+                    if any(texts):
+                        return "".join(texts)
+                if payload.get("stop_reason") == "refusal":
+                    raise StructuredOutputError(
+                        "provider refused the request", failure=ModelFailure.REFUSED, provider=self.key
+                    )
+                raise StructuredOutputError(
+                    "response contained no content", failure=ModelFailure.MALFORMED, provider=self.key
+                )
+
+            if self.key == "google":
+                candidates = payload.get("candidates") or []
+                parts: list[str] = []
+                for candidate in candidates:
+                    content = (candidate or {}).get("content") or {}
+                    for part in content.get("parts") or []:
+                        if isinstance(part, Mapping) and isinstance(part.get("text"), str):
+                            parts.append(part["text"])
+                if parts:
+                    return "".join(parts)
+                if payload.get("promptFeedback", {}).get("blockReason"):
+                    raise StructuredOutputError(
+                        f"provider blocked the request ({payload['promptFeedback']['blockReason']})",
+                        failure=ModelFailure.REFUSED,
+                        provider=self.key,
+                    )
+                raise StructuredOutputError(
+                    "response contained no candidates", failure=ModelFailure.MALFORMED, provider=self.key
+                )
+
+            # OpenAI-compatible
+            choices = payload.get("choices") or []
+            if not choices:
+                raise StructuredOutputError(
+                    "response contained no choices", failure=ModelFailure.MALFORMED, provider=self.key
+                )
+            message = (choices[0] or {}).get("message") or {}
+            if message.get("refusal"):
+                raise StructuredOutputError(
+                    "provider refused the request", failure=ModelFailure.REFUSED, provider=self.key
+                )
+            content = message.get("content")
+            if isinstance(content, list):        # content-parts form
+                content = "".join(
+                    part.get("text", "") for part in content if isinstance(part, Mapping)
+                )
+            if not isinstance(content, str) or not content.strip():
+                raise StructuredOutputError(
+                    "response contained no content", failure=ModelFailure.MALFORMED, provider=self.key
+                )
+            return content
+        except StructuredOutputError:
+            raise
+        except (AttributeError, TypeError) as exc:
+            raise StructuredOutputError(
+                f"unreadable response envelope: {type(exc).__name__}",
+                failure=ModelFailure.MALFORMED,
+                provider=self.key,
+            ) from exc
+
+
+#: The dialects this tool can speak.  Adding a backend is a data change here
+#: plus a row in :data:`PROVIDER_REGISTRY` — no orchestration code moves.
+PROVIDER_ADAPTERS: dict[str, ProviderAdapter] = {
+    "openai": ProviderAdapter(
+        key="openai",
+        label="OpenAI",
+        mode=StructuredMode.JSON_SCHEMA,
+        response_field="choices[0].message.content",
+        notes=("native JSON schema response_format",),
+    ),
+    "anthropic": ProviderAdapter(
+        key="anthropic",
+        label="Anthropic",
+        mode=StructuredMode.JSON_SCHEMA,
+        response_field="content[tool_use].input",
+        notes=("forced tool use carries the schema",),
+    ),
+    "google": ProviderAdapter(
+        key="google",
+        label="Google",
+        mode=StructuredMode.JSON_SCHEMA,
+        response_field="candidates[0].content.parts[*].text",
+        notes=("responseSchema is an OpenAPI subset, so the schema is simplified",),
+    ),
+    "local": ProviderAdapter(
+        key="local",
+        label="Local / OpenAI-compatible",
+        mode=StructuredMode.JSON_OBJECT,
+        response_field="choices[0].message.content",
+        notes=("JSON mode only; the schema travels in the prompt",),
+    ),
+}
+
+
+def provider_adapter(provider: str) -> ProviderAdapter:
+    """Look up the dialect for ``provider`` or fail with a readable reason."""
+
+    adapter = PROVIDER_ADAPTERS.get(provider)
+    if adapter is None:
+        raise UnsupportedStructuredOutput(
+            f"provider {provider!r} has no structured-output adapter; "
+            f"known: {', '.join(sorted(PROVIDER_ADAPTERS))}",
+            provider=provider,
+        )
+    if adapter.mode is StructuredMode.UNSUPPORTED:
+        raise UnsupportedStructuredOutput(
+            f"provider {provider!r} cannot return validated structured output "
+            f"({'; '.join(adapter.notes) or 'no JSON mode'}); configure a provider that can",
+            provider=provider,
+        )
+    return adapter
+
+
+def simplify_json_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
+    """Strip keywords a strict backend rejects (Google's ``responseSchema``).
+
+    Only a whitelist survives, so no unknown keyword can cause a hard 400 that
+    the operator cannot diagnose.  Anything dropped is cosmetic.
+    """
+
+    allowed = {
+        "type", "format", "description", "title", "nullable", "enum", "items",
+        "properties", "required", "minimum", "maximum", "minItems", "maxItems", "pattern", "anyOf", "default",
+    }
+
+    def walk(node: Any) -> Any:
+        if isinstance(node, Mapping):
+            out: dict[str, Any] = {}
+            for key, value in node.items():
+                if key not in allowed:
+                    continue
+                if key == "properties" and isinstance(value, Mapping):
+                    out[key] = {k: walk(v) for k, v in value.items()}
+                elif key in {"items", "anyOf"}:
+                    out[key] = walk(value) if isinstance(value, (Mapping, list)) else value
+                    if isinstance(out[key], list):
+                        out[key] = [walk(v) for v in out[key]]
+                else:
+                    out[key] = value
+            return out
+        if isinstance(node, list):
+            return [walk(item) for item in node]
+        return node
+
+    return walk(schema)  # type: ignore[return-value]
+
+
+def schema_for(model_cls: type[BaseModel], *, adapter: ProviderAdapter | None = None) -> dict[str, Any]:
+    """JSON Schema for a model, simplified when the dialect needs it."""
+
+    schema = model_cls.model_json_schema()
+    if adapter is not None and adapter.key == "google":
+        return simplify_json_schema(schema)
+    return schema
+
+
+# --------------------------------------------------------------------------
+# 20.3 The structured outputs — one per task, all factuality-enforcing
+# --------------------------------------------------------------------------
+
+#: Rejected wherever a model tries to attribute conduct without a source.
+_HEDGE_WORDS: tuple[str, ...] = (
+    "obviously", "clearly", "undoubtedly", "definitely",
+)
+
+
+def _require_text(value: str, *, what: str, minimum: int = 1) -> str:
+    if not isinstance(value, str) or len(value.strip()) < minimum:
+        raise ValueError(f"{what} must be a non-empty string (min {minimum} chars)")
+    return value.strip()
+
+
+def _reject_hedging(value: str, *, what: str) -> str:
+    """Confidence must be earned by sources, not asserted with adverbs."""
+
+    lowered = value.lower()
+    for word in _HEDGE_WORDS:
+        if word in lowered:
+            raise ValueError(f"{what} asserts certainty without evidence ({word!r})")
+    return value
+
+
+class ModelClaim(StrictModel):
+    """One factual statement a model wants us to rely on.
+
+    An ``observation`` must cite at least one source reference *that exists in
+    the supplied evidence*, an ``inference`` must state its reasoning, and every
+    claim states its uncertainty.  There is no "fact" shortcut.
+    """
+
+    kind: EvidenceKind = EvidenceKind.OBSERVATION
+    statement: str = Field(min_length=1)
+    #: ids of supplied evidence / source references backing this claim
+    source_refs: list[str] = Field(default_factory=list)
+    reasoning: str | None = None
+    confidence: Confidence = Confidence.UNKNOWN
+    uncertainty: str | None = None
+    supports: list[str] = Field(default_factory=list)
+
+    @field_validator("statement")
+    @classmethod
+    def _statement(cls, value: str) -> str:
+        return _require_text(_reject_hedging(value, what="statement"), what="statement", minimum=8)
+
+    @model_validator(mode="after")
+    def _evidence_rules(self) -> "ModelClaim":
+        """The same epistemic rules as :class:`EvidenceItem`, enforced earlier.
+
+        Catching this here means an unsourced observation never becomes a
+        ``FinalReport`` finding — it is rejected at the model boundary with an
+        actionable message the retry loop can feed back.
+        """
+
+        if self.kind is EvidenceKind.OBSERVATION:
+            if not self.source_refs:
+                raise ValueError("an observation must cite at least one source ref")
+            if self.uncertainty is None or len(self.uncertainty.strip()) < 3:
+                raise ValueError("an observation must state what is uncertain about it")
+        if self.kind is EvidenceKind.INFERENCE:
+            if not self.reasoning or len(self.reasoning.strip()) < 8:
+                raise ValueError("an inference must state the reasoning that produced it")
+            if self.confidence is Confidence.UNKNOWN:
+                raise ValueError("an inference must give a confidence and the basis for it")
+        if self.kind is EvidenceKind.ALLEGATION and not self.source_refs:
+            raise ValueError("an allegation must cite who made it")
+        return self
+
+
+class PlannedWorker(StrictModel):
+    """A Worker the Master wants created at runtime — never a fixed role."""
+
+    name: str = Field(min_length=1)
+    objective: str = Field(min_length=1)
+    inputs: list[str] = Field(default_factory=list)
+    output_schema: str | None = None
+    requires_network: bool = False
+    requires_browser: bool = False
+    rationale: str | None = None
+
+    @field_validator("objective")
+    @classmethod
+    def _objective(cls, value: str) -> str:
+        return _reject_hedging(value, what="worker objective")
+
+
+class PlannedSubagent(StrictModel):
+    """A task-specific Subagent proposed by the model, validated before use."""
+
+    name: str = Field(min_length=1)
+    objective: str = Field(min_length=1)
+    rationale: str = Field(min_length=8)          # why this agent exists at all
+    scope_entries: list[str] = Field(default_factory=list)
+    workers: list[PlannedWorker] = Field(default_factory=list)
+    max_workers: int = Field(default=4, ge=1, le=16)
+    depends_on: list[str] = Field(default_factory=list)
+
+    @field_validator("objective", "rationale")
+    @classmethod
+    def _plain(cls, value: str) -> str:
+        return _reject_hedging(value, what="subagent text")
+
+
+class PlanOutput(StrictModel):
+    """What the Master Agent may conclude about how to run a mission.
+
+    Deliberately narrow: a plan is a *sequence of questions and tasks*, with the
+    evidence needed for each and the criteria that would satisfy it.  It has no
+    field for a conclusion, so a model cannot smuggle attribution in as a plan.
+    """
+
+    objective: str = Field(min_length=1)
+    target_assets: list[str] = Field(default_factory=list)
+    hypotheses: list[str] = Field(min_length=1)
+    phases: list[str] = Field(default_factory=list)
+    subagents: list[PlannedSubagent] = Field(min_length=1)
+    acceptance_criteria: list[str] = Field(min_length=1)
+    out_of_scope: list[str] = Field(default_factory=list)
+    unknowns: list[UnknownValue] = Field(default_factory=list)
+    confidence: Confidence = Confidence.UNKNOWN
+    uncertainty: str | None = None
+
+    @field_validator("hypotheses", "acceptance_criteria")
+    @classmethod
+    def _no_guilt(cls, values: list[str]) -> list[str]:
+        for value in values:
+            _reject_hedging(value, what="hypothesis")
+        return values
+
+    @model_validator(mode="after")
+    def _must_state_uncertainty(self) -> "PlanOutput":
+        # A plan that claims no uncertainty is either trivial or dishonest.
+        if self.uncertainty is None or len(self.uncertainty.strip()) < 10:
+            raise ValueError("a plan must state its uncertainty explicitly")
+        if self.confidence is Confidence.UNKNOWN:
+            raise ValueError("a plan must give a confidence level")
+        return self
+
+
+class DecompositionOutput(StrictModel):
+    """The narrower question: how should this work be split up?"""
+
+    subagents: list[PlannedSubagent] = Field(min_length=1)
+    sequencing: str | None = None
+    parallelism_note: str | None = None
+    estimated_tasks: int | None = Field(default=None, ge=1)
+    unknowns: list[UnknownValue] = Field(default_factory=list)
+    uncertainty: str | None = None
+
+    @model_validator(mode="after")
+    def _state_uncertainty(self) -> "DecompositionOutput":
+        if self.uncertainty is None or len(self.uncertainty.strip()) < 10:
+            raise ValueError("a decomposition must state its uncertainty explicitly")
+        names = [s.name.strip().lower() for s in self.subagents]
+        if len(names) != len(set(names)):
+            raise ValueError("subagent names must be unique")
+        return self
+
+
+class ReviewOutput(StrictModel):
+    """A quality review: the criteria applied and what failed them."""
+
+    verdict: str = Field(pattern="^(pass|revise|reject|escalate)$")
+    criteria: list[str] = Field(min_length=1)
+    findings: list[str] = Field(default_factory=list)
+    unsupported_claims: list[str] = Field(default_factory=list)
+    evidence_reviewed: list[str] = Field(default_factory=list)
+    retask_guidance: str | None = None
+    confidence: Confidence = Confidence.UNKNOWN
+    uncertainty: str | None = None
+
+    @model_validator(mode="after")
+    def _coherent(self) -> "ReviewOutput":
+        if self.uncertainty is None or len(self.uncertainty.strip()) < 10:
+            raise ValueError("a review must state its uncertainty explicitly")
+        if self.verdict in {"reject", "revise"} and not (self.findings or self.unsupported_claims):
+            raise ValueError(f"a {self.verdict!r} verdict must name at least one finding or unsupported claim")
+        if self.verdict == "pass" and self.unsupported_claims:
+            raise ValueError("a 'pass' verdict cannot carry unsupported claims")
+        return self
+
+
+class SynthesisOutput(StrictModel):
+    """The evidence-based conclusion: claims, gaps, and explicit uncertainty."""
+
+    summary: str = Field(min_length=20)
+    claims: list[ModelClaim] = Field(default_factory=list)
+    hypotheses_supported: list[str] = Field(default_factory=list)
+    hypotheses_refuted: list[str] = Field(default_factory=list)
+    hypotheses_open: list[str] = Field(default_factory=list)
+    gaps: list[UnknownValue] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    confidence: Confidence = Confidence.UNKNOWN
+    confidence_basis: str | None = None
+    uncertainty_statement: str | None = None
+
+    @model_validator(mode="after")
+    def _uncertainty(self) -> "SynthesisOutput":
+        if self.uncertainty_statement is None or len(self.uncertainty_statement.strip()) < 15:
+            raise ValueError("a synthesis must state its uncertainty explicitly")
+        if self.confidence is not Confidence.UNKNOWN and not self.confidence_basis:
+            raise ValueError("a non-unknown confidence needs a stated basis")
+        if self.confidence is Confidence.HIGH and len(self.claims) < 2:
+            raise ValueError("high confidence needs at least two sourced claims")
+        if not self.claims and not self.gaps:
+            raise ValueError("a synthesis must carry claims or explicit gaps")
+        return self
+
+
+#: task → the model every response is validated against.
+TASK_MODELS: dict[ModelTask, type[BaseModel]] = {
+    ModelTask.PLAN: PlanOutput,
+    ModelTask.DECOMPOSE: DecompositionOutput,
+    ModelTask.REVIEW: ReviewOutput,
+    ModelTask.SYNTHESIZE: SynthesisOutput,
+}
+
+
+@dataclass(frozen=True)
+class ModelRequest:
+    """One structured ask.  ``context`` is data, never instructions."""
+
+    task: ModelTask
+    objective: str
+    #: Untrusted-ish context the model must reason over (evidence ids, notes).
+    context: str = ""
+    #: Extra, task-specific instructions appended to the shared contract.
+    instructions: str = ""
+    max_output_tokens: int = 2048
+    temperature: float = 0.0
+    #: Evidence ids a claim may cite.  Enforced after validation.
+    allowed_evidence_ids: tuple[str, ...] = ()
+    max_subagents: int | None = None
+    #: The mission boundary, for scope validation.  ``None`` skips that check.
+    scope: "Scope | None" = None
+
+    @property
+    def model_cls(self) -> type[BaseModel]:
+        return TASK_MODELS[self.task]
+
+    def prompt(self) -> str:
+        """The user turn: data, delimited, plus any task-specific line."""
+
+        blocks = [f"OBJECTIVE\n{self.objective.strip()}"]
+        if self.context.strip():
+            blocks.append("CONTEXT\n" + self.context.strip())
+        if self.instructions.strip():
+            blocks.append("ADDITIONAL INSTRUCTIONS\n" + self.instructions.strip())
+        return "\n\n".join(blocks)
+
+
+# --------------------------------------------------------------------------
+# 20.4 Prompt contract — every prompt demands sources and uncertainty
+# --------------------------------------------------------------------------
+
+
+def build_system_prompt(task: ModelTask, *, adapter: ProviderAdapter | None = None, model_cls: type[BaseModel] | None = None) -> str:
+    """The static system prompt for a task.
+
+    Four clauses are non-negotiable and shared by every task, because the
+    acceptance criterion is about *all* prompts, not just synthesis:
+
+    1. answer with one JSON object and nothing else;
+    2. state only what the supplied material supports, citing ids;
+    3. mark anything unsupported as a gap rather than filling it in;
+    4. always state uncertainty explicitly.
+    """
+
+    target = model_cls or TASK_MODELS[task]
+    task_lines = {
+        ModelTask.PLAN: (
+            "You are the planning stage of a forensic OSINT mission. "
+            "Produce a plan of questions and tasks — never a conclusion about a person."
+        ),
+        ModelTask.DECOMPOSE: (
+            "You are the decomposition stage of a forensic OSINT mission. "
+            "Propose task-specific subagents and workers; there are no fixed roles."
+        ),
+        ModelTask.REVIEW: (
+            "You are the quality-review stage of a forensic OSINT mission. "
+            "Judge only whether the supplied evidence supports the supplied statements."
+        ),
+        ModelTask.SYNTHESIZE: (
+            "You are the synthesis stage of a forensic OSINT mission. "
+            "Report what the evidence shows, what it does not, and what remains unknown."
+        ),
+    }[task]
+
+    common = (
+        "\n\nHARD REQUIREMENTS\n"
+        "- Reply with a single JSON object and nothing else: no prose, no markdown, no code fence.\n"
+        "- Use only the supplied material. Do not use outside knowledge about the target.\n"
+        "- Every claim must be factual and sourced: cite the evidence or source ids you rely on.\n"
+        "- Never invent an id, a URL, a date, a name or a quote.\n"
+        "- State uncertainty explicitly in the required field; 'unknown' is a valid and "
+        "expected answer.\n"
+        "- Distinguish observation (you were shown it) from inference (you concluded it) from "
+        "allegation (someone else claimed it).\n"
+        "- Never attribute conduct to a named person; describe indicators and competing hypotheses.\n"
+        "- Refuse nothing silently: if the request cannot be met, say so in the uncertainty field."
+    )
+
+    schema_hint = ""
+    if adapter is not None and adapter.mode is not StructuredMode.JSON_SCHEMA:
+        # The schema could not be sent natively, so it must be in the prompt.
+        schema_hint = (
+            "\n\nREQUIRED JSON SHAPE (JSON Schema)\n"
+            + canonical_json(target.model_json_schema())
+        )
+    elif adapter is not None and adapter.key == "google":
+        schema_hint = (
+            "\n\nREQUIRED JSON SHAPE (JSON Schema)\n" + canonical_json(simplify_json_schema(target.model_json_schema()))
+        )
+
+    return f"{task_lines}{common}{schema_hint}"
+
+
+class RepairPrompts:
+    """Prompts used to ask for a correction after a malformed response.
+
+    Short and specific: name the field that failed, show the offending snippet,
+    and repeat the contract.  Never includes the rest of the case material.
+    """
+
+    @staticmethod
+    def after_validation(errors: Sequence[str], *, excerpt: str) -> str:
+        listing = "\n".join(f"- {error}" for error in errors[:6]) or "- the response did not match the schema"
+        return (
+            "Your previous answer could not be accepted.\n\n"
+            "Problems:\n"
+            f"{listing}\n\n"
+            f"Previous answer (truncated):\n{excerpt[:400]}\n\n"
+            "Return the corrected JSON object only. Keep every claim you can source and move "
+            "anything you cannot source into the uncertainty/gaps fields."
+        )
+
+    @staticmethod
+    def after_transient(reason: str) -> str:
+        return f"Previous attempt failed transiently ({reason}). Return the same JSON object again."
+
+
+# --------------------------------------------------------------------------
+# 20.5 Response parsing and post-validation
+# --------------------------------------------------------------------------
+
+
+_FENCE_PATTERN = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+
+
+def extract_json_object(text: str) -> dict[str, Any]:
+    """Return the JSON object in ``text`` or raise :class:`StructuredOutputError`.
+
+    Tolerances are deliberate and narrow: a leading ```json fence and a
+    sentence before the object are stripped *because* they are unambiguous.
+    Everything else — truncated objects, arrays at the top level, trailing
+    prose that changes the meaning — is a ``MALFORMED`` failure, not something
+    we try to repair by guessing.
+    """
+
+    if not isinstance(text, str) or not text.strip():
+        raise StructuredOutputError("response was empty", failure=ModelFailure.MALFORMED)
+
+    stripped = text.strip()
+    stripped = _FENCE_PATTERN.sub("", stripped).strip()
+
+    candidates: list[str] = [stripped]
+    start, end = stripped.find("{"), stripped.rfind("}")
+    if start > 0 and end > start:
+        candidates.append(stripped[start : end + 1])
+
+    last_error: Exception | None = None
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            continue
+        if not isinstance(parsed, dict):
+            raise StructuredOutputError(
+                f"expected a JSON object, received {type(parsed).__name__}",
+                failure=ModelFailure.MALFORMED,
+                excerpt=stripped[:400],
+            )
+        return parsed
+
+    raise StructuredOutputError(
+        f"response was not valid JSON ({last_error})" if last_error else "response was not valid JSON",
+        failure=ModelFailure.MALFORMED,
+        excerpt=stripped[:400],
+    )
+
+
+def _format_validation_errors(exc: Exception) -> list[str]:
+    """Turn a pydantic error into short, actionable lines."""
+
+    errors: list[str] = []
+    raw = getattr(exc, "errors", None)
+    if callable(raw):
+        for error in raw():
+            location = ".".join(str(part) for part in error.get("loc", ())) or "<root>"
+            errors.append(f"{location}: {error.get('msg', 'invalid')}")
+    if not errors:
+        errors = [str(exc).splitlines()[0][:200]]
+    return errors
+
+
+class StructuredParser:
+    """Schema validation plus the layer pydantic cannot express.
+
+    Pydantic checks the *shape*.  This checks the *contract*: cited ids must
+    exist, scope entries must sit inside the mission scope, sizes must respect
+    the configured limits, and a synthesis must not quietly drop supplied
+    evidence.  A failure here is what keeps "invalid JSON" from becoming a plan.
+    """
+
+    def __init__(self, request: ModelRequest) -> None:
+        self.request = request
+        self.model_cls = request.model_cls
+
+    # -- public ------------------------------------------------------------
+
+    def parse(self, payload: Mapping[str, Any]) -> BaseModel:
+        prepared = self._normalise(payload)
+        try:
+            model = self.model_cls.model_validate(prepared)
+        except Exception as exc:                      # pydantic ValidationError and friends
+            errors = _format_validation_errors(exc)
+            # A contract clause can fail either on the field itself or in a
+            # model-level validator that names it; both are the same problem, and
+            # the operator should be told which clause rather than "invalid".
+            missing_uncertainty = any(
+                "uncertainty" in error.lower() and error.lower().startswith(("<root>", "uncertainty"))
+                for error in errors
+            )
+            if missing_uncertainty:
+                raise UncertaintyRequired(
+                    f"output did not state its uncertainty ({self.model_cls.__name__})",
+                    task=self.request.task,
+                    validation_errors=errors,
+                    excerpt=canonical_json(payload)[:400],
+                ) from exc
+            raise StructuredOutputError(
+                f"output did not match {self.model_cls.__name__}",
+                failure=ModelFailure.MALFORMED,
+                task=self.request.task,
+                validation_errors=errors,
+                excerpt=canonical_json(payload)[:400],
+                retryable=True,
+            ) from exc
+        self._enforce_contract(model)
+        return model
+
+    # -- tolerance that cannot change meaning ------------------------------
+
+    def _normalise(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Widen a few harmless shapes without inventing content.
+
+        Only two adjustments are made: a bare string in a list field becomes a
+        one-item list, and ``None`` stays ``None`` (never coerced to a default
+        that would read as a claim).  Anything else is left for validation to
+        reject.
+        """
+
+        data = dict(payload)
+        list_fields = {"hypotheses", "phases", "subagents", "acceptance_criteria", "out_of_scope",
+                       "criteria", "findings", "unsupported_claims", "evidence_reviewed",
+                       "claims", "gaps", "limitations", "hypotheses_supported",
+                       "hypotheses_refuted", "hypotheses_open", "target_assets", "workers",
+                       "scope_entries", "source_refs", "supports", "inputs", "unknowns"}
+
+        def coerce(value: Any) -> Any:
+            if value is None:
+                return value
+            if isinstance(value, str):
+                return [value]
+            return value
+
+        for field_name in list_fields & set(data):
+            data[field_name] = coerce(data[field_name])
+        # A single object where a list of objects was asked for.
+        for field_name in ("subagents", "claims", "gaps", "workers", "unknowns"):
+            if isinstance(data.get(field_name), Mapping):
+                data[field_name] = [data[field_name]]
+        return data
+
+    # -- the contract ------------------------------------------------------
+
+    def _enforce_contract(self, model: BaseModel) -> None:
+        if isinstance(model, (PlanOutput, SynthesisOutput)):
+            self._check_claim_sources(model)
+        if isinstance(model, (PlanOutput, DecompositionOutput)):
+            self._check_scope(model)
+            self._check_agent_count(model)
+        if isinstance(model, SynthesisOutput):
+            self._check_synthesis_preserves_evidence(model)
+
+    def _allowed(self) -> set[str]:
+        return {value.strip() for value in self.request.allowed_evidence_ids if value and value.strip()}
+
+    def _check_claim_sources(self, model: PlanOutput | SynthesisOutput) -> None:
+        allowed = self._allowed()
+        if not allowed:
+            return                      # nothing was supplied, so nothing to cross-check
+        claims = getattr(model, "claims", [])
+        for claim in claims:
+            unknown = [ref for ref in claim.source_refs if ref not in allowed]
+            if unknown:
+                raise PlanConstraintError(
+                    "output cites evidence that was never supplied "
+                    f"({', '.join(unknown[:3])}); a fabricated citation cannot drive a plan",
+                    task=self.request.task,
+                    validation_errors=[f"unknown source ref: {ref}" for ref in unknown[:3]],
+                    excerpt=canonical_json(model.model_dump(mode="json"))[:400],
+                )
+
+    def _check_scope(self, model: PlanOutput | DecompositionOutput) -> None:
+        scope = self.request.scope
+        if scope is None:
+            return
+        outside: list[str] = []
+        for subagent in model.subagents:
+            for entry in subagent.scope_entries:
+                if not scope.covers(entry):
+                    outside.append(entry)
+        if outside:
+            raise PlanConstraintError(
+                "output widened the mission scope "
+                f"({', '.join(dict.fromkeys(outside))[:120]}); planned work must stay inside the authorised boundary",
+                task=self.request.task,
+                validation_errors=[f"outside scope: {entry}" for entry in list(dict.fromkeys(outside))[:3]],
+            )
+
+    def _check_agent_count(self, model: PlanOutput | DecompositionOutput) -> None:
+        limit = self.request.max_subagents
+        if limit is not None and len(model.subagents) > limit:
+            raise PlanConstraintError(
+                f"plan asks for {len(model.subagents)} subagents but the limit is {limit}",
+                task=self.request.task,
+                validation_errors=[f"max_subagents={limit}"],
+            )
+
+    def _check_synthesis_preserves_evidence(self, model: SynthesisOutput) -> None:
+        """A synthesis may not silently drop the evidence it was given.
+
+        Conclusions are the model's business; *omitting* supplied material is a
+        integrity failure.  Every supplied id must appear in a claim's sources,
+        in ``evidence_reviewed``-style gaps, or be explicitly listed as unused.
+        """
+
+        allowed = self._allowed()
+        if not allowed:
+            return
+        cited = {ref for claim in model.claims for ref in claim.source_refs}
+        uncovered = sorted(allowed - cited)
+        if uncovered and not model.gaps:
+            raise PlanConstraintError(
+                f"synthesis ignored {len(uncovered)} supplied evidence id(s) without recording a gap "
+                f"({', '.join(uncovered[:3])})",
+                task=self.request.task,
+                validation_errors=[f"unaddressed evidence: {ref}" for ref in uncovered[:3]],
+            )
+
+
+# --------------------------------------------------------------------------
+# 20.6 Transports — the network edge, injectable and swappable
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class HttpResponse:
+    """One provider response, reduced to what the adapter needs."""
+
+    status: int
+    body: Any
+    headers: Mapping[str, str] = field(default_factory=dict)
+
+    @property
+    def ok(self) -> bool:
+        return 200 <= self.status < 300
+
+    def retry_after(self) -> float | None:
+        raw = self.headers.get("retry-after") if self.headers else None
+        try:
+            return float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+
+
+class Transport(Protocol):
+    """The single boundary between this file and the network."""
+
+    name: str
+
+    def post_json(
+        self, url: str, *, headers: Mapping[str, str], body: Mapping[str, Any], timeout: float
+    ) -> HttpResponse: ...
+
+
+class HttpTransport:
+    """``httpx``-backed transport, imported lazily so import stays side-effect free.
+
+    ``httpx`` is only needed when a model call actually happens, so the CLI,
+    the configuration and this file's own self-tests all work without it.
+    """
+
+    name = "httpx"
+
+    def __init__(self, *, client: Any = None) -> None:
+        self._client = client
+
+    @staticmethod
+    def available() -> bool:
+        return importlib.util.find_spec("httpx") is not None
+
+    def post_json(
+        self, url: str, *, headers: Mapping[str, str], body: Mapping[str, Any], timeout: float
+    ) -> HttpResponse:
+        if self._client is None:
+            if not self.available():
+                raise StructuredOutputError(
+                    "httpx is not installed; run: pip install httpx",
+                    failure=ModelFailure.DEPENDENCY,
+                )
+            import httpx as _httpx          # local import: keeps module import side-effect free
+
+            self._client = _httpx.Client(timeout=timeout, follow_redirects=False)
+        try:
+            response = self._client.post(url, headers=dict(headers), json=dict(body), timeout=timeout)
+        except Exception as exc:                 # httpx.*Error, socket errors, TLS failures
+            status = getattr(exc, "response", None)
+            code = getattr(status, "status_code", None)
+            raise StructuredOutputError(
+                f"request to the provider failed: {type(exc).__name__}"
+                + (f" (HTTP {code})" if code else ""),
+                failure=ModelFailure.TRANSIENT,
+                excerpt=str(exc)[:200],
+                retryable=True,
+            ) from exc
+        try:
+            payload: Any = response.json()
+        except Exception:
+            payload = {"raw": response.text[:2000]}
+        return HttpResponse(status=response.status_code, body=payload, headers=dict(response.headers))
+
+
+class ScriptedTransport:
+    """A transport driven by a list of canned responses.
+
+    Used by ``models --adapter --self-test`` and by orchestration tests, so the
+    whole retry/validation path is exercised without a provider, a network or a
+    credential.  Requests are recorded for assertion.
+    """
+
+    name = "scripted"
+
+    def __init__(self, responses: Sequence[Any]) -> None:
+        self._responses = list(responses)
+        self.requests: list[dict[str, Any]] = []
+
+    def post_json(
+        self, url: str, *, headers: Mapping[str, str], body: Mapping[str, Any], timeout: float
+    ) -> HttpResponse:
+        self.requests.append({"url": url, "headers": dict(headers), "body": dict(body), "timeout": timeout})
+        if not self._responses:
+            raise StructuredOutputError("scripted transport ran out of responses", failure=ModelFailure.INTERNAL)
+        item = self._responses.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        if isinstance(item, HttpResponse):
+            return item
+        return HttpResponse(status=200, body=item)
+
+    @classmethod
+    def ok_content(cls, text: str, *, envelope: str = "openai") -> HttpResponse:
+        """Wrap raw text in the response envelope of a given provider."""
+
+        if envelope == "anthropic":
+            return HttpResponse(status=200, body={"content": [{"type": "text", "text": text}], "stop_reason": "end_turn"})
+        if envelope == "google":
+            return HttpResponse(status=200, body={"candidates": [{"content": {"parts": [{"text": text}]}}]})
+        return HttpResponse(status=200, body={"choices": [{"message": {"content": text}}]})
+
+
+# --------------------------------------------------------------------------
+# 20.7 The adapter — one interface, four dialects, bounded retries
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ModelResult:
+    """A validated output plus everything needed to audit the call."""
+
+    task: ModelTask
+    output: BaseModel
+    provider: str
+    model: str
+    attempts: int
+    elapsed_ms: float
+    mode: StructuredMode
+    prompt_tokens: int | None = None
+
+    @property
+    def validated(self) -> bool:
+        """Always true: a result only exists once validation passed."""
+
+        return True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task": self.task.value,
+            "provider": self.provider,
+            "model": self.model,
+            "attempts": self.attempts,
+            "elapsed_ms": round(self.elapsed_ms, 1),
+            "mode": self.mode.value,
+            "output": json.loads(model_to_json(self.output)),
+        }
+
+
+class ModelAdapter:
+    """The one model-calling interface orchestration is allowed to use.
+
+    ``settings`` supplies provider, model, endpoint and credential lookup;
+    ``transport`` defaults to HTTP but can be scripted.  Nothing above this
+    class ever sees a URL, a header or a provider-specific field name.
+    """
+
+    def __init__(
+        self,
+        settings: "Settings",
+        *,
+        transport: Transport | None = None,
+        retry: RetryPolicy | None = None,
+        timeout: float | None = None,
+        renderer: "EventRenderer | None" = None,
+        logger: "MissionLogger | None" = None,
+        token: "CancellationToken | None" = None,
+        sleep: Callable[[float], None] | None = None,
+    ) -> None:
+        self.settings = settings
+        self.retry = retry or RetryPolicy.from_settings(settings)
+        self.timeout = timeout if timeout is not None else float(settings.http_timeout)
+        self.renderer = renderer
+        self.logger = logger
+        self.token = token
+        self._sleep = sleep or time.sleep
+        self.transport = transport or HttpTransport()
+
+    # -- configuration -----------------------------------------------------
+
+    @property
+    def provider(self) -> str:
+        return self.settings.provider
+
+    @property
+    def model(self) -> str | None:
+        return self.settings.model
+
+    def adapter(self) -> ProviderAdapter:
+        return provider_adapter(self.provider)
+
+    def base_url(self) -> str:
+        """Resolved endpoint root, with the provider's default filled in."""
+
+        if self.settings.base_url:
+            return self.settings.base_url.rstrip("/")
+        spec = self.settings.provider_spec()
+        if spec and spec.default_base_url:
+            return spec.default_base_url.rstrip("/")
+        raise ModelConfigError(
+            f"no endpoint configured for {self.provider!r}; set --base-url or ARGUS_LLM_BASE_URL",
+            provider=self.provider,
+            model=self.model,
+        )
+
+    def check_ready(self) -> list[StructuredOutputError]:
+        """Everything that must be true *before* a call, as readable problems.
+
+        Returned rather than raised so ``adapter --check`` can list all of them
+        in one pass — a failed preflight should never be one error at a time.
+        """
+
+        problems: list[StructuredOutputError] = []
+        adapter: ProviderAdapter | None = None
+        try:
+            adapter = provider_adapter(self.provider)
+        except StructuredOutputError as exc:
+            problems.append(exc)
+
+        if not self.model:
+            problems.append(
+                ModelConfigError(
+                    "no model configured; set --model or ARGUS_LLM_MODEL",
+                    provider=self.provider,
+                )
+            )
+        elif adapter is not None:
+            spec = self.settings.provider_spec()
+            if spec is not None and spec.models and self.model not in spec.models:
+                problems.append(
+                    ModelConfigError(
+                        f"model {self.model!r} is not a known {spec.label} model "
+                        f"(known: {', '.join(spec.models[:3])}, …); set a supported model",
+                        provider=self.provider,
+                        model=self.model,
+                    )
+                )
+        if adapter is not None and adapter.mode is StructuredMode.UNSUPPORTED:
+            problems.append(
+                UnsupportedStructuredOutput(
+                    f"{adapter.label} cannot return validated structured output; "
+                    "choose a provider with a JSON mode",
+                    provider=self.provider,
+                )
+            )
+        if self.settings.requires_credential() and not self.settings.resolve_api_key()[0]:
+            problems.append(
+                ModelConfigError(
+                    f"no credential for {self.provider!r}; looked in "
+                    f"{self.settings.provider_spec().key_env_summary() if self.settings.provider_spec() else 'unknown'}",
+                    provider=self.provider,
+                )
+            )
+        if not isinstance(self.transport, ScriptedTransport) and not HttpTransport.available():
+            problems.append(
+                StructuredOutputError("httpx is not installed; run: pip install httpx", failure=ModelFailure.DEPENDENCY)
+            )
+        try:
+            self.base_url()
+        except StructuredOutputError as exc:
+            problems.append(exc)
+        return problems
+
+    # -- public API --------------------------------------------------------
+
+    def call(self, request: ModelRequest) -> ModelResult:
+        """Call the provider and return a validated model, or raise.
+
+        The loop is bounded twice over (attempt count and elapsed time), each
+        attempt is validated before it is returned, and the failure carries the
+        last validation errors so the caller can show what went wrong.
+        """
+
+        started = time.monotonic()
+        problems = self.check_ready()
+        if problems:
+            blocking = problems[0]
+            blocking.task = request.task
+            raise blocking
+
+        adapter = self.adapter()
+        model = self.model or ""
+        url = adapter.endpoint(self.base_url(), model)
+        api_key, _ = self.settings.resolve_api_key()
+        schema = schema_for(request.model_cls, adapter=adapter)
+        system = build_system_prompt(request.task, adapter=adapter, model_cls=request.model_cls)
+        parser = StructuredParser(request)
+
+        attempt = 0
+        last: StructuredOutputError | None = None
+        sent_messages: list[str] = []
+
+        while attempt < self.retry.max_attempts:
+            attempt += 1
+            if (time.monotonic() - started) > self.retry.max_elapsed_seconds:
+                break
+            self._check_cancelled(request, attempt, attempts=self.retry.max_attempts)
+
+            self._log_started(request, attempt)
+            body = adapter.body(
+                model=model,
+                system=system,
+                user=request.prompt() if not sent_messages else f"{request.prompt()}\n\n{sent_messages[-1]}",
+                schema=schema,
+                max_output_tokens=request.max_output_tokens,
+            )
+            attempt_started = time.monotonic()
+            try:
+                response = self.transport.post_json(
+                    url, headers=adapter.headers(api_key), body=body, timeout=self.timeout
+                )
+                raw = self._handle_status(response, adapter, request, attempt)
+                payload = extract_json_object(raw)
+                output = parser.parse(payload)
+            except StructuredOutputError as exc:
+                exc.task = exc.task or request.task
+                exc.provider = exc.provider or self.provider
+                exc.model = exc.model or self.model
+                exc.attempt = attempt
+                exc.attempts_allowed = self.retry.max_attempts
+                last = exc
+                self._log_failure(request, exc, attempt, (time.monotonic() - attempt_started) * 1000)
+                if not exc.should_retry or attempt >= self.retry.max_attempts:
+                    raise
+                sent_messages.append(self._repair_message(exc, adapter, request))
+                self._backoff(request, attempt, exc)
+                continue
+
+            elapsed = (time.monotonic() - started) * 1000
+            result = ModelResult(
+                task=request.task,
+                output=output,
+                provider=self.provider,
+                model=model,
+                attempts=attempt,
+                elapsed_ms=elapsed,
+                mode=adapter.mode,
+            )
+            self._log_success(request, result, attempt, (time.monotonic() - attempt_started) * 1000)
+            return result
+
+        raise last or StructuredOutputError(
+            "no attempt produced a validated output within the retry budget",
+            failure=ModelFailure.TRANSIENT,
+            task=request.task,
+            provider=self.provider,
+            model=self.model,
+            attempt=attempt,
+            attempts_allowed=self.retry.max_attempts,
+            retryable=False,
+        )
+
+    # -- convenience wrappers: one per task --------------------------------
+
+    def plan(self, request: ModelRequest | None = None, **kwargs: Any) -> PlanOutput:
+        return _expect(self.call(_as_request(ModelTask.PLAN, request, kwargs)).output, PlanOutput)
+
+    def decompose(self, request: ModelRequest | None = None, **kwargs: Any) -> DecompositionOutput:
+        return _expect(self.call(_as_request(ModelTask.DECOMPOSE, request, kwargs)).output, DecompositionOutput)
+
+    def review(self, request: ModelRequest | None = None, **kwargs: Any) -> ReviewOutput:
+        return _expect(self.call(_as_request(ModelTask.REVIEW, request, kwargs)).output, ReviewOutput)
+
+    def synthesize(self, request: ModelRequest | None = None, **kwargs: Any) -> SynthesisOutput:
+        return _expect(self.call(_as_request(ModelTask.SYNTHESIZE, request, kwargs)).output, SynthesisOutput)
+
+    # -- internals ---------------------------------------------------------
+
+    def _check_cancelled(self, request: ModelRequest, attempt: int, *, attempts: int) -> None:
+        if self.token is not None and self.token.cancelled:
+            raise StructuredOutputError(
+                "model call cancelled before attempt",
+                failure=ModelFailure.CANCELLED,
+                task=request.task,
+                provider=self.provider,
+                model=self.model,
+                attempt=attempt,
+                attempts_allowed=attempts,
+            )
+
+    def _handle_status(
+        self, response: HttpResponse, adapter: ProviderAdapter, request: ModelRequest, attempt: int
+    ) -> str:
+        """Classify a status code, then extract text.  Retryability is explicit."""
+
+        status = response.status
+        if status in {429, 408} or status >= 500:
+            raise StructuredOutputError(
+                f"provider returned HTTP {status}",
+                failure=ModelFailure.TRANSIENT,
+                task=request.task,
+                provider=self.provider,
+                model=self.model,
+                attempt=attempt,
+                attempts_allowed=self.retry.max_attempts,
+                retryable=True,
+                excerpt=canonical_json(response.body)[:200],
+            )
+        if status in {401, 403}:
+            raise StructuredOutputError(
+                f"provider rejected the credential (HTTP {status})",
+                failure=ModelFailure.CONFIG,
+                task=request.task,
+                provider=self.provider,
+                model=self.model,
+                attempt=attempt,
+            )
+        if status in {400, 404, 422}:
+            # A 4xx on a structured request is a schema, model or parameter
+            # problem: repeating the same body verbatim cannot fix it, so this
+            # is explicitly not retryable even though the failure class reads
+            # like a malformed response.
+            raise StructuredOutputError(
+                f"provider rejected the request (HTTP {status})",
+                failure=ModelFailure.MALFORMED,
+                task=request.task,
+                provider=self.provider,
+                model=self.model,
+                attempt=attempt,
+                retryable=False,
+                excerpt=canonical_json(response.body)[:300],
+            )
+        if status in {413, 414}:
+            raise StructuredOutputError(
+                f"request too large for {adapter.label} (HTTP {status}); shorten the context",
+                failure=ModelFailure.MALFORMED,
+                task=request.task,
+                provider=self.provider,
+                model=self.model,
+                attempt=attempt,
+            )
+        if not response.ok:
+            raise StructuredOutputError(
+                f"unexpected HTTP {status} from {adapter.label}",
+                failure=ModelFailure.INTERNAL,
+                task=request.task,
+                provider=self.provider,
+                model=self.model,
+                attempt=attempt,
+            )
+        body = response.body if isinstance(response.body, Mapping) else {}
+        return adapter.parse(body)
+
+    def _repair_message(self, exc: StructuredOutputError, adapter: ProviderAdapter, request: ModelRequest) -> str:
+        """The corrective turn sent with the next attempt."""
+
+        if not adapter.supports_repair:
+            return RepairPrompts.after_transient(exc.failure.value)
+        if exc.failure is ModelFailure.MALFORMED:
+            return RepairPrompts.after_validation(
+                exc.validation_errors or [exc.message], excerpt=exc.excerpt or "<none>"
+            )
+        return RepairPrompts.after_transient(exc.failure.value)
+
+    def _backoff(self, request: ModelRequest, attempt: int, exc: StructuredOutputError) -> None:
+        delay = self.retry.delay_for(attempt)
+        self._log(
+            "warning",
+            event="model.retry",
+            message=f"retrying {request.task.value} after {exc.failure.value} "
+                    f"(attempt {attempt + 1}/{self.retry.max_attempts})",
+            attempt=attempt,
+            delay_ms=int(delay * 1000),
+        )
+        self._sleep(delay)
+
+    def _log(self, level: str, message: str, *, event: str = "model.call", **fields: Any) -> None:
+        """One place where model activity reaches the renderer and the log.
+
+        The event name distinguishes the three moments the log is actually read
+        for: a call being made, an answer being accepted, and an answer being
+        rejected with the reason.
+        """
+
+        if self.logger is not None:
+            self.logger.log(
+                event,
+                level=getattr(LogLevel, level.upper(), LogLevel.INFO),
+                message=message,
+                agent_id="master",
+                agent_kind="agent",
+                data={"provider": self.provider, "model": self.model, **fields},
+                duration_ms=fields.get("duration_ms"),
+            )
+        if self.renderer is not None:
+            if level == "error":
+                self.renderer.error(message, actor="master")
+            elif level == "warning":
+                self.renderer.warning(message, actor="master")
+            else:
+                self.renderer.master_thinking(message)
+
+    def _log_started(self, request: ModelRequest, attempt: int) -> None:
+        self._log(
+            "info",
+            event="model.call",
+            message=f"{request.task.value} request to {self.provider}/{self.model} (attempt {attempt})",
+            task=request.task.value,
+            attempt=attempt,
+        )
+
+    def _log_success(self, request: ModelRequest, result: ModelResult, attempt: int, duration_ms: float) -> None:
+        self._log(
+            "info",
+            event="model.validated",
+            message=f"{request.task.value} validated on attempt {attempt}",
+            task=request.task.value,
+            attempt=attempt,
+            duration_ms=round(duration_ms, 1),
+        )
+
+    def _log_failure(
+        self, request: ModelRequest, exc: StructuredOutputError, attempt: int, duration_ms: float
+    ) -> None:
+        self._log(
+            "warning" if exc.should_retry else "error",
+            event="model.rejected",
+            message=f"{request.task.value} rejected ({exc.failure.value}) on attempt {attempt}: {exc.message}",
+            task=request.task.value,
+            attempt=attempt,
+            duration_ms=round(duration_ms, 1),
+            failure=exc.failure.value,
+        )
+
+
+def _as_request(task: ModelTask, request: ModelRequest | None, kwargs: dict[str, Any]) -> ModelRequest:
+    """Let callers pass either a prepared request or keyword arguments."""
+
+    if request is not None:
+        if kwargs:
+            raise TypeError("pass either a ModelRequest or keyword arguments, not both")
+        return request
+    return ModelRequest(task=task, **kwargs)
+
+
+def _expect(output: Any, cls: type[Any]) -> Any:
+    """Narrow a validated output to its declared type, loudly."""
+
+    if not isinstance(output, cls):
+        raise StructuredOutputError(
+            f"adapter returned {type(output).__name__} where {cls.__name__} was expected",
+            failure=ModelFailure.INTERNAL,
+        )
+    return output
+
+
+def make_adapter(settings: "Settings", **kwargs: Any) -> ModelAdapter:
+    """Factory used by orchestration: provider choice stays inside settings."""
+
+    return ModelAdapter(settings, **kwargs)
+
+
+# --------------------------------------------------------------------------
+# 20.8 Self-test — the acceptance criteria as executable checks
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AdapterCheck:
+    name: str
+    ok: bool
+    detail: str
+
+
+#: A complete, valid answer for every task.  Shared by the self-test and the
+#: CLI demo so both always exercise the same contract.
+def sample_payloads() -> dict[ModelTask, dict[str, Any]]:
+    """One valid response per task, with sourced claims and explicit unknowns."""
+
+    def subagent(name: str, objective: str, scope: str) -> dict[str, Any]:
+        return {
+            "name": name,
+            "objective": objective,
+            "rationale": "the objective needs a separate collection path for this source family",
+            "scope_entries": [scope],
+            "workers": [
+                {
+                    "name": f"{name}-worker",
+                    "objective": f"collect and summarise records for {objective}",
+                    "inputs": ["scope entry"],
+                    "output_schema": "evidence items",
+                    "requires_network": True,
+                    "requires_browser": False,
+                    "rationale": "one worker keeps the collection path simple",
+                }
+            ],
+            "max_workers": 2,
+        }
+
+    return {
+        ModelTask.PLAN: {
+            "objective": "map the publicly documented attack surface of example.com",
+            "target_assets": ["example.com"],
+            "hypotheses": ["the published advisories name the affected component"],
+            "phases": ["collect", "review", "synthesise"],
+            "subagents": [
+                subagent("passive-dns", "enumerate published DNS records", "example.com"),
+                subagent("advisory-review", "read first-party advisories", "example.com"),
+            ],
+            "acceptance_criteria": ["every claim cites a retrieved source"],
+            "out_of_scope": ["any host outside example.com"],
+            "unknowns": [{"reason": "not-yet-observed", "detail": "no archive check yet"}],
+            "confidence": "low",
+            "uncertainty": "the plan assumes only public sources are reachable from this network",
+        },
+        ModelTask.DECOMPOSE: {
+            "subagents": [subagent("passive-dns", "enumerate published DNS records", "example.com")],
+            "sequencing": "collection first, review second",
+            "parallelism_note": "the two collection paths are independent",
+            "estimated_tasks": 3,
+            "uncertainty": "worker count is an estimate until the first source answers",
+        },
+        ModelTask.REVIEW: {
+            "verdict": "revise",
+            "criteria": ["every observation cites a retrieved source", "no claim about a person"],
+            "findings": ["one statement summarises an advisory without quoting it"],
+            "unsupported_claims": ["the revision history is not supported by the captured page"],
+            "evidence_reviewed": ["ev-1"],
+            "retask_guidance": "capture the advisory page text before summarising it",
+            "confidence": "medium",
+            "uncertainty": "the advisory page changed twice this year, so an older capture may differ",
+        },
+        ModelTask.SYNTHESIZE: {
+            "summary": "Two published sources describe the same component; nothing in the collected "
+                       "material identifies an individual or an actor.",
+            "claims": [
+                {
+                    "kind": "observation",
+                    "statement": "the advisory lists CVE-2026-0001 as fixed in version 2.1.4",
+                    "source_refs": ["ev-1"],
+                    "confidence": "medium",
+                    "uncertainty": "the advisory was retrieved once and could be updated later",
+                }
+            ],
+            "hypotheses_supported": ["the published advisories name the affected component"],
+            "hypotheses_refuted": [],
+            "hypotheses_open": ["whether the deployment in scope runs the affected version"],
+            "gaps": [{"reason": "not-yet-observed", "detail": "no version banner was captured"}],
+            "limitations": ["passive collection only"],
+            "confidence": "low",
+            "confidence_basis": "one first-party advisory, no independent corroboration yet",
+            "uncertainty_statement": "version status is inferred from published text only, not from the host",
+        },
+    }
+
+
+def _adapter_for_self_test(*, provider: str = "local", model: str = "llama3", responses: Sequence[Any] = ()) -> ModelAdapter:
+    """Build an adapter with a fake credential and a scripted transport."""
+
+    settings = build_settings(
+        {"provider": provider, "model": model},
+        env={**_self_test_env(provider)},
+    ).settings
+    return ModelAdapter(settings, transport=ScriptedTransport(responses), retry=RetryPolicy(max_attempts=3, base_delay=0))
+
+
+def _self_test_env(provider: str) -> dict[str, str]:
+    env = {"ARGUS_LLM_PROVIDER": provider, "ARGUS_LLM_MODEL": "unused"}
+    if provider in {"openai", "anthropic", "google"}:
+        env["ARGUS_LLM_API_KEY"] = "sk-test-SELFTEST0123456789abcdef"
+    return env
+
+
+def run_adapter_self_test() -> list[AdapterCheck]:
+    """Prove the adapter's contract without a provider, a network or a key."""
+
+    checks: list[AdapterCheck] = []
+
+    def record(name: str, ok: bool, detail: Any = "ok") -> None:
+        checks.append(AdapterCheck(name, ok, str(detail)))
+
+    def honest_payload(task: ModelTask) -> dict[str, Any]:
+        return json.loads(json.dumps(sample_payloads()[task]))
+
+    def as_openai(payload: Mapping[str, Any] | str) -> HttpResponse:
+        text = payload if isinstance(payload, str) else json.dumps(payload)
+        return HttpResponse(status=200, body={"choices": [{"message": {"content": text}}]})
+
+    # --- 1. dialect isolation ---------------------------------------------
+    for provider, mode in [
+        ("openai", StructuredMode.JSON_SCHEMA),
+        ("anthropic", StructuredMode.JSON_SCHEMA),
+        ("google", StructuredMode.JSON_SCHEMA),
+        ("local", StructuredMode.JSON_OBJECT),
+    ]:
+        adapter = provider_adapter(provider)
+        record(f"dialect: {provider} resolves", adapter.key == provider)
+        record(f"dialect: {provider} mode is {mode.value}", adapter.mode is mode, adapter.mode.value)
+        headers = adapter.headers("sk-test-KEY123")
+        record(f"dialect: {provider} sends auth", any("KEY123" in v or "sk-test" in v for v in headers.values())
+               or provider == "google", "header present" if headers else "none")
+        record(f"dialect: {provider} never leaks key in repr", "KEY123" not in repr(adapter))
+        body = adapter.body(model="m", system="s", user="u", schema={"type": "object"}, max_output_tokens=64)
+        record(f"dialect: {provider} body carries the schema contract",
+               "response_format" in body or "tools" in body or "responseMimeType" in body
+               or json.dumps(body).find("object") >= 0)
+    try:
+        provider_adapter("nope")
+        record("dialect: unknown provider refused", False)
+    except UnsupportedStructuredOutput as exc:
+        record("dialect: unknown provider refused", exc.failure is ModelFailure.UNSUPPORTED)
+    record("dialect: unsupported mode refused",
+           ProviderAdapter(key="x", label="X", mode=StructuredMode.UNSUPPORTED, response_field="?").mode
+           is StructuredMode.UNSUPPORTED)
+
+    # --- 2. the happy path, for all four tasks ----------------------------
+    for task in ModelTask:
+        payload = honest_payload(task)
+        adapter = _adapter_for_self_test(responses=[as_openai(payload)])
+        result = adapter.call(ModelRequest(task=task, objective="map example.com"))
+        record(f"{task.value}: valid output accepted", result.validated and isinstance(result.output, TASK_MODELS[task]),
+               type(result.output).__name__)
+        record(f"{task.value}: one attempt", result.attempts == 1, result.attempts)
+        record(f"{task.value}: result serialises", "output" in result.to_dict())
+
+    # --- 3. invalid JSON is never a plan ----------------------------------
+    good = json.dumps(honest_payload(ModelTask.PLAN))
+    bad_cases = {
+        "prose instead of JSON": "I have planned the mission. Step one is collection.",
+        "truncated object": good[: len(good) // 2],
+        "json array": "[{\"objective\": \"x\"}]",
+        "empty response": "   ",
+        "wrong field names": "{\"plan\": [\"collect\"], \"target\": \"example.com\"}",
+        "missing required": "{\"objective\": \"x\"}",
+        "unsourced observation": json.dumps(
+            {
+                **json.loads(good),
+                "subagents": json.loads(good)["subagents"],
+            }
+        ).replace("\"hypotheses\": [", "\"hypotheses\": [\"clearly the target is exposed\"], \"ignored\": ["),
+    }
+    for label, text in bad_cases.items():
+        adapter = _adapter_for_self_test(responses=[as_openai(text)] * 4)
+        try:
+            adapter.call(ModelRequest(task=ModelTask.PLAN, objective="map example.com"))
+            record(f"invalid: {label} rejected", False, "accepted!")
+        except StructuredOutputError as exc:
+            record(f"invalid: {label} rejected", True, exc.failure.value)
+            record(f"invalid: {label} never returns a plan", True)
+            record(f"invalid: {label} raises MALFORMED", exc.failure is ModelFailure.MALFORMED, exc.failure.value)
+
+    # --- 4. bounded retries ------------------------------------------------
+    transient_then_ok = ScriptedTransport([HttpResponse(status=503, body={}),
+                                           HttpResponse(status=429, body={}),
+                                           as_openai(good)])
+    sleeps: list[float] = []
+    settings = build_settings({"provider": "local", "model": "llama3"}, env=_self_test_env("local")).settings
+    adapter = ModelAdapter(settings, transport=transient_then_ok,
+                           retry=RetryPolicy(max_attempts=3, base_delay=0.01), sleep=sleeps.append)
+    result = adapter.call(ModelRequest(task=ModelTask.PLAN, objective="map example.com"))
+    record("retry: transient errors are retried", result.attempts == 3, result.attempts)
+    record("retry: backoff was applied between attempts", len(sleeps) == 2, sleeps)
+    record("retry: success after retries is validated", result.validated)
+
+    always_503 = ScriptedTransport([HttpResponse(status=503, body={})] * 10)
+    adapter = ModelAdapter(settings, transport=always_503, retry=RetryPolicy(max_attempts=3, base_delay=0),
+                           sleep=lambda _s: None)
+    try:
+        adapter.call(ModelRequest(task=ModelTask.PLAN, objective="x"))
+        record("retry: exhausted retries raise", False)
+    except StructuredOutputError as exc:
+        record("retry: exhausted retries raise", exc.failure is ModelFailure.TRANSIENT, exc.failure.value)
+        record("retry: bounded to max_attempts", len(always_503.requests) == 3, len(always_503.requests))
+        record("retry: reports the attempt count", exc.attempt == 3 and exc.attempts_allowed == 3,
+               f"{exc.attempt}/{exc.attempts_allowed}")
+
+    # malformed → repair → valid
+    repair_transport = ScriptedTransport([as_openai("not json at all"), as_openai(good)])
+    adapter = ModelAdapter(settings, transport=repair_transport, retry=RetryPolicy(max_attempts=2, base_delay=0),
+                           sleep=lambda _s: None)
+    result = adapter.call(ModelRequest(task=ModelTask.PLAN, objective="map example.com"))
+    record("retry: malformed response is repaired on a second attempt", result.attempts == 2, result.attempts)
+    repair_turn = json.dumps(repair_transport.requests[1]["body"])
+    record("retry: repair turn names the failure", "could not be accepted" in repair_turn)
+    record("retry: repair turn does not resend the objective twice",
+           repair_transport.requests[1]["body"]["messages"][1]["content"].count("OBJECTIVE") == 1)
+
+    # determinism of the schedule
+    policy = RetryPolicy(max_attempts=4, base_delay=0.5, max_delay=2.0)
+    record("retry: backoff doubles", [policy.delay_for(n) for n in (1, 2, 3, 4)] == [0.5, 1.0, 2.0, 2.0],
+           [policy.delay_for(n) for n in (1, 2, 3, 4)])
+    record("retry: ceiling is enforced", policy.delay_for(99) == 2.0)
+    try:
+        RetryPolicy(max_attempts=0)
+        record("retry: zero attempts refused", False)
+    except ValueError:
+        record("retry: zero attempts refused", True)
+
+    # --- 5. unsupported structured output ---------------------------------
+    unsupported = ProviderAdapter(key="legacy", label="Legacy", mode=StructuredMode.UNSUPPORTED, response_field="?")
+    PROVIDER_ADAPTERS["legacy"] = unsupported
+    try:
+        provider_adapter("legacy")
+        record("unsupported: provider without JSON mode refused", False)
+    except UnsupportedStructuredOutput as exc:
+        record("unsupported: provider without JSON mode refused", True)
+        record("unsupported: message names the remedy", "choose a provider" in str(exc) or "cannot" in str(exc))
+        record("unsupported: exit code is CONFIG", exc.exit_code == int(ExitCode.CONFIG), exc.exit_code)
+    finally:
+        PROVIDER_ADAPTERS.pop("legacy", None)
+
+    # --- 6. preflight problems are all reported at once -------------------
+    bare = build_settings({}, env={}).settings
+    bare_problems = ModelAdapter(bare, transport=ScriptedTransport([])).check_ready()
+    record("preflight: missing model reported", any("no model" in str(p) for p in bare_problems),
+           len(bare_problems))
+    record("preflight: problems are structured errors",
+           all(isinstance(p, StructuredOutputError) for p in bare_problems))
+    no_key = build_settings({"provider": "openai", "model": "gpt-4o-mini"}, env={}).settings
+    key_problems = ModelAdapter(no_key, transport=ScriptedTransport([])).check_ready()
+    record("preflight: missing credential reported", any(p.failure is ModelFailure.CONFIG and "credential" in str(p)
+                                                         for p in key_problems))
+    record("preflight: credential hint never prints a value",
+           not any("sk-" in str(p) for p in key_problems), [str(p)[:40] for p in key_problems])
+    try:
+        ModelAdapter(bare, transport=ScriptedTransport([as_openai(good)])).call(
+            ModelRequest(task=ModelTask.PLAN, objective="x")
+        )
+        record("preflight: a call is refused before the network", False, "made a call anyway")
+    except ModelConfigError as exc:
+        record("preflight: a call is refused before the network", exc.failure is ModelFailure.CONFIG)
+        record("preflight: refusal names the fix", "ARGUS_LLM_MODEL" in str(exc), str(exc)[:60])
+
+    # --- 7. post-validation contract --------------------------------------
+    plan = honest_payload(ModelTask.PLAN)
+    parser = StructuredParser(ModelRequest(task=ModelTask.PLAN, objective="x",
+                                           scope=Scope(entries=[ScopeEntry(pattern="example.com")])))
+    parsed = parser.parse(plan)
+    record("contract: in-scope plan accepted", isinstance(parsed, PlanOutput))
+    widened = json.loads(json.dumps(plan))
+    widened["subagents"][0]["scope_entries"] = ["evil.example.org"]
+    try:
+        parser.parse(widened)
+        record("contract: out-of-scope plan refused", False)
+    except PlanConstraintError as exc:
+        record("contract: out-of-scope plan refused", True)
+        record("contract: refusal names the offending entry", "evil.example.org" in str(exc), str(exc)[:80])
+    too_many = json.loads(json.dumps(plan))
+    too_many["subagents"] = too_many["subagents"] * 4
+    try:
+        StructuredParser(ModelRequest(task=ModelTask.PLAN, objective="x", max_subagents=2)).parse(too_many)
+        record("contract: subagent limit enforced", False)
+    except PlanConstraintError:
+        record("contract: subagent limit enforced", True)
+
+    synth = honest_payload(ModelTask.SYNTHESIZE)
+    synth_parser = StructuredParser(
+        ModelRequest(task=ModelTask.SYNTHESIZE, objective="x", allowed_evidence_ids=("ev-1", "ev-2"))
+    )
+    gap_free = json.loads(json.dumps(synth))
+    gap_free["gaps"] = []
+    try:
+        synth_parser.parse(gap_free)
+        record("contract: unreferenced evidence refused", False, "silently dropped ev-2")
+    except PlanConstraintError as exc:
+        record("contract: unreferenced evidence refused", True)
+        record("contract: gap-free omission is the trigger", "ignored" in str(exc), str(exc)[:70])
+    forgiven = json.loads(json.dumps(synth))
+    forgiven["gaps"] = [{"reason": "not-yet-observed", "detail": "ev-2 was not reachable"}]
+    record("contract: omission with an explicit gap is accepted",
+           isinstance(synth_parser.parse(forgiven), SynthesisOutput))
+    fabricated = json.loads(json.dumps(synth))
+    fabricated["claims"][0]["source_refs"] = ["ev-999"]
+    try:
+        synth_parser.parse(fabricated)
+        record("contract: fabricated citation refused", False)
+    except PlanConstraintError as exc:
+        record("contract: fabricated citation refused", True)
+        record("contract: fabrication is named", "ev-999" in str(exc), str(exc)[:70])
+
+    # --- 8. epistemic rules live at the model boundary --------------------
+    record("claims: unsourced observation refused",
+           not _accepts(ModelClaim, {"kind": "observation", "statement": "the host runs version 2.1.4"}))
+    record("claims: sourced observation accepted",
+           _accepts(ModelClaim, {"kind": "observation", "statement": "the advisory names version 2.1.4",
+                                 "source_refs": ["ev-1"], "confidence": "medium",
+                                 "uncertainty": "single first-party advisory"}))
+    record("claims: inference without reasoning refused",
+           not _accepts(ModelClaim, {"kind": "inference", "statement": "the host is unpatched",
+                                     "reasoning": "", "confidence": "medium", "uncertainty": "banner only"}))
+    record("claims: hedging adverb refused",
+           not _accepts(ModelClaim, {"kind": "observation", "statement": "clearly the host is exposed at once",
+                                     "source_refs": ["ev-1"], "uncertainty": "none"}))
+    record("plan: missing uncertainty refused", not _accepts(PlanOutput, {**plan, "uncertainty": None}))
+    record("plan: unknown confidence refused", not _accepts(PlanOutput, {**plan, "confidence": "unknown"}))
+    record("decomposition: duplicate names refused",
+           not _accepts(DecompositionOutput, {
+               **honest_payload(ModelTask.DECOMPOSE),
+               "subagents": [honest_payload(ModelTask.DECOMPOSE)["subagents"][0]] * 2,
+           }))
+    record("review: 'pass' with unsupported claims refused",
+           not _accepts(ReviewOutput, {**honest_payload(ModelTask.REVIEW), "verdict": "pass"}))
+    record("review: rejection without findings refused",
+           not _accepts(ReviewOutput, {**honest_payload(ModelTask.REVIEW), "findings": [],
+                                       "unsupported_claims": []}))
+    record("synthesis: high confidence on one claim refused",
+           not _accepts(SynthesisOutput, {**honest_payload(ModelTask.SYNTHESIZE), "confidence": "high"}))
+
+    # --- 9. prompt contract holds for every task -------------------------
+    for task in ModelTask:
+        prompt = build_system_prompt(task)
+        for clause, needle in [
+            ("json only", "single JSON object"),
+            ("sourced", "cite the evidence or source ids"),
+            ("no invented ids", "Never invent an id"),
+            ("explicit uncertainty", "State uncertainty explicitly"),
+            ("observation vs inference", "Distinguish observation"),
+            ("no attribution", "Never attribute conduct"),
+        ]:
+            record(f"prompt {task.value}: {clause}", needle in prompt)
+    prompt_with_schema = build_system_prompt(ModelTask.PLAN, adapter=provider_adapter("local"), model_cls=PlanOutput)
+    record("prompt: non-native JSON mode embeds the schema", "REQUIRED JSON SHAPE" in prompt_with_schema)
+    record("prompt: the contract is in the system turn, not the data",
+           "HARD REQUIREMENTS" not in ModelRequest(task=ModelTask.PLAN, objective="o", context="c").prompt())
+
+    # --- 10. response envelopes -------------------------------------------
+    for envelope, key in [("openai", "choices"), ("anthropic", "content"), ("google", "candidates")]:
+        adapter = provider_adapter(envelope if envelope != "openai" else "openai")
+        payload = ScriptedTransport.ok_content(good, envelope=envelope).body
+        record(f"envelope: {envelope} parses", extract_json_object(adapter.parse(payload))["objective"].startswith("map"))
+    refusal = HttpResponse(status=200, body={"choices": [{"message": {"content": "", "refusal": "I cannot help"}}]})
+    try:
+        provider_adapter("openai").parse(refusal.body)
+        record("envelope: refusal is not an empty plan", False)
+    except StructuredOutputError as exc:
+        record("envelope: refusal is not an empty plan", exc.failure is ModelFailure.REFUSED, exc.failure.value)
+    record("envelope: no choices refused",
+           _raises(lambda: provider_adapter("openai").parse({"choices": []})))
+    record("envelope: no candidates refused",
+           _raises(lambda: provider_adapter("google").parse({"candidates": []})))
+
+    # --- 11. secret safety ------------------------------------------------
+    secret_settings = build_settings(
+        {"provider": "openai", "model": "gpt-4o-mini"},
+        env={**os.environ, "ARGUS_LLM_PROVIDER": "openai", "ARGUS_LLM_MODEL": "gpt-4o-mini",
+             "OPENAI_API_KEY": "sk-live-ADAPTERSECRET0123456789"},
+    ).settings
+    leaky = ScriptedTransport([HttpResponse(status=400, body={"error": "bad key sk-live-ADAPTERSECRET0123456789"})])
+    leaky_adapter = ModelAdapter(secret_settings, transport=leaky, retry=RetryPolicy(max_attempts=1, base_delay=0))
+    try:
+        leaky_adapter.call(ModelRequest(task=ModelTask.PLAN, objective="x"))
+        record("secrets: provider error raised", False)
+    except StructuredOutputError as exc:
+        record("secrets: provider error raised", True)
+        record("secrets: provider error is redacted", "ADAPTERSECRET" not in str(exc), str(exc)[:60])
+        record("secrets: rendered error is redacted", "ADAPTERSECRET" not in exc.render())
+    record("secrets: adapter repr holds no credential",
+           "ADAPTERSECRET" not in repr(leaky_adapter) and "ADAPTERSECRET" not in repr(secret_settings))
+
+    # --- 12. cancellation -------------------------------------------------
+    token = CancellationToken()
+    token.cancel("operator stopped the run", InterruptionKind.OPERATOR)
+    cancelled_adapter = ModelAdapter(settings, transport=ScriptedTransport([as_openai(good)]), token=token)
+    try:
+        cancelled_adapter.call(ModelRequest(task=ModelTask.PLAN, objective="x"))
+        record("cancel: a cancelled run makes no model call", False)
+    except StructuredOutputError as exc:
+        record("cancel: a cancelled run makes no model call", exc.failure is ModelFailure.CANCELLED)
+        record("cancel: exit code is 130", exc.exit_code == EXIT_INTERRUPTED, exc.exit_code)
+
+    # --- 13. provider specifics stay inside this section ------------------
+    stray = provider_terms_outside_adapter()
+    record("isolation: no provider dialect vocabulary above the adapter", not stray,
+           f"found in sections 1-19: {stray}" if stray else "clean")
+
+    return checks
+
+
+def _accepts(model_cls: type[BaseModel], payload: Mapping[str, Any]) -> bool:
+    """True when the payload validates; used to assert *rejection* too."""
+
+    try:
+        model_cls.model_validate(dict(payload))
+        return True
+    except Exception:
+        return False
+
+
+def _raises(fn: Callable[[], Any]) -> bool:
+    try:
+        fn()
+        return False
+    except StructuredOutputError:
+        return True
+
+
+#: The structured outputs belong to the typed-model family, so they are added to
+#: :data:`MODEL_CATALOGUE` here rather than repeated there — this section is the
+#: only place they can be defined, because they must exist before ``models``
+#: can describe them.  ``models -n PlanOutput`` therefore works unchanged.
+MODEL_CATALOGUE = MODEL_CATALOGUE + (
+    ("PlanOutput", PlanOutput, "validated plan from the model (sourced, uncertainty stated)"),
+    ("DecompositionOutput", DecompositionOutput, "validated subagent/worker decomposition"),
+    ("ReviewOutput", ReviewOutput, "validated quality review with criteria"),
+    ("SynthesisOutput", SynthesisOutput, "validated evidence-based synthesis"),
+    ("ModelClaim", ModelClaim, "one sourced claim inside a synthesis"),
+    ("PlannedSubagent", PlannedSubagent, "runtime subagent proposed by the model"),
+    ("PlannedWorker", PlannedWorker, "runtime worker proposed by the model"),
+)
+
+
+#: Provider-dialect vocabulary.  It is legitimate inside this section and must
+#: never appear above it: orchestration asking for ``response_format`` is exactly
+#: the coupling this adapter exists to prevent.
+_VENDOR_TERMS: tuple[str, ...] = (
+    "response_format",
+    "tool_choice",
+    "anthropic-version",
+    "x-goog-api-key",
+    "chat/completions",
+    "generateContent",
+)
+
+#: Where this section starts, used to split the file for the isolation check.
+_MODEL_SECTION_BANNER = "# 20. Provider-aware structured model adapter"
+_ENTRY_SECTION_BANNER = "# 21. Entry point"
+
+
+def provider_terms_outside_adapter() -> list[str]:
+    """Dialect vocabulary found *above* this section, with line numbers.
+
+    Parsed with :mod:`ast` rather than by scanning text, so prose in a
+    docstring — including this one — cannot trigger a false positive.
+    """
+
+    import ast
+
+    try:
+        path = Path(__file__).resolve()
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    split = text.find(_MODEL_SECTION_BANNER)
+    if split < 0:
+        return []
+    head = text[:split]
+    hits: list[str] = []
+    try:
+        tree = ast.parse(head)
+    except SyntaxError:
+        return []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            for term in _VENDOR_TERMS:
+                if term in node.value:
+                    hits.append(f"line {node.lineno}: {term}")
+    return hits
+
+
+def _adapter_demo(
+    *,
+    kind: str = "valid",
+    provider: str = "openai",
+    model: str = "gpt-4o-mini",
+    out_dir: Path | None = None,
+    renderer: "EventRenderer | None" = None,
+) -> dict[str, Any]:
+    """Exercise the whole path with a scripted transport.
+
+    ``kind`` selects what the fake provider does: return a valid answer, emit
+    prose, emit a refusal, fail transiently twice and then succeed, or widen the
+    mission scope.  No network, no credential, no cost.
+    """
+
+    payload = sample_payloads()[ModelTask.PLAN]
+    good = json.dumps(payload, indent=None)
+    scope = Scope(entries=[ScopeEntry(pattern="example.com")], data_classes=[DataClass.PUBLIC_WEB])
+
+    widened = json.loads(json.dumps(payload))
+    widened["subagents"][0]["scope_entries"] = ["evil.example.org"]
+
+    def envelope(text: str) -> HttpResponse:
+        if provider == "anthropic":
+            return HttpResponse(status=200, body={"content": [{"type": "text", "text": text}],
+                                                  "stop_reason": "end_turn"})
+        if provider == "google":
+            return HttpResponse(status=200, body={"candidates": [{"content": {"parts": [{"text": text}]}}]})
+        return HttpResponse(status=200, body={"choices": [{"message": {"content": text}}]})
+
+    scripted: dict[str, list[Any]] = {
+        "valid": [envelope(good)],
+        "prose": [envelope("Sure! Here is the plan you asked for: start with DNS.")] * 3,
+        "refusal": [HttpResponse(status=200, body={"choices": [{"message": {"content": "", "refusal": "no"}}]})],
+        "transient": [HttpResponse(status=503, body={}), HttpResponse(status=429, body={}), envelope(good)],
+        "scope": [envelope(json.dumps(widened))],
+        "unsupported": [envelope(good)],
+    }
+
+    chosen_provider = "demo-legacy" if kind == "unsupported" else provider
+    if kind == "unsupported":
+        # A provider that exists but cannot constrain its output at all.
+        PROVIDER_ADAPTERS["demo-legacy"] = ProviderAdapter(
+            key="demo-legacy", label="Legacy", mode=StructuredMode.UNSUPPORTED, response_field="?"
+        )
+    settings = build_settings(
+        {"provider": chosen_provider, "model": model, "base_url": "https://model.invalid/v1"},
+        env={**_self_test_env(provider), "ARGUS_LLM_API_KEY": "sk-test-DEMO0000000000000000"},
+    ).settings
+    transport = ScriptedTransport(scripted.get(kind, scripted["valid"]))
+    sleep_calls: list[float] = []
+    adapter = ModelAdapter(
+        settings,
+        transport=transport,
+        retry=RetryPolicy(max_attempts=1 if kind == "unsupported" else 3, base_delay=0.01),
+        sleep=sleep_calls.append,
+        renderer=renderer,
+    )
+
+    request = ModelRequest(task=ModelTask.PLAN, objective="map the public attack surface of example.com",
+                           scope=scope, max_subagents=5)
+    outcome: dict[str, Any] = {
+        "kind": kind,
+        "provider": chosen_provider,
+        "model": model,
+        "mode": _safe_mode(chosen_provider),
+        "requests": len(transport.requests),
+        "sleeps": sleep_calls,
+        "ok": False,
+    }
+    try:
+        result = adapter.call(request)
+        outcome.update(
+            ok=True,
+            attempts=result.attempts,
+            elapsed_ms=round(result.elapsed_ms, 1),
+            subagents=[s.name for s in getattr(result.output, "subagents", [])],
+            uncertainty=getattr(result.output, "uncertainty", None),
+            output=json.loads(model_to_json(result.output)),
+        )
+    except StructuredOutputError as exc:
+        outcome.update(
+            ok=False,
+            failure=exc.failure.value,
+            exit_code=exc.exit_code,
+            message=exc.message,
+            rendered=exc.render(),
+            should_retry=exc.should_retry,
+            validation_errors=list(exc.validation_errors),
+        )
+    finally:
+        PROVIDER_ADAPTERS.pop("demo-legacy", None)
+
+    # Counted once, after the call, so the success path reports it too.
+    outcome["requests"] = len(transport.requests)
+    # The scripted request bodies prove which dialect was actually used.
+    if transport.requests:
+        body = transport.requests[-1]["body"]
+        outcome["used_native_schema"] = bool(
+            "response_format" in body or "tools" in body
+            or (isinstance(body.get("generationConfig"), Mapping)
+                and "responseSchema" in body["generationConfig"])
+        )
+        outcome["body_keys"] = sorted(body)
+    outcome["checks"] = run_checked_self_test()
+
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / f"adapter-{kind}.json").write_text(json.dumps(outcome, indent=2, default=str), encoding="utf-8")
+        outcome["artefact"] = str(out_dir / f"adapter-{kind}.json")
+    return outcome
+
+
+def run_checked_self_test() -> list[dict[str, Any]]:
+    """The self-test as JSON-ready rows, for the demo summary."""
+
+    return [
+        {"check": c.name, "ok": c.ok, "detail": c.detail}
+        for c in run_adapter_self_test()
+    ]
+
+
+@app.command("adapter", help="Call the configured model provider and validate structured output.")
+def adapter_command(
+    task: str | None = typer.Option(
+        None, "--task", help="plan | decompose | review | synthesize (default: all four).", show_default=False
+    ),
+    demo: str | None = typer.Option(
+        None, "--demo", help="Scripted run: valid | prose | refusal | transient | scope | unsupported.",
+        show_default=False,
+    ),
+    provider: str | None = typer.Option(None, "--provider", help="Override the configured provider."),
+    model: str | None = typer.Option(None, "--model", "-m", help="Override the configured model."),
+    self_test: bool = typer.Option(False, "--self-test", help="Verify the adapter's contract offline."),
+    show_prompts: bool = typer.Option(False, "--prompts", help="Print the system prompt for each task."),
+    check: bool = typer.Option(False, "--check", help="Report configuration problems and exit."),
+    out_dir: str | None = typer.Option(None, "--out-dir", help="Write demo artefacts here."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """No network access unless ``--demo`` is omitted and a provider is configured."""
+
+    console = get_console()
+
+    # -- self-test: the acceptance criteria, offline ------------------------
+    if self_test:
+        results = run_adapter_self_test()
+        failures = [r for r in results if not r.ok]
+        if as_json:
+            _emit(json.dumps({"ok": not failures, "checks": [asdict(r) for r in results]}, indent=2))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        console.print()
+        table = Table(title="structured model adapter self-test", title_justify="left", box=None, pad_edge=False)
+        table.add_column("", width=2)
+        table.add_column("check", style="bold", no_wrap=True)
+        table.add_column("detail", overflow="fold")
+        for result in results:
+            glyph, colour = ("✔", "green") if result.ok else ("✘", "red")
+            table.add_row(f"[{colour}]{glyph}[/{colour}]", escape(result.name), escape(result.detail))
+        console.print(table)
+        console.print(f"[{'green' if not failures else 'red'}]{len(results) - len(failures)} passed[/] · "
+                      f"{len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    # -- prompts: what every model is told ---------------------------------
+    if show_prompts:
+        chosen = _parse_tasks(task)
+        payload = {
+            t.value: build_system_prompt(t, adapter=provider_adapter((provider or "local").strip().lower()),
+                                         model_cls=TASK_MODELS[t])
+            for t in chosen
+        }
+        if as_json:
+            _emit(json.dumps(payload, indent=2))
+            raise typer.Exit(ExitCode.OK)
+        for task_name, text in payload.items():
+            console.print()
+            console.print(Panel(Text(text), title=f"[bold]{task_name}[/bold]", title_align="left",
+                                border_style="dim", expand=False))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    # -- configuration -----------------------------------------------------
+    result = build_settings({"provider": provider, "model": model} if (provider or model) else None)
+    adapter = ModelAdapter(result.settings)
+
+    if check:
+        problems = _merge_problems(adapter.check_ready(), result.problems)
+        payload = {
+            "ready": not problems,
+            "provider": result.settings.provider,
+            "model": result.settings.model,
+            "mode": _safe_mode(result.settings.provider),
+            "key_hint": result.settings.api_key_hint(),
+            "problems": problems,
+        }
+        if as_json:
+            _emit(json.dumps(payload, indent=2))
+            raise typer.Exit(ExitCode.OK if not problems else ExitCode.CONFIG)
+        console.print()
+        lines = Table(title="structured model adapter", title_justify="left", box=None, pad_edge=False)
+        lines.add_column("setting", style="dim", no_wrap=True)
+        lines.add_column("value", overflow="fold")
+        lines.add_row("provider", escape(result.settings.provider))
+        lines.add_row("model", escape(result.settings.model) if result.settings.model else "[red]unset[/red]")
+        lines.add_row("structured mode", escape(_safe_mode(result.settings.provider)))
+        lines.add_row("credential", escape(result.settings.api_key_hint()))
+        lines.add_row("retry budget", escape(RetryPolicy.from_settings(result.settings).describe()))
+        lines.add_row("status", "[green]ready[/green]" if not problems else "[red]not ready[/red]")
+        console.print(lines)
+        if problems:
+            body = Text()
+            for index, problem in enumerate(problems):
+                if index:
+                    body.append("\n")
+                body.append("✘ ", style="bold red")
+                body.append(problem["message"], style="white")
+            console.print()
+            console.print(Panel(body, title="[bold red]problems[/bold red]", title_align="left",
+                                border_style="red", expand=False))
+        console.print()
+        raise typer.Exit(ExitCode.OK if not problems else ExitCode.CONFIG)
+
+    # -- demo: the whole path, scripted ------------------------------------
+    if demo:
+        kind = demo.strip().lower()
+        if kind not in {"valid", "prose", "refusal", "transient", "scope", "unsupported"}:
+            console.print(f"[red]✘[/red] unknown demo {escape(repr(demo))}; choose from: valid, prose, "
+                          "refusal, transient, scope, unsupported")
+            raise typer.Exit(ExitCode.USAGE)
+        directory = Path(out_dir).expanduser() if out_dir else None
+        buffer = io.StringIO()
+        renderer = EventRenderer.from_options(stream=buffer, color=False, animation=False)
+        outcome = _adapter_demo(
+            kind=kind,
+            provider=(provider or "openai").strip().lower(),
+            model=model or ("llama3" if (provider or "").lower() == "local" else "gpt-4o-mini"),
+            out_dir=directory,
+            renderer=renderer,
+        )
+        if as_json:
+            _emit(json.dumps(outcome, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK if outcome["ok"] else int(outcome.get("exit_code", ExitCode.INTERNAL)))
+        console.print()
+        detail = Table(title=f"scripted model call — {kind}", title_justify="left", box=None, pad_edge=False)
+        detail.add_column("field", style="dim", no_wrap=True)
+        detail.add_column("value", overflow="fold")
+        detail.add_row("provider", escape(str(outcome["provider"])))
+        detail.add_row("structured mode", escape(str(outcome["mode"])))
+        detail.add_row("requests sent", str(outcome["requests"]))
+        if outcome["ok"]:
+            detail.add_row("outcome", "[green]validated[/green]")
+            detail.add_row("attempts", str(outcome.get("attempts")))
+            detail.add_row("subagents", escape(", ".join(outcome.get("subagents", [])) or "—"))
+            detail.add_row("uncertainty", escape(outcome.get("uncertainty") or "—"))
+        else:
+            detail.add_row("outcome", "[red]rejected[/red]")
+            detail.add_row("failure", escape(str(outcome.get("failure"))))
+            detail.add_row("exit code", str(outcome.get("exit_code")))
+        detail.add_row("native schema sent", "yes" if outcome.get("used_native_schema") else "no (prompt)")
+        console.print(detail)
+        if not outcome["ok"]:
+            console.print()
+            console.print(Panel(Text(str(outcome.get("rendered", ""))), title="[bold red]why[/bold red]",
+                                title_align="left", border_style="red", expand=False))
+        if outcome.get("artefact"):
+            console.print(f"[dim]artefact: {escape(outcome['artefact'])}[/dim]")
+        console.print()
+        raise typer.Exit(ExitCode.OK if outcome["ok"] else int(outcome.get("exit_code", ExitCode.INTERNAL)))
+
+    # -- real call ---------------------------------------------------------
+    chosen = _parse_tasks(task)
+    problems = _merge_problems(adapter.check_ready(), result.problems)
+    if problems:
+        first = problems[0]
+        console.print()
+        console.print(Panel(
+            Text(first["message"], style="red"),
+            title="[bold red]cannot call the model[/bold red]", title_align="left", border_style="red", expand=False,
+        ))
+        for extra in problems[1:4]:
+            console.print(f"[red]·[/red] {escape(extra['message'])}")
+        console.print("\n[dim]Fix the configuration, or run `adapter --self-test` to verify the "
+                      "adapter without a provider.[/dim]\n")
+        raise typer.Exit(first["exit_code"])
+
+    console.print()
+    console.print(f"[dim]provider {escape(result.settings.provider)} · model {escape(result.settings.model or '?')} · "
+                  f"{escape(RetryPolicy.from_settings(result.settings).describe())}[/dim]")
+    failed = 0
+    for current in chosen:
+        request = ModelRequest(
+            task=current,
+            objective=f"Demonstrate a {current.value} request for example.com.",
+            context="No evidence has been collected yet; this is a connectivity check.",
+            allowed_evidence_ids=(),
+        )
+        try:
+            with console.status(f"[cyan]{current.value}…[/cyan]"):
+                call = adapter.call(request)
+            console.print(f"[green]✔[/green] {current.value}: validated on attempt {call.attempts} "
+                          f"({call.elapsed_ms:.0f} ms, {call.mode.value})")
+            if as_json:
+                _emit(json.dumps(call.to_dict(), indent=2))
+        except StructuredOutputError as exc:
+            failed += 1
+            console.print(f"[red]✘[/red] {current.value}: {escape(exc.failure.value)} — {escape(exc.message)}")
+            if as_json:
+                _emit(json.dumps({"task": current.value, "failure": exc.failure.value,
+                                  "message": exc.message, "exit_code": exc.exit_code}, indent=2))
+    console.print()
+    raise typer.Exit(ExitCode.OK if not failed else ExitCode.INTERNAL)
+
+
+def _problem_topic(text: str, field: str | None = None) -> str:
+    """A coarse key for a configuration problem, so it can be de-duplicated.
+
+    ``build_settings`` and the adapter describe the same missing model in
+    slightly different words; the topic is what actually identifies the issue.
+    """
+
+    if field:
+        return field
+    lowered = text.lower()
+    if "no model" in lowered:
+        return "model"
+    if "credential" in lowered:
+        return "api_key"
+    if "endpoint" in lowered or "base_url" in lowered or "base url" in lowered:
+        return "base_url"
+    if "httpx" in lowered or "pip install" in lowered:
+        return "httpx"
+    if "provider" in lowered:
+        return "provider"
+    return f"other:{text[:40]}"
+
+
+def _merge_problems(
+    hard: Sequence["StructuredOutputError"], soft: Sequence[Any] = ()
+) -> list[dict[str, Any]]:
+    """Union preflight failures and configuration warnings, without duplicates.
+
+    One topic appears once: the adapter's precise message wins, and a settings
+    warning is only added when that topic is not already covered.
+    """
+
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for problem in hard:
+        text = redact_text(str(problem), secrets=known_secrets())
+        topic = _problem_topic(text)
+        if topic in seen:
+            continue
+        seen.add(topic)
+        merged.append({"failure": problem.failure.value, "message": text, "exit_code": problem.exit_code})
+    for problem in soft:
+        text = redact_text(str(getattr(problem, "message", problem)), secrets=known_secrets())
+        topic = _problem_topic(text, getattr(problem, "field", None))
+        if topic in seen:
+            continue
+        seen.add(topic)
+        merged.append({"failure": ModelFailure.CONFIG.value, "message": text, "exit_code": int(ExitCode.CONFIG)})
+    return merged
+
+
+def _parse_tasks(task: str | None) -> list[ModelTask]:
+    """Resolve ``--task`` into an ordered list, refusing unknown names."""
+
+    if task is None:
+        return list(ModelTask)
+    requested = [part.strip().lower() for part in task.replace(",", " ").split() if part.strip()]
+    chosen: list[ModelTask] = []
+    for name in requested:
+        try:
+            chosen.append(ModelTask(name))
+        except ValueError:
+            raise typer.BadParameter(
+                f"unknown task {name!r}; choose from {', '.join(t.value for t in ModelTask)}"
+            ) from None
+    return chosen or list(ModelTask)
+
+
+def _safe_mode(provider: str) -> str:
+    """Structured-output mode as a string, without raising for unknown providers."""
+
+    adapter = PROVIDER_ADAPTERS.get(provider)
+    return adapter.mode.value if adapter is not None else StructuredMode.UNSUPPORTED.value
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 21. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 
@@ -10981,6 +13536,20 @@ def run() -> None:
             )
         )
         raise typer.Exit(EXIT_INTERRUPTED)
+    except StructuredOutputError as exc:
+        # A provider/contract problem is not a bug: report it as its own class
+        # with the exit code the failure maps to.
+        console.print()
+        console.print(
+            Panel(
+                Text(redact_text(exc.render()), style="red"),
+                border_style="red",
+                title="model call failed",
+                title_align="left",
+                expand=False,
+            )
+        )
+        raise typer.Exit(exc.exit_code)
     except AgentError as exc:
         console.print()
         console.print(

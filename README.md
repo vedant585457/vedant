@@ -10,6 +10,7 @@ python vedant_osint.py mission -t example.com -o "map the attack surface"
 python vedant_osint.py config --settings     # merged config, secrets masked
 python vedant_osint.py doctor                # capability health check (CI gate)
 python vedant_osint.py resilience --self-test # logging, cancellation, cleanup
+python vedant_osint.py adapter --self-test    # structured model output contract
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -98,6 +99,40 @@ python vedant_osint.py resilience --demo exception        # recursive failure
 
 Exit status follows convention: `130` interrupted, `124` timeout, `70` internal
 error.
+
+## Structured model adapter
+
+One interface between orchestration and every provider. `ModelAdapter` returns a
+validated `PlanOutput`, `DecompositionOutput`, `ReviewOutput` or
+`SynthesisOutput` — never a string anyone has to interpret.
+
+```bash
+python vedant_osint.py adapter --self-test          # 134 guarantee checks, offline
+python vedant_osint.py adapter --demo prose         # what a rejection looks like
+python vedant_osint.py adapter --demo scope         # a plan that widens the scope
+python vedant_osint.py adapter --check              # is the provider usable?
+python vedant_osint.py adapter --prompts --task plan
+```
+
+- **Invalid JSON never becomes a plan** — the response is parsed, validated
+  against the task model, then checked against the mission contract: cited
+  evidence must have been supplied, planned scope must sit inside the mission
+  scope, the subagent count must respect the limit, and a synthesis may not drop
+  evidence without recording a gap.
+- **Bounded retries** — attempts *and* elapsed time are capped, with
+  deterministic backoff. Malformed answers get a repair turn naming the failing
+  field; 4xx schema rejections, refusals and policy violations are not retried.
+- **Every prompt demands sources and uncertainty** — a single JSON object, no
+  invented ids, every claim citing supplied ids, and a required uncertainty
+  field. `ModelClaim` refuses unsourced observations, unreasoned inferences and
+  hedging adverbs.
+- **Provider setup is isolated** — endpoints, auth headers, JSON modes and
+  response envelopes live in `PROVIDER_ADAPTERS`; a self-test proves no dialect
+  vocabulary appears above the adapter.
+
+Failures are typed (`malformed`, `policy`, `refused`, `unsupported`,
+`transient`, `config`, `cancelled`) and map to exit codes `70`, `7`, `70`, `3`,
+`70`, `3`, `130`.
 
 ## Run state
 
@@ -200,7 +235,7 @@ Authorised use only — collect from systems you own or are explicitly permitted
 | Phase | Scope | State |
 |-------|-------|-------|
 | 1 | Foundation — CLI skeleton, config probing, version reporting | ✅ done |
-| 2 | Contracts — settings, `doctor`, preflight, models, state, renderer, lifecycle, resilience | ✅ done |
+| 2 | Contracts — settings, `doctor`, preflight, models, state, renderer, lifecycle, resilience, model adapter | ✅ done |
 | 3 | Orchestration — LangGraph Master Agent + runtime Subagent factory | ⬜ next |
 | 4 | Browser — browser-use / Playwright sessions and capture | ⬜ |
 | 5 | Collection — passive OSINT sources, artefact hashing | ⬜ |
