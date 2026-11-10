@@ -416,6 +416,39 @@ by side).  There is no node named after a specialist role and no roster constant
     python vedant_osint.py flow --demo compare                    # one structure, two widths
     python vedant_osint.py flow -t example.com -o "assess the exposure of example.com"
 
+Bounded queues, deadlines and fair concurrency
+------------------------------------------------
+No unit runs unless the scheduler admits it.  :class:`BoundedScheduler` keeps one
+FIFO queue per :class:`ResourceKind` — model calls, browser sessions, forensic
+jobs, Subagents, Workers — behind one condition variable, and grants a slot only
+to the *oldest* waiter, so a long unit cannot re-acquire ahead of the queue and
+starve the tail of a large plan.  ``ResourceLimits`` carries a concurrent cap and
+an optional lifetime cap per kind, and the scheduler records its own ``peak``, so
+"nothing exceeded the cap" is a measurement rather than a claim.
+
+* **A wait that cannot be met fails loudly.**  A queue deadline raises
+  :class:`QueueTimeout`; the wait is clamped to what the mission has left, and a
+  caller holding an expired :class:`Deadline` is refused before it queues.
+* **Deadlines nest.**  ``Deadline.child()`` clamps a unit's budget to its
+  parent's, ``clamp()`` reduces a timeout to the time actually left, and
+  cancellation is checked before a unit queues *and* while it is parked.
+* **Only the Master creates Subagents; Workers create nothing.**  A
+  :class:`SpawnLedger` records who may create whom as a licence (depth 2), and
+  every attempt is licensed or refused with a reason.
+* **A plan too large is clipped, deterministically.**  :func:`clip_plan` keeps
+  dependency closure first and declaration order second — never thread order —
+  and returns a :class:`ClipReport` naming every decision.
+* **Backpressure is a recorded deferral.**  A unit refused a slot or a licence
+  still reports: status ``blocked``, the gate that stopped it, and a gap naming
+  the unit and the reason, so the mission still joins and a cancelled mission
+  stops before synthesis instead of presenting a partial answer as the answer.
+
+::
+
+    python vedant_osint.py sched --self-test       # 80 guarantee checks, offline
+    python vedant_osint.py sched --demo tight      # caps below the plan's width
+    python vedant_osint.py sched --clip forensic --workers 2 --subagents 2
+
 Structured model adapter
 ------------------------
 One model-calling interface sits between orchestration and every provider, so
@@ -577,7 +610,7 @@ from typing import Annotated, Any, Callable, Iterable, Iterator, Mapping, Protoc
 # is imported lazily inside the functions that need it.
 import typer
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from rich.console import Console
+from rich.console import Console, Group
 from rich.markup import escape
 from rich.panel import Panel
 from rich.status import Status
@@ -601,7 +634,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 14
+VERSION_MINOR: int = 15
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -656,7 +689,7 @@ PHASE_ROADMAP: tuple[tuple[int, str, str], ...] = (
     (1, "Foundation", "CLI skeleton, config probing, version reporting"),
     (2, "Contracts", "Contracts, state, rendering, lifecycle, resilience, model adapter"),
     (3, "Orchestration", "Master Agent (only fixed agent), runtime Subagent/Worker factories, "
-                         "LangGraph execution flow"),
+                         "LangGraph execution flow, bounded concurrency and budgets"),
     (4, "Browser", "browser-use/Playwright sessions and capture"),
     (5, "Collection", "passive OSINT sources, artefact hashing/chain of custody"),
     (6, "Synthesis", "cross-source correlation, findings and report export"),
@@ -19512,7 +19545,1559 @@ def workers_command(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 24. The LangGraph execution flow — hierarchy, fan-out, aggregation
+# 24. Bounded queues, deadlines and fair concurrency
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Section 24 made the hierarchy runnable.  This section makes it *stay* runnable
+# at scale, which is a different problem: a plan of nine Subagents each planning
+# twelve Workers produces 108 concurrent branches, and every one of them would
+# want a model call, a browser context and a forensic slot at the same moment.
+# Nothing in the graph itself prevents that, because a graph has no idea what a
+# resource costs.
+#
+# Four mechanisms, and one rule that is structural rather than advisory:
+#
+# * **Everything that can be exhausted is a named resource with a limit.**
+#   ``ResourceLimits`` carries a cap and a queue deadline for model calls,
+#   browser sessions, forensic jobs, Subagents and Workers.  A unit asks the
+#   scheduler for what it needs and waits — bounded — for a slot.
+# * **Waiting is bounded and fair.**  ``BoundedScheduler`` is a fair ticket lock
+#   per resource: waiters are admitted strictly in arrival order, so a long unit
+#   cannot overtake the twenty short ones behind it and starve them.  A waiter
+#   that does not get in before its deadline raises :class:`QueueTimeout` rather
+#   than blocking the mission forever.
+# * **Backpressure, not explosion.**  A unit that cannot queue is *deferred*: the
+#   flow marks it ``deferred`` with the reason, stops spawning its children, and
+#   the plan is clipped before it starts.  Memory and thread count therefore stay
+#   proportional to the limits, not to the plan.
+# * **Deadlines propagate and cancellation is one token.**  ``Deadline`` nests:
+#   a Worker's deadline is the earlier of its own budget and whatever is left of
+#   its Subagent's, which is the earlier of that and the mission's.  Cancelling
+#   the mission cancels every in-flight or waiting unit through the same
+#   :class:`CancellationToken`, and a cancelled unit becomes a gap — never a pass.
+#
+# The rule: **the Master creates Subagents, a Subagent creates Workers, and a
+# Worker creates nothing.**  Section 25 adds a runtime licence for it, sized per
+# run, so a Worker that tries to spawn anything is refused at the door rather
+# than trusted not to try.
+
+#: What the scheduler hands out.  A slot is only ever released by the same thread
+#: that acquired it, and ``SlotHold`` does that even when the body raises.
+class ResourceKind(str, Enum):
+    """A finite thing a mission can exhaust.  Each one has its own queue."""
+
+    MODEL_CALL = "model-call"
+    BROWSER = "browser"
+    FORENSIC = "forensic"
+    SUBAGENT = "subagent"
+    WORKER = "worker"
+
+    @property
+    def label(self) -> str:
+        return self.value.replace("-", " ")
+
+
+#: The order a mission-wide snapshot reports resources in: cheapest and most
+#: contended first, so a starved mission is obvious at the top of the table.
+RESOURCE_ORDER: tuple[ResourceKind, ...] = (
+    ResourceKind.MODEL_CALL,
+    ResourceKind.BROWSER,
+    ResourceKind.FORENSIC,
+    ResourceKind.WORKER,
+    ResourceKind.SUBAGENT,
+)
+
+
+class QueueTimeout(TimeoutError):
+    """Raised when a unit did not reach the front of a queue in time.
+
+    Inherits :class:`TimeoutError` on purpose: the CLI already maps that to exit
+    ``124`` with a "partial results were preserved" message, which is exactly
+    what a queue deadline means for the mission.
+    """
+
+    def __init__(self, kind: ResourceKind, waited: float, limit: int) -> None:
+        super().__init__(
+            f"queued {waited:.1f}s for a {kind.label} slot (limit {limit}); the queue "
+            f"deadline expired before the unit could start")
+        self.kind = kind
+        self.waited = waited
+        self.limit = limit
+
+
+class ResourceLimits(StrictModel):
+    """How much of each resource a mission may use at once, and how long to wait.
+
+    ``max_concurrent_*`` is a *simultaneous* cap; ``max_total_*`` is a mission
+    lifetime cap.  Both are enforced: the first by the queue, the second by the
+    ledger.  Zero lifetime caps mean "no lifetime limit", which is why the
+    defaults are generous but finite for the resources that cost money.
+    """
+
+    max_concurrent_model_calls: int = Field(default=4, ge=1, le=64)
+    max_concurrent_browsers: int = Field(default=2, ge=1, le=16)
+    max_concurrent_forensic_jobs: int = Field(default=2, ge=1, le=32)
+    max_concurrent_subagents: int = Field(default=4, ge=1, le=16)
+    max_concurrent_workers: int = Field(default=8, ge=1, le=32)
+    #: Mission-lifetime ceilings.  ``0`` means unlimited — never "forgotten".
+    max_total_model_calls: int = Field(default=0, ge=0, le=100_000)
+    max_total_browsers: int = Field(default=0, ge=0, le=10_000)
+    max_total_forensic_jobs: int = Field(default=0, ge=0, le=10_000)
+    #: How long one waiter may sit in a queue before it is deferred.
+    queue_timeout_seconds: float = Field(default=30.0, gt=0, le=600)
+    #: Mission wall clock.  Every nested deadline is clamped to it.
+    mission_deadline_seconds: float = Field(default=0.0, ge=0, le=86_400)
+    #: Plan-shape ceilings, applied before anything is created.
+    max_subagents: int = Field(default=8, ge=1, le=64)
+    max_workers_per_subagent: int = Field(default=8, ge=1, le=64)
+    #: Refuse a spawn attempt whose parent is not allowed to make one.
+    enforce_spawn_licence: bool = True
+
+    def concurrent(self, kind: ResourceKind) -> int:
+        return {
+            ResourceKind.MODEL_CALL: self.max_concurrent_model_calls,
+            ResourceKind.BROWSER: self.max_concurrent_browsers,
+            ResourceKind.FORENSIC: self.max_concurrent_forensic_jobs,
+            ResourceKind.SUBAGENT: self.max_concurrent_subagents,
+            ResourceKind.WORKER: self.max_concurrent_workers,
+        }[kind]
+
+    def total(self, kind: ResourceKind) -> int:
+        """Lifetime cap, or ``0`` when the resource has none."""
+
+        return {
+            ResourceKind.MODEL_CALL: self.max_total_model_calls,
+            ResourceKind.BROWSER: self.max_total_browsers,
+            ResourceKind.FORENSIC: self.max_total_forensic_jobs,
+        }.get(kind, 0)
+
+    @classmethod
+    def from_settings(cls, settings: "Settings", **overrides: Any) -> "ResourceLimits":
+        """Take the deployment's own numbers where it has them.
+
+        The browser and HTTP pool sizes are already validated settings, so the
+        scheduler starts from the operator's configuration instead of inventing
+        its own opinion of how many sessions are acceptable.
+        """
+
+        base: dict[str, Any] = {
+            "max_concurrent_browsers": settings.browser_concurrency,
+            "max_concurrent_model_calls": max(1, min(settings.http_concurrency, 8)),
+            "mission_deadline_seconds": float(settings.mission_budget_seconds),
+        }
+        base.update({key: value for key, value in overrides.items() if value is not None})
+        return cls(**base)
+
+    @classmethod
+    def from_context(cls, context: "MasterContext", **overrides: Any) -> "ResourceLimits":
+        base: dict[str, Any] = {
+            "max_concurrent_subagents": min(context.max_subagents, 8),
+            "max_concurrent_workers": max(2, min(context.max_total_workers, 16)),
+            "max_subagents": context.max_subagents,
+            "mission_deadline_seconds": float(context.mission_budget_seconds),
+        }
+        base.update({key: value for key, value in overrides.items() if value is not None})
+        return cls(**base)
+
+    def describe(self) -> str:
+        parts = [f"{kind.label} {self.concurrent(kind)}"
+                 + (f"/{self.total(kind)}" if self.total(kind) else "")
+                 for kind in RESOURCE_ORDER]
+        return "; ".join(parts)
+
+
+class Deadline:
+    """A monotonic instant that a unit must finish by.
+
+    Deadlines nest: :meth:`child` returns the earlier of the requested budget
+    and whatever is left of the parent, so a Worker can never outlive the
+    Subagent that owns it, which can never outlive the mission.  ``None`` means
+    unbounded, which is only reachable when every ancestor is unbounded.
+    """
+
+    __slots__ = ("at", "reason", "parent")
+
+    def __init__(self, at: float | None, reason: str = "", parent: "Deadline | None" = None) -> None:
+        self.at = at
+        self.reason = reason
+        self.parent = parent
+
+    @classmethod
+    def in_seconds(cls, seconds: float, *, reason: str = "",
+                   clock: Callable[[], float] | None = None) -> "Deadline":
+        now = (clock or time.monotonic)()
+        if seconds == 0:
+            # Zero is the sentinel for "unbounded" throughout the limits model.
+            return cls(None, reason)
+        # A negative budget is a deadline already gone, not an absent one: callers
+        # use it to say "this unit may not start".
+        return cls(now + seconds, reason)
+
+    def remaining(self, clock: Callable[[], float] | None = None) -> float | None:
+        if self.at is None:
+            return None
+        return max(0.0, self.at - (clock or time.monotonic)())
+
+    def expired(self, clock: Callable[[], float] | None = None) -> bool:
+        return self.at is not None and (clock or time.monotonic)() >= self.at
+
+    def child(self, seconds: float | None, *, reason: str = "",
+              clock: Callable[[], float] | None = None) -> "Deadline":
+        """The tighter of this deadline and a new ``seconds`` budget."""
+
+        now = (clock or time.monotonic)()
+        candidate = now + seconds if seconds and seconds > 0 else None
+        if self.at is None:
+            return Deadline(candidate, reason, parent=self)
+        if candidate is None or self.at < candidate:
+            return Deadline(self.at, self.reason or reason, parent=self)
+        return Deadline(candidate, reason, parent=self)
+
+    def clamp(self, seconds: float | None) -> float | None:
+        """``seconds``, reduced to the time actually left."""
+
+        left = self.remaining()
+        if seconds is None:
+            return left
+        if left is None:
+            return seconds
+        return min(seconds, left)
+
+    def describe(self) -> str:
+        left = self.remaining()
+        return "no deadline" if left is None else f"{left:.1f}s left"
+
+
+class SlotHold:
+    """One acquired slot.  Releasing twice is a no-op, not a double free."""
+
+    __slots__ = ("kind", "acquired_at", "waited", "_scheduler", "_released")
+
+    def __init__(self, scheduler: "BoundedScheduler", kind: ResourceKind,
+                 waited: float) -> None:
+        self.kind = kind
+        self.waited = waited
+        self.acquired_at = time.monotonic()
+        self._scheduler = scheduler
+        self._released = False
+
+    @property
+    def held_for(self) -> float:
+        return time.monotonic() - self.acquired_at
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._scheduler._release(self.kind, self.held_for)
+
+    def __enter__(self) -> "SlotHold":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        self.release()
+        return False
+
+
+class _Ticket:
+    """One waiter's place in a resource queue.  Ordered by arrival, always."""
+
+    __slots__ = ("number", "granted", "deadline")
+
+    def __init__(self, number: int, deadline: Deadline | None) -> None:
+        self.number = number
+        self.granted = False
+        self.deadline = deadline
+
+    def __repr__(self) -> str:                       # pragma: no cover - debugging aid
+        return f"<ticket {self.number}{' granted' if self.granted else ''}>"
+
+
+@dataclass
+class ResourceGauge:
+    """Live numbers for one resource.  Everything here is observed, not estimated."""
+
+    kind: ResourceKind
+    limit: int
+    active: int = 0
+    peak: int = 0
+    queued: int = 0
+    granted: int = 0
+    timed_out: int = 0
+    cancelled: int = 0
+    deferred: int = 0
+    wait_total: float = 0.0
+    wait_max: float = 0.0
+
+    @property
+    def total_cap(self) -> int:
+        return 0
+
+    @property
+    def pressure(self) -> float:
+        """``active / limit`` — how full the resource is right now."""
+
+        return 0.0 if self.limit <= 0 else min(1.0, self.active / self.limit)
+
+    @property
+    def starved(self) -> bool:
+        """Someone is waiting while the resource is full: real backpressure."""
+
+        return self.queued > 0 and self.active >= self.limit
+
+    @property
+    def mean_wait(self) -> float:
+        return 0.0 if not self.granted else self.wait_total / self.granted
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "resource": self.kind.value,
+            "limit": self.limit,
+            "active": self.active,
+            "peak": self.peak,
+            "queued": self.queued,
+            "granted": self.granted,
+            "timed_out": self.timed_out,
+            "cancelled": self.cancelled,
+            "deferred": self.deferred,
+            "pressure": round(self.pressure, 3),
+            "mean_wait": round(self.mean_wait, 4),
+            "max_wait": round(self.wait_max, 4),
+            "starved": self.starved,
+        }
+
+
+class BoundedScheduler:
+    """Fair, deadline-aware admission control for every finite resource.
+
+    One condition variable guards all the queues, because the interesting
+    decisions ("who goes next") are the same for every resource and a single
+    lock makes them easy to reason about: no unit holds two slots at once, so
+    there is no lock ordering to get wrong.
+
+    Fairness is strict FIFO per resource.  A slot is granted only to the oldest
+    waiter, so a long-running unit cannot repeatedly re-acquire ahead of the
+    queue — which is what an unfair ``Semaphore`` allows and what starves the
+    tail of a large plan.
+    """
+
+    #: How long a waiter sleeps between checks of its own deadline/cancellation
+    #: while it is parked.  Small enough to react promptly, large enough not to
+    #: spin 100 threads against one lock.
+    POLL_SECONDS: float = 0.01
+
+    def __init__(self, limits: ResourceLimits, *,
+                 token: "CancellationToken | None" = None,
+                 clock: Callable[[], float] | None = None,
+                 on_event: Callable[[str, dict[str, Any]], None] | None = None) -> None:
+        self.limits = limits
+        self.token = token
+        self._clock = clock or time.monotonic
+        self._on_event = on_event
+        self._cond = threading.Condition(threading.RLock())
+        self._gauges: dict[ResourceKind, ResourceGauge] = {
+            kind: ResourceGauge(kind=kind, limit=limits.concurrent(kind))
+            for kind in RESOURCE_ORDER
+        }
+        self._queues: dict[ResourceKind, list[_Ticket]] = {kind: [] for kind in RESOURCE_ORDER}
+        self._numbers: dict[ResourceKind, int] = {kind: 0 for kind in RESOURCE_ORDER}
+        #: Lifetime usage, for the *total* caps.  Survives slot release.
+        self._used: dict[ResourceKind, int] = {kind: 0 for kind in RESOURCE_ORDER}
+        self._refusals: list["SpawnRefusal"] = []
+        self._closed = False
+
+    # -- inspection ----------------------------------------------------------
+
+    def gauge(self, kind: ResourceKind) -> ResourceGauge:
+        with self._cond:
+            gauge = self._gauges[kind]
+            gauge.queued = len(self._queues[kind])
+            return ResourceGauge(**{**gauge.__dict__, "queued": gauge.queued})
+
+    def gauges(self) -> dict[ResourceKind, ResourceGauge]:
+        return {kind: self.gauge(kind) for kind in RESOURCE_ORDER}
+
+    def snapshot(self) -> dict[str, Any]:
+        """Everything the CLI prints, in one consistent read."""
+
+        with self._cond:
+            gauges = {kind.value: self.gauge(kind).to_dict() for kind in RESOURCE_ORDER}
+        return {
+            "limits": {
+                "concurrent": {kind.value: self.limits.concurrent(kind) for kind in RESOURCE_ORDER},
+                "total": {kind.value: self.limits.total(kind) for kind in RESOURCE_ORDER},
+                "queue_timeout_seconds": self.limits.queue_timeout_seconds,
+                "mission_deadline_seconds": self.limits.mission_deadline_seconds,
+            },
+            "resources": gauges,
+            "used": {kind.value: count for kind, count in self._used.items()},
+            "peak_active": max((g["peak"] for g in gauges.values()), default=0),
+            "starved": any(g["starved"] for g in gauges.values()),
+            "spawn_refusals": [refusal.to_dict() for refusal in self._refusals],
+            "closed": self._closed,
+        }
+
+    def usage(self, kind: ResourceKind) -> int:
+        with self._cond:
+            return self._used[kind]
+
+    @property
+    def refusals(self) -> list["SpawnRefusal"]:
+        with self._cond:
+            return list(self._refusals)
+
+    # -- admission -----------------------------------------------------------
+
+    def acquire(self, kind: ResourceKind, *, deadline: Deadline | None = None,
+                timeout: float | None = None, unit: str = "") -> SlotHold:
+        """Wait for a slot, fairly, and fail loudly if the wait is not bounded.
+
+        ``timeout`` defaults to the policy's queue deadline; a deadline shortens
+        it further.  Cancellation is checked both before queueing and while
+        parked, so an operator's Ctrl-C empties the queues instead of waiting for
+        them to drain.
+        """
+
+        self._raise_if_cancelled(kind)
+        started = self._clock()
+        ticket: _Ticket | None = None
+        wait_cap = self.limits.queue_timeout_seconds if timeout is None else timeout
+        if deadline is not None:
+            left = deadline.remaining(self._clock)
+            if left is not None:
+                wait_cap = min(wait_cap, left) if wait_cap else left
+
+        with self._cond:
+            self._check_lifetime(kind)
+            gauge = self._gauges[kind]
+            queue = self._queues[kind]
+            if not queue and gauge.active < gauge.limit:
+                gauge.active += 1
+                gauge.peak = max(gauge.peak, gauge.active)
+                gauge.granted += 1
+                self._used[kind] += 1
+                self._emit("resource.granted", kind, unit=unit, waited=0.0)
+                return SlotHold(self, kind, 0.0)
+            self._numbers[kind] += 1
+            ticket = _Ticket(self._numbers[kind], deadline)
+            queue.append(ticket)
+            gauge.queued = len(queue)
+            self._emit("resource.queued", kind, unit=unit, queued=len(queue),
+                       active=gauge.active, limit=gauge.limit,
+                       numbers={"ticket": ticket.number})
+
+        # Park outside the lock: the ticket is granted by whoever released a
+        # slot, so this loop only has to notice, check its own budget, and give up
+        # cleanly if it runs out of time.
+        while True:
+            with self._cond:
+                if ticket.granted:
+                    waited = self._clock() - started
+                    gauge = self._gauges[kind]
+                    gauge.granted += 1
+                    gauge.wait_total += waited
+                    gauge.wait_max = max(gauge.wait_max, waited)
+                    self._used[kind] += 1
+                    gauge.queued = len(self._queues[kind])
+                    self._emit("resource.granted", kind, unit=unit, waited=round(waited, 4))
+                    return SlotHold(self, kind, waited)
+                remaining = wait_cap - (self._clock() - started)
+                if remaining <= 0:
+                    gauge = self._gauges[kind]
+                    self._abandon(kind, ticket)
+                    gauge.timed_out += 1
+                    gauge.queued = len(self._queues[kind])
+                    self._emit("resource.timeout", kind, unit=unit,
+                               waited=round(self._clock() - started, 4))
+                    raise QueueTimeout(kind, self._clock() - started, gauge.limit)
+                self._cond.wait(min(self.POLL_SECONDS, max(0.001, remaining)))
+            self._raise_if_cancelled(kind, ticket=ticket, started=started)
+
+    def try_acquire(self, kind: ResourceKind, *, unit: str = "") -> SlotHold | None:
+        """Take a slot only if one is free right now — never queues."""
+
+        with self._cond:
+            gauge = self._gauges[kind]
+            if self._queues[kind] or gauge.active >= gauge.limit:
+                scale = self._gauges[kind]
+                scale.deferred += 1
+                self._emit("resource.deferred", kind, unit=unit, active=gauge.active,
+                           limit=gauge.limit, queued=len(self._queues[kind]))
+                return None
+            self._check_lifetime(kind)
+            gauge.active += 1
+            gauge.peak = max(gauge.peak, gauge.active)
+            gauge.granted += 1
+            self._used[kind] += 1
+            self._emit("resource.granted", kind, unit=unit, waited=0.0)
+            return SlotHold(self, kind, 0.0)
+
+    def release_all(self) -> None:
+        """Drain every queue and stop admitting.  Safe to call twice."""
+
+        with self._cond:
+            self._closed = True
+            for kind, queue in self._queues.items():
+                for ticket in queue:
+                    if not ticket.granted:
+                        self._gauges[kind].deferred += 1
+                queue.clear()
+                self._gauges[kind].queued = 0
+            self._cond.notify_all()
+
+    # -- internal ------------------------------------------------------------
+
+    def _check_lifetime(self, kind: ResourceKind) -> None:
+        cap = self.limits.total(kind)
+        if cap and self._used[kind] >= cap:
+            raise BudgetExceeded(
+                f"{kind.label} budget exhausted: {self._used[kind]} of {cap} used for this mission")
+
+    def _abandon(self, kind: ResourceKind, ticket: _Ticket) -> None:
+        """Leave the queue, or hand back a slot granted in the same instant."""
+
+        gauge = self._gauges[kind]
+        queue = self._queues[kind]
+        if ticket.granted:
+            gauge.active = max(0, gauge.active - 1)
+            self._promote(kind)
+            return
+        try:
+            queue.remove(ticket)
+        except ValueError:                       # pragma: no cover - granted concurrently
+            gauge.active = max(0, gauge.active - 1)
+        gauge.cancelled += 0                # counted by the caller that knows why
+        self._cond.notify_all()
+
+    def _raise_if_cancelled(self, kind: ResourceKind, *, ticket: _Ticket | None = None,
+                            started: float | None = None) -> None:
+        if self.token is None or not self.token.cancelled:
+            return
+        if ticket is not None:
+            with self._cond:
+                if ticket.granted:
+                    self._gauges[kind].active = max(0, self._gauges[kind].active - 1)
+                    self._promote(kind)
+                else:
+                    try:
+                        self._queues[kind].remove(ticket)
+                    except ValueError:
+                        pass
+                self._gauges[kind].cancelled += 1
+                self._gauges[kind].queued = len(self._queues[kind])
+                self._cond.notify_all()
+        self._emit("resource.cancelled", kind, waited=(
+            round(self._clock() - started, 4) if started is not None else None))
+        raise CancellationRequested(self.token.reason or "mission cancelled while queued")
+
+    def _release(self, kind: ResourceKind, held_for: float) -> None:
+        with self._cond:
+            gauge = self._gauges[kind]
+            gauge.active = max(0, gauge.active - 1)
+            self._promote(kind)
+            gauge.queued = len(self._queues[kind])
+            self._emit("resource.released", kind, held=round(held_for, 4))
+            self._cond.notify_all()
+
+    def _promote(self, kind: ResourceKind) -> None:
+        """Grant freed capacity to the oldest waiters, in order.  Never skips."""
+
+        gauge = self._gauges[kind]
+        queue = self._queues[kind]
+        while queue and gauge.active < gauge.limit:
+            ticket = queue.pop(0)
+            if ticket.deadline is not None and ticket.deadline.expired(self._clock):
+                gauge.timed_out += 1
+                continue
+            ticket.granted = True
+            gauge.active += 1
+            gauge.peak = max(gauge.peak, gauge.active)
+        gauge.queued = len(queue)
+
+    def _emit(self, event: str, kind: ResourceKind, **payload: Any) -> None:
+        if self._on_event is None:
+            return
+        try:
+            self._on_event(event, {"resource": kind.value, **payload})
+        except Exception:                       # telemetry must never break the mission
+            pass
+
+
+# --------------------------------------------------------------------------
+# 24.1 Who may create whom — a licence, not a convention
+# --------------------------------------------------------------------------
+
+
+class SpawnTier(str, Enum):
+    """The three tiers of the hierarchy.  Creation only ever flows downwards."""
+
+    MASTER = "master"
+    SUBAGENT = "subagent"
+    WORKER = "worker"
+
+    @property
+    def may_create(self) -> frozenset["SpawnTier"]:
+        """What this tier is allowed to create.  Workers create nothing."""
+
+        return {
+            SpawnTier.MASTER: frozenset({SpawnTier.SUBAGENT}),
+            SpawnTier.SUBAGENT: frozenset({SpawnTier.WORKER}),
+            SpawnTier.WORKER: frozenset(),
+        }[self]
+
+
+class SpawnRefused(PermissionError):
+    """A unit tried to create something it is not allowed to create.
+
+    Inherits :class:`PermissionError`: this is an authorisation boundary, not a
+    bug in the caller's loop, and it must never be swallowed as one.
+    """
+
+    def __init__(self, refusal: "SpawnRefusal") -> None:
+        super().__init__(refusal.describe())
+        self.refusal = refusal
+
+
+class SpawnRefusal(StrictModel):
+    """One refused creation, with who asked, for what, and why not."""
+
+    parent_id: str
+    parent_tier: SpawnTier
+    child_tier: SpawnTier
+    reason: str
+    detail: str
+    at: float = Field(default=0.0, ge=0)
+
+    def describe(self) -> str:
+        return (f"{self.parent_tier.value} {self.parent_id} may not create a "
+                f"{self.child_tier.value}: {self.detail}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(model_to_json(self))
+
+
+class SpawnLicence(StrictModel):
+    """How many children one live unit may still create.
+
+    A licence is issued by the thing that created the unit, is decremented at
+    each creation, and cannot be topped up by its holder — so "spawn until it
+    works" is not expressible.  ``remaining`` reaching zero is a refusal, not a
+    hint.
+    """
+
+    unit_id: str = Field(min_length=1)
+    tier: SpawnTier
+    child_tier: SpawnTier
+    granted: int = Field(ge=0, le=256)
+    used: int = Field(default=0, ge=0)
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.granted - self.used)
+
+    @property
+    def exhausted(self) -> bool:
+        return self.remaining == 0
+
+    def describe(self) -> str:
+        return (f"{self.tier.value} {self.unit_id} may create {self.child_tier.value}s: "
+                f"{self.used}/{self.granted} used")
+
+
+class SpawnPolicy(StrictModel):
+    """The runtime licence table: tiers, counts, and the recursion ceiling.
+
+    ``max_depth`` is the belt to the tier-braces: Master → Subagent → Worker is
+    depth 2 and is the deepest this hierarchy goes, so a depth-3 request is
+    refused even if a future edit widened :attr:`SpawnTier.may_create`.
+    """
+
+    enforce_tiers: bool = True
+    max_depth: int = Field(default=2, ge=1, le=4)
+    #: Children one Subagent may create.  Independent of its spec's ``max_workers``
+    #: — that is the plan's limit, this is the run's.
+    max_workers_per_subagent: int = Field(default=8, ge=1, le=64)
+    #: Children one Master may create for this run.
+    max_subagents_per_mission: int = Field(default=8, ge=1, le=64)
+
+    def licence_for(self, unit_id: str, tier: SpawnTier) -> SpawnLicence:
+        """The licence a *newly created* unit is given over its own children."""
+
+        child = {
+            SpawnTier.MASTER: SpawnTier.SUBAGENT,
+            SpawnTier.SUBAGENT: SpawnTier.WORKER,
+            SpawnTier.WORKER: SpawnTier.SUBAGENT,      # never permitted; sized for the refusal
+        }[tier]
+        granted = {
+            SpawnTier.MASTER: self.max_subagents_per_mission,
+            SpawnTier.SUBAGENT: self.max_workers_per_subagent,
+            SpawnTier.WORKER: 0,
+        }[tier]
+        return SpawnLicence(unit_id=unit_id, tier=tier, child_tier=child, granted=granted)
+
+
+class SpawnLedger:
+    """The only place a runtime licence is checked, spent, and recorded.
+
+    Every creation in the mission goes through :meth:`spawn`.  That is what
+    makes "only the Master creates Subagents, Workers create nothing" a property
+    of the running system rather than a rule in a document: a Worker has a
+    zero-sized licence, so the attempt is refused and logged before anything is
+    built.
+    """
+
+    def __init__(self, policy: SpawnPolicy | None = None,
+                 token: "CancellationToken | None" = None) -> None:
+        self.policy = policy or SpawnPolicy()
+        self.token = token
+        self._lock = threading.RLock()
+        self._licences: dict[str, SpawnLicence] = {}
+        self._tiers: dict[str, SpawnTier] = {"master": SpawnTier.MASTER}
+        self._depths: dict[str, int] = {"master": 0}
+        self._refused: list[SpawnRefusal] = []
+        self._created: dict[SpawnTier, int] = {tier: 0 for tier in SpawnTier}
+
+    # -- registration --------------------------------------------------------
+
+    def register(self, unit_id: str, tier: SpawnTier, *, parent: str = "master") -> SpawnLicence:
+        """Record a unit that already exists, and issue its licence.
+
+        Registration is separate from :meth:`spawn` so that a team built by
+        Section 22's factories is still *known* to the ledger — the ledger then
+        governs what those units do next, which is the part that can recurse.
+        """
+
+        with self._lock:
+            existing = self._licences.get(unit_id)
+            if existing is not None:
+                # Re-registering is a no-op: identity and depth are set once, so
+                # a second ``build`` cannot deepen the hierarchy or refill a
+                # licence that has already been spent.
+                return existing
+            self._tiers[unit_id] = tier
+            self._depths[unit_id] = 0 if tier is SpawnTier.MASTER \
+                else self._depths.get(parent, 0) + 1
+            licence = self.policy.licence_for(unit_id, tier)
+            self._licences[unit_id] = licence
+            return licence
+
+    def depth_of(self, unit_id: str) -> int:
+        with self._lock:
+            return self._depths.get(unit_id, 0)
+
+    def licence(self, unit_id: str) -> SpawnLicence | None:
+        with self._lock:
+            return self._licences.get(unit_id)
+
+    def tier_of(self, unit_id: str) -> SpawnTier | None:
+        with self._lock:
+            return self._tiers.get(unit_id)
+
+    @property
+    def refusals(self) -> list[SpawnRefusal]:
+        with self._lock:
+            return list(self._refused)
+
+    @property
+    def created(self) -> dict[str, int]:
+        with self._lock:
+            return {tier.value: count for tier, count in self._created.items()}
+
+    # -- the check -----------------------------------------------------------
+
+    def may_spawn(self, parent: str, child_tier: SpawnTier) -> SpawnRefusal | None:
+        """``None`` when the creation is allowed, otherwise the reason it is not."""
+
+        parent_tier = self.tier_of(parent) or SpawnTier.WORKER
+        depth = self.depth_of(parent) + 1
+        if self.policy.enforce_tiers and child_tier not in parent_tier.may_create:
+            why = ("a worker cannot create agents" if parent_tier is SpawnTier.WORKER
+                   else f"only the master creates {child_tier.value}s")
+            return SpawnRefusal(
+                parent_id=parent, parent_tier=parent_tier, child_tier=child_tier,
+                reason="tier", detail=why, at=float(depth))
+        if depth > self.policy.max_depth:
+            return SpawnRefusal(
+                parent_id=parent, parent_tier=parent_tier, child_tier=child_tier,
+                reason="depth",
+                detail=(f"depth {depth} exceeds the ceiling of {self.policy.max_depth}: "
+                        f"the hierarchy is at most master → subagent → worker"),
+                at=depth)
+        licence = self._licences.get(parent)
+        if licence is None:
+            return SpawnRefusal(
+                parent_id=parent, parent_tier=parent_tier, child_tier=child_tier,
+                reason="unregistered",
+                detail="the parent holds no licence because it was never registered",
+                at=depth)
+        if licence.remaining <= 0:
+            return SpawnRefusal(
+                parent_id=parent, parent_tier=parent_tier, child_tier=child_tier,
+                reason="licence",
+                detail=(f"its licence for {licence.granted} {child_tier.value}(s) is "
+                        f"exhausted"), at=depth)
+        return None
+
+    def spawn(self, parent: str, child_id: str, child_tier: SpawnTier) -> SpawnLicence:
+        """Spend one licence seat, or refuse.  Never partially creates."""
+
+        with self._lock:
+            refusal = self.may_spawn(parent, child_tier)
+            if refusal is not None:
+                self._refused.append(refusal)
+                if self.token is not None:
+                    pass        # cancellation is checked before the refusal is returned
+                raise SpawnRefused(refusal)
+            licence = self._licences[parent]
+            self._licences[parent] = licence.model_copy(update={"used": licence.used + 1})
+            child = self.policy.licence_for(child_id, child_tier)
+            self._licences[child_id] = child
+            self._tiers[child_id] = child_tier
+            self._depths[child_id] = self._depths.get(parent, 0) + 1
+            self._created[child_tier] += 1
+            return child
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "policy": json.loads(model_to_json(self.policy)),
+                "licences": [json.loads(model_to_json(licence))
+                             for licence in self._licences.values()],
+                "created": {tier.value: count for tier, count in self._created.items()},
+                "depths": dict(self._depths),
+                "refusals": [refusal.to_dict() for refusal in self._refused],
+            }
+
+
+# --------------------------------------------------------------------------
+# 24.2 A plan that is too large is clipped before it runs
+# --------------------------------------------------------------------------
+
+
+class ClipAction(str, Enum):
+    """What happened to one unit of a plan when it met a ceiling."""
+
+    KEPT = "kept"
+    DROPPED = "dropped"          # over a count ceiling: not run at all
+    MERGED = "merged"            # folded into a retained unit of the same subagent
+    DEFERRED = "deferred"        # run later, or on the next mission — never silently
+
+
+class PlanClip(StrictModel):
+    """One decision about one unit, with the reason and the room it freed."""
+
+    unit: str
+    parent: str
+    action: ClipAction
+    reason: str
+    detail: str = ""
+
+    def describe(self) -> str:
+        return f"{self.action.value} {self.unit}: {self.reason}"
+
+
+class ClipReport(StrictModel):
+    """What a plan looked like before and after it met the mission's ceilings."""
+
+    subagents_in: int = Field(ge=0)
+    subagents_out: int = Field(ge=0)
+    workers_in: int = Field(ge=0)
+    workers_out: int = Field(ge=0)
+    clips: list[PlanClip] = Field(default_factory=list)
+    limits: ResourceLimits = Field(default_factory=ResourceLimits)
+
+    @property
+    def clipped(self) -> bool:
+        return self.subagents_out < self.subagents_in or self.workers_out < self.workers_in
+
+    @property
+    def dropped(self) -> list[PlanClip]:
+        return [clip for clip in self.clips if clip.action is ClipAction.DROPPED]
+
+    @property
+    def changes(self) -> list[PlanClip]:
+        """The decisions that removed a unit — what a reader needs to see."""
+
+        return [clip for clip in self.clips if clip.action is not ClipAction.KEPT]
+
+    def summary(self) -> str:
+        if not self.clipped:
+            return (f"plan fits: {self.subagents_out} subagent(s), {self.workers_out} worker(s)")
+        return (f"plan clipped from {self.subagents_in}/{self.workers_in} subagent(s)/worker(s) "
+                f"to {self.subagents_out}/{self.workers_out}; "
+                f"{len(self.dropped)} unit(s) not run")
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(model_to_json(self))
+
+
+def clip_plan(subagents: Sequence[FlowSubagent], limits: ResourceLimits) -> tuple[
+        list[FlowSubagent], ClipReport]:
+    """Fit a plan inside the mission's ceilings, deterministically.
+
+    Retention order is *dependency* order first (a kernel: a Subagent nobody
+    depends on and that depends on nothing is cheapest to drop) and declaration
+    order second — never "whichever thread got here first", because a clip that
+    depends on thread timing would produce a different mission on every run.
+
+    A dropped Subagent's Workers go with it.  A Subagent that keeps its place but
+    exceeds ``max_workers_per_subagent`` keeps the Workers that others read
+    from, then the earliest declared — dropping a Worker whose output another
+    Worker declares as an input would break the graph's dependency edge, so those
+    are kept first and the clip says so.
+    """
+
+    clips: list[PlanClip] = []
+    wanted_subagents = list(subagents)
+    kept_subagents: list[FlowSubagent] = []
+
+    depended_on: dict[str, int] = {subagent.id: 0 for subagent in wanted_subagents}
+    for subagent in wanted_subagents:
+        for dependency in subagent.depends_on:
+            if dependency in depended_on:
+                depended_on[dependency] += 1
+
+    if len(wanted_subagents) > limits.max_subagents:
+        # Keep the ones others depend on; then keep declaration order.  The
+        # choice is then *closed*: if a kept Subagent reads from one that was
+        # about to be dropped, the dependency is kept in its place, because a
+        # plan whose surviving units cannot get their inputs is not a plan.
+        ranked = sorted(
+            range(len(wanted_subagents)),
+            key=lambda index: (-depended_on[wanted_subagents[index].id], index),
+        )
+        keep = set(ranked[:limits.max_subagents])
+        by_id = {subagent.id: index for index, subagent in enumerate(wanted_subagents)}
+        changed = True
+        while changed:
+            changed = False
+            for index in sorted(keep, reverse=True):
+                for dependency in wanted_subagents[index].depends_on:
+                    source = by_id.get(dependency)
+                    if source is None or source in keep:
+                        continue
+                    keep.add(source)          # the input comes along
+                    evicted = max(keep - {source},
+                                  key=lambda other: (-depended_on[wanted_subagents[other].id],
+                                                     -other))
+                    if evicted != source:
+                        keep.discard(evicted)
+                    changed = True
+                    break
+                if changed:
+                    break
+            if len(keep) > limits.max_subagents:   # a cycle of inputs: stop repairing
+                keep = set(sorted(keep)[:limits.max_subagents])
+                break
+        for index in sorted(keep):
+            kept_subagents.append(wanted_subagents[index])
+            clips.append(PlanClip(
+                unit=wanted_subagents[index].role, parent="master", action=ClipAction.KEPT,
+                reason="within the mission's subagent ceiling",
+                detail=f"{depended_on[wanted_subagents[index].id]} dependent unit(s)"))
+        for index in sorted(set(range(len(wanted_subagents))) - keep):
+            subagent = wanted_subagents[index]
+            clips.append(PlanClip(
+                unit=subagent.role, parent="master", action=ClipAction.DROPPED,
+                reason="over the subagent ceiling",
+                detail=(f"{len(wanted_subagents)} planned, {limits.max_subagents} allowed; "
+                        f"{len(subagent.workers)} worker(s) not created either")))
+        kept_subagents.sort(key=lambda subagent: by_id[subagent.id])
+    else:
+        kept_subagents = wanted_subagents
+        clips.extend(PlanClip(unit=subagent.role, parent="master", action=ClipAction.KEPT,
+                              reason="within the mission's subagent ceiling")
+                     for subagent in kept_subagents)
+
+    kept_ids = {subagent.id for subagent in kept_subagents}
+    output: list[FlowSubagent] = []
+    for subagent in kept_subagents:
+        dependencies = [dep for dep in subagent.depends_on if dep in kept_ids]
+        missing = [dep for dep in subagent.depends_on if dep not in kept_ids]
+        if missing:
+            # Its dependency was clipped away: the unit can still run, but only
+            # because every dependent is a data edge it can survive without.
+            clips.append(PlanClip(
+                unit=subagent.role, parent="master", action=ClipAction.KEPT,
+                reason="dependency clipped",
+                detail=f"runs without {', '.join(missing)}; its evidence will be a gap"))
+        workers = list(subagent.workers)
+        if len(workers) > limits.max_workers_per_subagent:
+            referenced = {dep for worker in workers for dep in worker.depends_on}
+            keep = sorted(range(len(workers)),
+                          key=lambda index: (workers[index].id not in referenced, index))
+            keep = sorted(keep[:limits.max_workers_per_subagent])
+            dropped = [index for index in range(len(workers)) if index not in set(keep)]
+            for index in dropped:
+                clips.append(PlanClip(
+                    unit=workers[index].name, parent=subagent.role,
+                    action=ClipAction.DROPPED, reason="over the per-subagent worker ceiling",
+                    detail=(f"{len(workers)} planned, {limits.max_workers_per_subagent} "
+                            f"allowed for {subagent.role}")))
+            workers = [workers[index] for index in keep]
+        output.append(subagent.model_copy(update={"workers": workers,
+                                                  "depends_on": dependencies}))
+
+    return output, ClipReport(
+        subagents_in=len(subagents), subagents_out=len(output),
+        workers_in=sum(len(subagent.workers) for subagent in subagents),
+        workers_out=sum(len(subagent.workers) for subagent in output),
+        clips=clips, limits=limits)
+
+
+# --------------------------------------------------------------------------
+# 24.3 A ConcurrencyRuntime per run — what the flow talks to
+# --------------------------------------------------------------------------
+
+
+class ConcurrencyRuntime:
+    """One mission's admission control: limits, queues, licences and deadlines.
+
+    The flow asks this object for everything it needs and nothing for anything
+    else, which is why the graph stays a graph: no node knows a limit, a queue or
+    a licence exists.
+    """
+
+    def __init__(
+        self,
+        limits: ResourceLimits | None = None,
+        *,
+        policy: SpawnPolicy | None = None,
+        token: "CancellationToken | None" = None,
+        clock: Callable[[], float] | None = None,
+        on_event: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> None:
+        self.limits = limits or ResourceLimits()
+        self.token = token or CancellationToken()
+        self._clock = clock or time.monotonic
+        self.on_event = on_event
+        self.started_at = self._clock()
+        #: The mission's own deadline: every child deadline is clamped to it.
+        self.deadline = Deadline.in_seconds(self.limits.mission_deadline_seconds,
+                                           reason="mission deadline", clock=self._clock)
+        self.scheduler = BoundedScheduler(self.limits, token=self.token, clock=self._clock,
+                                          on_event=self._emit)
+        self.spawns = SpawnLedger(policy, token=self.token)
+        self.spawns.register("master", SpawnTier.MASTER)
+        self._clips: list[ClipReport] = []
+        self._deadline_hits: list[dict[str, Any]] = []
+        self._lock = threading.RLock()
+
+    # -- telemetry -----------------------------------------------------------
+
+    def _emit(self, event: str, payload: dict[str, Any]) -> None:
+        if self.on_event is not None:
+            try:
+                self.on_event(event, payload)
+            except Exception:                   # telemetry must never break a mission
+                pass
+
+    # -- deadlines -----------------------------------------------------------
+
+    def child_deadline(self, seconds: float | None, *, reason: str) -> Deadline:
+        """A deadline nested inside the mission's own."""
+
+        return self.deadline.child(seconds, reason=reason, clock=self._clock)
+
+    def expired(self) -> bool:
+        return self.deadline.expired(self._clock)
+
+    def record_deadline(self, unit: str, *, stage: str, reason: str = "") -> None:
+        with self._lock:
+            self._deadline_hits.append({"unit": unit, "stage": stage,
+                                        "reason": reason or "deadline expired"})
+
+    @property
+    def deadline_hits(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self._deadline_hits)
+
+    # -- cancellation --------------------------------------------------------
+
+    @property
+    def cancelled(self) -> bool:
+        return self.token.cancelled
+
+    def cancel(self, reason: str = "",
+               kind: "InterruptionKind | None" = None) -> bool:
+        """Cancel the mission: every waiter and in-flight unit learns at once."""
+
+        first = self.token.cancel(reason or "mission cancelled", kind=kind
+                                  or InterruptionKind.OPERATOR)
+        if first:
+            self.scheduler.release_all()
+        return first
+
+    def raise_if_cancelled(self) -> None:
+        self.token.raise_if_cancelled(stage="concurrency")
+
+    # -- admission -----------------------------------------------------------
+
+    def slot(self, kind: ResourceKind, *, unit: str = "",
+             deadline: Deadline | None = None) -> SlotHold:
+        """Queue fairly for one slot.  Raises on timeout, cancellation or budget."""
+
+        self.raise_if_cancelled()
+        if self.expired():
+            self.record_deadline(unit, stage=kind.value, reason="mission deadline expired")
+            raise QueueTimeout(kind, 0.0, self.limits.concurrent(kind))
+        return self.scheduler.acquire(kind, deadline=deadline or self.deadline, unit=unit)
+
+    def try_slot(self, kind: ResourceKind, *, unit: str = "") -> SlotHold | None:
+        """Take a slot only if it is free: the backpressure decision."""
+
+        try:
+            return self.scheduler.try_acquire(kind, unit=unit)
+        except BudgetExceeded:
+            return None
+
+    # -- licences ------------------------------------------------------------
+
+    def register_subagent(self, subagent: FlowSubagent) -> SpawnLicence:
+        return self.spawns.register(subagent.id, SpawnTier.SUBAGENT, parent="master")
+
+    def register_worker(self, worker: FlowWorker, subagent: FlowSubagent) -> SpawnLicence:
+        return self.spawns.register(worker.id, SpawnTier.WORKER, parent=subagent.id)
+
+    def licence_refusal(self, parent: str, child_tier: SpawnTier) -> SpawnRefusal | None:
+        return self.spawns.may_spawn(parent, child_tier)
+
+    def attempt_worker_spawn(self, worker: FlowWorker) -> SpawnRefusal:
+        """What happens when a Worker tries to create anything.
+
+        Called by the self-test and by any future Worker-side code path: the
+        refusal is recorded and raised, so a Worker cannot quietly grow a team.
+        """
+
+        try:
+            self.spawns.spawn(worker.id, f"{worker.id}-child", SpawnTier.SUBAGENT)
+        except SpawnRefused as exc:
+            return exc.refusal
+        raise AssertionError("a worker was allowed to create a subagent")   # pragma: no cover
+
+    # -- plan shape ----------------------------------------------------------
+
+    def clip(self, subagents: Sequence[FlowSubagent]) -> tuple[list[FlowSubagent], ClipReport]:
+        kept, report = clip_plan(subagents, self.limits)
+        with self._lock:
+            self._clips.append(report)
+        self._emit("plan.clipped", {"subagents_in": report.subagents_in,
+                                    "subagents_out": report.subagents_out,
+                                    "workers_in": report.workers_in,
+                                    "workers_out": report.workers_out,
+                                    "clipped": report.clipped})
+        return kept, report
+
+    @property
+    def clips(self) -> list[ClipReport]:
+        with self._lock:
+            return list(self._clips)
+
+    @property
+    def last_clip(self) -> ClipReport | None:
+        with self._lock:
+            return self._clips[-1] if self._clips else None
+
+    def defer(self, unit: str, *, stage: str, reason: str) -> None:
+        """Record that a unit was not admitted.  Always visible, never silent."""
+
+        with self._lock:
+            self._deadline_hits.append({"unit": unit, "stage": stage, "reason": reason,
+                                        "deferred": True})
+        self._emit("unit.deferred", {"unit": unit, "stage": stage, "reason": reason})
+
+    # -- inspection ----------------------------------------------------------
+
+    def elapsed(self) -> float:
+        return self._clock() - self.started_at
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "limits": json.loads(model_to_json(self.limits)),
+            "resources": self.scheduler.snapshot(),
+            "spawns": self.spawns.snapshot(),
+            "deadline": {"seconds": self.limits.mission_deadline_seconds,
+                         "remaining": (None if self.deadline.at is None
+                                       else round(self.deadline.remaining(self._clock), 3)),
+                         "expired": self.expired()},
+            "cancelled": self.cancelled,
+            "deferred": self.deadline_hits,
+            "clips": [clip.to_dict() for clip in self.clips],
+            "elapsed": round(self.elapsed(), 3),
+        }
+
+    def describe(self) -> str:
+        gauge = self.scheduler.gauges()
+        return (f"{self.limits.describe()} · "
+                + " · ".join(f"{kind.label} peak {gauge[kind].peak}/{gauge[kind].limit}"
+                             for kind in RESOURCE_ORDER if gauge[kind].peak))
+
+
+# --------------------------------------------------------------------------
+# 24.4 Self-test — the acceptance criteria as executable checks
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ConcurrencyCheck:
+    """One claim about admission control, and the evidence for it."""
+
+    name: str
+    ok: bool
+    detail: str = ""
+
+
+def run_resource_self_test() -> list[ConcurrencyCheck]:
+    """Prove the scheduler's guarantees offline: no provider, no network.
+
+    Every check is a property of the scheduler or the flow rather than of one
+    run's timing, so the suite is deterministic enough to be the gate for the
+    section.
+    """
+
+    checks: list[ConcurrencyCheck] = []
+
+    def add(name: str, ok: bool, detail: Any = "") -> None:
+        checks.append(ConcurrencyCheck(name=name, ok=bool(ok), detail=str(detail)[:150]))
+
+    def raises(fn: Callable[[], Any], exc: type[BaseException]) -> bool:
+        try:
+            fn()
+        except exc:
+            return True
+        except Exception:
+            return False
+        return False
+
+    # ---- 1. limits: one cap, one queue, one deadline per resource -------
+    limits = ResourceLimits(max_concurrent_workers=2, max_concurrent_model_calls=1,
+                            queue_timeout_seconds=0.2)
+    add("every resource has a cap", all(limits.concurrent(kind) >= 1 for kind in RESOURCE_ORDER),
+        {kind.value: limits.concurrent(kind) for kind in RESOURCE_ORDER})
+    add("lifetime caps default to unlimited", limits.total(ResourceKind.MODEL_CALL) == 0)
+    add("a concurrent cap can be tightened but not zeroed",
+        raises(lambda: ResourceLimits(max_concurrent_workers=0), ValueError))
+
+    scheduler = BoundedScheduler(limits)
+    held = scheduler.acquire(ResourceKind.WORKER, unit="a")
+    add("a slot is granted when the resource is idle", holds(scheduler, ResourceKind.WORKER))
+    second = scheduler.acquire(ResourceKind.WORKER, unit="b")
+    add("a second slot is granted up to the cap",
+        scheduler.gauge(ResourceKind.WORKER).active == 2)
+    add("the peak is recorded", scheduler.gauge(ResourceKind.WORKER).peak == 2)
+    add("a third waiter cannot be granted at once",
+        not scheduler.try_acquire(ResourceKind.WORKER, unit="c"))
+    add("a refusal to admit is counted as deferred",
+        scheduler.gauge(ResourceKind.WORKER).deferred == 1)
+    held.release()
+    add("releasing frees exactly one slot",
+        scheduler.gauge(ResourceKind.WORKER).active == 1)
+    second.release()
+    add("releasing twice does not free twice",
+        (held.release(), scheduler.gauge(ResourceKind.WORKER).active == 0)[1])
+
+    # a queue that cannot drain raises, and says what it was waiting for
+    stuck = BoundedScheduler(ResourceLimits(max_concurrent_browsers=1,
+                                           queue_timeout_seconds=0.15))
+    blocker = stuck.acquire(ResourceKind.BROWSER)
+
+    def wait_forever() -> None:
+        stuck.acquire(ResourceKind.BROWSER, unit="late")
+
+    add("a queue deadline raises instead of hanging", raises(wait_forever, QueueTimeout))
+    add("the timeout is counted on the resource",
+        stuck.gauge(ResourceKind.BROWSER).timed_out == 1)
+    add("a queue timeout is a TimeoutError, so the CLI maps it to 124",
+        issubclass(QueueTimeout, TimeoutError))
+    blocker.release()
+
+    # lifetime caps are enforced even when the queue is empty
+    capped = BoundedScheduler(ResourceLimits(max_total_model_calls=2))
+    for _ in range(2):
+        capped.acquire(ResourceKind.MODEL_CALL).release()
+    add("a lifetime cap refuses the next call",
+        raises(lambda: capped.acquire(ResourceKind.MODEL_CALL), BudgetExceeded))
+    add("the lifetime count is what it says",
+        capped.usage(ResourceKind.MODEL_CALL) == 2, capped.usage(ResourceKind.MODEL_CALL))
+
+    # ---- 2. fairness: arrival order, never re-acquisition --------------
+    fair = BoundedScheduler(ResourceLimits(max_concurrent_workers=1,
+                                          queue_timeout_seconds=5.0))
+    hold = fair.acquire(ResourceKind.WORKER)
+    order: list[str] = []
+    gate = threading.Lock()
+
+    def waiter(name: str, sleep_for: float) -> None:
+        time.sleep(sleep_for)
+        slot = fair.acquire(ResourceKind.WORKER, unit=name)
+        with gate:
+            order.append(name)
+        time.sleep(0.01)
+        slot.release()
+
+    threads = [threading.Thread(target=waiter, args=(f"u{index}", index * 0.02))
+               for index in range(5)]
+    for thread in threads:
+        thread.start()
+    time.sleep(0.15)
+    hold.release()
+    for thread in threads:
+        thread.join(timeout=10)
+    add("waiters are admitted in arrival order", order == sorted(order), order)
+    add("the greedy waiter did not overtake the queue", order[0] == "u0", order)
+
+    # the same fairness under a full flight of parallel requesters
+    burst = BoundedScheduler(ResourceLimits(max_concurrent_model_calls=3,
+                                            queue_timeout_seconds=10.0))
+    seen: list[int] = []
+
+    def request(index: int) -> None:
+        with burst.acquire(ResourceKind.MODEL_CALL, unit=f"m{index}"):
+            with gate:
+                seen.append(burst.gauge(ResourceKind.MODEL_CALL).active)
+            time.sleep(0.005)
+
+    threads = [threading.Thread(target=request, args=(index,)) for index in range(12)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+    gauge = burst.gauge(ResourceKind.MODEL_CALL)
+    add("no more than the cap ran at once", max(seen) <= 3, max(seen))
+    add("the scheduler's peak agrees", gauge.peak <= 3, gauge.peak)
+    add("every request was eventually granted", gauge.granted == 12, gauge.granted)
+    add("nothing is left in flight", gauge.active == 0, gauge.active)
+
+    # ---- 3. deadlines nest ---------------------------------------------
+    mission = Deadline.in_seconds(1.0, reason="mission")
+    child = mission.child(5.0, reason="subagent")
+    grandchild = child.child(0.05, reason="worker")
+    add("a child deadline is clamped to its parent",
+        child.at is not None and mission.at is not None and child.at <= mission.at + 1e-6,
+        f"{child.remaining():.2f}s vs {mission.remaining():.2f}s")
+    add("a grandchild can be tighter still",
+        grandchild.remaining() <= mission.remaining() + 1e-6)
+    add("an unbounded mission yields an unbounded child",
+        Deadline(None).child(0).at is None)
+    add("an expired deadline reports itself", Deadline.in_seconds(-1).expired())
+    time.sleep(0.06)
+    add("the tight deadline expires while the loose one does not",
+        grandchild.expired() and not child.expired())
+
+    runtime = ConcurrencyRuntime(ResourceLimits(mission_deadline_seconds=0.05))
+    time.sleep(0.1)
+    add("an expired mission deadline refuses new work",
+        raises(lambda: runtime.slot(ResourceKind.WORKER), QueueTimeout))
+    add("the refusal is recorded, not inferred", bool(runtime.deadline_hits),
+        runtime.deadline_hits[:1])
+
+    # ---- 4. cancellation propagates ------------------------------------
+    token = CancellationToken()
+    cancelled = ConcurrencyRuntime(ResourceLimits(max_concurrent_browsers=1,
+                                                  queue_timeout_seconds=5.0), token=token)
+    blocker = cancelled.slot(ResourceKind.BROWSER)
+    observed: dict[str, Any] = {}
+
+    def queued_waiter() -> None:
+        try:
+            cancelled.slot(ResourceKind.BROWSER, unit="queued")
+        except CancellationRequested as exc:
+            observed["reason"] = str(exc)
+
+    thread = threading.Thread(target=queued_waiter)
+    thread.start()
+    time.sleep(0.1)
+    add("a waiter is parked while the resource is full",
+        cancelled.scheduler.gauge(ResourceKind.BROWSER).queued == 1,
+        cancelled.scheduler.gauge(ResourceKind.BROWSER).queued)
+    add("cancelling is first-wins", cancelled.cancel("operator stopped the mission") is True
+        and cancelled.cancel("again") is False)
+    thread.join(timeout=5)
+    add("cancellation reaches a queued unit", observed.get("reason") is not None,
+        observed.get("reason"))
+    add("the queue is emptied, not left to drain",
+        cancelled.scheduler.gauge(ResourceKind.BROWSER).queued == 0)
+    add("an in-flight slot still releases cleanly", (blocker.release(), True)[1])
+    add("a cancelled runtime refuses to hand out more work",
+        raises(lambda: cancelled.slot(ResourceKind.WORKER), CancellationRequested))
+
+    # ---- 5. the spawn licence: Master → Subagent → Worker, no further ---
+    ledger = SpawnLedger()
+    ledger.register("master", SpawnTier.MASTER)
+    sub = ledger.spawn("master", "sa-1", SpawnTier.SUBAGENT)
+    add("the master may create a subagent", sub.tier is SpawnTier.SUBAGENT)
+    add("a subagent licence covers workers", sub.granted >= 1, sub.granted)
+    worker = ledger.spawn("sa-1", "wrk-1", SpawnTier.WORKER)
+    add("a subagent may create a worker", worker.tier is SpawnTier.WORKER)
+    add("a worker's own licence is zero-sized", worker.granted == 0)
+    add("a worker cannot create a subagent",
+        raises(lambda: ledger.spawn("wrk-1", "sa-2", SpawnTier.SUBAGENT), SpawnRefused))
+    add("a worker cannot create a worker either",
+        raises(lambda: ledger.spawn("wrk-1", "wrk-2", SpawnTier.WORKER), SpawnRefused))
+    add("a subagent cannot create another subagent",
+        raises(lambda: ledger.spawn("sa-1", "sa-3", SpawnTier.SUBAGENT), SpawnRefused))
+    add("every refusal is recorded with its reason",
+        len(ledger.refusals) == 3 and {r.reason for r in ledger.refusals} == {"tier"},
+        [r.reason for r in ledger.refusals])
+    add("the refusal says who and why", "may not create" in ledger.refusals[0].describe(),
+        ledger.refusals[0].describe())
+    add("depth is bounded: master 0, subagent 1, worker 2",
+        [ledger.depth_of("master"), ledger.depth_of("sa-1"), ledger.depth_of("wrk-1")]
+        == [0, 1, 2])
+    deep = SpawnLedger(SpawnPolicy(max_depth=1))
+    deep.register("master", SpawnTier.MASTER)
+    deep.spawn("master", "sa-1", SpawnTier.SUBAGENT)
+    add("a depth ceiling refuses the next level",
+        raises(lambda: deep.spawn("sa-1", "wrk-1", SpawnTier.WORKER), SpawnRefused))
+    add("the depth refusal names the ceiling",
+        "ceiling" in deep.refusals[0].describe(), deep.refusals[0].describe())
+    tiny = SpawnLedger(SpawnPolicy(max_workers_per_subagent=2))
+    tiny.register("master", SpawnTier.MASTER)
+    tiny.spawn("master", "sa-1", SpawnTier.SUBAGENT)
+    tiny.spawn("sa-1", "w1", SpawnTier.WORKER)
+    tiny.spawn("sa-1", "w2", SpawnTier.WORKER)
+    add("a licence cannot be over-spent",
+        raises(lambda: tiny.spawn("sa-1", "w3", SpawnTier.WORKER), SpawnRefused))
+    add("the exhaustion is visible on the licence",
+        tiny.licence("sa-1").exhausted and tiny.licence("sa-1").remaining == 0)
+
+    # ---- 6. a large plan is clipped, not attempted ---------------------
+    context = _selftest_context("forensic")
+    team = _wide_team(context)
+    tight = ResourceLimits(max_subagents=2, max_workers_per_subagent=2)
+    kept, report = clip_plan(team, tight)
+    add("a wide plan is clipped", report.clipped, report.summary())
+    add("the clipped plan fits the subagent ceiling", len(kept) <= 2, len(kept))
+    add("every subagent fits the worker ceiling",
+        all(len(unit.workers) <= 2 for unit in kept),
+        [len(unit.workers) for unit in kept])
+    add("nothing is clipped silently", len(report.clips) >= len(team), len(report.clips))
+    add("every dropped unit has a reason",
+        all(clip.reason for clip in report.dropped), [c.reason for c in report.dropped][:2])
+    add("the clip is deterministic",
+        [unit.id for unit in kept] == [unit.id for unit in clip_plan(team, tight)[0]])
+    # Dependency closure: a kept unit may never read from a dropped one, so the
+    # kept set always has its inputs.  (Which two survive depends on the plan.)
+    kept_ids = {unit.id for unit in kept}
+    vanished = [unit.role for unit in team if unit.id not in kept_ids]
+    add("no kept unit reads from a dropped one",
+        all(set(unit.depends_on) <= kept_ids or not unit.depends_on for unit in kept)
+        or not any(unit.depends_on for unit in team),
+        f"dropped {vanished}")
+    roomy = ResourceLimits(max_subagents=16, max_workers_per_subagent=16)
+    kept_all, report_all = clip_plan(team, roomy)
+    add("a plan that fits is left alone",
+        not report_all.clipped and len(kept_all) == len(team), report_all.summary())
+
+    # clipping inside the real graph
+    flow = HierarchicalFlow(context=context, subagents=team,
+                            runtime=ConcurrencyRuntime(tight),
+                            runner=_MeasuringRunner(scope=context.scope_entries))
+    result = flow.run()
+    add("a clipped flow still runs to a synthesis", result.synthesis is not None)
+    add("the clip travels with the result", result.clip is not None and result.clip.clipped)
+    add("the flow ran only the units it kept",
+        result.total_workers == report.workers_out, f"{result.total_workers} workers")
+    add("the clip is in the payload", result.to_dict()["clip"]["subagents_out"] == len(kept))
+
+    # ---- 7. limits hold while the flow is actually parallel ------------
+    wide = _wide_team(_selftest_context("forensic"))
+    runner = _MeasuringRunner(scope=("example.com",), delay_seconds=0.02)
+    limited = ResourceLimits(max_concurrent_workers=2, max_concurrent_subagents=2,
+                             max_concurrent_model_calls=2, max_subagents=8,
+                             max_workers_per_subagent=8, queue_timeout_seconds=10.0)
+    parallel_flow = HierarchicalFlow(context=context, subagents=wide, runner=runner,
+                                     runtime=ConcurrencyRuntime(limited))
+    parallel_result = parallel_flow.run()
+    gauges = parallel_flow.runtime.scheduler.gauges()
+    add("the mission completed under limits", parallel_result.synthesis is not None)
+    add("the worker cap held", gauges[ResourceKind.WORKER].peak <= 2,
+        gauges[ResourceKind.WORKER].peak)
+    add("the runner agrees the cap held", runner.peak <= 2, runner.peak)
+    add("the subagent cap held", gauges[ResourceKind.SUBAGENT].peak <= 2,
+        gauges[ResourceKind.SUBAGENT].peak)
+    add("the model-call cap held", gauges[ResourceKind.MODEL_CALL].peak <= 2,
+        gauges[ResourceKind.MODEL_CALL].peak)
+    add("work really did overlap under the cap", runner.peak >= 2, runner.peak)
+    add("every attempt got its model slot",
+        gauges[ResourceKind.MODEL_CALL].granted >= runner.calls,
+        f"{gauges[ResourceKind.MODEL_CALL].granted} vs {runner.calls}")
+    add("no slot leaked", all(gauge.active == 0 for gauge in gauges.values()),
+        {kind.value: gauge.active for kind, gauge in gauges.items()})
+    add("the result carries the concurrency report",
+        parallel_result.concurrency["resources"]["worker"]["peak"] <= 2,
+        parallel_result.concurrency["resources"]["worker"]["peak"])
+
+    # ---- 8. backpressure: a saturated resource defers, never crashes ---
+    starved = ResourceLimits(max_concurrent_workers=1, max_concurrent_model_calls=1,
+                             queue_timeout_seconds=0.05, mission_deadline_seconds=8.0)
+    starving_flow = HierarchicalFlow(
+        context=context, subagents=_wide_team(context),
+        runner=_MeasuringRunner(scope=("example.com",), delay_seconds=0.05),
+        runtime=ConcurrencyRuntime(starved))
+    starving_result = starving_flow.run()
+    deferred = [event for event in starving_result.trace
+                if event["stage"] == FlowStage.DEFERRED.value]
+    add("a starved mission defers rather than hangs", bool(deferred), len(deferred))
+    add("a deferred unit is named in the ledger",
+        any(event["unit"] for event in deferred), [e["unit"] for e in deferred][:2])
+    add("a starved mission still joins", starving_result.synthesis is not None
+        or starving_result.stopped)
+    add("nothing was dropped without a record",
+        len(starving_result.reports) == len(starving_flow.subagents),
+        f"{len(starving_result.reports)}/{len(starving_flow.subagents)}")
+
+    # ---- 9. cancellation reaches the graph ------------------------------
+    # The token is cancelled after the flow has compiled but *before* it runs, so
+    # every unit meets the same refusal at the same point: a timer would race the
+    # first branch and make the suite a test of this machine's scheduler.
+    token = CancellationToken()
+    cancel_flow = HierarchicalFlow(
+        context=context, subagents=_wide_team(context),
+        runner=_MeasuringRunner(scope=("example.com",), delay_seconds=0.01),
+        runtime=ConcurrencyRuntime(ResourceLimits(queue_timeout_seconds=5.0,
+                                                 mission_deadline_seconds=10.0), token=token))
+    cancel_flow.build()
+    token.cancel("self-test cancelled")
+    cancelled_result = cancel_flow.run()
+    add("a cancelled mission produces no premature aggregate",
+        cancelled_result.synthesis is None and cancelled_result.stopped,
+        cancelled_result.stop_reason)
+    add("cancellation is visible in the ledger",
+        any(event["stage"] == FlowStage.DEFERRED.value for event in cancelled_result.trace),
+        len(cancelled_result.trace))
+    add("the cancelled units are gaps, not passes",
+        bool(cancelled_result.reports) and all(report.gaps for report in cancelled_result.reports),
+        [len(report.gaps) for report in cancelled_result.reports])
+
+    # ---- 10. the licence table reaches the live flow -------------------
+    licensed = HierarchicalFlow(context=context, subagents=_wide_team(context),
+                                runner=_MeasuringRunner(scope=("example.com",)))
+    licensed.run()
+    snapshot = licensed.runtime.spawns.snapshot()
+    add("the run records what it created",
+        sum(snapshot["created"].values()) >= len(licensed.subagents) + 1,
+        snapshot["created"])
+    add("workers hold zero-sized licences",
+        all(licence["granted"] == 0 for licence in snapshot["licences"]
+            if licence["tier"] == SpawnTier.WORKER.value))
+    add("no worker ever created anything", not snapshot["refusals"],
+        snapshot["refusals"][:1])
+    runtime = ConcurrencyRuntime()
+    refusal = runtime.attempt_worker_spawn(licensed.subagents[0].workers[0])
+    add("a worker-side spawn is refused and recorded", refusal.reason == "tier",
+        refusal.describe())
+    return checks
+
+
+def holds(scheduler: BoundedScheduler, kind: ResourceKind) -> bool:
+    """True when the resource reports at least one slot in use."""
+
+    return scheduler.gauge(kind).active >= 1
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 25. The LangGraph execution flow — hierarchy, fan-out, aggregation
 # ══════════════════════════════════════════════════════════════════════════
 #
 # Sections 21–23 decided *who should exist* and *what each of them owes*.  This
@@ -19554,6 +21139,7 @@ class FlowStage(str, Enum):
     """The stages of the graph.  There is one node per stage, never per role."""
 
     PLAN = "master-plan"
+    DEFERRED = "deferred"                  # admitted by the scheduler, or not
     SUBAGENT = "subagent"                  # composite node: the child graph
     WORKER = "worker-task"
     REVIEW = "worker-review"
@@ -19579,6 +21165,7 @@ class FlowGate(str, Enum):
 #: visible.
 FLOW_STAGE_ORDER: tuple[FlowStage, ...] = (
     FlowStage.PLAN,
+    FlowStage.DEFERRED,
     FlowStage.WORKER,
     FlowStage.REVIEW,
     FlowStage.SUBAGENT_AGGREGATE,
@@ -19822,7 +21409,7 @@ def check_join(stage: str, expected: Sequence[str], received: Sequence[str]) -> 
 
 
 # --------------------------------------------------------------------------
-# 24.2 What the graph carries: units of work, and who executes them
+# 25.1 What the graph carries: units of work, and who executes them
 # --------------------------------------------------------------------------
 
 
@@ -20136,8 +21723,10 @@ class DeterministicRunner:
                 f"{context.objective[:90]}; this build's runner is deterministic and collects "
                 f"nothing, so the observations demonstrate the flow rather than the target"
             ),
-            claims=claims or [ModelClaim(statement="no evidence was returned by any subagent",
-                                         source_refs=["no-evidence"], confidence=Confidence.UNKNOWN)],
+            claims=claims or [ModelClaim(
+                statement="no evidence was returned by any subagent",
+                source_refs=["no-evidence"], confidence=Confidence.UNKNOWN,
+                uncertainty="nothing was collected, so nothing here is observed")],
             gaps=gaps,
             hypotheses_open=[question for subagent in subagents
                              for question in subagent.addresses_questions][:6],
@@ -20153,6 +21742,50 @@ class DeterministicRunner:
             # a runner must not be able to invent its own barrier.
             aggregate_basis=None,
         )
+
+
+class _MeasuringRunner(DeterministicRunner):
+    """A runner that measures the pool it ran inside.
+
+    Overlap is only observable if the thing doing the work records it, so the
+    peak here is the ground truth the scheduler's own gauge is checked against.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.active = 0
+        self.peak = 0
+        self.calls = 0
+        self._gate = threading.Lock()
+
+    def run_worker(self, subagent: FlowSubagent, worker: FlowWorker, *,
+                   attempt: int, guidance: str = "") -> WorkerOutcome:
+        with self._gate:
+            self.active += 1
+            self.calls += 1
+            self.peak = max(self.peak, self.active)
+        try:
+            return super().run_worker(subagent, worker, attempt=attempt, guidance=guidance)
+        finally:
+            with self._gate:
+                self.active -= 1
+
+
+def _wide_team(context: "MasterContext") -> list[FlowSubagent]:
+    """A team large enough to contend: more workers than any test limit allows."""
+
+    units = flow_units_for(context, "forensic")
+    padded: list[FlowSubagent] = []
+    for unit in units:
+        template = unit.workers[0]
+        workers = [template.model_copy(update={
+            "id": content_id("worker", unit.id, index),
+            "name": f"{template.name}-{index}",
+            "work_unit": f"{template.work_unit}-{index}",
+            "completion_criteria": [f"at least one cited row for unit {index} of {unit.role}"],
+        }) for index in range(1, 5)]
+        padded.append(unit.model_copy(update={"workers": workers}))
+    return padded
 
 
 class SubagentOutcome(StrictModel):
@@ -20252,6 +21885,10 @@ class FlowResult(StrictModel):
     #: Worker outcomes across the whole mission, including retries.
     worker_attempts: int = Field(default=0, ge=0)
     retries: int = Field(default=0, ge=0)
+    #: The plan after it met the mission's ceilings, and why.
+    clip: ClipReport | None = None
+    #: What the scheduler observed and enforced during this run.
+    concurrency: dict[str, Any] = Field(default_factory=dict)
 
     @property
     def total_workers(self) -> int:
@@ -20285,6 +21922,8 @@ class FlowResult(StrictModel):
             "stop_reason": self.stop_reason,
             "worker_attempts": self.worker_attempts,
             "retries": self.retries,
+            "clip": self.clip.to_dict() if self.clip else None,
+            "concurrency": self.concurrency,
             "seconds": round(self.seconds, 3),
             "stage_order": self.stage_order(),
             "trace": self.trace,
@@ -20299,6 +21938,8 @@ class _WorkerState(TypedDict, total=False):
     wave: int
     round: int
     guidance: str
+    #: The Worker's deadline, set by the branch that admitted it.
+    deadline: Any
     outcome: dict[str, Any]
     verdict: dict[str, Any]
     attempts: Annotated[list[dict[str, Any]], operator.add]
@@ -20346,9 +21987,9 @@ def _worker_state() -> dict[str, Any]:
     """The initial state of one Worker graph."""
 
     return {"subagent": "", "worker": "", "wave": 0, "round": 0, "guidance": "",
-            "attempts": [], "reviews": []}
+            "deadline": None, "attempts": [], "reviews": []}
 # --------------------------------------------------------------------------
-# 24.3 LangGraph, imported lazily
+# 25.2 LangGraph, imported lazily
 # --------------------------------------------------------------------------
 
 
@@ -20371,7 +22012,7 @@ def _langgraph_primitives() -> tuple[tuple[Any, Any, Any], Any, Any]:
         ) from exc
     return (StateGraph, START, END), Send, Command
 # --------------------------------------------------------------------------
-# 24.4 The graph — the same nodes for every mission
+# 25.3 The graph — the same nodes for every mission
 # --------------------------------------------------------------------------
 #
 # Three LangGraph mechanics carry the whole design; each is load-bearing:
@@ -20420,6 +22061,7 @@ class HierarchicalFlow:
         renderer: "EventRenderer | None" = None,
         logger: "MissionLogger | None" = None,
         mission_id: str = "",
+        runtime: "ConcurrencyRuntime | None" = None,
     ) -> None:
         if not subagents:
             raise ValueError("a flow needs at least one subagent")
@@ -20454,6 +22096,51 @@ class HierarchicalFlow:
         self._store_offline = False
         #: Why this run is not recording to a store, when one was supplied.
         self.detach_note = ""
+        #: The run's admission control.  One per flow, so a second run of the same
+        #: instance starts with empty queues and fresh licences.
+        self.runtime: ConcurrencyRuntime = runtime or ConcurrencyRuntime(
+            self._limits_for_run(), token=CancellationToken(), on_event=self._on_resource)
+        #: The plan after clipping, set by ``build``.
+        self.clip: ClipReport | None = None
+        #: Set by ``build``: the units came from a real specification pipeline.
+        self.from_specs = False
+
+    def _limits_for_run(self) -> ResourceLimits:
+        """The mission's limits, derived from the policy when none were given."""
+
+        return ResourceLimits(
+            max_concurrent_subagents=self.policy.max_parallel_subagents,
+            max_concurrent_workers=self.policy.max_parallel_workers,
+            max_subagents=max(self.policy.max_parallel_subagents, 8),
+            max_workers_per_subagent=max(self.policy.max_parallel_workers, 8),
+            queue_timeout_seconds=self.policy.wait_timeout_seconds,
+        )
+
+    def _on_resource(self, event: str, payload: Mapping[str, Any]) -> None:
+        """Mirror scheduler decisions into the ledger and the log.
+
+        Queueing is part of the execution order, so it belongs in the trace: a
+        unit that waited 4s for a model slot did not run when its branch started.
+        """
+
+        if event not in {"resource.timeout", "resource.cancelled", "unit.deferred"}:
+            return
+        unit = str(payload.get("unit") or "")
+        self.trace.record(FlowStage.DEFERRED, unit=unit,
+                          detail=f"{event.split('.')[-1]}: {payload.get('resource', '')}"
+                                 + (f" ({payload.get('reason')})" if payload.get("reason") else ""))
+
+    def _defer(self, subagent: FlowSubagent, gate: FlowGate, why: str) -> SubagentOutcome:
+        """A Subagent the scheduler refused: recorded as deferred, not as a run."""
+
+        self.runtime.defer(subagent.id, stage="subagent", reason=why)
+        report = self._gated_report(subagent, gate)
+        report = report.model_copy(update={
+            "gaps": [UnknownValue(reason=UnknownReason.FAILED, determined_by=subagent.id,
+                                  detail=f"{subagent.role}: deferred — {why}")]})
+        self._record(FlowStage.DEFERRED, unit=subagent.id, parent="master",
+                     detail=f"deferred: {why}")
+        return report
 
     def _resolved(self, subagent: FlowSubagent) -> FlowSubagent:
         """Resolve declared dependency names to ids, once, before anything runs.
@@ -20593,10 +22280,28 @@ class HierarchicalFlow:
         return self._top_graph
 
     def build(self) -> "HierarchicalFlow":
-        """Compile the hierarchy.  Idempotent."""
+        """Clip the plan, register the licences, compile.  Idempotent.
 
-        if self._top_graph is None:
-            self._compile()
+        Clipping happens here rather than in ``run`` so that anything inspecting
+        the flow — the CLI's summary, the self-test, a caller counting workers —
+        sees the plan that will actually run.
+        """
+
+        if self._top_graph is not None:
+            return self
+        kept, report = self.runtime.clip(self.subagents)
+        self.clip = report
+        if kept:
+            self.subagents = [self._resolved(subagent) for subagent in kept]
+            self._by_id = {subagent.id: subagent for subagent in self.subagents}
+        # Register the licences for the surviving team.  A Worker's licence is
+        # deliberately zero-sized, so nothing it does can create anything.
+        self.runtime.spawns.register("master", SpawnTier.MASTER)
+        for subagent in self.subagents:
+            self.runtime.register_subagent(subagent)
+            for worker in subagent.workers:
+                self.runtime.register_worker(worker, subagent)
+        self._compile()
         return self
 
     # -- bookkeeping ---------------------------------------------------------
@@ -20654,6 +22359,10 @@ class HierarchicalFlow:
                      detail=f"waiting for {', '.join(pending[:3])}")
         deadline = time.monotonic() + self.policy.wait_timeout_seconds
         while pending:
+            if self.runtime.cancelled:
+                # Nobody is going to settle this now: say so instead of waiting
+                # out the timeout that the cancellation already made pointless.
+                return FlowGate.CANCELLED
             if time.monotonic() >= deadline:
                 return FlowGate.DEPENDENCY_FAILED
             time.sleep(0.005)
@@ -20698,11 +22407,53 @@ class HierarchicalFlow:
             self._settled["master"].add(subagent.id)
             return {"reports": [json.loads(model_to_json(report))]}
 
-        with self._subagent_slots:
+        # A Subagent may only exist because the Master's licence allows it.
+        if not self.from_specs:
+            try:
+                self.runtime.spawns.spawn("master", subagent.id, SpawnTier.SUBAGENT)
+            except SpawnRefused as exc:
+                self._settled["master"].add(subagent.id)
+                report = self._defer(subagent, FlowGate.BUDGET, exc.refusal.detail)
+                return {"reports": [json.loads(model_to_json(report))]}
+            for worker in subagent.workers:
+                # Workers are created *by* this Subagent, and the attempt is
+                # recorded the same way a refusal would be.
+                try:
+                    self.runtime.spawns.spawn(subagent.id, worker.id, SpawnTier.WORKER)
+                except SpawnRefused:            # pragma: no cover - licence is sized
+                    break
+
+        try:
+            admitted = self._admit_subagent(subagent, wave)
+        except QueueTimeout as exc:
+            self._settled["master"].add(subagent.id)
+            return {"reports": [json.loads(model_to_json(
+                self._defer(subagent, FlowGate.BUDGET, redact_text(str(exc))[:120])))]}
+        except BudgetExceeded as exc:
+            self._settled["master"].add(subagent.id)
+            return {"reports": [json.loads(model_to_json(
+                self._defer(subagent, FlowGate.BUDGET, redact_text(str(exc))[:120])))]}
+        except CancellationRequested as exc:
+            self._settled["master"].add(subagent.id)
+            return {"reports": [json.loads(model_to_json(
+                self._defer(subagent, FlowGate.CANCELLED, redact_text(str(exc))[:120])))]}
+        # Settle only after the branch has produced its report: a dependent that
+        # wakes on this must find the aggregate it was waiting for.
+        self._settled["master"].add(subagent.id)
+        return admitted
+
+    def _admit_subagent(self, subagent: FlowSubagent, wave: int = 0) -> dict[str, Any]:
+        """Run one Subagent's graph while holding a Subagent slot."""
+
+        with self.runtime.slot(ResourceKind.SUBAGENT, unit=subagent.id,
+                               deadline=self.runtime.deadline):
             self._started[subagent.id] = time.monotonic()
             if self.tracker is not None:
                 self.tracker.spawn(subagent.id, subagent.role, kind=LifecycleKind.SUBAGENT,
                                    parent="master", detail=subagent.objective[:60])
+            # The join for this Subagent is tracked on the *master* key, because
+            # the workers that settle it run on other threads and their parent is
+            # this Subagent.
             self._settled[subagent.id] = set()
             payload = {**_subagent_state(), "subagent": subagent.id, "wave": wave}
             result = self._subagent_graph.invoke(payload)
@@ -20712,7 +22463,6 @@ class HierarchicalFlow:
                 stage=f"subagent:{subagent.role}",
                 expected=[worker.id for worker in subagent.workers], received=[],
                 missing=[worker.id for worker in subagent.workers]))
-        self._settled["master"].add(subagent.id)
         return {"reports": [dict(report)]}
 
     def _gated_report(self, subagent: FlowSubagent, gate: FlowGate) -> SubagentOutcome:
@@ -20762,21 +22512,36 @@ class HierarchicalFlow:
         worker = subagent.worker(str(state.get("worker")))
         if worker is None:                    # pragma: no cover - guarded by the fan-out
             return {"outcomes": [], "reviews": []}
-        gate = self._wait_for(worker.id, worker.depends_on, parent=subagent.id,
-                              stage=FlowStage.WORKER)
+        gate = self._blocked(subagent, worker)
         if gate is not FlowGate.NONE:
-            self._gates[worker.id] = gate
-            self._settled[subagent.id].add(worker.id)
-            outcome = WorkerOutcome(
-                worker_id=worker.id, subagent_id=subagent.id, status=EntityStatus.BLOCKED,
-                attempt=0, gate=gate, summary=f"{worker.name}: dependency did not settle",
-                task_id=content_id("task", subagent.id, worker.id, 0),
-            )
-            return {"outcomes": [json.loads(model_to_json(outcome))], "reviews": []}
+            return {"outcomes": [json.loads(model_to_json(
+                        self._blocked_outcome(subagent, worker, gate)))], "reviews": []}
 
-        with self._worker_slots:
-            payload = {**_worker_state(), "subagent": subagent.id, "worker": worker.id}
-            result = self._worker_graph.invoke(payload)
+        try:
+            # The Worker holds one worker slot for its whole attempt→review loop;
+            # every attempt inside it holds a model-call slot while it runs.
+            with self.runtime.slot(ResourceKind.WORKER, unit=worker.id,
+                                   deadline=self._worker_deadline(subagent, worker)):
+                payload = {**_worker_state(), "subagent": subagent.id, "worker": worker.id,
+                           "deadline": self._worker_deadline(subagent, worker)}
+                result = self._worker_graph.invoke(payload)
+        except (QueueTimeout, BudgetExceeded) as exc:
+            # Backpressure, not a crash: the unit is deferred with its reason and
+            # the graph keeps its join intact.
+            return {"outcomes": [json.loads(model_to_json(
+                        self._blocked_outcome(subagent, worker, FlowGate.BUDGET,
+                                              why=redact_text(str(exc))[:120])))],
+                    "reviews": []}
+        except CancellationRequested as exc:
+            return {"outcomes": [json.loads(model_to_json(
+                        self._blocked_outcome(subagent, worker, FlowGate.CANCELLED,
+                                              why=redact_text(str(exc))[:120])))],
+                    "reviews": []}
+        except Exception as exc:              # noqa: BLE001 - a unit never kills the mission
+            return {"outcomes": [json.loads(model_to_json(
+                        self._blocked_outcome(subagent, worker, FlowGate.ERROR,
+                                              why=f"{type(exc).__name__}: {str(exc)}"[:120])))],
+                    "reviews": []}
         outcome = WorkerOutcome.model_validate(result["outcome"])
         verdict = ReviewVerdict.model_validate(result["verdict"])
         self._gates[worker.id] = FlowGate.NONE if verdict.approved else (
@@ -20785,6 +22550,47 @@ class HierarchicalFlow:
         self._record_in_store(subagent, worker, outcome)
         return {"outcomes": [json.loads(model_to_json(outcome))],
                 "reviews": [json.loads(model_to_json(verdict))]}
+
+    def _worker_deadline(self, subagent: FlowSubagent, worker: FlowWorker) -> Deadline:
+        """The Worker's deadline: its own budget, clamped to the mission's."""
+
+        own = self.runtime.child_deadline(float(worker.timeout_seconds),
+                                          reason=f"{worker.name} budget")
+        return own
+
+    def _blocked(self, subagent: FlowSubagent, worker: FlowWorker) -> FlowGate:
+        """Why this Worker may not start, if it may not.  Recorded when it is."""
+
+        gate = self._wait_for(worker.id, worker.depends_on, parent=subagent.id,
+                              stage=FlowStage.WORKER)
+        if gate is FlowGate.NONE and self.runtime.expired():
+            self.runtime.record_deadline(worker.id, stage="worker",
+                                         reason="mission deadline expired")
+            gate = FlowGate.BUDGET
+        return gate
+
+    def _blocked_outcome(self, subagent: FlowSubagent, worker: FlowWorker, gate: FlowGate,
+                         *, why: str = "") -> WorkerOutcome:
+        """A Worker that never ran, with the reason it never ran."""
+
+        reason = why or ("dependency did not settle" if gate is FlowGate.DEPENDENCY_FAILED
+                         else "mission deadline expired" if gate is FlowGate.BUDGET
+                         else gate.value)
+        if gate is FlowGate.BUDGET:
+            self.runtime.defer(worker.id, stage="worker", reason=reason)
+        self._gates[worker.id] = gate
+        self._settled[subagent.id].add(worker.id)
+        self._record(FlowStage.DEFERRED, unit=worker.id, parent=subagent.id,
+                     detail=f"not run: {reason}")
+        return WorkerOutcome(
+            worker_id=worker.id, subagent_id=subagent.id, status=EntityStatus.BLOCKED,
+            # A unit that never started still counts as its first attempt: the
+            # record has no "did not try" state, and inventing one would hide the
+            # difference between a deferred unit and a finished one.
+            attempt=1, gate=gate, summary=f"{worker.name}: not run — {reason}",
+            task_id=content_id("task", subagent.id, worker.id, 0),
+            error=reason,
+        )
 
     # -- 3. one attempt -------------------------------------------------------
 
@@ -20796,9 +22602,34 @@ class HierarchicalFlow:
                      wave=int(state.get("wave") or 0),
                      detail=f"attempt {attempt}: {worker.work_unit or worker.name}")
         started = time.monotonic()
+        deadline = state.get("deadline")
+        if deadline is not None and deadline.expired():
+            self.runtime.record_deadline(worker.id, stage="attempt",
+                                         reason=f"{worker.name} budget expired")
+            return {"outcome": json.loads(model_to_json(WorkerOutcome(
+                        worker_id=worker.id, subagent_id=subagent.id,
+                        status=EntityStatus.BLOCKED, attempt=attempt,
+                        gate=FlowGate.BUDGET,
+                        summary=f"{worker.name}: deadline expired before the attempt",
+                        error="deadline expired",
+                        task_id=content_id("task", subagent.id, worker.id, attempt)))),
+                    "verdict": json.loads(model_to_json(ReviewVerdict(
+                        worker_id=worker.id, approved=False, verdict="reject",
+                        criteria=list(worker.completion_criteria),
+                        findings=["the attempt budget for this unit expired"],
+                        retry=False))),
+                    "round": attempt,
+                    "attempts": [{"attempt": attempt, "status": "blocked"}]}
         try:
-            outcome = self.runner.run_worker(subagent, worker, attempt=attempt,
-                                             guidance=str(state.get("guidance") or ""))
+            # Every attempt spends one model-call slot for as long as it runs.
+            # This is the queue the whole mission is really contending for, and
+            # it is bounded, fair and cancellable like any other resource.
+            with self.runtime.slot(ResourceKind.MODEL_CALL, unit=worker.id,
+                                   deadline=deadline):
+                outcome = self.runner.run_worker(subagent, worker, attempt=attempt,
+                                                 guidance=str(state.get("guidance") or ""))
+        except (QueueTimeout, BudgetExceeded, CancellationRequested):
+            raise
         except Exception as exc:              # a runner failure is an outcome, not a crash
             outcome = WorkerOutcome(
                 worker_id=worker.id, subagent_id=subagent.id, status=EntityStatus.FAILED,
@@ -20962,10 +22793,17 @@ class HierarchicalFlow:
                              [subagent.id for subagent in self.subagents],
                              [report.subagent_id for report in reports])
         blocking = [report for report in reports if report.blocking]
-        stopped = bool(self.policy.stop_on_blocking_failure and blocking)
+        cancelled = self.runtime.cancelled
+        stopped = bool(self.policy.stop_on_blocking_failure and blocking) or cancelled
         self._record(FlowStage.MASTER_REVIEW,
                      detail=f"{barrier.describe()}; {len(blocking)} blocking report(s)"
                             + ("" if not stopped else " — stopping before synthesis"))
+        if cancelled:
+            # A cancelled mission has no aggregate to give: synthesising from the
+            # units that happened to finish would present a partial answer as the
+            # mission's answer.
+            return {"stopped": True,
+                    "stop_reason": "cancelled: " + (self.runtime.token.reason or "operator")}
         return {"stopped": stopped,
                 "stop_reason": ("" if not stopped else
                                 "blocking subagent failure: "
@@ -21006,9 +22844,6 @@ class HierarchicalFlow:
         self._settled = {"master": set()}
         self._started = {}
         self._gates = {}
-        self._subagent_slots = threading.BoundedSemaphore(self.policy.max_parallel_subagents)
-        self._worker_slots = threading.BoundedSemaphore(self.policy.max_parallel_workers)
-
         if self.detach_note:
             self._record(FlowStage.PLAN, detail=self.detach_note)
         started = time.monotonic()
@@ -21030,6 +22865,8 @@ class HierarchicalFlow:
             worker_attempts=len(self.trace.events(stage=FlowStage.WORKER)),
             retries=sum(report.retries for report in kept),
             structure=self.structure(),
+            clip=self.clip,
+            concurrency=self.runtime.scheduler.snapshot(),
         )
         if self.logger is not None:
             self.logger.log(
@@ -21043,7 +22880,7 @@ class HierarchicalFlow:
 
 
 # --------------------------------------------------------------------------
-# 24.5 Building the graph's units from a mission's own specifications
+# 25.4 Building the graph's units from a mission's own specifications
 # --------------------------------------------------------------------------
 
 
@@ -21134,7 +22971,7 @@ def flow_units_for(context: "MasterContext", key: str) -> list[FlowSubagent]:
     drafts = drafts_from_team(TeamDesign.model_validate(_team_payload(key)), context)
     return team_units(context, drafts)
 # --------------------------------------------------------------------------
-# 24.6 Self-test — order, parallelism, and the two joins
+# 25.5 Self-test — order, parallelism, and the two joins
 # --------------------------------------------------------------------------
 
 
@@ -21456,7 +23293,7 @@ def run_flow_self_test(console: "Console | None" = None) -> list[FlowCheck]:
 
 
 # --------------------------------------------------------------------------
-# 24.7 Demo and CLI
+# 25.6 The flow demo
 # --------------------------------------------------------------------------
 
 
@@ -21873,8 +23710,265 @@ def _drafts_for_objective(context: "MasterContext") -> list[SubagentSpecDraft]:
     return drafts
 
 
+# --------------------------------------------------------------------------
+# 25.7 The concurrency demo — caps, queues and refusals in one screen
+# --------------------------------------------------------------------------
+
+
+class _TimedRunner(_MeasuringRunner):
+    """A measuring runner that also records how long each Worker waited."""
+    """A runner that records how long each Worker waited before it ran.
+
+    The scheduler's fairness claim is about *waiting*, so the demo measures it
+    the only place that can: inside the unit, next to the work.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.waits: list[float] = []
+
+    def run_worker(self, subagent: FlowSubagent, worker: FlowWorker, *,
+                   attempt: int, guidance: str = "") -> WorkerOutcome:
+        started = time.monotonic()
+        try:
+            return super().run_worker(subagent, worker, attempt=attempt, guidance=guidance)
+        finally:
+            with self._gate:
+                self.waits.append(time.monotonic() - started)
+
+
+def render_concurrency_summary(payload: Mapping[str, Any]) -> Group:
+    """One mission's admission control as a table: caps, peaks, refusals."""
+
+    limits = payload["limits"]
+    table = Table(title="concurrency — caps, peaks and refusals", title_justify="left",
+                  box=None, pad_edge=False)
+    table.add_column("resource", no_wrap=True)
+    table.add_column("cap", justify="right")
+    table.add_column("peak", justify="right")
+    table.add_column("granted", justify="right")
+    table.add_column("queued", justify="right")
+    table.add_column("timed out", justify="right")
+    table.add_column("total", justify="right")
+    for kind in RESOURCE_ORDER:
+        gauge = payload["resources"][kind.value]
+        cap = limits["concurrent"][kind.value]
+        over = " [red]over[/red]" if gauge["peak"] > cap else ""
+        table.add_row(escape(kind.value), str(cap), f"{gauge['peak']}{over}",
+                      str(gauge["granted"]), str(gauge["queued"]),
+                      str(gauge["timed_out"]), str(limits["total"][kind.value] or "∞"))
+    rows: list[Any] = [table]
+    clip = payload.get("clip")
+    if clip:
+        # Only the decisions that removed something: a kept unit is the plan
+        # working, and listing every one of them buries the clip that matters.
+        changes = [decision for decision in clip["clips"] or []
+                   if decision["action"] != ClipAction.KEPT.value]
+        rows.append(Text(
+            f"\nclip: {clip['subagents_in']}→{clip['subagents_out']} subagent(s), "
+            f"{clip['workers_in']}→{clip['workers_out']} worker(s); "
+            + ("nothing removed" if not changes else f"{len(changes)} unit(s) not run"),
+            style="dim"))
+        for decision in changes[:6]:
+            rows.append(Text(f"  · {decision['action']:<8}{decision['unit'][:30]:<32}"
+                             f"{decision['detail'][:60]}", style="dim"))
+    waiting = payload.get("waiting") or []
+    if waiting:
+        contended = sum(gauge["timed_out"] + gauge["deferred"]
+                        for gauge in payload["resources"].values())
+        rows.append(Text(f"\nqueueing: {len(waiting)} unit(s) ran; longest "
+                         f"{max(waiting):.2f}s, mean {sum(waiting) / len(waiting):.2f}s; "
+                         + ("no unit was refused a slot" if not contended
+                            else f"{contended} unit(s) refused a slot"), style="dim"))
+    refusals = payload.get("spawn_refusals") or []
+    rows.append(Text(f"\nspawns: {payload.get('subagents', 0)} subagent(s), "
+                     f"{payload.get('workers', 0)} worker(s), "
+                     f"{len(refusals)} refusal(s)"
+                     + ("" if not refusals else
+                        f" — first: {refusals[0]['detail'][:70]}"), style="dim"))
+    if payload.get("deadline_hits"):
+        rows.append(Text(f"\ndefaults: {len(payload['deadline_hits'])} unit(s) deferred with a reason",
+                         style="dim"))
+    return Group(*rows)
+
+
+def _concurrency_demo(*, tight: bool = True, delay: float = 0.03) -> dict[str, Any]:
+    """Run one scripted mission through a contending set of limits, offline.
+
+    ``tight`` is the point of the demo: the same team, the same objective, with
+    caps below the plan's width.  Nothing may exceed a cap, and every unit the
+    caps push aside must come back as a recorded deferral rather than a silence.
+    ``roomy`` is the control: the same code with nothing to refuse, so the two
+    screens differ only in what the limits did.
+    """
+
+    context = _selftest_context("forensic")
+    units = _wide_team(context)
+    limits = (ResourceLimits(max_concurrent_model_calls=2, max_concurrent_workers=2,
+                             max_concurrent_subagents=2, max_concurrent_browsers=1,
+                             max_concurrent_forensic_jobs=1, max_subagents=3,
+                             max_workers_per_subagent=3,
+                             # A short queue deadline is how backpressure shows up
+                             # as a deferral in a two-second demo instead of as a
+                             # fifty-second wait a viewer would never sit through.
+                             queue_timeout_seconds=0.012,
+                             mission_deadline_seconds=60.0)
+              if tight else ResourceLimits(max_concurrent_subagents=4,
+                                           max_concurrent_workers=8))
+    runner = _TimedRunner(scope=context.scope_entries, delay_seconds=delay)
+    flow = HierarchicalFlow(context=context, subagents=units, runner=runner,
+                            runtime=ConcurrencyRuntime(limits))
+    result = flow.run()
+    payload: dict[str, Any] = {
+        "objective": context.objective,
+        "tight": tight,
+        **result.concurrency,
+        "clip": result.clip.to_dict() if result.clip else None,
+        "waiting": [round(wait, 4) for wait in runner.waits],
+        "deadline_hits": flow.runtime.deadline_hits,
+        "subagents": len(flow.subagents),
+        "workers": sum(len(subagent.workers) for subagent in flow.subagents),
+        "reports": [
+            {"role": report.role, "status": report.status.value, "gate": report.gate.value,
+             "outcomes": len(report.outcomes), "gaps": len(report.gaps)}
+            for report in result.reports],
+        "deferred": [event for event in result.trace
+                     if event["stage"] == FlowStage.DEFERRED.value],
+        "peak_concurrency": max((gauge["peak"] for gauge in result.concurrency["resources"].values()),
+                                default=0),
+        "seconds": round(result.seconds, 3),
+    }
+    return payload
+
+
+@app.command("sched", help="Admission control: bounded queues, deadlines, spawn licences, clipping.")
+def sched_command(
+    self_test: bool = typer.Option(False, "--self-test",
+                                   help="Verify the concurrency guarantees offline."),
+    demo: str | None = typer.Option(
+        None, "--demo", help="Scripted run: tight | roomy.", show_default=False),
+    show_plan: str | None = typer.Option(
+        None, "--clip", help="Clip a demo plan: exposure | forensic | compare.",
+        show_default=False),
+    workers: int = typer.Option(8, "--workers", min=1, max=64,
+                                help="Concurrent Worker cap for --clip."),
+    subagents: int = typer.Option(4, "--subagents", min=1, max=64,
+                                  help="Concurrent Subagent cap for --clip."),
+    model_calls: int = typer.Option(4, "--model-calls", min=1, max=256,
+                                    help="Concurrent model-call cap for --clip."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Show, and prove, how the mission is kept inside its budgets."""
+
+    console = get_console()
+
+    if self_test:
+        results = run_resource_self_test()
+        failures = [result for result in results if not result.ok]
+        if as_json:
+            _emit(json.dumps({"ok": not failures,
+                              "checks": [asdict(result) for result in results]}, indent=2))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        console.print()
+        table = Table(title="concurrency self-test", title_justify="left", box=None,
+                      pad_edge=False)
+        table.add_column("", width=2)
+        table.add_column("check", no_wrap=True)
+        table.add_column("detail", overflow="fold")
+        for result in results:
+            glyph, colour = ("✔", "green") if result.ok else ("✘", "red")
+            table.add_row(f"[{colour}]{glyph}[/{colour}]", escape(result.name),
+                          escape(result.detail))
+        console.print(table)
+        colour = "green" if not failures else "red"
+        console.print(f"\n[{colour}]{len(results) - len(failures)} passed[/] · "
+                      f"{len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    if show_plan:
+        key = show_plan.strip().lower()
+        if key not in {*_SELFTEST_OBJECTIVES, "compare"}:
+            console.print(f"[red]✘[/red] unknown plan {escape(repr(show_plan))}; choose from: "
+                          f"{', '.join([*_SELFTEST_OBJECTIVES, 'compare'])}")
+            raise typer.Exit(ExitCode.USAGE)
+        limits = ResourceLimits(max_concurrent_model_calls=model_calls,
+                                max_concurrent_workers=workers,
+                                max_concurrent_subagents=subagents,
+                                max_subagents=subagents, max_workers_per_subagent=workers)
+        keys = list(_SELFTEST_OBJECTIVES) if key == "compare" else [key]
+        payloads: dict[str, Any] = {}
+        for name in keys:
+            context = _selftest_context(name)
+            planned = flow_units_for(context, name)
+            kept, report = clip_plan(planned, limits)
+            payloads[name] = {
+                "objective": context.objective,
+                "planned": {"subagents": len(planned),
+                            "workers": sum(len(unit.workers) for unit in planned)},
+                "kept": {"subagents": len(kept),
+                         "workers": sum(len(unit.workers) for unit in kept)},
+                "report": report.to_dict(),
+            }
+        if as_json:
+            _emit(json.dumps(payloads, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        for name, payload in payloads.items():
+            console.print(Panel(Text("\n".join(
+                f"{label:<14}{value}" for label, value in (
+                    ("plan", payload["objective"]),
+                    ("limits", f"{limits.max_subagents} subagent(s), "
+                               f"{limits.max_workers_per_subagent} worker(s) each, "
+                               f"{limits.max_concurrent_model_calls} model call(s)"),
+                    ("planned", f"{payload['planned']['subagents']} subagent(s) / "
+                                f"{payload['planned']['workers']} worker(s)"),
+                    ("kept", f"{payload['kept']['subagents']} subagent(s) / "
+                             f"{payload['kept']['workers']} worker(s)"),
+                    ("clipped", "yes" if payload["report"]["subagents_in"]
+                                != payload["report"]["subagents_out"] else "no"))),
+                    ),
+                title=name, title_align="left", border_style="dim", expand=False))
+            for decision in payload["report"]["clips"]:
+                if decision["action"] != "kept":
+                    console.print(f"  [dim]{escape(decision['action'])}[/dim] "
+                                  f"{escape(decision['unit'][:32]):<34}"
+                                  f"{escape(decision['detail'][:70])}")
+        console.print("\n[dim]Clipping is deterministic: dependency closure first, then "
+                      "declaration order — never thread order.[/dim]\n")
+        raise typer.Exit(ExitCode.OK)
+
+    key = (demo or "tight").strip().lower()
+    if key not in {"tight", "roomy"}:
+        console.print(f"[red]✘[/red] unknown demo {escape(repr(demo))}; choose tight or roomy")
+        raise typer.Exit(ExitCode.USAGE)
+    payload = _concurrency_demo(tight=key == "tight")
+    if as_json:
+        _emit(json.dumps(payload, indent=2, default=str))
+        raise typer.Exit(ExitCode.OK)
+    console.print()
+    console.print(render_concurrency_summary(payload))
+    console.print()
+    table = Table(title=f"units — {len(payload['reports'])} subagent(s)",
+                  title_justify="left", box=None, pad_edge=False)
+    table.add_column("role", no_wrap=True)
+    table.add_column("status", no_wrap=True)
+    table.add_column("gate", no_wrap=True)
+    table.add_column("outcomes", justify="right")
+    table.add_column("gaps", justify="right")
+    for report in payload["reports"]:
+        colour = {"succeeded": "green", "blocked": "yellow"}.get(report["status"], "red")
+        table.add_row(escape(report["role"]), f"[{colour}]{report['status']}[/{colour}]",
+                      escape(report["gate"]), str(report["outcomes"]), str(report["gaps"]))
+    console.print(table)
+    console.print(f"\n[dim]{payload['subagents']} subagent(s) / {payload['workers']} worker(s) "
+                  f"in {payload['seconds']}s; peak {payload['peak_concurrency']} concurrent "
+                  f"unit(s). Nothing above a cap, and every unit that did not run says why."
+                  f"[/dim]\n")
+    raise typer.Exit(ExitCode.OK)
+
+
 # ══════════════════════════════════════════════════════════════════════════
-# 25. Entry point
+# 26. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 

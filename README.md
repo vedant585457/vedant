@@ -15,6 +15,7 @@ python vedant_osint.py master --self-test     # Master Agent boundaries
 python vedant_osint.py subagents --self-test  # runtime Subagent specifications
 python vedant_osint.py workers --self-test    # runtime Worker specifications
 python vedant_osint.py flow --self-test       # LangGraph execution flow
+python vedant_osint.py sched --self-test      # bounded queues, deadlines, licences
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -364,10 +365,11 @@ python vedant_osint.py flow -t example.com -o "assess the exposure of example.co
   aggregate rebuilds its `JoinBarrier` and raises `PrematureAggregate` if a unit
   is missing, and the barrier travels inside the report as proof the aggregate was
   not premature.
-- **Parallelism is bounded, and depends on nothing** — `FlowPolicy` caps
-  Subagents and Workers with semaphores (LangGraph's `max_concurrency` is per
-  invocation and a child graph does not inherit it). A unit takes its slot only
-  after its dependencies settle, so waiting can never starve what it waits for.
+- **Parallelism is bounded, and depends on nothing** — every unit takes a slot
+  from the mission's `BoundedScheduler` (see below), because LangGraph's
+  `max_concurrency` is per invocation and a child graph does not inherit its
+  parent's limit. A unit takes its slot only after its dependencies settle, so
+  waiting can never starve the unit being waited for.
 - **Everything is observable** — `FlowTrace` is a sequence-ordered ledger of
   stage, unit, dependency wave, thread and monotonic time, and it computes
   concurrency from the ledger alone, so "it ran in parallel" is a measurement.
@@ -376,13 +378,53 @@ python vedant_osint.py flow -t example.com -o "assess the exposure of example.co
   the gate. A mission whose Subagents produced nothing stops with a reason
   instead of synthesising an empty answer.
 
+## Bounded queues, deadlines and fair concurrency
+
+No unit runs unless the scheduler admits it. `BoundedScheduler` is one FIFO
+queue per resource — model calls, browser sessions, forensic jobs, Subagents,
+Workers — behind one condition variable, and it grants a slot only to the oldest
+waiter, so a long unit cannot re-acquire ahead of the queue and starve the tail
+of a large plan.
+
+```bash
+python vedant_osint.py sched --self-test                  # 80 guarantee checks, offline
+python vedant_osint.py sched --demo tight                 # caps below the plan's width
+python vedant_osint.py sched --demo roomy                 # the same code, nothing refused
+python vedant_osint.py sched --clip forensic --workers 2 --subagents 2
+python vedant_osint.py sched --demo tight --json          # the whole snapshot
+```
+
+- **Caps are per resource and per mission, and both are enforced.** `ResourceLimits`
+  carries a concurrent cap and an optional lifetime cap per kind; `peak` is
+  recorded by the scheduler itself, so `peak ≤ cap` in the demo table is the
+  scheduler's own measurement, not the runner's guess.
+- **A wait that cannot be met fails loudly.** A queue deadline (`QueueTimeout`)
+  shortens the wait to what the mission has left, and a caller with an expired
+  `Deadline` is refused before it queues. Nothing waits forever.
+- **Deadlines nest.** `Deadline.child()` clamps a unit's budget to its parent's,
+  `clamp()` reduces a timeout to the time actually left, and an expired mission
+  deadline refuses everything below it. Cancellation is checked both before a
+  unit queues and while it is parked, so Ctrl-C empties the queues.
+- **Only the Master creates Subagents; Workers create nothing.** `SpawnLedger`
+  records who may create whom as a licence (`SpawnTier.MASTER` → `SUBAGENT` →
+  `WORKER`, depth 2), and every spawn attempt is either licensed or refused with
+  a reason — a Worker asking to create a Subagent is refused, not ignored.
+- **A plan too large is clipped, deterministically.** `clip_plan()` keeps
+  dependency closure first and declaration order second — never thread order —
+  drops the Workers that go with a dropped Subagent, and returns a `ClipReport`
+  naming every decision. Nothing is clipped silently.
+- **Backpressure is a recorded deferral.** A unit refused a slot or a licence
+  still produces its report: status `blocked`, the gate that stopped it, and a
+  gap naming the unit and the reason. The mission still joins, and a cancelled
+  mission stops before synthesis instead of presenting a partial answer.
+
 ## Status
 
 | Phase | Scope | State |
 |-------|-------|-------|
 | 1 | Foundation — CLI skeleton, config probing, version reporting | ✅ done |
 | 2 | Contracts — settings, `doctor`, preflight, models, state, renderer, lifecycle, resilience, model adapter | ✅ done |
-| 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow) |
+| 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control) |
 | 4 | Browser — browser-use / Playwright sessions and capture | ⬜ |
 | 5 | Collection — passive OSINT sources, artefact hashing | ⬜ |
 | 6 | Synthesis — cross-source correlation and reporting | ⬜ |
