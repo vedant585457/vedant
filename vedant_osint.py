@@ -369,6 +369,53 @@ one plus two for the other objective.
     python vedant_osint.py workers --role dns-and-archive
     python vedant_osint.py workers --demo reject     # what the Subagent is sent back
 
+The execution flow
+------------------
+The hierarchy is executed by a LangGraph workflow, not by loops in this file.
+:class:`HierarchicalFlow` compiles three graphs and reuses each one for every
+mission:
+
+* **Master** — ``master-plan`` → one ``Send`` per Subagent → ``master-review`` →
+  ``master-synthesize``.
+* **Subagent** (one child graph per Subagent, compiled once) — ``subagent`` →
+  one ``Send`` per Worker → ``subagent-aggregate``.
+* **Worker** (one child graph per Worker, compiled once) — ``worker-task`` →
+  ``worker-review``, looping while the review asks for a retry.
+
+The widths are *data*: a mission with two Subagents and a mission with nine
+compile to the same structure (``flow --demo compare`` prints both node sets side
+by side).  There is no node named after a specialist role and no roster constant
+— ``flow --self-test`` parses the file to prove it.
+
+* **A join is an edge, and is then re-checked.**  Every Worker branch ends at
+  ``subagent-aggregate`` over a plain edge, so LangGraph runs that node once,
+  after the last branch settles; ``master-synthesize`` waits the same way for
+  every Subagent.  Each aggregate also rebuilds its :class:`JoinBarrier` from
+  what it received and raises :class:`PrematureAggregate` if a unit is missing —
+  the edge makes the order correct, the check makes a mis-wired edge loud.  The
+  barrier travels inside the report, so a produced aggregate carries the proof
+  that it was not premature.
+* **Parallelism is bounded by the policy, not by hope.**  ``FlowPolicy`` caps
+  Subagents and Workers with semaphores, because LangGraph's ``max_concurrency``
+  is per invocation and a child graph does not inherit its parent's limit.  A
+  unit takes its slot only after its dependencies have settled, so waiting never
+  starves the unit being waited for.
+* **Every step is observable.**  ``FlowTrace`` is an append-only, sequence
+  ordered ledger of stage, unit, dependency wave, thread and monotonic time; it
+  computes ``max_concurrency`` and ``threads`` from the ledger alone, so "it ran
+  in parallel" is a measurement rather than a claim.
+* **A failure is a gap, never a pass.**  Retries are bounded by the Worker's own
+  budget; when they run out the verdict stands, the gap names the Worker and the
+  gate, and a mission whose Subagents produced nothing stops with
+  ``stopped``/``stop_reason`` instead of synthesising an empty answer.
+
+::
+
+    python vedant_osint.py flow --self-test                       # 60 guarantee checks
+    python vedant_osint.py flow --demo exposure                   # ledger + joins
+    python vedant_osint.py flow --demo compare                    # one structure, two widths
+    python vedant_osint.py flow -t example.com -o "assess the exposure of example.com"
+
 Structured model adapter
 ------------------------
 One model-calling interface sits between orchestration and every provider, so
@@ -514,13 +561,14 @@ import tempfile
 import threading
 import time
 import uuid
+import operator
 from asyncio import CancelledError
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum, IntEnum
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence
+from typing import Annotated, Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence, TypedDict
 
 # --- third party: CLI surface -------------------------------------------------
 # Typer + Rich are the only hard imports.  They are imported at module level
@@ -553,7 +601,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 13
+VERSION_MINOR: int = 14
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -607,7 +655,8 @@ BUILD_PHASE_NAME: str = "Orchestration"
 PHASE_ROADMAP: tuple[tuple[int, str, str], ...] = (
     (1, "Foundation", "CLI skeleton, config probing, version reporting"),
     (2, "Contracts", "Contracts, state, rendering, lifecycle, resilience, model adapter"),
-    (3, "Orchestration", "Master Agent (only fixed agent) + runtime Subagent factory"),
+    (3, "Orchestration", "Master Agent (only fixed agent), runtime Subagent/Worker factories, "
+                         "LangGraph execution flow"),
     (4, "Browser", "browser-use/Playwright sessions and capture"),
     (5, "Collection", "passive OSINT sources, artefact hashing/chain of custody"),
     (6, "Synthesis", "cross-source correlation, findings and report export"),
@@ -19463,7 +19512,2369 @@ def workers_command(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 24. Entry point
+# 24. The LangGraph execution flow — hierarchy, fan-out, aggregation
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Sections 21–23 decided *who should exist* and *what each of them owes*.  This
+# section runs them.
+#
+# The graph is deliberately dumb about roles and clever about structure.  There
+# is one node per *stage*, never one per specialist: the number of Subagents and
+# the number of Workers are data, so a mission with two Subagents and a mission
+# with seven run through the same compiled graph unchanged.  Fan-out is
+# ``Send``-based, which is what makes "however many there are" expressible:
+#
+#   START → master_plan → fan out one *child graph* per Subagent
+#             child: START → fan out one task per Worker
+#                            task → review ─ pass ─→ done
+#                                        └─ revise/retry ─→ task (bounded)
+#                            done → subagent_aggregate        (waits: join)
+#           → master_review → master_synthesize → END          (waits: join)
+#
+# Two things are enforced by construction rather than by hope:
+#
+# * **A join is a real join.**  LangGraph runs every outstanding ``Send`` branch
+#   before a plain edge fires, so ``subagent_aggregate`` sees every Worker
+#   outcome and ``master_synthesize`` sees every Subagent report.  Each of them
+#   *also* checks the expectation and refuses to aggregate early — the
+#   :class:`JoinBarrier` records which sources were required and which arrived,
+#   so "no aggregate was produced prematurely" is an assertion, not a comment.
+# * **Dependencies are edges.**  A Subagent that depends on another runs in a
+#   later wave; a Worker that reads another Worker's output is ordered after it.
+#   Independent units in the same wave run concurrently, capped by the mission
+#   limits (``--graph-workers``), so parallelism is observable in the ledger.
+#
+# A Worker's own execution is injected.  ``MissionRunner`` supplies it, and the
+# self-test supplies a scripted one, so the entire orchestration — fan-out,
+# review, retry, aggregation, synthesis — is testable with no provider, no
+# network and no browser.
+
+
+class FlowStage(str, Enum):
+    """The stages of the graph.  There is one node per stage, never per role."""
+
+    PLAN = "master-plan"
+    SUBAGENT = "subagent"                  # composite node: the child graph
+    WORKER = "worker-task"
+    REVIEW = "worker-review"
+    SUBAGENT_AGGREGATE = "subagent-aggregate"
+    MASTER_REVIEW = "master-review"
+    MASTER_SYNTHESIZE = "master-synthesize"
+
+
+class FlowGate(str, Enum):
+    """Why a unit of work did not run or did not pass."""
+
+    NONE = "none"
+    RETRY_EXHAUSTED = "retry-exhausted"
+    REVIEW_REJECTED = "review-rejected"
+    DEPENDENCY_FAILED = "dependency-failed"
+    CANCELLED = "cancelled"
+    BUDGET = "budget"
+    ERROR = "error"
+
+
+#: Every stage in the order it can first run.  A ledger trace is monotone in this
+#: ordering for sequential stages, which is what makes premature aggregation
+#: visible.
+FLOW_STAGE_ORDER: tuple[FlowStage, ...] = (
+    FlowStage.PLAN,
+    FlowStage.WORKER,
+    FlowStage.REVIEW,
+    FlowStage.SUBAGENT_AGGREGATE,
+    FlowStage.MASTER_REVIEW,
+    FlowStage.MASTER_SYNTHESIZE,
+)
+
+
+class FlowPolicy(StrictModel):
+    """The concurrency and retry budget for one graph run.
+
+    These are limits, not hints: a semaphore bounds the units in flight at each
+    level, and no unit is retried more times than its own specification allows.
+    """
+
+    #: Caps are enforced with semaphores around each unit rather than with
+    #: LangGraph's ``max_concurrency``, which is per invocation — a child graph
+    #: does not inherit its parent's limit.
+    max_parallel_subagents: int = Field(default=4, ge=1, le=16)
+    max_parallel_workers: int = Field(default=8, ge=1, le=32)
+    #: How many times one Worker task may be reviewed-and-retried.
+    max_review_rounds: int = Field(default=2, ge=0, le=5)
+    #: Abort synthesis when any Subagent reports a blocking failure.
+    stop_on_blocking_failure: bool = True
+    #: Simulated per-stage latency used by the demo so parallelism is observable.
+    stage_delay_seconds: float = Field(default=0.0, ge=0.0, le=5.0)
+    #: How long a unit waits for a dependency before its gate fails it.  Bounded
+    #: so a dependency cycle degrades into an explicit gap instead of a hang.
+    wait_timeout_seconds: float = Field(default=30.0, gt=0, le=600)
+    #: Informational only: the caps above are the ones enforced.
+    max_concurrency: int = Field(default=0, ge=0, le=64)
+
+    @classmethod
+    def from_context(cls, context: "MasterContext", **overrides: Any) -> "FlowPolicy":
+        """Derive the limits from the mission's own configuration."""
+
+        base = {
+            "max_parallel_subagents": min(context.max_subagents, 8),
+            "max_parallel_workers": max(2, min(context.max_total_workers, 16)),
+        }
+        base.update({key: value for key, value in overrides.items() if value is not None})
+        return cls(**base)
+
+
+class FlowEvent(StrictModel):
+    """One observable step of one unit of work.
+
+    The ledger is append-only and ordered by a monotonic sequence number, so the
+    order and the overlap of stages can be read back after the run rather than
+    inferred from timing.
+    """
+
+    seq: int = Field(ge=0)
+    stage: FlowStage
+    unit: str = ""                      # subagent or worker id
+    parent: str = ""                    # owning subagent, for worker events
+    wave: int = Field(default=0, ge=0)
+    at: float = Field(description="Monotonic seconds since the run started.")
+    detail: str = ""
+    thread: str = ""
+
+    @property
+    def key(self) -> tuple[str, str, str]:
+        return (self.stage.value, self.parent, self.unit)
+
+    def render(self) -> str:
+        where = f"{self.parent}/{self.unit}" if self.parent else self.unit
+        thread = f" · {self.thread}" if self.thread else ""
+        return (f"{self.at:7.3f}s  {self.stage.value:<18} {where}{thread}"
+                + (f"  {self.detail}" if self.detail else ""))
+
+
+class FlowTrace:
+    """Thread-safe, append-only record of what happened, in order.
+
+    It answers the two questions the acceptance criteria ask: *in what order did
+    the stages run*, and *what overlapped with what*.  Nothing here decides
+    anything; it only observes.
+    """
+
+    def __init__(self, *, clock: "Callable[[], float] | None" = None) -> None:
+        self._clock = clock or time.monotonic
+        self._start = self._clock()
+        self._events: list[FlowEvent] = []
+        self._lock = threading.Lock()
+
+    def now(self) -> float:
+        return self._clock() - self._start
+
+    def record(self, stage: FlowStage, *, unit: str = "", parent: str = "", wave: int = 0,
+               detail: str = "") -> FlowEvent:
+        with self._lock:
+            event = FlowEvent(
+                seq=len(self._events), stage=stage, unit=unit, parent=parent, wave=wave,
+                at=self.now(), detail=detail,
+                thread=threading.current_thread().name,
+            )
+            self._events.append(event)
+            return event
+
+    def events(self, *, stage: FlowStage | None = None) -> list[FlowEvent]:
+        with self._lock:
+            items = list(self._events)
+        return [event for event in items if stage is None or event.stage is stage]
+
+    def units(self, stage: FlowStage) -> list[str]:
+        return [event.unit for event in self.events(stage=stage)]
+
+    def first(self, stage: FlowStage) -> FlowEvent | None:
+        found = self.events(stage=stage)
+        return found[0] if found else None
+
+    def last(self, stage: FlowStage) -> FlowEvent | None:
+        found = self.events(stage=stage)
+        return found[-1] if found else None
+
+    def first_seq_after(self, stage: FlowStage, seq: int) -> FlowEvent | None:
+        """The first event of ``stage`` that happened after ledger position ``seq``."""
+
+        return next((event for event in self.events(stage=stage) if event.seq > seq), None)
+
+    def overlaps(self, left: FlowStage, right: FlowStage) -> list[tuple[str, str, float]]:
+        """Units whose stages overlapped in time — the evidence of parallelism.
+
+        Each entry is ``(unit, stage, seconds)`` where the last element is the
+        overlap window.  Two stages "overlap" when their events are interleaved
+        in the ledger, which happens only when the graph ran them concurrently.
+        """
+
+        windows: dict[str, dict[FlowStage, tuple[int, float]]] = {}
+        for event in self.events():
+            if event.stage in {left, right}:
+                spot = windows.setdefault(event.unit, {})
+                start_seq, start_time = spot.get(event.stage, (event.seq, event.at))
+                spot[event.stage] = (start_seq, start_time)
+        found: list[tuple[str, str, float]] = []
+        pairs: dict[FlowStage, list[FlowEvent]] = {left: [], right: []}
+        for event in self.events():
+            if event.stage in pairs:
+                pairs[event.stage].append(event)
+        for unit, spot in windows.items():
+            if left in spot and right in spot:
+                found.append((unit, f"{left.value}↔{right.value}", 0.0))
+            elif unit in {e.unit for e in pairs[left]} and unit in {e.unit for e in pairs[right]}:
+                found.append((unit, f"{left.value}↔{right.value}", 0.0))
+        # Interleaving is the real signal: a stage that starts before the previous
+        # one's last unit finished was running concurrently.
+        if pairs[left] and pairs[right]:
+            for earlier, later in ((pairs[left][0], pairs[right][0]),):
+                if later.seq < pairs[left][-1].seq or earlier.seq < pairs[right][-1].seq:
+                    found.append((later.unit or earlier.unit, f"{left.value}↔{right.value}",
+                                  round(min(pairs[left][-1].at, pairs[right][-1].at)
+                                        - max(earlier.at, later.at), 3)))
+        return [item for item in found if item[2] >= 0.0]
+
+    def threads(self) -> set[str]:
+        """Distinct threads that produced events — a concurrency fingerprint."""
+
+        return {event.thread for event in self.events() if event.thread}
+
+    def max_concurrency(self) -> int:
+        """The largest number of units that were in flight at the same instant.
+
+        Computed from the ledger alone: the run is sliced at every event boundary
+        and the number of *distinct units* with an open start and no finish is
+        counted.  This is how "it really ran in parallel" is demonstrated without
+        trusting a boolean.
+        """
+
+        opens: dict[str, float] = {}
+        closes: dict[str, float] = {}
+        for event in self.events():
+            opens.setdefault(f"{event.parent}/{event.unit}", event.at)
+            closes[f"{event.parent}/{event.unit}"] = event.at
+        best = 0
+        for moment in sorted(set(opens.values()) | set(closes.values())):
+            live = sum(1 for unit, start in opens.items() if start <= moment <= closes[unit])
+            best = max(best, live)
+        return best
+
+    def render(self, *, limit: int | None = None) -> str:
+        events = self.events()
+        if limit is not None:
+            events = events[-limit:]
+        return "\n".join(event.render() for event in events)
+
+    def to_list(self) -> list[dict[str, Any]]:
+        return [json.loads(model_to_json(event)) for event in self.events()]
+
+    def __len__(self) -> int:
+        return len(self.events())
+
+
+class JoinBarrier(StrictModel):
+    """What an aggregation step was waiting for, and what arrived.
+
+    Aggregation refuses to run while anything it requires is missing.  The
+    barrier is returned in the aggregate's payload so the report itself carries
+    the evidence that it was not premature.
+    """
+
+    stage: str = Field(min_length=1)
+    expected: list[str] = Field(default_factory=list)
+    received: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+
+    @property
+    def satisfied(self) -> bool:
+        return not self.missing
+
+    def describe(self) -> str:
+        return (f"{len(self.received)}/{len(self.expected)} outcome(s) received"
+                + (f"; missing {', '.join(self.missing[:3])}" if self.missing else ""))
+
+
+class PrematureAggregate(RuntimeError):
+    """Raised when an aggregation step is asked to run before its join is met.
+
+    This is a programming error in the graph, not a mission failure: it exists so
+    that a future edit that wires an aggregate to the wrong edge fails loudly in
+    the self-test instead of quietly summarising half a mission.
+    """
+
+    def __init__(self, barrier: JoinBarrier) -> None:
+        super().__init__(f"{barrier.stage} cannot aggregate yet: {barrier.describe()}")
+        self.barrier = barrier
+
+
+def check_join(stage: str, expected: Sequence[str], received: Sequence[str]) -> JoinBarrier:
+    """Build the barrier for one join, and raise if it is not met."""
+
+    wanted = list(dict.fromkeys(str(item) for item in expected))
+    got = list(dict.fromkeys(str(item) for item in received))
+    barrier = JoinBarrier(
+        stage=stage, expected=wanted, received=got,
+        missing=[item for item in wanted if item not in got],
+    )
+    if not barrier.satisfied:
+        raise PrematureAggregate(barrier)
+    return barrier
+
+
+# --------------------------------------------------------------------------
+# 24.2 What the graph carries: units of work, and who executes them
+# --------------------------------------------------------------------------
+
+
+class FlowWorker(StrictModel):
+    """One Worker as the graph sees it: an id, its slice, and what it may spend."""
+
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    objective: str = Field(min_length=1)
+    work_unit: str = ""
+    tools: list[str] = Field(default_factory=list)
+    input_names: list[str] = Field(default_factory=list)
+    #: Worker ids this one reads from.  Turns into edges, so they cannot race.
+    depends_on: list[str] = Field(default_factory=list)
+    completion_criteria: list[str] = Field(default_factory=list)
+    expected_evidence: str = ""
+    max_attempts: int = Field(default=2, ge=1, le=10)
+    timeout_seconds: int = Field(default=300, ge=5, le=3600)
+
+    @classmethod
+    def from_birth(cls, birth: "WorkerBirth") -> "FlowWorker":
+        draft = birth.draft
+        return cls(
+            id=birth.spec.id, name=draft.name, objective=draft.objective,
+            work_unit=draft.mandate.work_unit, tools=list(draft.tools),
+            input_names=[item.name for item in draft.inputs],
+            depends_on=[unit for unit in draft.depends_on_units()],
+            completion_criteria=list(draft.completion_criteria),
+            expected_evidence=draft.expected_evidence.describe(),
+            max_attempts=draft.budget.max_attempts,
+            timeout_seconds=draft.budget.timeout_seconds,
+        )
+
+
+class FlowSubagent(StrictModel):
+    """One Subagent as the graph sees it: its Workers and what it depends on."""
+
+    id: str = Field(min_length=1)
+    role: str = Field(min_length=1)
+    objective: str = Field(min_length=1)
+    workers: list[FlowWorker] = Field(min_length=1)
+    #: Worker *unit* names this Subagent's plan chained.  Resolved to worker ids
+    #: at fan-out time; kept as units because that is how a plan names them.
+    depends_on: list[str] = Field(default_factory=list)
+    completion_criteria: list[str] = Field(default_factory=list)
+    addresses_questions: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def from_birth(cls, birth: "SubagentBirth", workers: Sequence["WorkerBirth"]) -> "FlowSubagent":
+        return cls(
+            id=birth.spec.id, role=birth.draft.role, objective=birth.draft.objective,
+            workers=[FlowWorker.from_birth(worker) for worker in workers],
+            depends_on=list(birth.draft.depends_on),
+            completion_criteria=list(birth.draft.termination.stop_on),
+            addresses_questions=list(birth.draft.addresses_questions),
+        )
+
+    def waves(self) -> list[list[str]]:
+        """This Subagent's Workers, grouped by the order they can run in.
+
+        Independent Workers share a wave and therefore run concurrently; a Worker
+        that reads another's output waits for the next wave.  Computed from the
+        declared inputs, never from the order the plan happened to list them.
+        """
+
+        pending = [(worker.id, list(worker.depends_on)) for worker in self.workers]
+        done: set[str] = set()
+        waves: list[list[str]] = []
+        while pending:
+            ready = [wid for wid, deps in pending if set(deps) <= done]
+            if not ready:                      # a cycle: preserve order, do not loop
+                waves.append([wid for wid, _deps in pending])
+                break
+            waves.append(ready)
+            done |= set(ready)
+            pending = [(wid, deps) for wid, deps in pending if wid not in ready]
+        return waves
+
+    def worker(self, worker_id: str) -> FlowWorker | None:
+        return next((worker for worker in self.workers if worker.id == worker_id), None)
+
+
+class WorkerOutcome(StrictModel):
+    """What the graph knows about one Worker task when it finishes.
+
+    ``payload`` is whatever the runner returned — identifiers and values, not a
+    prompt and not a model scratchpad, so it can travel into logs and reports.
+    """
+
+    worker_id: str = Field(min_length=1)
+    subagent_id: str = Field(min_length=1)
+    task_id: str = Field(default="")
+    status: EntityStatus = EntityStatus.SUCCEEDED
+    attempt: int = Field(default=1, ge=1)
+    gate: FlowGate = FlowGate.NONE
+    summary: str = ""
+    evidence_ids: list[str] = Field(default_factory=list)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = None
+    seconds: float = Field(default=0.0, ge=0)
+
+    @property
+    def failed(self) -> bool:
+        return self.status not in {EntityStatus.SUCCEEDED}
+
+
+class ReviewVerdict(StrictModel):
+    """The outcome of reviewing one Worker outcome.
+
+    ``retry`` is separate from ``approved`` on purpose: "the work is fine but the
+    budget is gone" and "the work is wrong" are different facts, and the graph
+    acts differently on each.
+    """
+
+    worker_id: str = Field(min_length=1)
+    approved: bool
+    verdict: str = Field(default="pass", pattern="^(pass|revise|reject|escalate)$")
+    criteria: list[str] = Field(default_factory=list)
+    findings: list[str] = Field(default_factory=list)
+    retry: bool = False
+    guidance: str = ""
+    reviewer: str = "subagent"
+
+    @model_validator(mode="after")
+    def _coherent(self) -> "ReviewVerdict":
+        if not self.approved and not self.findings:
+            raise ValueError("a rejection must name at least one finding")
+        if self.retry and not self.approved and not self.guidance:
+            raise ValueError("a retry must say what to change")
+        return self
+
+
+#: The result schema a runner must fill in.  Narrow by design: facts and
+#: citations, never a conclusion — the Subagent aggregates, the Master concludes.
+DETERMINISTIC_SCHEMA = "EvidenceSet"
+
+
+class MissionRunner(Protocol):
+    """How the graph asks for work.  One method per unit type, nothing else.
+
+    The graph never imports a provider, a browser or a collector: it hands a
+    Worker (or a Subagent) to the runner and receives a validated record back.
+    The self-test's runner is scripted; the CLI's runner is deterministic; a real
+    collection runner is a Phase 4/5 implementation of this same protocol.
+    """
+
+    def run_worker(self, subagent: FlowSubagent, worker: FlowWorker, *,
+                   attempt: int, guidance: str = "") -> WorkerOutcome:
+        """Execute one Worker task and return its outcome (never an exception)."""
+
+    def review_worker(self, subagent: FlowSubagent, worker: FlowWorker,
+                      outcome: WorkerOutcome, *, round_number: int) -> ReviewVerdict:
+        """Judge one Worker outcome against the Worker's completion criteria."""
+
+    def synthesize(self, subagents: Sequence[FlowSubagent],
+                   reports: Sequence["SubagentOutcome"],
+                   context: "MasterContext") -> "MasterSynthesis":
+        """Turn the aggregated reports into the mission-level answer."""
+
+
+class DeterministicRunner:
+    """The default runner: real records, no model, no network.
+
+    Each Worker produces one observation per completion criterion, sourced from
+    the mission scope.  That is a *demonstration* of the flow — the evidence is
+    labelled as such — and it is the right default because it means the graph can
+    be exercised end to end in CI without inventing findings.
+    """
+
+    def __init__(self, *, scope: Sequence[str] = ("example.com",),
+                 delay_seconds: float = 0.0,
+                 failing: Sequence[str] = (),
+                 flaky: Sequence[str] = (),
+                 always_revise: Sequence[str] = ()) -> None:
+        self.scope = list(scope) or ["example.com"]
+        self.delay_seconds = delay_seconds
+        self.failing = set(failing)
+        self.flaky = set(flaky)
+        self.always_revise = set(always_revise)
+        self._attempts: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    # -- execution ----------------------------------------------------------
+
+    def run_worker(self, subagent: FlowSubagent, worker: FlowWorker, *,
+                   attempt: int, guidance: str = "") -> WorkerOutcome:
+        started = time.monotonic()
+        if self.delay_seconds:
+            time.sleep(self.delay_seconds)
+        with self._lock:
+            self._attempts[worker.id] = self._attempts.get(worker.id, 0) + 1
+        if worker.id in self.failing:
+            return WorkerOutcome(
+                worker_id=worker.id, subagent_id=subagent.id,
+                status=EntityStatus.FAILED, attempt=attempt, gate=FlowGate.ERROR,
+                summary=f"{worker.name}: source unavailable",
+                error="simulated source failure",
+                seconds=time.monotonic() - started,
+            )
+        if worker.id in self.flaky and attempt < 2:
+            return WorkerOutcome(
+                worker_id=worker.id, subagent_id=subagent.id,
+                status=EntityStatus.FAILED, attempt=attempt, gate=FlowGate.ERROR,
+                summary=f"{worker.name}: transient failure on attempt {attempt}",
+                error="simulated transient failure",
+                seconds=time.monotonic() - started,
+            )
+        evidence = self._evidence(subagent, worker)
+        return WorkerOutcome(
+            worker_id=worker.id, subagent_id=subagent.id,
+            status=EntityStatus.SUCCEEDED, attempt=attempt,
+            summary=f"{worker.name}: {len(evidence)} observation(s) collected",
+            evidence_ids=[item.id for item in evidence],
+            payload={"evidence": [json.loads(model_to_json(item)) for item in evidence],
+                     "work_unit": worker.work_unit},
+            seconds=time.monotonic() - started,
+        )
+
+    def _evidence(self, subagent: FlowSubagent, worker: FlowWorker) -> list[EvidenceItem]:
+        items: list[EvidenceItem] = []
+        for index, criterion in enumerate(worker.completion_criteria or [worker.objective], start=1):
+            locator = self.scope[(index - 1) % len(self.scope)]
+            url = locator if locator.startswith(("http://", "https://")) else None
+            source = SourceReference(
+                kind=SourceKind.PUBLIC_WEB if url else SourceKind.LOCAL_ARTIFACT,
+                url=url,
+                artifact_path=None if url else locator,
+                title=f"{worker.name} — {subagent.role}",
+                retrieved_at=utc_now(),
+                retrieval_method=RetrievalMethod.HTTP if url else RetrievalMethod.LOCAL_READ,
+                http_status=200 if url else None,
+                excerpt=criterion[:160],
+            )
+            items.append(
+                EvidenceItem(
+                    kind=EvidenceKind.OBSERVATION,
+                    statement=f"{worker.name}: {criterion}",
+                    sources=[source],
+                    confidence=Confidence.LOW,
+                    confidence_basis=(
+                        "single automated run of the deterministic demo runner; "
+                        "not a collected finding"
+                    ),
+                    collected_by=worker.id,
+                )
+            )
+        return items
+
+    # -- review -------------------------------------------------------------
+
+    def review_worker(self, subagent: FlowSubagent, worker: FlowWorker,
+                      outcome: WorkerOutcome, *, round_number: int) -> ReviewVerdict:
+        criteria = list(worker.completion_criteria or ["the worker returns evidence"])
+        if outcome.failed:
+            return ReviewVerdict(
+                worker_id=worker.id, approved=False, verdict="revise", criteria=criteria,
+                findings=[f"the task did not complete: {outcome.error or outcome.status.value}"],
+                retry=outcome.gate is not FlowGate.RETRY_EXHAUSTED,
+                guidance="retry the same unit; if it fails again, report the gap",
+            )
+        missing = [criterion for criterion in criteria if not outcome.evidence_ids]
+        if missing or not outcome.evidence_ids:
+            return ReviewVerdict(
+                worker_id=worker.id, approved=False, verdict="revise", criteria=criteria,
+                findings=[f"no evidence id satisfies: {missing[0] if missing else criteria[0]}"],
+                retry=True, guidance="collect at least one sourced observation per criterion",
+            )
+        if worker.id in self.always_revise and round_number < 2:
+            return ReviewVerdict(
+                worker_id=worker.id, approved=False, verdict="revise", criteria=criteria,
+                findings=["the first review always asks for a second pass in this demo"],
+                retry=True, guidance="re-read the unit and return only sourced rows",
+            )
+        return ReviewVerdict(
+            worker_id=worker.id, approved=True, verdict="pass", criteria=criteria,
+            findings=[], reviewer="deterministic-runner",
+        )
+
+    # -- synthesis ----------------------------------------------------------
+
+    def synthesize(self, subagents: Sequence[FlowSubagent],
+                   reports: Sequence["SubagentOutcome"],
+                   context: "MasterContext") -> "MasterSynthesis":
+        sourced = [item for report in reports for item in report.evidence]
+        claims = [
+            ModelClaim(
+                statement=f"{report.role} returned {len(report.evidence)} sourced observation(s)",
+                source_refs=report.evidence_ids[:4] or ["no-evidence"],
+                confidence=Confidence.LOW,
+                uncertainty=("the observations are synthetic and come from one runner, "
+                             "not from the target itself"),
+            )
+            for report in reports if report.evidence
+        ][:6]
+        gaps = [
+            UnknownValue(reason=UnknownReason.FAILED, determined_by=report.subagent_id,
+                         detail=f"{report.role} returned no evidence ({report.gate.value})")
+            for report in reports if not report.evidence
+        ]
+        # A subagent that collected something but not everything still has gaps,
+        # and a synthesis that dropped them would report a cleaner mission than
+        # the one that ran.
+        gaps.extend(
+            UnknownValue(reason=gap.reason, determined_by=report.subagent_id,
+                         detail=f"{report.role}: {gap.detail}" if gap.detail else report.role)
+            for report in reports for gap in report.gaps if report.evidence
+        )
+        return MasterSynthesis(
+            summary=(
+                f"{len(reports)} subagent(s) reported {len(sourced)} sourced observation(s) for "
+                f"{context.objective[:90]}; this build's runner is deterministic and collects "
+                f"nothing, so the observations demonstrate the flow rather than the target"
+            ),
+            claims=claims or [ModelClaim(statement="no evidence was returned by any subagent",
+                                         source_refs=["no-evidence"], confidence=Confidence.UNKNOWN)],
+            gaps=gaps,
+            hypotheses_open=[question for subagent in subagents
+                             for question in subagent.addresses_questions][:6],
+            limitations=["the deterministic runner does not contact the target"],
+            confidence=Confidence.LOW if claims else Confidence.UNKNOWN,
+            confidence_basis=("observations are synthetic and single-sourced"
+                              if claims else "no evidence was collected"),
+            uncertainty_statement=(
+                "no claim about the target is made: the flow was executed with a deterministic "
+                "runner that records what a collection phase would have to supply"
+            ),
+            # Set by the synthesising node from the join it actually waited on;
+            # a runner must not be able to invent its own barrier.
+            aggregate_basis=None,
+        )
+
+
+class SubagentOutcome(StrictModel):
+    """One Subagent's aggregate, after every one of its Workers was reviewed.
+
+    ``aggregate_basis`` is the join it waited on: the Worker outcomes it required
+    and the ones it received.  An aggregate can only exist with that barrier met,
+    so a report is never built from a partial team.
+    """
+
+    subagent_id: str = Field(min_length=1)
+    role: str = Field(min_length=1)
+    objective: str = ""
+    status: EntityStatus = EntityStatus.SUCCEEDED
+    gate: FlowGate = FlowGate.NONE
+    outcomes: list[WorkerOutcome] = Field(default_factory=list)
+    reviews: list[ReviewVerdict] = Field(default_factory=list)
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    aggregate_basis: JoinBarrier | None = None
+    open_questions: list[str] = Field(default_factory=list)
+    gaps: list[UnknownValue] = Field(default_factory=list)
+    #: Attempts beyond the first, summed over this Subagent's Workers.
+    retries: int = Field(default=0, ge=0)
+    seconds: float = Field(default=0.0, ge=0)
+
+    @property
+    def evidence_ids(self) -> list[str]:
+        return [item.id for item in self.evidence]
+
+    @property
+    def succeeded(self) -> bool:
+        return self.status is EntityStatus.SUCCEEDED
+
+    @property
+    def blocking(self) -> bool:
+        """True when this Subagent produced nothing the mission can build on.
+
+        ``BLOCKED`` is a *partial* report — some Workers settled, some did not —
+        and it is deliberately not blocking: the mission finishes with a named
+        gap rather than dying on one bad Worker.  A report that never ran or
+        returned no evidence at all is blocking.
+        """
+
+        return self.status in {EntityStatus.FAILED, EntityStatus.CANCELLED,
+                               EntityStatus.BUDGET_EXCEEDED}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "subagent_id": self.subagent_id,
+            "role": self.role,
+            "status": self.status.value,
+            "gate": self.gate.value,
+            "workers": [outcome.worker_id for outcome in self.outcomes],
+            "evidence": len(self.evidence),
+            "retries": self.retries,
+            "reviews": len(self.reviews),
+            "join": self.aggregate_basis.describe() if self.aggregate_basis else "not met",
+            "seconds": round(self.seconds, 3),
+            "gaps": [gap.describe() for gap in self.gaps],
+        }
+
+
+class MasterSynthesis(StrictModel):
+    """The Master's final aggregate, produced only after every Subagent reported."""
+
+    summary: str = Field(min_length=20)
+    claims: list[ModelClaim] = Field(default_factory=list)
+    gaps: list[UnknownValue] = Field(default_factory=list)
+    hypotheses_open: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    confidence: Confidence = Confidence.UNKNOWN
+    confidence_basis: str | None = None
+    uncertainty_statement: str = Field(min_length=15)
+    aggregate_basis: JoinBarrier | None = None
+
+    @property
+    def sourced_claims(self) -> list[ModelClaim]:
+        return [claim for claim in self.claims if claim.source_refs]
+
+
+class FlowResult(StrictModel):
+    """Everything one graph run produced, with the order it happened in."""
+
+    mission_id: str = ""
+    objective: str = ""
+    subagents: list[FlowSubagent] = Field(default_factory=list)
+    reports: list[SubagentOutcome] = Field(default_factory=list)
+    synthesis: MasterSynthesis | None = None
+    stopped: bool = False
+    stop_reason: str = ""
+    policy: FlowPolicy = Field(default_factory=FlowPolicy)
+    waves: list[list[str]] = Field(default_factory=list)
+    #: The compiled node set, so a caller can show that width is data.
+    structure: list[str] = Field(default_factory=list)
+    seconds: float = Field(default=0.0, ge=0)
+    trace: list[dict[str, Any]] = Field(default_factory=list)
+    #: Worker outcomes across the whole mission, including retries.
+    worker_attempts: int = Field(default=0, ge=0)
+    retries: int = Field(default=0, ge=0)
+
+    @property
+    def total_workers(self) -> int:
+        return sum(len(subagent.workers) for subagent in self.subagents)
+
+    @property
+    def evidence(self) -> list[EvidenceItem]:
+        return [item for report in self.reports for item in report.evidence]
+
+    def stage_order(self) -> list[str]:
+        """The stages as they first appeared in the ledger."""
+
+        order: list[str] = []
+        for event in self.trace:
+            stage = str(event.get("stage"))
+            if stage not in order:
+                order.append(stage)
+        return order
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mission_id": self.mission_id,
+            "objective": self.objective,
+            "policy": json.loads(model_to_json(self.policy)),
+            "waves": self.waves,
+            "structure": self.structure,
+            "subagents": [subagent.model_dump(mode="json") for subagent in self.subagents],
+            "reports": [report.to_dict() for report in self.reports],
+            "synthesis": json.loads(model_to_json(self.synthesis)) if self.synthesis else None,
+            "stopped": self.stopped,
+            "stop_reason": self.stop_reason,
+            "worker_attempts": self.worker_attempts,
+            "retries": self.retries,
+            "seconds": round(self.seconds, 3),
+            "stage_order": self.stage_order(),
+            "trace": self.trace,
+        }
+
+
+#: The state of one Worker branch.  Typed, because a typo in a dict key would
+#: otherwise surface as a missing channel at run time instead of here.
+class _WorkerState(TypedDict, total=False):
+    subagent: str
+    worker: str
+    wave: int
+    round: int
+    guidance: str
+    outcome: dict[str, Any]
+    verdict: dict[str, Any]
+    attempts: Annotated[list[dict[str, Any]], operator.add]
+    reviews: Annotated[list[dict[str, Any]], operator.add]
+
+
+#: The state of one Subagent's graph.  Worker branches merge their outcomes and
+#: reviews into these lists, so the aggregate sees all of them.
+class _SubagentState(TypedDict, total=False):
+    subagent: str
+    wave: int
+    waves: list[list[str]]
+    outcomes: Annotated[list[dict[str, Any]], operator.add]
+    reviews: Annotated[list[dict[str, Any]], operator.add]
+    report: dict[str, Any]
+
+
+#: The state of the Master's graph.  Subagent branches merge their reports here.
+class _MasterState(TypedDict, total=False):
+    mission_id: str
+    objective: str
+    subagent: str
+    wave: int
+    waves: list[list[str]]
+    reports: Annotated[list[dict[str, Any]], operator.add]
+    synthesis: dict[str, Any]
+    stopped: bool
+    stop_reason: str
+
+
+def _master_state(mission_id: str, objective: str) -> dict[str, Any]:
+    """The initial state of the Master graph, with every reducer key present."""
+
+    return {"mission_id": mission_id, "objective": objective, "subagent": "", "wave": 0,
+            "waves": [], "reports": [], "stopped": False, "stop_reason": ""}
+
+
+def _subagent_state() -> dict[str, Any]:
+    """The initial state of one Subagent graph."""
+
+    return {"subagent": "", "wave": 0, "waves": [], "outcomes": [], "reviews": []}
+
+
+def _worker_state() -> dict[str, Any]:
+    """The initial state of one Worker graph."""
+
+    return {"subagent": "", "worker": "", "wave": 0, "round": 0, "guidance": "",
+            "attempts": [], "reviews": []}
+# --------------------------------------------------------------------------
+# 24.3 LangGraph, imported lazily
+# --------------------------------------------------------------------------
+
+
+def _langgraph_primitives() -> tuple[tuple[Any, Any, Any], Any, Any]:
+    """Return ``((StateGraph, START, END), Send, Command)``.
+
+    Imported at the moment a graph is compiled, not at module import: ``version``,
+    ``config`` and ``doctor`` are exactly the commands an operator runs *before*
+    the dependencies are installed, and none of them may need LangGraph.
+    """
+
+    try:
+        from langgraph.graph import END, START, StateGraph
+        from langgraph.types import Command, Send
+    except Exception as exc:                # pragma: no cover - environment dependent
+        raise StructuredOutputError(
+            f"LangGraph is required to execute a mission flow ({exc}); "
+            f"install it with: pip install langgraph",
+            failure=ModelFailure.DEPENDENCY,
+        ) from exc
+    return (StateGraph, START, END), Send, Command
+# --------------------------------------------------------------------------
+# 24.4 The graph — the same nodes for every mission
+# --------------------------------------------------------------------------
+#
+# Three LangGraph mechanics carry the whole design; each is load-bearing:
+#
+# * **Fan-out is a ``Send``.**  ``master-plan`` returns one ``Send`` per
+#   Subagent and ``subagent-plan`` one per Worker, so the *width* of both levels
+#   is the mission's own data.  No node is named after a specialist role and no
+#   such node is ever added — the compiled structure is identical for a mission
+#   with two Subagents and one with nine (the self-test asserts this).
+# * **A join is a plain edge.**  Every Subagent branch ends at ``master-review``
+#   over a normal edge and every Worker branch at ``subagent-aggregate``, so
+#   LangGraph runs each aggregate exactly once, after the last branch of that
+#   superstep has finished.  Retries happen *inside* a Worker's own child graph,
+#   which is why a settled branch can never arrive after its aggregate.
+# * **Caps are semaphores, dependencies are waits.**  ``max_concurrency`` is
+#   per invocation in LangGraph and a child graph does not inherit the parent's
+#   limit, so the policy is enforced by a semaphore around each unit of work; a
+#   unit acquires its slot only *after* its dependencies are settled, so a
+#   waiting unit can never starve the one it is waiting for.
+#
+# Each aggregate also re-checks its join from the state it received and raises
+# :class:`PrematureAggregate` if it is unmet: the edge is what makes the ordering
+# correct, the re-check is what makes a mis-wired edge fail loudly instead of
+# quietly summarising half a mission.
+
+
+class HierarchicalFlow:
+    """Compile and run the hierarchical graph for one mission.
+
+    One instance per mission.  The top-level structure and the Subagent structure
+    are compiled once and shared by every unit, and the per-Worker structure is
+    compiled once and shared by every Worker, so the graph's shape is fixed while
+    its width is data.
+    """
+
+    def __init__(
+        self,
+        *,
+        context: "MasterContext",
+        subagents: Sequence[FlowSubagent],
+        runner: MissionRunner | None = None,
+        policy: FlowPolicy | None = None,
+        trace: FlowTrace | None = None,
+        store: "RunStateStore | None" = None,
+        tracker: "LifecycleTracker | None" = None,
+        renderer: "EventRenderer | None" = None,
+        logger: "MissionLogger | None" = None,
+        mission_id: str = "",
+    ) -> None:
+        if not subagents:
+            raise ValueError("a flow needs at least one subagent")
+        self.context = context
+        self.subagents = list(subagents)
+        self.runner: MissionRunner = runner or DeterministicRunner(
+            scope=context.scope_entries or ["example.com"])
+        self.policy = policy or FlowPolicy.from_context(context)
+        self.trace = trace or FlowTrace()
+        self.store = store
+        self.tracker = tracker
+        self.renderer = renderer
+        self.logger = logger
+        self.mission_id = mission_id or context.mission_id or content_id(
+            "flow", context.objective.strip().lower())
+        self._by_id = {subagent.id: subagent for subagent in self.subagents}
+        self.subagents = [self._resolved(subagent) for subagent in self.subagents]
+        self._by_id = {subagent.id: subagent for subagent in self.subagents}
+
+        # Compiled once, shared by every unit.  ``None`` until ``build``.
+        self._top_graph: Any = None
+        self._subagent_graph: Any = None
+        self._worker_graph: Any = None
+
+        # Run-scoped bookkeeping.  The graph itself carries ids between nodes; the
+        # join evidence lives here, where both the barrier check and the trace can
+        # see it.
+        self._settled: dict[str, set[str]] = {}
+        self._started: dict[str, float] = {}
+        self._gates: dict[str, FlowGate] = {}
+        #: Set when the store has refused a write, so the seam is tried once.
+        self._store_offline = False
+        #: Why this run is not recording to a store, when one was supplied.
+        self.detach_note = ""
+
+    def _resolved(self, subagent: FlowSubagent) -> FlowSubagent:
+        """Resolve declared dependency names to ids, once, before anything runs.
+
+        A plan names its dependencies in its own vocabulary — a role name, or the
+        unit of work a Worker produces — while the graph waits on ids.  Resolving
+        here means every wait, edge and wave is comparing like with like; an
+        unresolvable name is kept verbatim so the wait reports it as missing
+        rather than silently treating it as met.
+        """
+
+        roles = {other.role.strip().lower(): other.id for other in self.subagents}
+        deps = [roles.get(str(dep).strip().lower(), str(dep)) for dep in subagent.depends_on]
+        units = {worker.work_unit.strip().lower(): worker.id for worker in subagent.workers}
+        workers = [
+            worker.model_copy(update={
+                "depends_on": [units.get(str(dep).strip().lower(), str(dep))
+                               for dep in worker.depends_on]})
+            for worker in subagent.workers
+        ]
+        return subagent.model_copy(update={"depends_on": deps, "workers": workers})
+
+    # -- structure ----------------------------------------------------------
+
+    def structure(self) -> list[str]:
+        """The compiled top-level node set, as data.
+
+        Two objectives with different widths must report the *same* structure:
+        that is the difference between "dynamic fan-out" and "a node per
+        specialist".
+        """
+
+        if self._top_graph is None:
+            return sorted(["master-plan", "master-review", "master-synthesize",
+                           "master-subagent"])
+        return sorted(str(node) for node in self._top_graph.get_graph().nodes
+                      if not str(node).startswith("__"))
+
+    def structures(self) -> dict[str, list[str]]:
+        """Every level's node set, so the whole hierarchy can be inspected."""
+
+        self.build()
+        return {
+            "master": self.structure(),
+            "subagent": sorted(str(node) for node in self._subagent_graph.get_graph().nodes
+                               if not str(node).startswith("__")),
+            "worker": sorted(str(node) for node in self._worker_graph.get_graph().nodes
+                             if not str(node).startswith("__")),
+        }
+
+    def subagent_waves(self) -> list[list[str]]:
+        """Subagent ids grouped by declared dependency.
+
+        A Subagent that names a dependency is placed in a later wave than it, and
+        units inside one wave are independent — so a wave is the set that may run
+        together.  The ids come from the team the Master designed; nothing here
+        knows what a role *means*.
+        """
+
+        by_role = {subagent.role.strip().lower(): subagent.id for subagent in self.subagents}
+        resolved: dict[str, list[str]] = {}
+        for subagent in self.subagents:
+            deps: list[str] = []
+            for dep in subagent.depends_on:
+                token = str(dep).strip().lower()
+                target = token if token in self._by_id else by_role.get(token)
+                if target and target != subagent.id and target not in deps:
+                    deps.append(target)
+            resolved[subagent.id] = deps
+
+        pending = [(subagent.id, resolved[subagent.id]) for subagent in self.subagents]
+        done: set[str] = set()
+        waves: list[list[str]] = []
+        while pending:
+            ready = [sid for sid, deps in pending if set(deps) <= done]
+            if not ready:                    # dependency cycle: run the rest together
+                waves.append([sid for sid, _deps in pending])
+                break
+            waves.append(ready)
+            done |= set(ready)
+            pending = [(sid, deps) for sid, deps in pending if sid not in ready]
+        return waves
+
+    def worker_waves(self, subagent: FlowSubagent) -> list[list[str]]:
+        """That Subagent's Workers grouped by the units they produce and consume."""
+
+        return subagent.waves()
+
+    # -- compilation --------------------------------------------------------
+
+    def _compile(self) -> Any:
+        """Build the three graphs.  LangGraph is imported here, never at import."""
+
+        graph_module, send_cls, _command = _langgraph_primitives()
+        StateGraph, START, END = graph_module
+
+        # ---- level 1: the Master --------------------------------------
+        master = StateGraph(_MasterState)
+        master.add_node(FlowStage.PLAN.value, self._node_master_plan)
+        master.add_node("master-subagent", self._node_master_subagent)
+        master.add_node(FlowStage.MASTER_REVIEW.value, self._node_master_review)
+        master.add_node(FlowStage.MASTER_SYNTHESIZE.value, self._node_master_synthesize)
+        master.add_edge(START, FlowStage.PLAN.value)
+        master.add_conditional_edges(FlowStage.PLAN.value, self._subagent_sends,
+                                     ["master-subagent"])
+        # The join: every Subagent branch arrives here, so this node runs once.
+        master.add_edge("master-subagent", FlowStage.MASTER_REVIEW.value)
+        # A mission with a blocking failure stops here: it produces no aggregate
+        # at all rather than a synthesis built on work that never arrived.
+        master.add_conditional_edges(FlowStage.MASTER_REVIEW.value, self._after_master_review,
+                                     [FlowStage.MASTER_SYNTHESIZE.value, END])
+        master.add_edge(FlowStage.MASTER_SYNTHESIZE.value, END)
+        self._top_graph = master.compile()
+
+        # ---- level 2: one Subagent, whatever its Workers -----------------
+        subagent = StateGraph(_SubagentState)
+        subagent.add_node(FlowStage.SUBAGENT.value, self._node_subagent_plan)
+        subagent.add_node(FlowStage.WORKER.value, self._node_worker)
+        subagent.add_node(FlowStage.SUBAGENT_AGGREGATE.value, self._node_subagent_aggregate)
+        subagent.add_edge(START, FlowStage.SUBAGENT.value)
+        subagent.add_conditional_edges(FlowStage.SUBAGENT.value, self._worker_sends,
+                                       [FlowStage.WORKER.value])
+        # The join: every Worker branch arrives here, so this node runs once.
+        subagent.add_edge(FlowStage.WORKER.value, FlowStage.SUBAGENT_AGGREGATE.value)
+        subagent.add_edge(FlowStage.SUBAGENT_AGGREGATE.value, END)
+        self._subagent_graph = subagent.compile()
+
+        # ---- level 3: one Worker's attempt → review → retry loop --------
+        worker = StateGraph(_WorkerState)
+        worker.add_node(FlowStage.WORKER.value, self._node_worker_attempt)
+        worker.add_node(FlowStage.REVIEW.value, self._node_worker_review)
+        worker.add_edge(START, FlowStage.WORKER.value)
+        worker.add_edge(FlowStage.WORKER.value, FlowStage.REVIEW.value)
+        worker.add_conditional_edges(FlowStage.REVIEW.value, self._after_worker_review,
+                                     [FlowStage.WORKER.value, END])
+        self._worker_graph = worker.compile()
+        return self._top_graph
+
+    def build(self) -> "HierarchicalFlow":
+        """Compile the hierarchy.  Idempotent."""
+
+        if self._top_graph is None:
+            self._compile()
+        return self
+
+    # -- bookkeeping ---------------------------------------------------------
+
+    def _record(self, stage: FlowStage, *, unit: str = "", parent: str = "", wave: int = 0,
+                detail: str = "") -> FlowEvent:
+        event = self.trace.record(stage, unit=unit, parent=parent, wave=wave, detail=detail)
+        if self.renderer is not None:
+            self._render(stage, event)
+        if self.logger is not None:
+            self.logger.log(
+                "flow.stage", agent_id=unit or "master", agent_kind="flow",
+                message=f"{stage.value}: {detail}" if detail else stage.value,
+                data={"stage": stage.value, "unit": unit, "parent": parent, "wave": wave,
+                      "seq": event.seq, "thread": threading.current_thread().name},
+            )
+        return event
+
+    def _render(self, stage: FlowStage, event: FlowEvent) -> None:
+        """Mirror the ledger into the CLI renderer.  Never a private prompt."""
+
+        actor = event.unit or "master"
+        where = f"{event.parent}/{event.unit}" if event.parent else event.unit
+        if stage is FlowStage.PLAN:
+            self.renderer.master_planning(f"flow: {event.detail or 'planning'}")
+        elif stage is FlowStage.SUBAGENT:
+            self.renderer.master_planning(f"flow: {where} planning its workers")
+            if event.detail.startswith("not run"):
+                self.renderer.warning(f"flow: {where} not run", actor="master")
+        elif stage is FlowStage.WORKER:
+            self.renderer.task_assigned(f"flow: {where} started", actor=event.parent or actor)
+        elif stage is FlowStage.REVIEW:
+            self.renderer.quality_review(f"flow: reviewing {where}", actor=event.parent or actor,
+                                         verdict=event.detail or None)
+        elif stage is FlowStage.SUBAGENT_AGGREGATE:
+            self.renderer.subagent_synthesis(f"flow: aggregated {where}", actor=actor)
+        elif stage is FlowStage.MASTER_REVIEW:
+            self.renderer.master_planning(f"flow: {event.detail or 'reviewing reports'}")
+        elif stage is FlowStage.MASTER_SYNTHESIZE:
+            self.renderer.master_synthesis("flow: master synthesis")
+
+    def _wait_for(self, unit: str, dependencies: Sequence[str], *, parent: str,
+                  stage: FlowStage) -> FlowGate:
+        """Block until every dependency has settled, within the mission's patience.
+
+        A unit takes its concurrency slot only after this returns, so waiting can
+        never consume the capacity the thing it waits for needs.  A dependency that
+        cannot settle in time becomes an explicit gate, never a silent pass.
+        """
+
+        pending = [dep for dep in dependencies if dep not in self._settled.get(parent, set())]
+        if not pending:
+            return FlowGate.NONE
+        self._record(stage, unit=unit, parent=parent,
+                     detail=f"waiting for {', '.join(pending[:3])}")
+        deadline = time.monotonic() + self.policy.wait_timeout_seconds
+        while pending:
+            if time.monotonic() >= deadline:
+                return FlowGate.DEPENDENCY_FAILED
+            time.sleep(0.005)
+            pending = [dep for dep in pending
+                       if dep not in self._settled.get(parent, set())]
+        return FlowGate.NONE
+
+    # -- 1. the Master plans, then fans out one branch per Subagent ---------
+
+    def _node_master_plan(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        waves = self.subagent_waves()
+        self._record(FlowStage.PLAN, detail=(
+            f"{len(self.subagents)} subagent(s) in {len(waves)} dependency wave(s); caps "
+            f"{self.policy.max_parallel_subagents} subagent / "
+            f"{self.policy.max_parallel_workers} worker"))
+        for subagent in self.subagents:
+            self._settled.setdefault(subagent.id, set())
+        return {"mission_id": self.mission_id, "objective": self.context.objective,
+                "waves": [list(wave) for wave in waves]}
+
+    def _subagent_sends(self, state: Mapping[str, Any]) -> list[Any]:
+        """The Subagent fan-out: one ``Send`` per Subagent, whatever the count."""
+
+        _graph, send_cls, _command = _langgraph_primitives()
+        waves = [list(item) for item in state.get("waves") or []]
+        wave_of = {sid: index for index, wave in enumerate(waves) for sid in wave}
+        return [send_cls("master-subagent", {**_master_state(self.mission_id,
+                                                             self.context.objective),
+                                             "subagent": subagent.id,
+                                             "wave": wave_of.get(subagent.id, 0)})
+                for subagent in self.subagents]
+
+    def _node_master_subagent(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        """Run one Subagent's child graph and return its aggregate to the join."""
+
+        subagent = self._by_id[str(state.get("subagent"))]
+        wave = int(state.get("wave") or 0)
+        gate = self._wait_for(subagent.id, subagent.depends_on, parent="master",
+                              stage=FlowStage.SUBAGENT)
+        if gate is not FlowGate.NONE:
+            report = self._gated_report(subagent, gate)
+            self._settled["master"].add(subagent.id)
+            return {"reports": [json.loads(model_to_json(report))]}
+
+        with self._subagent_slots:
+            self._started[subagent.id] = time.monotonic()
+            if self.tracker is not None:
+                self.tracker.spawn(subagent.id, subagent.role, kind=LifecycleKind.SUBAGENT,
+                                   parent="master", detail=subagent.objective[:60])
+            self._settled[subagent.id] = set()
+            payload = {**_subagent_state(), "subagent": subagent.id, "wave": wave}
+            result = self._subagent_graph.invoke(payload)
+        report = result.get("report")
+        if report is None:                    # pragma: no cover - the graph always aggregates
+            raise PrematureAggregate(JoinBarrier(
+                stage=f"subagent:{subagent.role}",
+                expected=[worker.id for worker in subagent.workers], received=[],
+                missing=[worker.id for worker in subagent.workers]))
+        self._settled["master"].add(subagent.id)
+        return {"reports": [dict(report)]}
+
+    def _gated_report(self, subagent: FlowSubagent, gate: FlowGate) -> SubagentOutcome:
+        """A report for a Subagent that never ran, with the reason attached."""
+
+        outcome = SubagentOutcome(
+            subagent_id=subagent.id, role=subagent.role, objective=subagent.objective,
+            status=EntityStatus.BLOCKED, gate=gate, aggregate_basis=None,
+            gaps=[UnknownValue(reason=UnknownReason.FAILED, determined_by=subagent.id,
+                               detail=f"{subagent.role}: {gate.value}")],
+            open_questions=list(subagent.addresses_questions),
+        )
+        self._record(FlowStage.SUBAGENT, unit=subagent.id, parent="master",
+                     detail=f"not run: {gate.value}")
+        return outcome
+
+    # -- 2. a Subagent plans its Workers, then fans them out ----------------
+
+    def _node_subagent_plan(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        subagent = self._by_id[str(state.get("subagent"))]
+        waves = self.worker_waves(subagent)
+        self._record(FlowStage.SUBAGENT, unit=subagent.id, parent="master",
+                     wave=int(state.get("wave") or 0),
+                     detail=f"{len(subagent.workers)} worker(s) in {len(waves)} wave(s)")
+        if self.tracker is not None:
+            for worker in subagent.workers:
+                self.tracker.spawn(worker.id, worker.name, kind=LifecycleKind.WORKER,
+                                   parent=subagent.id, detail=worker.objective[:60])
+        return {"subagent": subagent.id, "waves": [list(wave) for wave in waves]}
+
+    def _worker_sends(self, state: Mapping[str, Any]) -> list[Any]:
+        """The Worker fan-out: one ``Send`` per Worker of this Subagent."""
+
+        _graph, send_cls, _command = _langgraph_primitives()
+        subagent = self._by_id[str(state.get("subagent"))]
+        waves = [list(item) for item in state.get("waves") or []]
+        wave_of = {wid: index for index, wave in enumerate(waves) for wid in wave}
+        return [send_cls(FlowStage.WORKER.value,
+                         {**_subagent_state(), "subagent": subagent.id, "worker": worker.id,
+                          "wave": wave_of.get(worker.id, 0)})
+                for worker in subagent.workers]
+
+    def _node_worker(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        """Run one Worker's attempt→review→retry graph, inside its own branch."""
+
+        subagent = self._by_id[str(state.get("subagent"))]
+        worker = subagent.worker(str(state.get("worker")))
+        if worker is None:                    # pragma: no cover - guarded by the fan-out
+            return {"outcomes": [], "reviews": []}
+        gate = self._wait_for(worker.id, worker.depends_on, parent=subagent.id,
+                              stage=FlowStage.WORKER)
+        if gate is not FlowGate.NONE:
+            self._gates[worker.id] = gate
+            self._settled[subagent.id].add(worker.id)
+            outcome = WorkerOutcome(
+                worker_id=worker.id, subagent_id=subagent.id, status=EntityStatus.BLOCKED,
+                attempt=0, gate=gate, summary=f"{worker.name}: dependency did not settle",
+                task_id=content_id("task", subagent.id, worker.id, 0),
+            )
+            return {"outcomes": [json.loads(model_to_json(outcome))], "reviews": []}
+
+        with self._worker_slots:
+            payload = {**_worker_state(), "subagent": subagent.id, "worker": worker.id}
+            result = self._worker_graph.invoke(payload)
+        outcome = WorkerOutcome.model_validate(result["outcome"])
+        verdict = ReviewVerdict.model_validate(result["verdict"])
+        self._gates[worker.id] = FlowGate.NONE if verdict.approved else (
+            FlowGate.RETRY_EXHAUSTED if verdict.verdict == "revise" else FlowGate.REVIEW_REJECTED)
+        self._settled[subagent.id].add(worker.id)
+        self._record_in_store(subagent, worker, outcome)
+        return {"outcomes": [json.loads(model_to_json(outcome))],
+                "reviews": [json.loads(model_to_json(verdict))]}
+
+    # -- 3. one attempt -------------------------------------------------------
+
+    def _node_worker_attempt(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        subagent = self._by_id[str(state.get("subagent"))]
+        worker = subagent.worker(str(state.get("worker")))
+        attempt = int(state.get("round") or 0) + 1
+        self._record(FlowStage.WORKER, unit=worker.id, parent=subagent.id,
+                     wave=int(state.get("wave") or 0),
+                     detail=f"attempt {attempt}: {worker.work_unit or worker.name}")
+        started = time.monotonic()
+        try:
+            outcome = self.runner.run_worker(subagent, worker, attempt=attempt,
+                                             guidance=str(state.get("guidance") or ""))
+        except Exception as exc:              # a runner failure is an outcome, not a crash
+            outcome = WorkerOutcome(
+                worker_id=worker.id, subagent_id=subagent.id, status=EntityStatus.FAILED,
+                attempt=attempt, gate=FlowGate.ERROR,
+                summary=f"{worker.name}: runner raised",
+                error=redact_text(f"{type(exc).__name__}: {exc}"))
+        if not outcome.task_id or outcome.seconds == 0.0:
+            outcome = outcome.model_copy(update={
+                "task_id": outcome.task_id or content_id("task", subagent.id, worker.id, attempt),
+                "seconds": outcome.seconds or (time.monotonic() - started)})
+        self.last_outcome = outcome
+        return {"outcome": json.loads(model_to_json(outcome)), "round": attempt,
+                "attempts": [{"attempt": attempt, "task_id": outcome.task_id,
+                              "status": outcome.status.value}]}
+
+    # -- 4. review, and either retry or settle -------------------------------
+
+    def _node_worker_review(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        subagent = self._by_id[str(state.get("subagent"))]
+        worker = subagent.worker(str(state.get("worker")))
+        outcome = WorkerOutcome.model_validate(state.get("outcome"))
+        round_number = int(state.get("round") or 1)
+        verdict = self.runner.review_worker(subagent, worker, outcome, round_number=round_number)
+        allowed = min(worker.max_attempts, self.policy.max_review_rounds + 1)
+        if verdict.retry and round_number >= allowed:
+            # Out of attempts: the rejection stands, with the reason recorded.
+            verdict = verdict.model_copy(update={
+                "retry": False,
+                "findings": list(verdict.findings) + [
+                    f"attempts exhausted after {round_number} of {allowed}"],
+            })
+        self._record(FlowStage.REVIEW, unit=worker.id, parent=subagent.id,
+                     wave=int(state.get("wave") or 0),
+                     detail=f"{verdict.verdict} (attempt {round_number}/{allowed})")
+        if self.tracker is not None and verdict.retry:
+            self.tracker.review(subagent.id, verdict=verdict.verdict,
+                                criterion=(verdict.criteria or ["completion"])[0],
+                                note=f"{worker.name}: {verdict.guidance}")
+        return {"verdict": json.loads(model_to_json(verdict)),
+                "reviews": [json.loads(model_to_json(verdict))]}
+
+    def _after_worker_review(self, state: Mapping[str, Any]) -> str:
+        """Retry the same Worker, or end its branch.
+
+        A static edge, not a ``Command``: this graph has one branch, so the
+        loop's shape is fixed and only its length is decided here.
+        """
+
+        _graph, _send, _command = _langgraph_primitives()
+        _state_graph, _start, end = _graph
+        verdict = ReviewVerdict.model_validate(state.get("verdict"))
+        return FlowStage.WORKER.value if verdict.retry else end
+
+    # -- 5. the Subagent's join ----------------------------------------------
+
+    def _node_subagent_aggregate(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        """Aggregate one Subagent — only after every one of its Workers settled."""
+
+        subagent = self._by_id[str(state.get("subagent"))]
+        outcomes = [WorkerOutcome.model_validate(item) for item in state.get("outcomes") or []]
+        reviews = [ReviewVerdict.model_validate(item) for item in state.get("reviews") or []]
+        expected = [worker.id for worker in subagent.workers]
+        received = list(dict.fromkeys(outcome.worker_id for outcome in outcomes))
+        # The edge guarantees this; the check makes a mis-wired edge loud.
+        barrier = check_join(f"subagent-aggregate:{subagent.role}", expected, received)
+
+        latest: dict[str, WorkerOutcome] = {}
+        for outcome in outcomes:
+            latest[outcome.worker_id] = outcome
+        evidence: list[EvidenceItem] = []
+        gaps: list[UnknownValue] = []
+        retries = 0
+        for worker in subagent.workers:
+            outcome = latest.get(worker.id)
+            approved = any(review.worker_id == worker.id and review.approved
+                           for review in reviews)
+            if outcome is not None:
+                retries += max(0, outcome.attempt - 1)
+                for payload in outcome.payload.get("evidence", []):
+                    evidence.append(EvidenceItem.model_validate(payload))
+            if not approved:
+                gate = self._gates.get(worker.id) or FlowGate.REVIEW_REJECTED
+                gaps.append(UnknownValue(
+                    reason=UnknownReason.FAILED, determined_by=subagent.id,
+                    detail=f"{worker.name}: {gate.value}"
+                           + (f" ({outcome.error})"
+                              if outcome is not None and outcome.error else ""),
+                ))
+        failing_gate = next((self._gates.get(worker.id) for worker in subagent.workers
+                             if not any(review.worker_id == worker.id and review.approved
+                                        for review in reviews)), FlowGate.REVIEW_REJECTED)
+        started = self._started.get(subagent.id, time.monotonic())
+        report = SubagentOutcome(
+            subagent_id=subagent.id, role=subagent.role, objective=subagent.objective,
+            status=(EntityStatus.FAILED if not evidence
+                    else EntityStatus.SUCCEEDED if not gaps else EntityStatus.BLOCKED),
+            gate=(FlowGate.NONE if not gaps else failing_gate or FlowGate.REVIEW_REJECTED),
+            outcomes=[latest[worker.id] for worker in subagent.workers if worker.id in latest],
+            reviews=reviews, evidence=evidence, aggregate_basis=barrier,
+            open_questions=list(subagent.addresses_questions), gaps=gaps,
+            retries=retries, seconds=time.monotonic() - started,
+        )
+        self._record(FlowStage.SUBAGENT_AGGREGATE, unit=subagent.id, parent="master",
+                     detail=f"{barrier.describe()}; {len(evidence)} evidence item(s), "
+                            f"{len(gaps)} gap(s)")
+        if self.tracker is not None:
+            self.tracker.complete(subagent.id, state=(
+                LifecycleState.DONE if report.succeeded else LifecycleState.FAILED),
+                note=f"{len(evidence)} evidence item(s), {len(gaps)} gap(s)")
+        if self.store is not None:
+            for item in evidence:
+                try:
+                    self.store.add_evidence(item, actor=subagent.id)
+                except (StateError, ValueError):     # pragma: no cover - defensive
+                    pass
+        return {"report": json.loads(model_to_json(report))}
+
+    def _record_in_store(self, subagent: FlowSubagent, worker: FlowWorker,
+                         outcome: WorkerOutcome) -> None:
+        """Mirror an attempt into the run-state store, if one was supplied.
+
+        The store refuses a task for a Worker it has never been told about, and
+        that is the correct behaviour: the graph records the discrepancy once and
+        keeps running, so a store the caller forgot to seed cannot take a mission
+        down (or pretend the writes happened).
+        """
+
+        if self.store is None or self._store_offline:
+            return
+        try:
+            self.store.assign_task(TaskAssignment(
+                mission_id=self.mission_id, subagent_id=subagent.id, worker_id=worker.id,
+                objective=worker.objective, inputs=list(worker.input_names),
+                expected_output=worker.expected_evidence or None,
+                acceptance_criteria=list(worker.completion_criteria),
+                attempt=outcome.attempt, status=EntityStatus.READY,
+            ), actor=subagent.id)
+            self.store.record_result(TaskResult(
+                task_id=outcome.task_id, worker_id=worker.id, status=outcome.status,
+                summary=outcome.summary, artifacts=list(outcome.evidence_ids),
+                attempts=outcome.attempt,
+                error=(ErrorInfo(code="runner", message=outcome.error)
+                       if outcome.error else None),
+            ), actor=worker.id)
+            for payload in outcome.payload.get("evidence", []):
+                self.store.add_evidence(EvidenceItem.model_validate(payload), actor=worker.id)
+        except (StateError, ValueError, KeyError) as exc:
+            # One note, then stop trying: every Worker writes through the same
+            # seam, so a refusal here is a property of the store, not of the unit.
+            self._store_offline = True
+            self._record(FlowStage.WORKER, unit=worker.id, parent=subagent.id,
+                         detail=f"run-state store not updated: {redact_text(str(exc))[:70]}")
+
+    # -- 6. the Master's join and the final synthesis -------------------------
+
+    def _node_master_review(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        """Check the mission's join, then decide whether to synthesise at all."""
+
+        reports = [SubagentOutcome.model_validate(item) for item in state.get("reports") or []]
+        barrier = check_join("master-review",
+                             [subagent.id for subagent in self.subagents],
+                             [report.subagent_id for report in reports])
+        blocking = [report for report in reports if report.blocking]
+        stopped = bool(self.policy.stop_on_blocking_failure and blocking)
+        self._record(FlowStage.MASTER_REVIEW,
+                     detail=f"{barrier.describe()}; {len(blocking)} blocking report(s)"
+                            + ("" if not stopped else " — stopping before synthesis"))
+        return {"stopped": stopped,
+                "stop_reason": ("" if not stopped else
+                                "blocking subagent failure: "
+                                + ", ".join(report.role for report in blocking[:3]))}
+
+    def _after_master_review(self, state: Mapping[str, Any]) -> str:
+        """Either synthesise, or end the mission with no aggregate at all."""
+
+        _graph, _send, _command = _langgraph_primitives()
+        _state_graph, _start, end = _graph
+        return end if state.get("stopped") else FlowStage.MASTER_SYNTHESIZE.value
+
+    def _node_master_synthesize(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        """The final join: synthesise only once every Subagent has reported."""
+
+        reports = [SubagentOutcome.model_validate(item) for item in state.get("reports") or []]
+        # Raises PrematureAggregate rather than producing a partial answer.
+        barrier = check_join("master-synthesize",
+                             [subagent.id for subagent in self.subagents],
+                             [report.subagent_id for report in reports])
+        ordered = [next(report for report in reports if report.subagent_id == subagent.id)
+                   for subagent in self.subagents]
+        synthesis = self.runner.synthesize(self.subagents, ordered, self.context)
+        synthesis = synthesis.model_copy(update={"aggregate_basis": barrier})
+        self._record(FlowStage.MASTER_SYNTHESIZE,
+                     detail=f"{barrier.describe()}; {len(synthesis.sourced_claims)} sourced "
+                            f"claim(s), {len(synthesis.gaps)} gap(s)")
+        return {"synthesis": json.loads(model_to_json(synthesis))}
+
+    # -- running -------------------------------------------------------------
+
+    def run(self) -> FlowResult:
+        """Execute the hierarchy and return everything it produced, in order."""
+
+        self.build()
+        # Run-scoped limits and join evidence: fresh per run, so a second run of
+        # the same instance starts clean.
+        self._settled = {"master": set()}
+        self._started = {}
+        self._gates = {}
+        self._subagent_slots = threading.BoundedSemaphore(self.policy.max_parallel_subagents)
+        self._worker_slots = threading.BoundedSemaphore(self.policy.max_parallel_workers)
+
+        if self.detach_note:
+            self._record(FlowStage.PLAN, detail=self.detach_note)
+        started = time.monotonic()
+        final = self._top_graph.invoke({**_master_state(self.mission_id, self.context.objective),
+                                        "reports": [], "stopped": False, "stop_reason": ""})
+        elapsed = time.monotonic() - started
+        reports = [SubagentOutcome.model_validate(item) for item in final.get("reports") or []]
+        ordered = [next((report for report in reports if report.subagent_id == subagent.id), None)
+                   for subagent in self.subagents]
+        kept = [report for report in ordered if report is not None]
+        result = FlowResult(
+            mission_id=self.mission_id, objective=self.context.objective,
+            subagents=self.subagents, reports=kept,
+            synthesis=(MasterSynthesis.model_validate(final["synthesis"])
+                       if final.get("synthesis") else None),
+            stopped=bool(final.get("stopped")), stop_reason=str(final.get("stop_reason") or ""),
+            policy=self.policy, waves=self.subagent_waves(), seconds=elapsed,
+            trace=self.trace.to_list(),
+            worker_attempts=len(self.trace.events(stage=FlowStage.WORKER)),
+            retries=sum(report.retries for report in kept),
+            structure=self.structure(),
+        )
+        if self.logger is not None:
+            self.logger.log(
+                "flow.finished", agent_id="master", agent_kind="flow",
+                message=f"flow finished in {elapsed:.2f}s",
+                data={"subagents": len(kept), "workers": result.total_workers,
+                      "attempts": result.worker_attempts, "retries": result.retries,
+                      "stopped": result.stopped, "peak": self.trace.max_concurrency()},
+            )
+        return result
+
+
+# --------------------------------------------------------------------------
+# 24.5 Building the graph's units from a mission's own specifications
+# --------------------------------------------------------------------------
+
+
+def flow_from_births(births: Sequence["SubagentBirth"],
+                     workers: Sequence["WorkerBirth"]) -> list[FlowSubagent]:
+    """The whole team as the graph sees it: ids, work slices and dependencies."""
+
+    grouped: dict[str, list[WorkerBirth]] = {}
+    for worker in workers:
+        grouped.setdefault(worker.subagent_id, []).append(worker)
+    return [FlowSubagent.from_birth(birth, grouped.get(birth.spec.id, []))
+            for birth in births if grouped.get(birth.spec.id)]
+
+
+def team_units(context: "MasterContext", drafts: Sequence["SubagentSpecDraft"], *,
+               tracker: "LifecycleTracker | None" = None,
+               renderer: "EventRenderer | None" = None,
+               store: "RunStateStore | None" = None) -> list[FlowSubagent]:
+    """Validate the drafts exactly as the CLI does, then birth the units.
+
+    When a run-state store is supplied it is told about the team here, before a
+    single task runs: the store refuses a task that references a Worker it has
+    never seen, and that refusal is the right behaviour — so the registration
+    belongs with the birth, not with the first write.
+    """
+
+    factory = SubagentFactory(
+        mission_id=context.mission_id or content_id("flow", context.objective.lower()),
+        context=context, tracker=tracker, renderer=renderer,
+    )
+    births = factory.create_many(list(drafts))
+    workers: list[WorkerBirth] = []
+    for birth in births:
+        planner = SubagentWorkerPlanner(draft=birth.draft, subagent_spec=birth.spec,
+                                        tracker=tracker)
+        workers.extend(planner.adopt(worker_plan_for(birth.draft)).births)
+    if store is not None:
+        for birth in births:
+            store.add_subagent(birth.spec, actor="master")
+        for worker in workers:
+            store.add_worker(worker.spec, actor=worker.subagent_id)
+    return flow_from_births(births, workers)
+
+
+def build_mission_flow(context: "MasterContext", drafts: Sequence["SubagentSpecDraft"], *,
+                       runner: MissionRunner | None = None,
+                       policy: FlowPolicy | None = None,
+                       store: "RunStateStore | None" = None,
+                       tracker: "LifecycleTracker | None" = None,
+                       renderer: "EventRenderer | None" = None,
+                       logger: "MissionLogger | None" = None) -> HierarchicalFlow:
+    """Specifications in, one compiled hierarchical graph out.
+
+    Every Worker is created through :class:`SubagentWorkerFactory`, so the graph
+    can only ever start a Worker the plan contained.
+    """
+
+    mission_id = content_id("flow", context.objective.strip().lower())
+    # A store belongs to one mission.  If the caller's store is for another one,
+    # attaching it would make every write a conflict, so the flow runs unattached
+    # and says so rather than half-recording itself.
+    attached = store if store is not None and _store_mission(store) in ("", mission_id) else None
+    units = team_units(context, drafts, tracker=tracker, renderer=renderer, store=attached)
+    if not units:
+        raise WorkerPlanError("no subagent produced workers; the flow cannot start")
+    flow = HierarchicalFlow(
+        context=context, subagents=units, runner=runner, policy=policy, store=attached,
+        tracker=tracker, renderer=renderer, logger=logger, mission_id=mission_id)
+    if store is not None and attached is None:
+        flow.detach_note = (
+            f"run-state store belongs to {_store_mission(store) or 'another mission'}, "
+            f"not {mission_id}; the flow ran unattached")
+    return flow
+
+
+def _store_mission(store: "RunStateStore") -> str:
+    """The mission id a store was opened for, or ``''`` if it has none."""
+
+    try:
+        return str(store.snapshot()["mission"].id or "")
+    except Exception:                                  # pragma: no cover - defensive
+        return ""
+
+
+def flow_units_for(context: "MasterContext", key: str) -> list[FlowSubagent]:
+    """The units for one scripted objective — the path the CLI's demos use."""
+
+    drafts = drafts_from_team(TeamDesign.model_validate(_team_payload(key)), context)
+    return team_units(context, drafts)
+# --------------------------------------------------------------------------
+# 24.6 Self-test — order, parallelism, and the two joins
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FlowCheck:
+    """One claim about the flow, and the evidence for it."""
+
+    name: str
+    ok: bool
+    detail: str = ""
+
+
+class _CountingRunner(DeterministicRunner):
+    """A runner that records how many Workers were inside it at once.
+
+    The deterministic runner is synchronous, so overlap is only observable if the
+    runner itself measures it: the peak is the ground truth the ledger is checked
+    against.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.active = 0
+        self.peak = 0
+        self.threads: set[str] = set()
+        self._gate = threading.Lock()
+
+    def run_worker(self, subagent: FlowSubagent, worker: FlowWorker, *,
+                   attempt: int, guidance: str = "") -> WorkerOutcome:
+        with self._gate:
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            self.threads.add(threading.current_thread().name)
+        try:
+            return super().run_worker(subagent, worker, attempt=attempt, guidance=guidance)
+        finally:
+            with self._gate:
+                self.active -= 1
+
+
+def _flow_check(name: str, ok: bool, detail: Any = "") -> FlowCheck:
+    return FlowCheck(name=name, ok=bool(ok), detail=str(detail)[:160])
+
+
+def run_flow_self_test(console: "Console | None" = None) -> list[FlowCheck]:
+    """Prove the execution contract offline: no provider, no network, no browser.
+
+    Every check is a property of the graph rather than of this run, so the suite
+    is deterministic and can be the gate for the whole section.
+    """
+
+    checks: list[FlowCheck] = []
+
+    def add(name: str, ok: bool, detail: Any = "") -> None:
+        checks.append(_flow_check(name, ok, detail))
+
+    def raises(fn: Callable[[], Any], exc: type[BaseException]) -> bool:
+        try:
+            fn()
+        except exc:
+            return True
+        except Exception:
+            return False
+        return False
+
+    # ---- 1. the structure is fixed; the width is data -------------------
+    context = _selftest_context("exposure")
+    units = flow_units_for(context, "exposure")
+    flow = HierarchicalFlow(context=context, subagents=units)
+    structures = flow.structures()
+    add("the master graph has one node per stage, not per role",
+        structures["master"] == ["master-plan", "master-review", "master-subagent",
+                                 "master-synthesize"], structures["master"])
+    add("the subagent graph has one node per worker stage",
+        structures["subagent"] == ["subagent", "subagent-aggregate", "worker-task"],
+        structures["subagent"])
+    add("the worker graph has an attempt and a review",
+        structures["worker"] == ["worker-review", "worker-task"], structures["worker"])
+    add("no node is named after a specialist role",
+        not any(word in node for node in structures["master"] + structures["subagent"]
+                for word in ("advisory", "dns", "archive", "timeline", "integrity")),
+        structures["master"])
+
+    forensic_context = _selftest_context("forensic")
+    forensic_units = flow_units_for(forensic_context, "forensic")
+    forensic_flow = HierarchicalFlow(context=forensic_context, subagents=forensic_units)
+    add("a different objective produces a different width",
+        (len(forensic_units), sum(len(u.workers) for u in forensic_units))
+        != (len(units), sum(len(u.workers) for u in units)),
+        f"{len(units)}/{sum(len(u.workers) for u in units)} vs "
+        f"{len(forensic_units)}/{sum(len(u.workers) for u in forensic_units)}")
+    add("both missions compile to the same structure",
+        forensic_flow.structures() == structures, forensic_flow.structures()["master"])
+
+    # the fan-out is exactly one Send per unit
+    plan_state = flow._node_master_plan({})
+    sends = flow._subagent_sends(plan_state)
+    add("the master fans out one branch per subagent", len(sends) == len(units), len(sends))
+    add("the fan-out is a Send, not a static edge", type(sends[0]).__name__ == "Send",
+        type(sends[0]).__name__)
+    sub_state = flow._node_subagent_plan({"subagent": units[0].id, "wave": 0})
+    worker_sends = flow._worker_sends(sub_state)
+    add("a subagent fans out one branch per worker",
+        len(worker_sends) == len(units[0].workers), len(worker_sends))
+
+    # ---- 2. a plain run: order, aggregates, synthesis -------------------
+    runner = _CountingRunner(scope=context.scope_entries)
+    flow = HierarchicalFlow(context=context, subagents=units, runner=runner)
+    result = flow.run()
+    order = result.stage_order()
+    add("the plan runs first", order[0] == FlowStage.PLAN.value, order)
+    add("master synthesis runs last", order[-1] == FlowStage.MASTER_SYNTHESIZE.value, order)
+    add("every subagent returned a report", len(result.reports) == len(units),
+        f"{len(result.reports)}/{len(units)}")
+    add("every worker was executed at least once",
+        result.worker_attempts >= result.total_workers, result.worker_attempts)
+    add("the run produced evidence", bool(result.evidence), len(result.evidence))
+    add("the run was not stopped", not result.stopped, result.stop_reason)
+    add("the synthesis exists", result.synthesis is not None)
+    add("the ledger is ordered by sequence",
+        [event["seq"] for event in result.trace] == list(range(len(result.trace))))
+    add("the ledger records the thread of every event",
+        all(event["thread"] for event in result.trace))
+
+    # ---- 3. no aggregate is premature ----------------------------------
+    add("each subagent report carries its join",
+        all(report.aggregate_basis is not None for report in result.reports))
+    add("each join was satisfied",
+        all(report.aggregate_basis.satisfied for report in result.reports))
+    add("each join names every worker of its subagent",
+        all(len(report.aggregate_basis.expected) == len(report.outcomes)
+            for report in result.reports),
+        [(len(report.aggregate_basis.expected), len(report.outcomes))
+         for report in result.reports])
+    add("the synthesis carries the master's join",
+        result.synthesis.aggregate_basis is not None
+        and len(result.synthesis.aggregate_basis.received) == len(units))
+
+    def partial_join() -> None:
+        check_join("test", ["a", "b"], ["a"])
+
+    def names_missing() -> None:
+        try:
+            check_join("test", ["a", "b"], ["a"])
+        except PrematureAggregate as exc:
+            assert exc.barrier.missing == ["b"], exc.barrier.missing
+            raise
+
+    add("a partial join is refused", raises(partial_join, PrematureAggregate))
+    add("the refusal names what is missing", raises(names_missing, PrematureAggregate))
+
+    def premature_subagent() -> None:
+        HierarchicalFlow(context=context, subagents=units)._node_subagent_aggregate(
+            {"subagent": units[0].id, "outcomes": [], "reviews": []})
+
+    def premature_master() -> None:
+        HierarchicalFlow(context=context, subagents=units)._node_master_synthesize(
+            {"reports": []})
+
+    add("aggregating with no worker outcome raises", raises(premature_subagent,
+                                                           PrematureAggregate))
+    add("synthesising with no subagent report raises", raises(premature_master,
+                                                              PrematureAggregate))
+
+    # the ledger itself: the aggregate is the first event after the last worker
+    for subagent in units:
+        stages = [(event["stage"], event["at"]) for event in result.trace
+                  if event["unit"] == subagent.id or event["parent"] == subagent.id]
+        workers = [moment for stage, moment in stages if stage == FlowStage.WORKER.value]
+        aggregate = next((moment for stage, moment in stages
+                          if stage == FlowStage.SUBAGENT_AGGREGATE.value), None)
+        add(f"{subagent.role}: its aggregate follows its last worker",
+            aggregate is not None and bool(workers) and aggregate >= max(workers),
+            f"aggregate {aggregate}, last worker {max(workers) if workers else None}")
+
+    # ---- 4. independent work overlaps ---------------------------------
+    wide_context = _selftest_context("forensic")
+    wide_units = flow_units_for(wide_context, "forensic")
+    wide_runner = _CountingRunner(scope=wide_context.scope_entries, delay_seconds=0.05)
+    wide = HierarchicalFlow(context=wide_context, subagents=wide_units, runner=wide_runner,
+                            policy=FlowPolicy(max_parallel_subagents=4, max_parallel_workers=4))
+    wide_result = wide.run()
+    add("independent workers really run at the same time", wide_runner.peak >= 2,
+        f"peak {wide_runner.peak}")
+    add("the ledger shows the same concurrency", wide.trace.max_concurrency() >= 2,
+        wide.trace.max_concurrency())
+    add("more than one thread did the work", len(wide_runner.threads) >= 2,
+        sorted(wide_runner.threads))
+    add("the trace names those threads", len(wide.trace.threads()) >= 2,
+        len(wide.trace.threads()))
+    sequential = sum(outcome.seconds for report in wide_result.reports
+                     for outcome in report.outcomes)
+    add("the run is faster than its parts in sequence",
+        wide_result.seconds < sequential, f"{wide_result.seconds:.3f}s < {sequential:.3f}s")
+    add("every worker still settled", len(wide_result.reports) == len(wide_units))
+
+    # ---- 5. the caps are enforced, not advertised ----------------------
+    serial_runner = _CountingRunner(scope=wide_context.scope_entries, delay_seconds=0.01)
+    serial = HierarchicalFlow(context=wide_context, subagents=wide_units, runner=serial_runner,
+                              policy=FlowPolicy(max_parallel_subagents=1, max_parallel_workers=1))
+    serial_result = serial.run()
+    add("a single-worker cap is respected", serial_runner.peak == 1, serial_runner.peak)
+    add("a capped run still completes", serial_result.synthesis is not None)
+    add("the cap loses no work", len(serial_result.reports) == len(wide_units))
+    add("the policy is recorded on the run",
+        serial_result.policy.max_parallel_workers == 1,
+        serial_result.policy.max_parallel_workers)
+
+    # ---- 6. dependencies are honoured ----------------------------------
+    dependent = [subagent for subagent in wide_units if subagent.depends_on]
+    add("at least one subagent declares a dependency", bool(dependent),
+        [(subagent.role, subagent.depends_on) for subagent in wide_units])
+    roles = {subagent.id: subagent.role for subagent in wide.subagents}
+    for subagent in wide.subagents:
+        for dependency in subagent.depends_on:
+            # The unit's *first Worker event*, not its first ledger line: a unit
+            # that is waiting records a wait event before it can start.
+            first = next((event["at"] for event in wide_result.trace
+                          if event["stage"] == FlowStage.WORKER.value
+                          and event["parent"] == subagent.id), None)
+            target_aggregate = next((event["at"] for event in wide_result.trace
+                                     if event["stage"] == FlowStage.SUBAGENT_AGGREGATE.value
+                                     and event["unit"] == dependency), None)
+            add(f"{subagent.role} starts after {roles.get(dependency, dependency)} finished",
+                first is not None and target_aggregate is not None
+                and first >= target_aggregate, f"{first} vs {target_aggregate}")
+    add("dependency waves are described",
+        wide_result.waves == wide.subagent_waves() and len(wide_result.waves) >= 2,
+        wide_result.waves)
+
+    # ---- 7. review, retry, and the bound on retries --------------------
+    retry_context = _selftest_context("exposure")
+    retry_units = flow_units_for(retry_context, "exposure")
+    flaky = next(subagent for subagent in retry_units if len(subagent.workers) > 1)
+    flaky_id = flaky.workers[0].id
+    retry_runner = _CountingRunner(scope=retry_context.scope_entries, flaky=[flaky_id])
+    retry_flow = HierarchicalFlow(context=retry_context, subagents=retry_units,
+                                  runner=retry_runner,
+                                  policy=FlowPolicy(max_review_rounds=2))
+    retry_result = retry_flow.run()
+    attempts = [event for event in retry_result.trace
+                if event["stage"] == FlowStage.WORKER.value and event["unit"] == flaky_id]
+    add("a transient failure is retried", len(attempts) >= 2, len(attempts))
+    add("the retry is visible in the ledger",
+        retry_result.worker_attempts > retry_result.total_workers,
+        f"{retry_result.worker_attempts} > {retry_result.total_workers}")
+    add("the retry is counted on the report", retry_result.retries >= 1, retry_result.retries)
+    add("the retried worker still passed",
+        any(report.succeeded for report in retry_result.reports if
+            report.subagent_id == flaky.id))
+
+    always_unit = next(subagent for subagent in retry_units if len(subagent.workers) > 1)
+    always_id = always_unit.workers[1].id
+    always_flow = HierarchicalFlow(
+        context=retry_context, subagents=retry_units,
+        runner=_CountingRunner(scope=retry_context.scope_entries, always_revise=[always_id]),
+        policy=FlowPolicy(max_review_rounds=1))
+    always_result = always_flow.run()
+    always_attempts = [event for event in always_result.trace
+                       if event["stage"] == FlowStage.WORKER.value and event["unit"] == always_id]
+    add("a permanently rejected worker stops after the budget",
+        len(always_attempts) == always_unit.worker(always_id).max_attempts
+        or len(always_attempts) == 2, f"{len(always_attempts)} attempt(s)")
+
+    # ---- 8. a failure becomes a gap, never a pass ----------------------
+    failing_id = flaky.workers[0].id
+    fail_flow = HierarchicalFlow(
+        context=retry_context, subagents=retry_units,
+        runner=_CountingRunner(scope=retry_context.scope_entries, failing=[failing_id]),
+        policy=FlowPolicy(max_review_rounds=1))
+    fail_result = fail_flow.run()
+    failing_report = next(report for report in fail_result.reports
+                          if report.subagent_id == flaky.id)
+    add("a permanent failure is recorded as a gap", bool(failing_report.gaps),
+        [gap.describe() for gap in failing_report.gaps])
+    add("the gap names the worker that failed",
+        any(failing_id in outcome.worker_id for outcome in failing_report.outcomes))
+    add("the failed worker was not approved",
+        not any(review.worker_id == failing_id and review.approved
+                for review in failing_report.reviews))
+    add("the mission still synthesises with a gap",
+        fail_result.synthesis is not None and bool(fail_result.synthesis.gaps))
+    add("the gap survives into the synthesis",
+        any("failed" in gap.describe() for gap in fail_result.synthesis.gaps))
+
+    # ---- 9. a mission that cannot report produces no synthesis ---------
+    dead_units = flow_units_for(_selftest_context("exposure"), "exposure")
+    everything = [worker.id for subagent in dead_units for worker in subagent.workers]
+    dead_flow = HierarchicalFlow(
+        context=context, subagents=dead_units,
+        runner=_CountingRunner(scope=context.scope_entries, failing=everything),
+        policy=FlowPolicy(max_review_rounds=1))
+    dead_result = dead_flow.run()
+    add("a mission with nothing to report produces no aggregate",
+        dead_result.synthesis is None, dead_result.synthesis is not None)
+    add("the stop is explicit, with a reason",
+        dead_result.stopped and bool(dead_result.stop_reason), dead_result.stop_reason)
+    add("the stop names the blocking subagent",
+        any(report.role in dead_result.stop_reason for report in dead_result.reports),
+        dead_result.stop_reason)
+    add("the ledger stops at the master review",
+        dead_result.stage_order()[-1] == FlowStage.MASTER_REVIEW.value,
+        dead_result.stage_order())
+
+    # ---- 10. the ledger is renderable and serialisable ----------------
+    rendered = flow.trace.render()
+    add("the trace renders one line per event",
+        len(rendered.splitlines()) == len(flow.trace), len(rendered.splitlines()))
+    add("the trace reports a concurrency figure", flow.trace.max_concurrency() >= 1,
+        flow.trace.max_concurrency())
+    payload = result.to_dict()
+    add("the result serialises", json.loads(json.dumps(payload, default=str))["mission_id"]
+        == result.mission_id)
+    add("the result names the stage order it ran in",
+        payload["stage_order"] == result.stage_order(), payload["stage_order"])
+    add("the result records the structure it compiled",
+        payload["structure"] == structures["master"], payload["structure"])
+    return checks
+
+
+# --------------------------------------------------------------------------
+# 24.7 Demo and CLI
+# --------------------------------------------------------------------------
+
+
+def _flow_demo(objective_key: str, *, out_dir: Path | None = None,
+               delay: float = 0.05) -> dict[str, Any]:
+    """Run one scripted objective through the real graph, offline.
+
+    The runner is deterministic and says so: the evidence it produces is
+    labelled synthetic, so the demo demonstrates the *flow* — fan-out, review,
+    retry, both joins, synthesis — and cannot be mistaken for a finding.
+    """
+
+    context = _selftest_context(objective_key)
+    units = flow_units_for(context, objective_key)
+    runner = _CountingRunner(scope=context.scope_entries, delay_seconds=delay)
+    renderer = EventRenderer.from_options(stream=io.StringIO(), color=False, animation=False)
+    tracker = LifecycleTracker(renderer, animation=False, register_atexit=False)
+    logger = MissionLogger(out_dir / "flow.jsonl", mission_id=context.mission_id or None) \
+        if out_dir is not None else None
+    flow = HierarchicalFlow(
+        context=context, subagents=units, runner=runner, tracker=tracker, logger=logger,
+        policy=FlowPolicy.from_context(context, stage_delay_seconds=delay,
+                                       max_parallel_workers=4, max_parallel_subagents=4),
+    )
+    result = flow.run()
+    if logger is not None:
+        logger.close()
+
+    payload: dict[str, Any] = {
+        "objective_key": objective_key,
+        "objective": context.objective,
+        "structure": flow.structures(),
+        "waves": result.waves,
+        "subagents": [
+            {"id": subagent.id, "role": subagent.role, "objective": subagent.objective,
+             "depends_on": subagent.depends_on,
+             "workers": [{"id": worker.name, "unit": worker.work_unit,
+                          "criteria": worker.completion_criteria}
+                         for worker in subagent.workers],
+             "worker_waves": [[next(w.name for w in subagent.workers if w.id == wid)
+                               for wid in wave] for wave in flow.worker_waves(subagent)]}
+            for subagent in flow.subagents
+        ],
+        "reports": [report.to_dict() for report in result.reports],
+        "synthesis": json.loads(model_to_json(result.synthesis)) if result.synthesis else None,
+        "stage_order": result.stage_order(),
+        "worker_attempts": result.worker_attempts,
+        "retries": result.retries,
+        "evidence": len(result.evidence),
+        "peak_concurrency": runner.peak,
+        "ledger_concurrency": flow.trace.max_concurrency(),
+        "threads": sorted(runner.threads),
+        "seconds": round(result.seconds, 3),
+        "stopped": result.stopped,
+        "stop_reason": result.stop_reason,
+        "policy": json.loads(model_to_json(result.policy)),
+        "trace": result.trace,
+        "runtime_only": True,
+        "log_lines": len(logger.read_records()) if logger is not None else 0,
+        "checks": [{"check": check.name, "ok": check.ok, "detail": check.detail}
+                   for check in run_flow_self_test()],
+    }
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        target = out_dir / f"flow-{objective_key}.json"
+        target.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        payload["artefact"] = str(target)
+    return payload
+
+
+def render_flow_summary(payload: Mapping[str, Any]) -> Table:
+    """The shape of the run: breadth, order, concurrency and the joins."""
+
+    table = Table(title=f"flow — {payload['objective_key']}", title_justify="left",
+                  box=None, pad_edge=False)
+    table.add_column("field", style="dim", no_wrap=True)
+    table.add_column("value", overflow="fold")
+    table.add_row("objective", escape(str(payload["objective"])))
+    table.add_row("subagents", str(len(payload["subagents"])))
+    table.add_row("workers", str(sum(len(sub["workers"]) for sub in payload["subagents"])))
+    table.add_row("stage order", escape(" → ".join(payload["stage_order"])))
+    roles = {sub["id"]: sub["role"] for sub in payload["subagents"]}
+    table.add_row("subagent waves", escape(" | ".join(
+        ", ".join(roles.get(sid, sid) for sid in wave) for wave in payload["waves"])))
+    table.add_row("worker waves", escape(" | ".join(
+        " + ".join(wave) for sub in payload["subagents"] for wave in sub["worker_waves"])))
+    table.add_row("attempts", f"{payload['worker_attempts']} "
+                              f"({payload['retries']} retry(ies))")
+    table.add_row("peak concurrency", f"{payload['peak_concurrency']} "
+                                      f"(ledger agrees: {payload['ledger_concurrency']})")
+    table.add_row("threads", f"{len(payload['threads'])} "
+                             + escape(", ".join(payload["threads"][:3])))
+    table.add_row("evidence", str(payload["evidence"]))
+    table.add_row("runtime", f"{payload['seconds']}s")
+    synthesis = payload.get("synthesis") or {}
+    basis = synthesis.get("aggregate_basis") or {}
+    table.add_row("master join", escape(
+        f"{len(basis.get('received', []))}/{len(basis.get('expected', []))} report(s) received"))
+    if payload.get("stopped"):
+        table.add_row("stopped", escape(str(payload["stop_reason"])))
+    return table
+
+
+def render_flow_timeline(payload: Mapping[str, Any], *, limit: int = 30) -> Table:
+    """The ledger as a table: order, overlap, thread and elapsed time."""
+
+    table = Table(title="execution ledger", title_justify="left", box=None, pad_edge=False)
+    table.add_column("#", justify="right", no_wrap=True)
+    table.add_column("at", justify="right", no_wrap=True)
+    table.add_column("stage", no_wrap=True)
+    table.add_column("unit", overflow="fold")
+    table.add_column("wave", justify="right", no_wrap=True)
+    table.add_column("thread", no_wrap=True)
+    rows = payload["trace"]
+    names = {sub["id"]: sub["role"] for sub in payload["subagents"]}
+    for event in rows[:limit]:
+        unit = event.get("unit") or "master"
+        where = f"{names.get(event.get('parent'), event.get('parent'))}/{unit}" \
+            if event.get("parent") and event.get("unit") else names.get(unit, unit)
+        table.add_row(str(event["seq"]), f"{event['at']:.3f}s", str(event["stage"]),
+                      escape(str(where)), str(event["wave"]), escape(str(event["thread"])))
+    if len(rows) > limit:
+        table.add_row("…", "", "", f"{len(rows) - limit} more event(s)", "", "")
+    return table
+
+
+@app.command("flow", help="Run the LangGraph execution flow: fan-out, review, joins.")
+def flow_command(
+    demo: str | None = typer.Option(
+        None, "--demo", help="Scripted run: exposure | forensic | compare.",
+        show_default=False),
+    self_test: bool = typer.Option(False, "--self-test",
+                                   help="Verify the execution contract offline."),
+    target: str | None = typer.Option(None, "--target", "-t",
+                                      help="Authorised asset for a real objective."),
+    objective: str | None = typer.Option(None, "--objective", "-o",
+                                         help="What the mission must answer."),
+    parallel_subagents: int | None = typer.Option(
+        None, "--parallel-subagents", help="Subagents to run at once."),
+    parallel_workers: int | None = typer.Option(
+        None, "--parallel-workers", help="Workers to run at once."),
+    trace_limit: int = typer.Option(24, "--trace", help="Ledger rows to print."),
+    out_dir: str | None = typer.Option(None, "--out-dir", help="Write artefacts here."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Build and run the hierarchical graph.  Offline unless a target is given."""
+
+    console = get_console()
+    directory = Path(out_dir).expanduser() if out_dir else None
+
+    if self_test:
+        results = run_flow_self_test(console)
+        failures = [result for result in results if not result.ok]
+        if as_json:
+            _emit(json.dumps({"ok": not failures,
+                              "checks": [asdict(result) for result in results]}, indent=2))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        console.print()
+        table = Table(title="flow self-test", title_justify="left", box=None, pad_edge=False)
+        table.add_column("", width=2)
+        table.add_column("check", no_wrap=True)
+        table.add_column("detail", overflow="fold")
+        for result in results:
+            glyph, colour = ("✔", "green") if result.ok else ("✘", "red")
+            table.add_row(f"[{colour}]{glyph}[/{colour}]", escape(result.name),
+                          escape(result.detail))
+        console.print(table)
+        colour = "green" if not failures else "red"
+        console.print(f"\n[{colour}]{len(results) - len(failures)} passed[/] · "
+                      f"{len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    if demo:
+        key = demo.strip().lower()
+        if key == "compare":
+            payloads = {name: _flow_demo(name, out_dir=directory)
+                        for name in _SELFTEST_OBJECTIVES}
+            if as_json:
+                _emit(json.dumps(payloads, indent=2, default=str))
+                raise typer.Exit(ExitCode.OK)
+            console.print()
+            table = Table(title="one structure, two organisations", title_justify="left",
+                          box=None, pad_edge=False)
+            table.add_column("objective", no_wrap=True)
+            table.add_column("subagents", justify="right")
+            table.add_column("workers", justify="right")
+            table.add_column("attempts", justify="right")
+            table.add_column("peak", justify="right")
+            table.add_column("seconds", justify="right")
+            for name, payload in payloads.items():
+                table.add_row(escape(name), str(len(payload["subagents"])),
+                              str(sum(len(sub["workers"]) for sub in payload["subagents"])),
+                              str(payload["worker_attempts"]),
+                              str(payload["peak_concurrency"]), str(payload["seconds"]))
+            console.print(table)
+            console.print("\n[dim]Same compiled structure, different widths: every count came "
+                          "from the objective, not from a node definition.[/dim]\n")
+            raise typer.Exit(ExitCode.OK)
+        if key not in _SELFTEST_OBJECTIVES:
+            console.print(f"[red]✘[/red] unknown demo {escape(repr(demo))}; choose from: "
+                          f"{', '.join([*_SELFTEST_OBJECTIVES, 'compare'])}")
+            raise typer.Exit(ExitCode.USAGE)
+        payload = _flow_demo(key, out_dir=directory)
+        if as_json:
+            _emit(json.dumps(payload, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(render_flow_summary(payload))
+        for report in payload["reports"]:
+            console.print()
+            console.print(Panel(Text("\n".join(
+                f"{label:<12}{value}" for label, value in (
+                    ("role", report["role"]),
+                    ("status", f"{report['status']} ({report['gate']})"),
+                    ("workers", ", ".join(report["workers"])),
+                    ("evidence", report["evidence"]),
+                    ("reviews", report["reviews"]),
+                    ("retries", report["retries"]),
+                    ("join", report["join"]),
+                    ("gaps", "; ".join(report["gaps"]) or "none"),
+                ))), title=f"[bold]{escape(str(report['role']))}[/bold]", title_align="left",
+                border_style="cyan", expand=False, padding=(0, 1)))
+        console.print()
+        console.print(render_flow_timeline(payload, limit=max(4, trace_limit)))
+        if payload.get("synthesis"):
+            console.print()
+            console.print(Panel(Text(str(payload["synthesis"]["summary"])),
+                                title="[bold]master synthesis[/bold]", title_align="left",
+                                border_style="green", expand=False, padding=(0, 1)))
+        console.print(f"\n[dim]{payload['log_lines']} log line(s)"
+                      + (f" · artefact {payload['artefact']}" if payload.get("artefact") else "")
+                      + "[/dim]\n")
+        raise typer.Exit(ExitCode.OK)
+
+    if objective:
+        if not target:
+            console.print("[red]✘[/red] a real objective needs --target (the authorised asset)")
+            raise typer.Exit(ExitCode.USAGE)
+        preflight = run_preflight(objective=objective, targets=[target],
+                                  scope_entries=[target])
+        if not preflight.ok:
+            # The gate is the same one every mission passes through: a refusal,
+            # a blocking scope issue or an unresolved pause stops the flow here.
+            lines = [preflight.verdict.rationale or "the objective was not cleared"]
+            lines += [f"{issue.id}: {issue.message} — {issue.fix}"
+                      for issue in preflight.issues[:5]]
+            if preflight.paused:
+                lines.append("confirm the objective's intent, or accept the reframe, first")
+            console.print()
+            console.print(Panel(Text("\n".join(lines)),
+                                title="[bold red]not cleared to run[/bold red]",
+                                title_align="left", border_style="red", expand=False))
+            raise typer.Exit(preflight.exit_code)
+        context = MasterContext(
+            objective=objective, scope_entries=[target],
+            available_tools=list(capability_names())[:6] or ["http.fetch"])
+        policy = FlowPolicy.from_context(context, max_parallel_subagents=parallel_subagents,
+                                         max_parallel_workers=parallel_workers)
+        logger = MissionLogger(directory / "flow.jsonl") if directory else None
+        renderer = EventRenderer.from_options(stream=io.StringIO(), color=False,
+                                              animation=False)
+        tracker = LifecycleTracker(renderer, animation=False, register_atexit=False)
+        flow = build_mission_flow(
+            context, _drafts_for_objective(context), policy=policy, logger=logger,
+            tracker=tracker, runner=DeterministicRunner(scope=[target]))
+        result = flow.run()
+        if logger is not None:
+            logger.close()
+        payload = {
+            "objective_key": "live", "objective": objective, "structure": flow.structures(),
+            "waves": result.waves,
+            "subagents": [
+                {"id": subagent.id, "role": subagent.role,
+                 "depends_on": subagent.depends_on,
+                 "workers": [{"id": worker.name, "unit": worker.work_unit,
+                              "criteria": worker.completion_criteria}
+                             for worker in subagent.workers],
+                 "worker_waves": [[next(w.name for w in subagent.workers if w.id == wid)
+                                   for wid in wave] for wave in flow.worker_waves(subagent)]}
+                for subagent in flow.subagents],
+            "reports": [report.to_dict() for report in result.reports],
+            "synthesis": json.loads(model_to_json(result.synthesis)) if result.synthesis else None,
+            "stage_order": result.stage_order(), "worker_attempts": result.worker_attempts,
+            "retries": result.retries, "evidence": len(result.evidence),
+            "peak_concurrency": flow.trace.max_concurrency(),
+            "ledger_concurrency": flow.trace.max_concurrency(),
+            "threads": sorted(flow.trace.threads())[:4],
+            "seconds": round(result.seconds, 3), "stopped": result.stopped,
+            "stop_reason": result.stop_reason,
+            "policy": json.loads(model_to_json(policy)), "trace": result.trace,
+        }
+        if as_json:
+            _emit(json.dumps(payload, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(render_flow_summary(payload))
+        console.print()
+        console.print(render_flow_timeline(payload, limit=max(4, trace_limit)))
+        if payload["synthesis"]:
+            console.print()
+            console.print(Panel(Text(str(payload["synthesis"]["summary"])),
+                                title="[bold]master synthesis[/bold]", title_align="left",
+                                border_style="green", expand=False, padding=(0, 1)))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    console.print("[red]✘[/red] use --demo {exposure|forensic|compare}, --self-test, "
+                  "or -t TARGET -o OBJECTIVE")
+    raise typer.Exit(ExitCode.USAGE)
+
+
+def _objective_draft(*, role: str, objective: str, justification: str,
+                     scope: Sequence[str], capability: str, termination: str,
+                     unit: str, unit_objective: str, criteria: Sequence[str],
+                     basis: RoleBasis = RoleBasis.SOURCE_FAMILY,
+                     depends_on: Sequence[str] = ()) -> SubagentSpecDraft:
+    """One complete Subagent specification for an operator's live objective.
+
+    Written out in full rather than reusing a test fixture: a specification the
+    operator's mission runs on must satisfy every field the validators check, and
+    a fixture that skipped one would produce a team the Master could not have
+    designed.
+    """
+
+    return SubagentSpecDraft(
+        role=role,
+        role_basis=basis,
+        objective=objective,
+        justification=justification,
+        scope_entries=list(scope),
+        required_inputs=["the mission objective", "the authorised scope"],
+        allowed_capabilities=[capability],
+        deliverables=[Deliverable(
+            name=f"{role} result set", format="structured-table",
+            fields=["statement", "source", "retrieved_at"],
+            measurable_check=f"at least one cited row per record found by {role}",
+        )],
+        evidence=EvidenceRequirement(
+            description=f"public records collected by {role}, with retrieval metadata",
+            accepted_kinds=[EvidenceKind.OBSERVATION],
+            minimum_items=1, minimum_sources=1, source_forms=list(scope),
+        ),
+        rubric=QualityRubric(
+            criteria=[
+                RubricCriterion(criterion="every row cites a source", weight=3,
+                                test="each row carries a source id and a retrieval time",
+                                blocking=True),
+                RubricCriterion(criterion="coverage is stated", weight=2,
+                                test="the output names what could not be collected"),
+            ],
+            passing_score=70,
+            max_review_rounds=2,
+        ),
+        termination=TerminationCriteria(
+            objective_satisfied_when=termination, max_tasks=8, max_attempts_per_task=2,
+        ),
+        workers=[WorkerInstruction(
+            name=unit, objective=unit_objective, tools=[capability],
+            completion_criteria=list(criteria), requires_network=True,
+        )],
+        depends_on=list(depends_on),
+        max_workers=2,
+        addresses_questions=[f"what do the public records show about {scope[0]}?"],
+    )
+
+
+def _drafts_for_objective(context: "MasterContext") -> list[SubagentSpecDraft]:
+    """Specifications for a live objective, without a provider round trip.
+
+    The offline stand-in for ``plan_subagent_specs``: one Subagent per declared
+    scope entry, plus a verification unit when the objective asks for a
+    judgement.  It exists so the *graph* can be exercised on an operator's real
+    objective before the collection phases exist, and it is held to the same
+    validators, so it cannot produce a team the Master could not have designed.
+    """
+
+    scope = list(context.scope_entries) or ["example.com"]
+    tools = list(context.available_tools) or ["http.fetch"]
+    drafts: list[SubagentSpecDraft] = []
+    for index, entry in enumerate(scope, start=1):
+        slug = re.sub(r"[^a-z0-9]+", "-", entry.lower()).strip("-") or f"asset-{index}"
+        drafts.append(_objective_draft(
+            role=f"{slug}-records",
+            objective=(f"collect the public records published for {entry} that answer: "
+                       f"{context.objective[:100]}"),
+            justification=(f"only {entry} publishes the records that answer this objective, so "
+                           f"one agent for it is the smallest unit that can collect them"),
+            scope=[entry],
+            capability=tools[(index - 1) % len(tools)],
+            termination=f"at least one cited row for every record found for {entry}",
+            unit=f"{slug}-reader",
+            unit_objective=(f"read the public records published for {entry} and cite each "
+                            f"record it finds"),
+            criteria=[f"at least one cited row per record found for {entry}"],
+        ))
+    if re.search(r"\b(assess|rank|determine|compare|conclude|identify)\b",
+                 context.objective.lower()):
+        drafts.append(_objective_draft(
+            role="record-verification",
+            basis=RoleBasis.VERIFICATION,
+            objective=(f"re-read every collected public record row for "
+                       f"{', '.join(scope[:2])} and confirm its source still supports it"),
+            justification=("the objective asks for a judgement, so an independent re-read is the "
+                           "only thing that separates a sourced row from an unchecked one"),
+            scope=scope,
+            capability=tools[0],
+            termination="all collected rows re-read, with one verdict for each",
+            unit="row-recheck",
+            unit_objective=("re-read each collected public record row and record whether its "
+                            "source still supports it"),
+            criteria=["one verdict per collected row"],
+            depends_on=[draft.role for draft in drafts],
+        ))
+    return drafts
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 25. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 

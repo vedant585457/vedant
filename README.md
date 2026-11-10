@@ -14,6 +14,7 @@ python vedant_osint.py adapter --self-test    # structured model output contract
 python vedant_osint.py master --self-test     # Master Agent boundaries
 python vedant_osint.py subagents --self-test  # runtime Subagent specifications
 python vedant_osint.py workers --self-test    # runtime Worker specifications
+python vedant_osint.py flow --self-test       # LangGraph execution flow
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -337,13 +338,51 @@ scrubbed from all diagnostics.
 
 Authorised use only — collect from systems you own or are explicitly permitted to assess.
 
+## The execution flow
+
+The hierarchy is executed by LangGraph, not by loops in this file.
+`HierarchicalFlow` compiles three graphs and reuses each one for every mission:
+a **Master** graph (`master-plan` → one `Send` per Subagent → `master-review` →
+`master-synthesize`), a **Subagent** child graph (`subagent` → one `Send` per
+Worker → `subagent-aggregate`), and a **Worker** child graph (`worker-task` →
+`worker-review`, looping while the review asks for a retry).
+
+```bash
+python vedant_osint.py flow --self-test        # 60 guarantee checks, offline
+python vedant_osint.py flow --demo exposure    # summary + ledger + joins
+python vedant_osint.py flow --demo compare     # one structure, two widths
+python vedant_osint.py flow -t example.com -o "assess the exposure of example.com"
+```
+
+- **Width is data, never structure** — both fan-outs are `Send`s built from the
+  mission's own team, so a 2-Subagent and a 9-Subagent mission compile to the
+  *same* node set. No node is named after a specialist role and no roster
+  constant exists; the self-test parses the file to prove it.
+- **A join is an edge, then a check** — every Worker branch reaches
+  `subagent-aggregate` over a plain edge, so it runs once, after the last branch
+  settles; `master-synthesize` waits the same way for every Subagent. Each
+  aggregate rebuilds its `JoinBarrier` and raises `PrematureAggregate` if a unit
+  is missing, and the barrier travels inside the report as proof the aggregate was
+  not premature.
+- **Parallelism is bounded, and depends on nothing** — `FlowPolicy` caps
+  Subagents and Workers with semaphores (LangGraph's `max_concurrency` is per
+  invocation and a child graph does not inherit it). A unit takes its slot only
+  after its dependencies settle, so waiting can never starve what it waits for.
+- **Everything is observable** — `FlowTrace` is a sequence-ordered ledger of
+  stage, unit, dependency wave, thread and monotonic time, and it computes
+  concurrency from the ledger alone, so "it ran in parallel" is a measurement.
+- **A failure is a gap, never a pass** — retries are bounded by the Worker's own
+  budget; when they run out the verdict stands and the gap names the Worker and
+  the gate. A mission whose Subagents produced nothing stops with a reason
+  instead of synthesising an empty answer.
+
 ## Status
 
 | Phase | Scope | State |
 |-------|-------|-------|
 | 1 | Foundation — CLI skeleton, config probing, version reporting | ✅ done |
 | 2 | Contracts — settings, `doctor`, preflight, models, state, renderer, lifecycle, resilience, model adapter | ✅ done |
-| 3 | Orchestration — Master Agent (only fixed agent) + runtime Subagent/Worker factories | 🟡 started (Master Agent, Subagent and Worker specifications) |
+| 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow) |
 | 4 | Browser — browser-use / Playwright sessions and capture | ⬜ |
 | 5 | Collection — passive OSINT sources, artefact hashing | ⬜ |
 | 6 | Synthesis — cross-source correlation and reporting | ⬜ |
