@@ -41,25 +41,43 @@ file — no ``requirements.txt`` is generated.
 
 Environment variables
 ---------------------
-Model access (needed once orchestration lands in Phase 3)::
+Model access::
 
     ARGUS_LLM_MODEL           Model id, e.g. "gpt-4.1-mini" or "claude-sonnet-4".
-    ARGUS_LLM_PROVIDER        Provider hint: openai | anthropic | google | local.
+    ARGUS_LLM_PROVIDER        Provider: openai | anthropic | google | local.
+    ARGUS_LLM_BASE_URL        Optional OpenAI-compatible endpoint override.
+
+Credentials — looked up, never printed.  A provider's key is read from its
+:data:`PROVIDER_REGISTRY` entry (first *set* variable wins)::
+
+    ARGUS_LLM_API_KEY         Provider-neutral key, checked before the above.
     OPENAI_API_KEY            Used when the provider is openai.
     ANTHROPIC_API_KEY         Used when the provider is anthropic.
     GOOGLE_API_KEY            Used when the provider is google.
-    ARGUS_LLM_BASE_URL        Optional OpenAI-compatible endpoint override.
+    OLLAMA_HOST               Endpoint for the local provider (host only).
 
-Runtime behaviour::
+Paths and operator::
 
     ARGUS_HOME                Root for case data (default: ./argus_home).
-    ARGUS_CASE_DIR            Directory for the current mission's artefacts.
+    ARGUS_OUTPUT_DIR          Mission output directory (default: $ARGUS_HOME/output).
+    ARGUS_CASE_DIR            Artefact directory for the current mission.
     ARGUS_LOG_LEVEL           DEBUG | INFO | WARNING | ERROR (default: INFO).
     ARGUS_OPERATOR            Operator name recorded in the audit trail.
-    ARGUS_MAX_WORKERS         Hard ceiling on concurrent Workers (default: 8).
-    ARGUS_MAX_SUBAGENTS       Hard ceiling on live Subagents (default: 5).
-    ARGUS_HTTP_TIMEOUT        Per-request timeout in seconds (default: 30).
     ARGUS_USER_AGENT          User-Agent presented to remote hosts.
+    ARGUS_HTTP_TIMEOUT        Per-request timeout in seconds (default: 30).
+
+Orchestration limits and budgets (every one is range-checked before any
+model or browser call — see :func:`build_settings`)::
+
+    ARGUS_MAX_SUBAGENTS          Live Subagents per mission     (1-25,  default 5)
+    ARGUS_MAX_WORKERS_PER_AGENT  Concurrent Workers per Subagent (1-16, default 4)
+    ARGUS_MAX_TOTAL_WORKERS      Concurrent Workers mission-wide (1-64, default 16)
+    ARGUS_WORKER_RETRIES         Retries per Worker task        (0-10,  default 2)
+    ARGUS_REVIEW_RETRIES         Review cycles per Subagent     (0-5,   default 2)
+    ARGUS_MISSION_BUDGET_SECONDS Wall-clock budget              (30-86400, default 3600)
+    ARGUS_TASK_BUDGET_SECONDS    Per-task time budget           (5-3600, default 300)
+    ARGUS_BROWSER_CONCURRENCY    Concurrent browser contexts    (1-8,   default 2)
+    ARGUS_HTTP_CONCURRENCY       Concurrent HTTP workers        (1-32,  default 8)
 
 Browser and network switches::
 
@@ -68,6 +86,13 @@ Browser and network switches::
     ARGUS_ALLOW_NETWORK       "0" to force an offline / dry mission (default: 1).
     ARGUS_RESPECT_ROBOTS      "0" to ignore robots.txt (default: 1 — respected).
 
+Precedence
+----------
+CLI option > environment variable > built-in default, applied per field.
+``mission --phase settings`` renders the merged result with ``--source``
+annotations; secrets appear only as ``set``/``unset`` with a masked hint such
+as ``sk-p…c3f9`` and are scrubbed from every error and diagnostic surface.
+
 Usage
 -----
 ::
@@ -75,7 +100,9 @@ Usage
     python vedant_osint.py --help
     python vedant_osint.py version
     python vedant_osint.py config
+    python vedant_osint.py config --settings            # merged, redacted view
     python vedant_osint.py mission --target example.com -o "map the attack surface"
+    python vedant_osint.py mission -t example.com -o "..." --phase settings --json
 
 Exit codes
 ----------
@@ -100,13 +127,14 @@ import importlib.util
 import json
 import os
 import platform
+import re
 import sys
 import tempfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum, IntEnum
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 # --- third party: CLI surface -------------------------------------------------
 # Typer + Rich are the only hard imports.  They are imported at module level
@@ -137,7 +165,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 1
+VERSION_MINOR: int = 2
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "skeleton"          # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -154,20 +182,43 @@ MIN_PYTHON: tuple[int, int] = (3, 10)
 ENV_PREFIX: str = "ARGUS_"
 
 DEFAULT_HOME_DIRNAME: str = "argus_home"
+DEFAULT_OUTPUT_DIRNAME: str = "output"
 DEFAULT_MAX_SUBAGENTS: int = 5
-DEFAULT_MAX_WORKERS: int = 8
+DEFAULT_MAX_WORKERS_PER_AGENT: int = 4
+DEFAULT_MAX_TOTAL_WORKERS: int = 16
+DEFAULT_WORKER_RETRIES: int = 2
+DEFAULT_REVIEW_RETRIES: int = 2
+DEFAULT_MISSION_BUDGET_SECONDS: int = 3600
+DEFAULT_TASK_BUDGET_SECONDS: int = 300
+DEFAULT_BROWSER_CONCURRENCY: int = 2
+DEFAULT_HTTP_CONCURRENCY: int = 8
+DEFAULT_LLM_PROVIDER: str = "openai"
 DEFAULT_HTTP_TIMEOUT: float = 30.0
 DEFAULT_USER_AGENT: str = f"{APP_TITLE}/{__version__} (+authorised-security-research)"
 DEFAULT_LOG_LEVEL: str = "INFO"
 
+#: Hard bounds for every numeric orchestration limit.  ``None`` means unbounded.
+#: Out-of-range values are refused *before* any model or browser call.
+LIMIT_BOUNDS: dict[str, tuple[int | None, int | None]] = {
+    "max_subagents": (1, 25),
+    "max_workers_per_agent": (1, 16),
+    "max_total_workers": (1, 64),
+    "worker_retries": (0, 10),
+    "review_retries": (0, 5),
+    "mission_budget_seconds": (30, 86_400),
+    "task_budget_seconds": (5, 3_600),
+    "browser_concurrency": (1, 8),
+    "http_concurrency": (1, 32),
+}
+
 #: Build phase currently implemented.  Later tasks advance this number.
-BUILD_PHASE: int = 1
-BUILD_PHASE_NAME: str = "Foundation"
+BUILD_PHASE: int = 2
+BUILD_PHASE_NAME: str = "Contracts"
 
 #: Section banners shared by the banner panel and ``version --json``.
 PHASE_ROADMAP: tuple[tuple[int, str, str], ...] = (
     (1, "Foundation", "CLI skeleton, config probing, version reporting"),
-    (2, "Contracts", "Mission/evidence models, case workspace layout"),
+    (2, "Contracts", "Strict settings object, mission/evidence contracts"),
     (3, "Orchestration", "LangGraph Master Agent + runtime Subagent factory"),
     (4, "Browser", "browser-use/Playwright sessions and capture"),
     (5, "Collection", "passive OSINT sources, artefact hashing/chain of custody"),
@@ -199,8 +250,69 @@ class MissionMode(str, Enum):
     FORENSIC = "forensic"     # local artefacts only, no remote collection
 
 
+class MissionPhase(str, Enum):
+    """What ``mission --phase`` renders."""
+
+    PLAN = "plan"             # what the Master Agent would do
+    SETTINGS = "settings"     # the merged, redacted configuration
+
+
 # ══════════════════════════════════════════════════════════════════════════
-# 3. Capability registry (dependencies + environment)
+# 3. Secret redaction
+# ══════════════════════════════════════════════════════════════════════════
+
+#: Stand-in for a value that must never reach a terminal, log or report.
+REDACTED: str = "<redacted>"
+
+#: Credential shapes we scrub even when the variable name is unknown to us
+#: (a pasted key in an error message, a URL with userinfo, a bearer header).
+_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?i)\b(?:sk|rk|pk|ak)-[A-Za-z0-9_\-]{8,}"),          # OpenAI/Anthropic-style
+    re.compile(r"(?i)\bAIza[0-9A-Za-z_\-]{20,}"),                      # Google API key
+    re.compile(r"(?i)\bgh[pousr]_[A-Za-z0-9]{16,}"),                   # GitHub token
+    re.compile(r"(?i)\bxox[abprs]-[A-Za-z0-9\-]{10,}"),                # Slack token
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{12,}"),                # auth header
+    re.compile(r"(?i)\b(api[_-]?key|token|secret|password|passwd|pwd)=([^\s&,;\"']+)"),
+)
+
+
+def mask_secret(value: str | None) -> str:
+    """Return a hint like ``sk-p…c3f9`` — enough to identify, useless to an attacker.
+
+    Anything shorter than 12 characters is fully redacted, because a short
+    secret leaves too few unknown characters for the hint to be safe.
+    """
+
+    if not value:
+        return "unset"
+    if len(value) < 12:
+        return f"{REDACTED} (len {len(value)})"
+    return f"{value[:4]}…{value[-4:]} (len {len(value)})"
+
+
+def redact_text(text: str, *, secrets: Iterable[str | None] = ()) -> str:
+    """Scrub known secret *values* plus anything matching a credential pattern."""
+
+    scrubbed = str(text)
+    # Longest first so a key that contains another key is replaced wholly.
+    for secret in sorted({s for s in secrets if s}, key=len, reverse=True):
+        scrubbed = scrubbed.replace(secret, REDACTED)
+    for pattern in _SECRET_PATTERNS:
+        if pattern.groups >= 2:                      # key=value shapes
+            scrubbed = pattern.sub(lambda m: f"{m.group(1)}={REDACTED}", scrubbed)
+        else:
+            scrubbed = pattern.sub(REDACTED, scrubbed)
+    return scrubbed
+
+
+def known_secrets() -> tuple[str, ...]:
+    """Current credential values from the environment (for scrubbing only)."""
+
+    return tuple(v for v in (env_value(name) for name in SECRET_ENV_VARS) if v)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 4. Capability registry (dependencies + environment)
 # ══════════════════════════════════════════════════════════════════════════
 
 
@@ -248,29 +360,149 @@ class EnvSpec:
     default: str | None = None
 
 
+@dataclass(frozen=True)
+class ProviderSpec:
+    """A model provider, the credential variables it accepts, and its needs.
+
+    Credential *names* live here; credential *values* are fetched on demand by
+    :meth:`Settings.resolve_api_key` and are never stored on the settings object.
+    """
+
+    key: str
+    label: str
+    key_env_vars: tuple[str, ...]
+    models: tuple[str, ...] = ()
+    base_url_env: str | None = None
+    default_base_url: str | None = None
+    #: True for backends that authenticate by network position (e.g. local Ollama).
+    key_optional: bool = False
+
+    def key_env_summary(self) -> str:
+        """Human-readable list of accepted credential variables."""
+
+        return " | ".join(self.key_env_vars) if self.key_env_vars else "none required"
+
+
+#: Provider table consulted by :func:`model_problems`.  Extend here — no code
+#: changes elsewhere — to support another backend.
+PROVIDER_REGISTRY: dict[str, ProviderSpec] = {
+    "openai": ProviderSpec(
+        key="openai",
+        label="OpenAI",
+        key_env_vars=("ARGUS_LLM_API_KEY", "OPENAI_API_KEY"),
+        models=(
+            "gpt-4.1",
+            "gpt-4.1-mini",
+            "gpt-4o",
+            "gpt-4o-mini",
+            "o3",
+            "o4-mini",
+        ),
+    ),
+    "anthropic": ProviderSpec(
+        key="anthropic",
+        label="Anthropic",
+        key_env_vars=("ARGUS_LLM_API_KEY", "ANTHROPIC_API_KEY"),
+        models=(
+            "claude-sonnet-4-20250514",
+            "claude-opus-4-20250514",
+            "claude-3-7-sonnet-20250219",
+            "claude-3-5-haiku-20241022",
+        ),
+    ),
+    "google": ProviderSpec(
+        key="google",
+        label="Google",
+        key_env_vars=("ARGUS_LLM_API_KEY", "GOOGLE_API_KEY"),
+        models=(
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+        ),
+    ),
+    "local": ProviderSpec(
+        key="local",
+        label="Local / OpenAI-compatible",
+        key_env_vars=("ARGUS_LLM_API_KEY", "OPENAI_API_KEY"),
+        default_base_url="http://127.0.0.1:11434/v1",
+        base_url_env="OLLAMA_HOST",
+        key_optional=True,
+    ),
+}
+
+#: Variables scrubbed from every error, log line and diagnostic we emit.
+SECRET_ENV_VARS: tuple[str, ...] = tuple(
+    sorted({name for spec in PROVIDER_REGISTRY.values() for name in spec.key_env_vars})
+)
+
 ENV_SPECS: tuple[EnvSpec, ...] = (
     EnvSpec("ARGUS_LLM_MODEL", EnvKind.REQUIRED, "model id driving all agents", 3),
-    EnvSpec("ARGUS_LLM_PROVIDER", EnvKind.OPTIONAL, "openai | anthropic | google | local", 3, "openai"),
+    EnvSpec("ARGUS_LLM_PROVIDER", EnvKind.OPTIONAL, "openai | anthropic | google | local", 3, DEFAULT_LLM_PROVIDER),
     EnvSpec("ARGUS_LLM_BASE_URL", EnvKind.OPTIONAL, "OpenAI-compatible endpoint override", 3),
+    EnvSpec("ARGUS_LLM_API_KEY", EnvKind.SECRET, "provider-neutral credential", 3),
     EnvSpec("OPENAI_API_KEY", EnvKind.SECRET, "credential for the OpenAI provider", 3),
     EnvSpec("ANTHROPIC_API_KEY", EnvKind.SECRET, "credential for the Anthropic provider", 3),
     EnvSpec("GOOGLE_API_KEY", EnvKind.SECRET, "credential for the Google provider", 3),
     EnvSpec("ARGUS_HOME", EnvKind.OPTIONAL, "root directory for case data", 2, DEFAULT_HOME_DIRNAME),
+    EnvSpec("ARGUS_OUTPUT_DIR", EnvKind.OPTIONAL, "mission output directory", 2),
     EnvSpec("ARGUS_CASE_DIR", EnvKind.OPTIONAL, "artefact directory for this mission", 2),
     EnvSpec("ARGUS_LOG_LEVEL", EnvKind.OPTIONAL, "DEBUG | INFO | WARNING | ERROR", 1, DEFAULT_LOG_LEVEL),
     EnvSpec("ARGUS_OPERATOR", EnvKind.OPTIONAL, "operator name for the audit trail", 1),
-    EnvSpec("ARGUS_MAX_SUBAGENTS", EnvKind.OPTIONAL, "ceiling on live Subagents", 3, str(DEFAULT_MAX_SUBAGENTS)),
-    EnvSpec("ARGUS_MAX_WORKERS", EnvKind.OPTIONAL, "ceiling on concurrent Workers", 3, str(DEFAULT_MAX_WORKERS)),
+    EnvSpec("ARGUS_MAX_SUBAGENTS", EnvKind.OPTIONAL, "live Subagents per mission", 3, str(DEFAULT_MAX_SUBAGENTS)),
+    EnvSpec(
+        "ARGUS_MAX_WORKERS_PER_AGENT",
+        EnvKind.OPTIONAL,
+        "concurrent Workers per Subagent",
+        3,
+        str(DEFAULT_MAX_WORKERS_PER_AGENT),
+    ),
+    EnvSpec(
+        "ARGUS_MAX_TOTAL_WORKERS",
+        EnvKind.OPTIONAL,
+        "concurrent Workers mission-wide",
+        3,
+        str(DEFAULT_MAX_TOTAL_WORKERS),
+    ),
+    EnvSpec("ARGUS_WORKER_RETRIES", EnvKind.OPTIONAL, "retries per Worker task", 3, str(DEFAULT_WORKER_RETRIES)),
+    EnvSpec("ARGUS_REVIEW_RETRIES", EnvKind.OPTIONAL, "review cycles per Subagent", 3, str(DEFAULT_REVIEW_RETRIES)),
+    EnvSpec(
+        "ARGUS_MISSION_BUDGET_SECONDS",
+        EnvKind.OPTIONAL,
+        "wall-clock mission budget",
+        3,
+        str(DEFAULT_MISSION_BUDGET_SECONDS),
+    ),
+    EnvSpec(
+        "ARGUS_TASK_BUDGET_SECONDS",
+        EnvKind.OPTIONAL,
+        "per-task time budget",
+        3,
+        str(DEFAULT_TASK_BUDGET_SECONDS),
+    ),
+    EnvSpec(
+        "ARGUS_BROWSER_CONCURRENCY",
+        EnvKind.OPTIONAL,
+        "concurrent browser contexts",
+        4,
+        str(DEFAULT_BROWSER_CONCURRENCY),
+    ),
+    EnvSpec(
+        "ARGUS_HTTP_CONCURRENCY",
+        EnvKind.OPTIONAL,
+        "concurrent HTTP workers",
+        5,
+        str(DEFAULT_HTTP_CONCURRENCY),
+    ),
     EnvSpec("ARGUS_HTTP_TIMEOUT", EnvKind.OPTIONAL, "per-request timeout (seconds)", 5, str(int(DEFAULT_HTTP_TIMEOUT))),
     EnvSpec("ARGUS_USER_AGENT", EnvKind.OPTIONAL, "User-Agent sent to remote hosts", 4, DEFAULT_USER_AGENT),
     EnvSpec("ARGUS_BROWSER_HEADLESS", EnvKind.OPTIONAL, "1 = headless Chromium", 4, "1"),
     EnvSpec("ARGUS_BROWSER_PROFILE_DIR", EnvKind.OPTIONAL, "persistent browser profile path", 4),
     EnvSpec("ARGUS_ALLOW_NETWORK", EnvKind.OPTIONAL, "0 = offline/dry mission", 5, "1"),
-    EnvSpec("ARGUS_RESPECT_ROBOTS", EnvKind.OPTIONAL, "1 = honour robots.txt", 5, "1"),
+    EnvSpec("ARGUS_RESPECT_ROBOTS", EnvKind.OPTIONAL, "0 = ignore robots.txt", 5, "1"),
 )
 
 # ══════════════════════════════════════════════════════════════════════════
-# 4. Runtime value objects
+# 5. Runtime value objects
 # ══════════════════════════════════════════════════════════════════════════
 
 
@@ -278,8 +510,9 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
 class MissionRequest:
     """Everything the Master Agent needs to plan a mission.
 
-    Phase 2 turns this into a validated Pydantic model; Phase 3 feeds it to the
-    Master Agent graph.  For now it is a plain, serialisable value object.
+    Limits and paths are copied from a :class:`Settings` object that has already
+    passed validation, so a request can never carry an out-of-range limit into
+    Phase 3.  Phase 3 feeds this to the Master Agent graph.
     """
 
     targets: list[str]
@@ -287,10 +520,35 @@ class MissionRequest:
     mode: MissionMode = MissionMode.PASSIVE
     authorised: bool = False
     max_subagents: int = DEFAULT_MAX_SUBAGENTS
-    max_workers: int = DEFAULT_MAX_WORKERS
-    home_dir: str = field(default_factory=lambda: os.environ.get("ARGUS_HOME", DEFAULT_HOME_DIRNAME))
-    operator: str | None = field(default_factory=lambda: os.environ.get("ARGUS_OPERATOR") or None)
+    max_workers_per_agent: int = DEFAULT_MAX_WORKERS_PER_AGENT
+    max_total_workers: int = DEFAULT_MAX_TOTAL_WORKERS
+    worker_retries: int = DEFAULT_WORKER_RETRIES
+    review_retries: int = DEFAULT_REVIEW_RETRIES
+    mission_budget_seconds: int = DEFAULT_MISSION_BUDGET_SECONDS
+    task_budget_seconds: int = DEFAULT_TASK_BUDGET_SECONDS
+    output_dir: str = field(default_factory=lambda: str(resolve_default_output_dir()))
+    operator: str | None = field(default_factory=lambda: env_value("ARGUS_OPERATOR"))
+    dry_run: bool = True
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
+
+    @classmethod
+    def from_settings(cls, settings: "Settings", **overrides: Any) -> "MissionRequest":
+        """Copy validated configuration into a request, then apply overrides."""
+
+        base: dict[str, Any] = {
+            "max_subagents": settings.max_subagents,
+            "max_workers_per_agent": settings.max_workers_per_agent,
+            "max_total_workers": settings.max_total_workers,
+            "worker_retries": settings.worker_retries,
+            "review_retries": settings.review_retries,
+            "mission_budget_seconds": settings.mission_budget_seconds,
+            "task_budget_seconds": settings.task_budget_seconds,
+            "output_dir": str(settings.output_dir),
+            "operator": settings.operator,
+            "dry_run": settings.dry_run,
+        }
+        base.update(overrides)
+        return cls(**base)
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-safe representation (enums flattened to their values)."""
@@ -322,7 +580,7 @@ class CheckResult:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 5. Console + formatting helpers
+# 6. Console + formatting helpers
 # ══════════════════════════════════════════════════════════════════════════
 
 _STATUS_STYLE: dict[str, tuple[str, str]] = {
@@ -417,7 +675,7 @@ def print_version(*, as_json: bool = False) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 6. Configuration probing
+# 7. Configuration probing
 # ══════════════════════════════════════════════════════════════════════════
 
 
@@ -446,6 +704,13 @@ def resolve_home_dir() -> Path:
     """Directory that will hold case data.  Not created here."""
 
     return Path(env_value("ARGUS_HOME") or DEFAULT_HOME_DIRNAME).expanduser()
+
+
+def resolve_default_output_dir() -> Path:
+    """Default output directory: ``$ARGUS_OUTPUT_DIR`` or ``$ARGUS_HOME/output``."""
+
+    override = env_value("ARGUS_OUTPUT_DIR")
+    return Path(override).expanduser() if override else resolve_home_dir() / DEFAULT_OUTPUT_DIRNAME
 
 
 def directory_writable(path: Path) -> bool:
@@ -526,7 +791,773 @@ def collect_config_results() -> list[CheckResult]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 7. Typer application
+# 8. Strict configuration management
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class SettingSource(str, Enum):
+    """Where an effective value came from.  CLI always wins."""
+
+    CLI = "cli"
+    ENV = "env"
+    DEFAULT = "default"
+
+
+class Severity(str, Enum):
+    """A configuration problem either blocks the run or merely warns."""
+
+    ERROR = "error"
+    WARNING = "warning"
+
+
+@dataclass(frozen=True)
+class SettingProblem:
+    """One validation failure, addressed to a single setting."""
+
+    field: str
+    message: str
+    severity: Severity = Severity.ERROR
+    source: SettingSource = SettingSource.DEFAULT
+    env_var: str | None = None
+
+    def location(self) -> str:
+        """Where the operator should look to fix it."""
+
+        if self.source is SettingSource.CLI:
+            return "command line"
+        if self.source is SettingSource.ENV and self.env_var:
+            return self.env_var
+        return "default"
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "field": self.field,
+            "message": self.message,
+            "severity": self.severity.value,
+            "source": self.source.value,
+            "env_var": self.env_var or "",
+            "location": self.location(),
+        }
+
+
+@dataclass(frozen=True)
+class Settings:
+    """Immutable, fully validated runtime configuration.
+
+    Built exclusively by :func:`build_settings`, which applies
+    ``CLI > environment > default`` precedence per field and refuses
+    out-of-range values.  No model client or browser is constructed here, so
+    construction can never have external side effects.
+
+    Credential *values* are deliberately absent: :meth:`resolve_api_key` reads
+    them at the moment they are needed and callers must not print the result.
+    """
+
+    # --- model -----------------------------------------------------------------
+    provider: str
+    model: str | None
+    base_url: str | None
+
+    # --- paths -----------------------------------------------------------------
+    home_dir: Path
+    output_dir: Path
+    case_dir: Path | None
+
+    # --- operator context ------------------------------------------------------
+    operator: str | None
+    log_level: str
+    dry_run: bool
+
+    # --- orchestration limits --------------------------------------------------
+    max_subagents: int
+    max_workers_per_agent: int
+    max_total_workers: int
+    worker_retries: int
+    review_retries: int
+    mission_budget_seconds: int
+    task_budget_seconds: int
+
+    # --- browser and network ---------------------------------------------------
+    browser_headless: bool
+    browser_profile_dir: Path | None
+    browser_concurrency: int
+    http_concurrency: int
+    http_timeout: float
+    user_agent: str
+    allow_network: bool
+    respect_robots: bool
+
+    #: field -> where the value came from (excluded from equality/repr).
+    provenance: Mapping[str, SettingSource] = field(default_factory=dict, repr=False, compare=False)
+
+    #: Zero-argument callable returning the environment mapping credentials are
+    #: looked up in.  A *callable* keeps secret values out of the dataclass
+    #: fields, so neither ``repr`` nor ``to_dict`` can ever expose a key.
+    _credential_env: Callable[[], Mapping[str, str]] | None = field(
+        default=None, repr=False, compare=False
+    )
+
+    def _environ(self) -> Mapping[str, str]:
+        """Environment used for credential lookup (injectable for tests)."""
+
+        return self._credential_env() if self._credential_env is not None else os.environ
+
+    # -- model helpers ---------------------------------------------------------
+
+    def provider_spec(self) -> ProviderSpec | None:
+        """Registry entry for the configured provider, if known."""
+
+        return PROVIDER_REGISTRY.get(self.provider)
+
+    def resolve_api_key(self) -> tuple[str | None, str | None]:
+        """Look the credential up at call time.
+
+        Returns ``(value, variable_name)``.  Callers pass the value straight to
+        the model client — never to a console, log or report.  Use
+        :meth:`api_key_hint` for anything user-visible.
+        """
+
+        spec = self.provider_spec()
+        if spec is None:
+            return None, None
+        environ = self._environ()
+        for name in spec.key_env_vars:
+            raw = environ.get(name)
+            value = raw.strip() if raw else None
+            if value:
+                return value, name
+        return None, None
+
+    def api_key_hint(self) -> str:
+        """Safe, non-reversible description of the credential state."""
+
+        value, name = self.resolve_api_key()
+        spec = self.provider_spec()
+        if value:
+            return f"{mask_secret(value)} from {name}"
+        if not self.requires_credential():
+            return f"not required for {spec.label if spec else self.provider}"
+        return f"unset (looked in {spec.key_env_summary() if spec else 'unknown'})"
+
+    def requires_credential(self) -> bool:
+        spec = self.provider_spec()
+        return bool(spec and spec.key_env_vars and not spec.key_optional)
+
+    # -- derived values --------------------------------------------------------
+
+    @property
+    def max_potential_workers(self) -> int:
+        """Workers if every Subagent were saturated — surfaced for transparency."""
+
+        return self.max_subagents * self.max_workers_per_agent
+
+    def source_of(self, field_name: str) -> SettingSource:
+        return self.provenance.get(field_name, SettingSource.DEFAULT)
+
+    # -- serialisation ---------------------------------------------------------
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe, secret-free snapshot used by ``--json`` output."""
+
+        return {
+            "model": {
+                "provider": self.provider,
+                "provider_label": (self.provider_spec().label if self.provider_spec() else "unknown"),
+                "model": self.model,
+                "base_url": self.base_url,
+                "api_key": self.api_key_hint(),
+            },
+            "paths": {
+                "home_dir": str(self.home_dir),
+                "output_dir": str(self.output_dir),
+                "case_dir": str(self.case_dir) if self.case_dir else None,
+            },
+            "operator": self.operator,
+            "log_level": self.log_level,
+            "dry_run": self.dry_run,
+            "orchestration": {
+                "max_subagents": self.max_subagents,
+                "max_workers_per_agent": self.max_workers_per_agent,
+                "max_total_workers": self.max_total_workers,
+                "max_potential_workers": self.max_potential_workers,
+                "worker_retries": self.worker_retries,
+                "review_retries": self.review_retries,
+            },
+            "budgets": {
+                "mission_budget_seconds": self.mission_budget_seconds,
+                "task_budget_seconds": self.task_budget_seconds,
+            },
+            "browser": {
+                "headless": self.browser_headless,
+                "concurrency": self.browser_concurrency,
+                "profile_dir": str(self.browser_profile_dir) if self.browser_profile_dir else None,
+            },
+            "network": {
+                "allow_network": self.allow_network,
+                "respect_robots": self.respect_robots,
+                "http_concurrency": self.http_concurrency,
+                "http_timeout": self.http_timeout,
+                "user_agent": self.user_agent,
+            },
+            "provenance": {k: v.value for k, v in self.provenance.items()},
+        }
+
+
+@dataclass
+class SettingsResult:
+    """Outcome of :func:`build_settings`: the settings plus everything wrong."""
+
+    settings: Settings
+    problems: list[SettingProblem] = field(default_factory=list)
+
+    @property
+    def errors(self) -> list[SettingProblem]:
+        return [p for p in self.problems if p.severity is Severity.ERROR]
+
+    @property
+    def warnings(self) -> list[SettingProblem]:
+        return [p for p in self.problems if p.severity is Severity.WARNING]
+
+    @property
+    def ok(self) -> bool:
+        """True only when nothing blocks a run."""
+
+        return not self.errors
+
+
+# --------------------------------------------------------------------------
+# 8.1 Typed parsing helpers — every failure becomes a SettingProblem
+# --------------------------------------------------------------------------
+
+_TRUE_WORDS = frozenset({"1", "true", "yes", "on", "y", "t"})
+_FALSE_WORDS = frozenset({"0", "false", "no", "off", "n", "f"})
+_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+#: field -> (env var, CLI flag) for provenance rendering.
+SETTING_SOURCES: dict[str, tuple[str | None, str | None]] = {
+    "provider": ("ARGUS_LLM_PROVIDER", "--provider"),
+    "model": ("ARGUS_LLM_MODEL", "--model"),
+    "base_url": ("ARGUS_LLM_BASE_URL", "--base-url"),
+    "home_dir": ("ARGUS_HOME", "--home"),
+    "output_dir": ("ARGUS_OUTPUT_DIR", "--output-dir"),
+    "case_dir": ("ARGUS_CASE_DIR", "--case-dir"),
+    "operator": ("ARGUS_OPERATOR", "--operator"),
+    "log_level": ("ARGUS_LOG_LEVEL", "--log-level"),
+    "max_subagents": ("ARGUS_MAX_SUBAGENTS", "--max-subagents"),
+    "max_workers_per_agent": ("ARGUS_MAX_WORKERS_PER_AGENT", "--max-workers"),
+    "max_total_workers": ("ARGUS_MAX_TOTAL_WORKERS", "--max-total-workers"),
+    "worker_retries": ("ARGUS_WORKER_RETRIES", "--worker-retries"),
+    "review_retries": ("ARGUS_REVIEW_RETRIES", "--review-retries"),
+    "mission_budget_seconds": ("ARGUS_MISSION_BUDGET_SECONDS", "--mission-budget"),
+    "task_budget_seconds": ("ARGUS_TASK_BUDGET_SECONDS", "--task-budget"),
+    "browser_headless": ("ARGUS_BROWSER_HEADLESS", "--headless"),
+    "browser_profile_dir": ("ARGUS_BROWSER_PROFILE_DIR", "--browser-profile"),
+    "browser_concurrency": ("ARGUS_BROWSER_CONCURRENCY", "--browser-concurrency"),
+    "http_concurrency": ("ARGUS_HTTP_CONCURRENCY", "--http-concurrency"),
+    "http_timeout": ("ARGUS_HTTP_TIMEOUT", "--http-timeout"),
+    "user_agent": ("ARGUS_USER_AGENT", "--user-agent"),
+    "allow_network": ("ARGUS_ALLOW_NETWORK", "--allow-network"),
+    "respect_robots": ("ARGUS_RESPECT_ROBOTS", "--respect-robots"),
+    "dry_run": (None, "--dry-run/--execute"),
+}
+
+
+def _env_var_for(field_name: str) -> str | None:
+    return SETTING_SOURCES.get(field_name, (None, None))[0]
+
+
+def _problem(field_name: str, message: str, source: SettingSource, severity: Severity = Severity.ERROR) -> SettingProblem:
+    """Build a problem with its env var attached (values are never included)."""
+
+    return SettingProblem(
+        field=field_name,
+        message=redact_text(message, secrets=known_secrets()),
+        severity=severity,
+        source=source,
+        env_var=_env_var_for(field_name) if source is SettingSource.ENV else None,
+    )
+
+
+def _parse_int(
+    field_name: str, raw: Any, source: SettingSource
+) -> tuple[int | None, SettingProblem | None]:
+    """Parse an integer, rejecting floats, blanks and junk."""
+
+    if raw is None:
+        return None, None
+    if isinstance(raw, bool):                        # bool is an int subclass
+        return None, _problem(field_name, "expected an integer, got a boolean", source)
+    if isinstance(raw, int):
+        return raw, None
+    text = str(raw).strip()
+    if not text:
+        return None, _problem(field_name, "expected an integer, got an empty value", source)
+    try:
+        return int(text, 10), None
+    except ValueError:
+        return None, _problem(
+            field_name, f"expected an integer, got {redact_text(text)!r}", source
+        )
+
+
+def _parse_bool(
+    field_name: str, raw: Any, source: SettingSource
+) -> tuple[bool | None, SettingProblem | None]:
+    """Parse booleans from flags or from 1/0/true/false/yes/no/on/off."""
+
+    if raw is None:
+        return None, None
+    if isinstance(raw, bool):
+        return raw, None
+    text = str(raw).strip().lower()
+    if text in _TRUE_WORDS:
+        return True, None
+    if text in _FALSE_WORDS:
+        return False, None
+    return None, _problem(field_name, f"expected a boolean (true/false/1/0), got {text!r}", source)
+
+
+def _check_bounds(field_name: str, value: int, source: SettingSource) -> SettingProblem | None:
+    """Enforce :data:`LIMIT_BOUNDS`; the message names the accepted range."""
+
+    low, high = LIMIT_BOUNDS.get(field_name, (None, None))
+    if low is not None and value < low:
+        return _problem(field_name, f"must be >= {low}, got {value}", source)
+    if high is not None and value > high:
+        return _problem(field_name, f"must be <= {high}, got {value}", source)
+    return None
+
+
+def _resolve(
+    field_name: str,
+    cli_values: Mapping[str, Any],
+    env: Mapping[str, str],
+    default: Any,
+) -> tuple[Any, SettingSource]:
+    """Apply ``CLI > env > default`` for one field, tracking the winner."""
+
+    cli_value = cli_values.get(field_name)
+    if cli_value is not None:
+        return cli_value, SettingSource.CLI
+    env_var = _env_var_for(field_name)
+    if env_var:
+        raw = env.get(env_var)
+        if raw is not None and raw.strip() != "":
+            return raw.strip(), SettingSource.ENV
+    return default, SettingSource.DEFAULT
+
+
+# --------------------------------------------------------------------------
+# 8.2 The builder
+# --------------------------------------------------------------------------
+
+
+def build_settings(
+    cli_values: Mapping[str, Any] | None = None,
+    env: Mapping[str, str] | None = None,
+) -> SettingsResult:
+    """Merge CLI options and environment into a validated :class:`Settings`.
+
+    Precedence is per field: a CLI option beats the environment variable, which
+    beats the built-in default.  Every numeric limit is bounds-checked, every
+    boolean parsed strictly, and every path expanded.  Nothing is created on
+    disk and no network client is built — so a bad value can never be
+    discovered *after* a model or browser call has already started.
+
+    The returned result carries problems instead of raising, which lets callers
+    render several errors at once.
+    """
+
+    cli = dict(cli_values or {})
+    environ: Mapping[str, str] = dict(os.environ if env is None else env)
+    problems: list[SettingProblem] = []
+    provenance: dict[str, SettingSource] = {}
+
+    def take(field_name: str, default: Any) -> tuple[Any, SettingSource]:
+        value, source = _resolve(field_name, cli, environ, default)
+        provenance[field_name] = source
+        return value, source
+
+    # --- integer limits ------------------------------------------------------
+    int_defaults: dict[str, int] = {
+        "max_subagents": DEFAULT_MAX_SUBAGENTS,
+        "max_workers_per_agent": DEFAULT_MAX_WORKERS_PER_AGENT,
+        "max_total_workers": DEFAULT_MAX_TOTAL_WORKERS,
+        "worker_retries": DEFAULT_WORKER_RETRIES,
+        "review_retries": DEFAULT_REVIEW_RETRIES,
+        "mission_budget_seconds": DEFAULT_MISSION_BUDGET_SECONDS,
+        "task_budget_seconds": DEFAULT_TASK_BUDGET_SECONDS,
+        "browser_concurrency": DEFAULT_BROWSER_CONCURRENCY,
+        "http_concurrency": DEFAULT_HTTP_CONCURRENCY,
+    }
+    numbers: dict[str, int] = {}
+    for field_name, default in int_defaults.items():
+        raw, source = take(field_name, default)
+        value, problem = _parse_int(field_name, raw, source)
+        if problem:
+            problems.append(problem)
+            numbers[field_name] = default          # keep the object constructible
+            continue
+        assert value is not None                   # raw=None only when default is None
+        bounds_problem = _check_bounds(field_name, value, source)
+        if bounds_problem:
+            problems.append(bounds_problem)
+        numbers[field_name] = value
+
+    # --- booleans ------------------------------------------------------------
+    bool_defaults: dict[str, bool] = {
+        "browser_headless": True,
+        "allow_network": True,
+        "respect_robots": True,
+    }
+    flags: dict[str, bool] = {}
+    for field_name, default in bool_defaults.items():
+        raw, source = take(field_name, default)
+        value, problem = _parse_bool(field_name, raw, source)
+        if problem:
+            problems.append(problem)
+            flags[field_name] = default
+        else:
+            flags[field_name] = bool(value)
+
+    # dry-run is a CLI-only switch (mission --dry-run/--execute); it is never
+    # read from the environment so a stray variable cannot start real collection.
+    dry_run = bool(cli.get("dry_run", True))
+    provenance["dry_run"] = SettingSource.CLI
+
+    # --- model ---------------------------------------------------------------
+    provider_default = str(environ.get("ARGUS_LLM_PROVIDER") or DEFAULT_LLM_PROVIDER).strip().lower()
+    provider_raw, provider_source = take("provider", provider_default)
+    provider = str(provider_raw).strip().lower()
+    if provider not in PROVIDER_REGISTRY:
+        problems.append(
+            _problem(
+                "provider",
+                f"unknown provider {provider!r}; choose one of {', '.join(sorted(PROVIDER_REGISTRY))}",
+                provider_source,
+            )
+        )
+
+    model_raw, model_source = take("model", None)
+    model = str(model_raw).strip() if model_raw not in (None, "") else None
+
+    spec = PROVIDER_REGISTRY.get(provider)
+    base_url_default = spec.default_base_url if spec else None
+    base_url_raw, base_url_source = take("base_url", base_url_default)
+    if base_url_source is SettingSource.DEFAULT and spec and spec.base_url_env:
+        env_base = environ.get(spec.base_url_env)
+        if env_base:
+            base_url_raw, base_url_source = env_base, SettingSource.ENV
+    base_url = str(base_url_raw).strip() if base_url_raw else None
+    if base_url and not re.match(r"^https?://[^\s]+$", base_url):
+        problems.append(
+            _problem("base_url", "must be an http(s) URL, e.g. https://api.openai.com/v1", base_url_source)
+        )
+
+    # --- paths ---------------------------------------------------------------
+    home_raw, home_source = take("home_dir", DEFAULT_HOME_DIRNAME)
+    home_dir = Path(str(home_raw)).expanduser()
+    if not str(home_dir).strip():
+        problems.append(_problem("home_dir", "must not be empty", home_source))
+
+    output_raw, output_source = take("output_dir", home_dir / DEFAULT_OUTPUT_DIRNAME)
+    output_dir = Path(str(output_raw)).expanduser()
+    if output_dir.exists() and not output_dir.is_dir():
+        problems.append(_problem("output_dir", f"{output_dir} exists and is not a directory", output_source))
+
+    case_raw, case_source = take("case_dir", None)
+    case_dir = Path(str(case_raw)).expanduser() if case_raw else None
+    if case_dir and case_dir.exists() and not case_dir.is_dir():
+        problems.append(_problem("case_dir", f"{case_dir} exists and is not a directory", case_source))
+
+    # --- operator / logging --------------------------------------------------
+    operator_raw, _ = take("operator", None)
+    operator = str(operator_raw).strip() if operator_raw else None
+
+    log_raw, log_source = take("log_level", DEFAULT_LOG_LEVEL)
+    log_level = str(log_raw).strip().upper()
+    if log_level not in _LOG_LEVELS:
+        problems.append(
+            _problem("log_level", f"must be one of {', '.join(_LOG_LEVELS)}, got {log_level!r}", log_source)
+        )
+
+    user_agent_raw, _ = take("user_agent", DEFAULT_USER_AGENT)
+    user_agent = str(user_agent_raw).strip()
+
+    # --- numeric extras ------------------------------------------------------
+    timeout_raw, timeout_source = take("http_timeout", DEFAULT_HTTP_TIMEOUT)
+    try:
+        http_timeout = float(str(timeout_raw))
+    except (TypeError, ValueError):
+        problems.append(
+            _problem("http_timeout", f"expected a number of seconds, got {str(timeout_raw)!r}", timeout_source)
+        )
+        http_timeout = DEFAULT_HTTP_TIMEOUT
+    else:
+        if not 1.0 <= http_timeout <= 300.0:
+            problems.append(_problem("http_timeout", f"must be between 1 and 300 seconds, got {http_timeout}", timeout_source))
+
+    profile_raw, profile_source = take("browser_profile_dir", None)
+    browser_profile_dir = Path(str(profile_raw)).expanduser() if profile_raw else None
+
+    # --- cross-field sanity --------------------------------------------------
+    if numbers["task_budget_seconds"] > numbers["mission_budget_seconds"]:
+        problems.append(
+            _problem(
+                "task_budget_seconds",
+                f"greater than the mission budget ({numbers['mission_budget_seconds']}s); "
+                "the task budget would never bind",
+                provenance.get("task_budget_seconds", SettingSource.DEFAULT),
+                severity=Severity.WARNING,
+            )
+        )
+    if numbers["max_workers_per_agent"] > numbers["max_total_workers"]:
+        problems.append(
+            _problem(
+                "max_workers_per_agent",
+                f"exceeds max_total_workers ({numbers['max_total_workers']}); "
+                "per-subagent capacity cannot exceed the mission-wide ceiling",
+                provenance.get("max_workers_per_agent", SettingSource.DEFAULT),
+            )
+        )
+
+    settings = Settings(
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        home_dir=home_dir,
+        output_dir=output_dir,
+        case_dir=case_dir,
+        operator=operator,
+        log_level=log_level,
+        dry_run=dry_run,
+        max_subagents=numbers["max_subagents"],
+        max_workers_per_agent=numbers["max_workers_per_agent"],
+        max_total_workers=numbers["max_total_workers"],
+        worker_retries=numbers["worker_retries"],
+        review_retries=numbers["review_retries"],
+        mission_budget_seconds=numbers["mission_budget_seconds"],
+        task_budget_seconds=numbers["task_budget_seconds"],
+        browser_headless=flags["browser_headless"],
+        browser_profile_dir=browser_profile_dir,
+        browser_concurrency=numbers["browser_concurrency"],
+        http_concurrency=numbers["http_concurrency"],
+        http_timeout=http_timeout,
+        user_agent=user_agent,
+        allow_network=flags["allow_network"],
+        respect_robots=flags["respect_robots"],
+        provenance=provenance,
+        # Capture the mapping (not its values) so credential lookup matches the
+        # run that produced these settings — including injected test envs.
+        _credential_env=(lambda captured=environ: captured),
+    )
+
+    # Model/credential readiness is checked last: it depends on the provider
+    # that survived validation above.  These are warnings — they gate Phase 3
+    # execution, not inspection of the configuration.
+    problems.extend(readiness_problems(settings))
+
+    # Final redaction pass: scrub any credential value from the environment that
+    # produced these settings, even one pasted into a mis-typed option.
+    injected = tuple(v for v in (environ.get(name) for name in SECRET_ENV_VARS) if v)
+    if injected:
+        problems = [
+            replace(problem, message=redact_text(problem.message, secrets=injected))
+            for problem in problems
+        ]
+    return SettingsResult(settings=settings, problems=problems)
+
+
+def readiness_problems(settings: Settings) -> list[SettingProblem]:
+    """Warnings for capabilities a mission will need but that are not set yet.
+
+    Kept separate from :func:`build_settings`' hard validation so that
+    ``config --settings`` and ``mission --phase settings`` can render them as
+    guidance instead of refusing to run.
+    """
+
+    problems: list[SettingProblem] = []
+    spec = settings.provider_spec()
+    if spec is None:
+        return problems                                # already an error above
+
+    if not settings.model:
+        problems.append(
+            _problem("model", "no model configured — set --model or ARGUS_LLM_MODEL", SettingSource.DEFAULT, Severity.WARNING)
+        )
+    elif spec.models and settings.model not in spec.models:
+        problems.append(
+            _problem(
+                "model",
+                f"{settings.model!r} is not a known {spec.label} model "
+                f"(known: {', '.join(spec.models[:3])}, …); continuing anyway",
+                settings.source_of("model"),
+                Severity.WARNING,
+            )
+        )
+
+    if settings.requires_credential() and not settings.resolve_api_key()[0]:
+        problems.append(
+            SettingProblem(
+                field="api_key",
+                message=f"no credential found for {spec.label}; looked in {spec.key_env_summary()}",
+                severity=Severity.WARNING,
+                source=SettingSource.ENV,
+                env_var=spec.key_env_summary(),
+            )
+        )
+    return problems
+
+
+# --------------------------------------------------------------------------
+# 8.3 Rich rendering
+# --------------------------------------------------------------------------
+
+
+def render_settings_problems(problems: Sequence[SettingProblem], *, title: str = "invalid configuration") -> Panel:
+    """Build the error panel shown when validation fails.
+
+    Every line names the setting, the offending value's *source* and a fix.
+    Messages have already passed through :func:`redact_text`.
+    """
+
+    body = Text()
+    ordered = sorted(problems, key=lambda p: (p.severity is Severity.WARNING, p.field))
+    for index, problem in enumerate(ordered):
+        if index:
+            body.append("\n")
+        colour = "red" if problem.severity is Severity.ERROR else "yellow"
+        glyph = "✘" if problem.severity is Severity.ERROR else "!"
+        body.append(f"{glyph} ", style=f"bold {colour}")
+        body.append(problem.field, style=f"bold {colour}")
+        body.append(f" ({problem.location()}): ", style="dim")
+        body.append(problem.message, style="white")
+
+    errors = sum(1 for p in problems if p.severity is Severity.ERROR)
+    body.append("\n\n")
+    body.append(
+        f"{errors} error(s) must be fixed before any model or browser call is made."
+        if errors
+        else "No blocking errors.",
+        style="dim",
+    )
+    return Panel(body, border_style="red" if errors else "yellow", title=title, title_align="left")
+
+
+def render_settings(settings: Settings, *, show_provenance: bool = True) -> Table:
+    """Render the merged configuration as a grouped table with masked secrets."""
+
+    table = Table(
+        title=f"{APP_TITLE} effective settings",
+        title_justify="left",
+        box=None,
+        pad_edge=False,
+    )
+    table.add_column("setting", style="dim", no_wrap=True)
+    table.add_column("value", overflow="fold")
+    if show_provenance:
+        table.add_column("source", no_wrap=True, justify="right")
+
+    def add(field_name: str, label: str, value: str) -> None:
+        row = [label, value]
+        if show_provenance:
+            source = settings.source_of(field_name)
+            colour = {"cli": "bold cyan", "env": "bold yellow", "default": "dim"}[source.value]
+            row.append(f"[{colour}]{source.value}[/{colour}]")
+        table.add_row(*row)
+
+    def group(name: str) -> None:
+        cells = [f"[bold]{name}[/bold]", ""]
+        if show_provenance:
+            cells.append("")
+        table.add_row(*cells)
+
+    group("model")
+    add("provider", "provider", escape(settings.provider))
+    add("model", "model", escape(settings.model) if settings.model else "[yellow]unset[/yellow]")
+    add("base_url", "base_url", escape(settings.base_url or "—"))
+    # Never the key itself — only its masked state and where it came from.
+    # Provenance is "env" only when a credential variable actually holds a value.
+    key_present = bool(settings.resolve_api_key()[0])
+    table.add_row(
+        "api_key",
+        escape(settings.api_key_hint()),
+        *([] if not show_provenance else ["[dim]env[/dim]" if key_present else "[dim]—[/dim]"]),
+    )
+
+    group("paths")
+    add("home_dir", "home_dir", escape(str(settings.home_dir)))
+    add("output_dir", "output_dir", escape(str(settings.output_dir)))
+    add("case_dir", "case_dir", escape(str(settings.case_dir) if settings.case_dir else "—"))
+
+    group("orchestration")
+    add("max_subagents", "max_subagents", str(settings.max_subagents))
+    add("max_workers_per_agent", "max_workers_per_agent", str(settings.max_workers_per_agent))
+    add("max_total_workers", "max_total_workers", str(settings.max_total_workers))
+    table.add_row(
+        "max_potential_workers",
+        str(settings.max_potential_workers),
+        *([] if not show_provenance else ["[dim]derived[/dim]"]),
+    )
+    add("worker_retries", "worker_retries", str(settings.worker_retries))
+    add("review_retries", "review_retries", str(settings.review_retries))
+
+    group("budgets")
+    add("mission_budget_seconds", "mission_budget_seconds", f"{settings.mission_budget_seconds} ({_human_duration(settings.mission_budget_seconds)})")
+    add("task_budget_seconds", "task_budget_seconds", f"{settings.task_budget_seconds} ({_human_duration(settings.task_budget_seconds)})")
+
+    group("browser")
+    add("browser_headless", "headless", "yes" if settings.browser_headless else "no")
+    add("browser_concurrency", "concurrency", str(settings.browser_concurrency))
+    add("browser_profile_dir", "profile_dir", escape(str(settings.browser_profile_dir) if settings.browser_profile_dir else "ephemeral"))
+
+    group("network")
+    add("allow_network", "allow_network", "yes" if settings.allow_network else "no (offline)")
+    add("respect_robots", "respect_robots", "yes" if settings.respect_robots else "no")
+    add("http_concurrency", "http_concurrency", str(settings.http_concurrency))
+    add("http_timeout", "http_timeout", f"{settings.http_timeout:g}s")
+    add("user_agent", "user_agent", escape(settings.user_agent))
+
+    group("context")
+    add("operator", "operator", escape(settings.operator) if settings.operator else "[yellow]unset[/yellow]")
+    add("log_level", "log_level", escape(settings.log_level))
+    add("dry_run", "dry_run", "yes" if settings.dry_run else "[red]no[/red]")
+    return table
+
+
+def _human_duration(seconds: int) -> str:
+    """Compact ``1h 30m`` / ``5m 0s`` rendering for budget columns."""
+
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def print_settings_report(result: SettingsResult) -> None:
+    """Render settings, then any problems, with a one-line verdict."""
+
+    console = get_console()
+    console.print()
+    console.print(render_settings(result.settings))
+    if result.problems:
+        console.print(
+            render_settings_problems(
+                result.problems,
+                title="configuration problems" if result.ok else "invalid configuration",
+            )
+        )
+    else:
+        console.print("[green]✔ configuration valid[/green] — no problems detected.")
+    console.print()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 9. Typer application
 # ══════════════════════════════════════════════════════════════════════════
 
 app = typer.Typer(
@@ -576,7 +1607,7 @@ def main(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 8. Command: version
+# 10. Command: version
 # ══════════════════════════════════════════════════════════════════════════
 
 
@@ -590,12 +1621,17 @@ def version_command(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 9. Command: config
+# 11. Command: config
 # ══════════════════════════════════════════════════════════════════════════
 
 
-@app.command("config", help="Check interpreter, dependencies, environment and workspace.")
+@app.command("config", help="Check interpreter, dependencies, environment and effective settings.")
 def config_command(
+    settings_only: bool = typer.Option(
+        False,
+        "--settings/--capabilities",
+        help="Show the merged settings object instead of the capability probes.",
+    ),
     as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
     strict: bool = typer.Option(False, "--strict", help="Treat warnings as failures."),
     show_all: bool = typer.Option(
@@ -604,7 +1640,35 @@ def config_command(
         help="List every probe, or only warnings and failures.",
     ),
 ) -> None:
-    """Diagnose the environment.  Exits non-zero when a hard requirement fails."""
+    """Diagnose the environment and validate the effective configuration.
+
+    Exits non-zero when a hard requirement fails, or when the merged settings
+    contain an invalid value (checked before any model or browser is touched).
+    """
+
+    # Validation always runs — a broken setting is a configuration failure even
+    # when the operator only asked about installed packages.
+    settings_result = build_settings()
+    validation_failed = not settings_result.ok
+
+    if settings_only:
+        if as_json:
+            _emit(
+                json.dumps(
+                    {
+                        "app": APP_NAME,
+                        "version": __version__,
+                        "build_phase": BUILD_PHASE,
+                        "ok": settings_result.ok,
+                        "settings": settings_result.settings.to_dict(),
+                        "problems": [p.to_dict() for p in settings_result.problems],
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print_settings_report(settings_result)
+        raise typer.Exit(ExitCode.CONFIG if validation_failed else ExitCode.OK)
 
     results = collect_config_results()
     failures = [r for r in results if r.status == "fail"]
@@ -617,10 +1681,12 @@ def config_command(
                     "app": APP_NAME,
                     "version": __version__,
                     "build_phase": BUILD_PHASE,
-                    "ok": not failures and not (strict and warnings),
+                    "ok": not failures and not (strict and warnings) and not validation_failed,
                     "failures": len(failures),
                     "warnings": len(warnings),
                     "checks": [asdict(r) for r in results],
+                    "settings": settings_result.settings.to_dict(),
+                    "settings_problems": [p.to_dict() for p in settings_result.problems],
                 },
                 indent=2,
             )
@@ -671,9 +1737,20 @@ def config_command(
                 "[yellow]No hard failures. Warnings are optional capabilities that are not "
                 "configured yet — features needing them report a clear error until then.[/yellow]"
             )
+
+        if settings_result.problems:
+            console.print()
+            console.print(
+                render_settings_problems(
+                    settings_result.problems,
+                    title="invalid configuration" if validation_failed else "configuration notes",
+                )
+            )
+        else:
+            console.print("[green]✔ configuration valid[/green] — effective settings passed all checks.")
         console.print()
 
-    if failures or (strict and warnings):
+    if failures or (strict and warnings) or validation_failed:
         if strict and warnings and not failures:
             if not as_json:
                 get_console().print(
@@ -685,7 +1762,7 @@ def config_command(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 10. Command: mission (placeholder — orchestration arrives in Phase 3)
+# 12. Command: mission (placeholder — orchestration arrives in Phase 3)
 # ══════════════════════════════════════════════════════════════════════════
 
 
@@ -707,21 +1784,31 @@ def _normalise_targets(raw: Iterable[str]) -> list[str]:
 
 
 def _validate_request(request: MissionRequest) -> None:
-    """Reject obviously unusable missions before any planning happens."""
+    """Mission-shape checks that are independent of configuration.
+
+    Numeric limits are *not* re-validated here: :func:`build_settings` already
+    refused anything out of range before a request could be constructed.  The
+    cheap guard below is defence in depth for programmatic callers.
+    """
 
     if not request.targets:
         raise typer.BadParameter("at least one --target is required")
     if not request.objective.strip():
         raise typer.BadParameter("--objective must not be empty")
-    if request.mode is MissionMode.ACTIVE and not request.authorised:
-        raise typer.BadParameter(
-            "active mode interacts with the target; pass --i-authorize to assert permission"
-        )
-    if request.max_subagents < 1 or request.max_workers < 1:
-        raise typer.BadParameter("--max-subagents and --max-workers must be >= 1")
+    for name, value in (
+        ("max_subagents", request.max_subagents),
+        ("max_workers_per_agent", request.max_workers_per_agent),
+        ("max_total_workers", request.max_total_workers),
+    ):
+        if value < 1:
+            raise typer.BadParameter(f"{name} must be >= 1 (got {value})")
+    if request.worker_retries < 0 or request.review_retries < 0:
+        raise typer.BadParameter("retry counts must be >= 0")
+    if request.mission_budget_seconds < 1 or request.task_budget_seconds < 1:
+        raise typer.BadParameter("time budgets must be >= 1 second")
 
 
-def render_mission_plan(request: MissionRequest) -> None:
+def render_mission_plan(request: MissionRequest, settings: Settings) -> None:
     """Show what the Master Agent *would* do.  No collection is performed."""
 
     console = get_console()
@@ -749,16 +1836,45 @@ def render_mission_plan(request: MissionRequest) -> None:
     table.add_row("targets", f"{len(request.targets)}")
     for index, target in enumerate(request.targets, start=1):
         table.add_row("", f"[bold]{index}.[/bold] {escape(target)}")
-    table.add_row("subagents", f"up to {request.max_subagents} (runtime-created)")
-    table.add_row("workers", f"up to {request.max_workers} per subagent (runtime-created)")
-    table.add_row("case root", escape(str(resolve_home_dir())))
+    table.add_row(
+        "model",
+        f"{escape(settings.provider)} / {escape(settings.model or '[yellow]unset[/yellow]')}"
+        f"  ·  key {escape(settings.api_key_hint())}",
+    )
+    table.add_row("subagents", f"max {request.max_subagents} (runtime-created)")
+    table.add_row(
+        "workers",
+        f"max {request.max_workers_per_agent} per subagent, {request.max_total_workers} total "
+        f"(ceiling {request.max_subagents * request.max_workers_per_agent})",
+    )
+    table.add_row(
+        "retries",
+        f"{request.worker_retries} per task, {request.review_retries} review cycle(s) per subagent",
+    )
+    table.add_row(
+        "budgets",
+        f"mission {_human_duration(request.mission_budget_seconds)}, "
+        f"task {_human_duration(request.task_budget_seconds)}",
+    )
+    table.add_row("output", escape(request.output_dir))
+    table.add_row("browser", f"headless={'yes' if settings.browser_headless else 'no'}, concurrency={settings.browser_concurrency}")
+    table.add_row("network", "allowed" if settings.allow_network else "offline")
     table.add_row("operator", escape(request.operator or "unset (ARGUS_OPERATOR)"))
     table.add_row("created", request.created_at)
     console.print(table)
+
+    if not settings.dry_run:
+        console.print("[red]dry_run: no[/red] — execution requested")
     console.print()
 
 
-@app.command("mission", help="Plan an OSINT/forensics mission (planning scaffold).")
+def _mission_settings_cli_values(**kwargs: Any) -> dict[str, Any]:
+    """Drop unset (``None``) options so environment/defaults can apply."""
+
+    return {key: value for key, value in kwargs.items() if value is not None}
+
+
+@app.command("mission", help="Plan an OSINT/forensics mission using validated settings.")
 def mission_command(
     target: list[str] = typer.Option(
         ...,
@@ -784,51 +1900,162 @@ def mission_command(
         "--i-authorize",
         help="Assert written permission to interact with the targets.",
     ),
-    max_subagents: int = typer.Option(
-        DEFAULT_MAX_SUBAGENTS,
-        "--max-subagents",
-        min=1,
-        max=25,
-        help="Ceiling on Subagents the Master Agent may spawn.",
-    ),
-    max_workers: int = typer.Option(
-        DEFAULT_MAX_WORKERS,
+    # --- configuration overrides: unset means "use env, then default" --------
+    provider: str | None = typer.Option(None, "--provider", help="Model provider (overrides ARGUS_LLM_PROVIDER)."),
+    model: str | None = typer.Option(None, "--model", help="Model id (overrides ARGUS_LLM_MODEL)."),
+    base_url: str | None = typer.Option(None, "--base-url", help="OpenAI-compatible endpoint."),
+    home: str | None = typer.Option(None, "--home", help="Case-data root directory."),
+    output_dir: str | None = typer.Option(None, "--output-dir", help="Mission output directory."),
+    case_dir: str | None = typer.Option(None, "--case-dir", help="Artefact directory for this mission."),
+    operator: str | None = typer.Option(None, "--operator", help="Operator name for the audit trail."),
+    log_level: str | None = typer.Option(None, "--log-level", help="DEBUG | INFO | WARNING | ERROR."),
+    max_subagents: int | None = typer.Option(None, "--max-subagents", help="Ceiling on live Subagents (1-25)."),
+    max_workers: int | None = typer.Option(
+        None,
         "--max-workers",
-        min=1,
-        max=64,
-        help="Ceiling on concurrent Workers per Subagent.",
+        help="Ceiling on concurrent Workers per Subagent (1-16).",
+    ),
+    max_total_workers: int | None = typer.Option(
+        None,
+        "--max-total-workers",
+        help="Mission-wide concurrent Worker ceiling (1-64).",
+    ),
+    worker_retries: int | None = typer.Option(None, "--worker-retries", help="Retries per Worker task (0-10)."),
+    review_retries: int | None = typer.Option(None, "--review-retries", help="Review cycles per Subagent (0-5)."),
+    mission_budget: int | None = typer.Option(None, "--mission-budget", help="Wall-clock mission budget in seconds."),
+    task_budget: int | None = typer.Option(None, "--task-budget", help="Per-task time budget in seconds."),
+    headless: bool | None = typer.Option(None, "--headless/--headed", help="Run Chromium headless or visible."),
+    browser_profile: str | None = typer.Option(None, "--browser-profile", help="Persistent browser profile path."),
+    browser_concurrency: int | None = typer.Option(
+        None, "--browser-concurrency", help="Concurrent browser contexts (1-8)."
+    ),
+    http_concurrency: int | None = typer.Option(None, "--http-concurrency", help="Concurrent HTTP workers (1-32)."),
+    http_timeout: float | None = typer.Option(None, "--http-timeout", help="Per-request timeout in seconds."),
+    user_agent: str | None = typer.Option(None, "--user-agent", help="User-Agent presented to remote hosts."),
+    allow_network: bool | None = typer.Option(
+        None, "--allow-network/--offline", help="Permit or forbid network collection."
+    ),
+    respect_robots: bool | None = typer.Option(
+        None, "--respect-robots/--ignore-robots", help="Honour robots.txt."
     ),
     dry_run: bool = typer.Option(
         True,
         "--dry-run/--execute",
         help="Plan only (default). --execute is rejected until Phase 3.",
     ),
-    as_json: bool = typer.Option(False, "--json", help="Emit the plan as JSON."),
+    phase: MissionPhase = typer.Option(
+        MissionPhase.PLAN,
+        "--phase",
+        case_sensitive=False,
+        help="Output to show: the mission plan, or the effective settings.",
+    ),
+    show_sources: bool = typer.Option(
+        True,
+        "--sources/--no-sources",
+        help="Annotate each setting with where its value came from.",
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit structured JSON."),
 ) -> None:
-    """Validate a mission request and print the plan.  Never performs collection."""
+    """Validate settings + mission, then print the plan.  Never performs collection."""
 
-    request = MissionRequest(
+    console = get_console()
+
+    # 1. Configuration first.  Nothing below this point runs when a limit is
+    #    invalid, so no model client or browser can ever see a bad value.
+    cli_values = _mission_settings_cli_values(
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        home_dir=home,
+        output_dir=output_dir,
+        case_dir=case_dir,
+        operator=operator,
+        log_level=log_level,
+        max_subagents=max_subagents,
+        max_workers_per_agent=max_workers,
+        max_total_workers=max_total_workers,
+        worker_retries=worker_retries,
+        review_retries=review_retries,
+        mission_budget_seconds=mission_budget,
+        task_budget_seconds=task_budget,
+        browser_headless=headless,
+        browser_profile_dir=browser_profile,
+        browser_concurrency=browser_concurrency,
+        http_concurrency=http_concurrency,
+        http_timeout=http_timeout,
+        user_agent=user_agent,
+        allow_network=allow_network,
+        respect_robots=respect_robots,
+        dry_run=dry_run,
+    )
+    result = build_settings(cli_values)
+
+    if not result.ok:
+        if as_json:
+            _emit(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "stage": "configuration",
+                        "aborted_before_model_call": True,
+                        "problems": [p.to_dict() for p in result.problems],
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            console.print()
+            console.print(render_settings_problems(result.errors))
+            console.print(
+                "[dim]Aborted before any model or browser call. "
+                "Nothing was collected and no client was constructed.[/dim]\n"
+            )
+        raise typer.Exit(ExitCode.CONFIG)
+
+    settings = result.settings
+
+    # 2. Mission shape and authorisation.
+    request = MissionRequest.from_settings(
+        settings,
         targets=_normalise_targets(target),
         objective=objective,
         mode=mode,
         authorised=i_authorize,
-        max_subagents=max_subagents,
-        max_workers=max_workers,
+        dry_run=dry_run,
     )
-
     try:
         _validate_request(request)
     except typer.BadParameter as exc:
-        get_console().print(f"[red]invalid mission:[/red] {escape(str(exc))}")
+        console.print(f"[red]invalid mission:[/red] {escape(str(exc))}")
         raise typer.Exit(ExitCode.USAGE) from exc
 
     if request.mode is MissionMode.ACTIVE and not request.authorised:
-        get_console().print(
+        console.print(
             "[red]refusing mission:[/red] active mode requires --i-authorize (authorised use only)."
         )
         raise typer.Exit(ExitCode.AUTHORIZATION)
 
-    if as_json:
+    # 3. Render.  ``settings`` phase is a pure configuration view.
+    if phase is MissionPhase.SETTINGS:
+        if as_json:
+            _emit(
+                json.dumps(
+                    {
+                        "mission_id": request.fingerprint(),
+                        "ok": True,
+                        "settings": settings.to_dict(),
+                        "problems": [p.to_dict() for p in result.problems],
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            console.print()
+            console.print(render_settings(settings, show_provenance=show_sources))
+            if result.problems:
+                console.print(render_settings_problems(result.problems, title="configuration notes"))
+            console.print()
+    elif as_json:
         _emit(
             json.dumps(
                 {
@@ -836,9 +2063,14 @@ def mission_command(
                     "build_phase": BUILD_PHASE,
                     "executed": False,
                     "request": request.to_dict(),
+                    "settings": settings.to_dict(),
+                    "warnings": [p.to_dict() for p in result.problems],
                     "plan": {
                         "subagents": f"runtime-created, max {request.max_subagents}",
-                        "workers": f"runtime-created, max {request.max_workers}",
+                        "workers": (
+                            f"runtime-created, max {request.max_workers_per_agent} per subagent, "
+                            f"{request.max_total_workers} total"
+                        ),
                         "orchestrator": "langgraph (phase 3)",
                     },
                 },
@@ -846,10 +2078,13 @@ def mission_command(
             )
         )
     else:
-        render_mission_plan(request)
+        render_mission_plan(request, settings)
+        if result.problems:
+            console.print(render_settings_problems(result.problems, title="configuration notes"))
+            console.print()
 
     if not dry_run:
-        get_console().print(
+        console.print(
             Panel(
                 Text(
                     "Execution is not wired up yet — the LangGraph Master Agent and the runtime "
@@ -868,7 +2103,7 @@ def mission_command(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 11. Entry point
+# 13. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 
