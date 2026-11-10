@@ -102,6 +102,7 @@ Usage
     python vedant_osint.py config
     python vedant_osint.py config --settings            # merged, redacted view
     python vedant_osint.py doctor                       # full capability health check
+    python vedant_osint.py policy -o "..." --scope example.com          # safety preflight only
     python vedant_osint.py mission --target example.com -o "map the attack surface"
     python vedant_osint.py mission -t example.com -o "..." --phase settings --json
 
@@ -128,11 +129,33 @@ Credential values are never printed: the model section reports only a masked
 hint such as ``sk-p…c3f9 (len 51) from OPENAI_API_KEY``.  Set
 ``PLAYWRIGHT_BROWSERS_PATH`` to point the browser probe at a custom location.
 
+Safety and scope preflight
+--------------------------
+Every mission passes a policy gate **before** anything is planned.  Supported
+work is limited to public-web OSINT and forensic review of artefacts you own or
+are explicitly authorised to examine.
+
+Objectives requesting unauthorised account access, credential theft, evasion or
+anti-forensics, doxxing, harassment or destructive action are **refused**
+(exit ``7``).  No flag overrides a refusal.  Objectives that assume guilt
+("find the bad guys") or attribute conduct from suspicion are **paused**
+(exit ``8``) until the operator either confirms authorised intent
+(``--confirm-intent``) or adopts an evidence-based reframe (``--accept-reframe``)
+that collects indicators, tests competing hypotheses, attributes nothing to an
+individual, and reports uncertainty.
+
+Scope is an explicit allow-list of assets.  A target not covered by ``--scope``
+(or matching ``--exclude``) is blocked with exit ``2`` and never reaches
+planning; a programmatic caller must also pass
+:func:`enforce_preflight`, which raises :class:`PolicyViolation`.
+
 Exit codes
 ----------
 See :class:`ExitCode`.  ``config`` and ``doctor`` return ``3`` (CONFIG) when a
 *required* capability is missing — usable as CI/installation gates — and ``0``
-when only optional capabilities are absent.
+when only optional capabilities are absent.  ``mission`` returns ``7`` for a
+policy refusal, ``8`` for a paused objective and ``2`` for an out-of-scope
+target.
 
 Authorised use only
 -------------------
@@ -149,6 +172,7 @@ from __future__ import annotations
 
 # --- standard library: cheap, side-effect free -------------------------------
 import importlib.util
+import ipaddress
 import json
 import os
 import platform
@@ -191,7 +215,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 3
+VERSION_MINOR: int = 4
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -244,7 +268,7 @@ BUILD_PHASE_NAME: str = "Contracts"
 #: Section banners shared by the banner panel and ``version --json``.
 PHASE_ROADMAP: tuple[tuple[int, str, str], ...] = (
     (1, "Foundation", "CLI skeleton, config probing, version reporting"),
-    (2, "Contracts", "Strict settings object, contracts and the capability doctor"),
+    (2, "Contracts", "Strict settings, capability doctor, safety & scope preflight"),
     (3, "Orchestration", "LangGraph Master Agent + runtime Subagent factory"),
     (4, "Browser", "browser-use/Playwright sessions and capture"),
     (5, "Collection", "passive OSINT sources, artefact hashing/chain of custody"),
@@ -265,6 +289,8 @@ class ExitCode(IntEnum):
     DEPENDENCY = 4            # optional capability requested but not installed
     AUTHORIZATION = 5         # mission refused: no authorisation asserted
     NOT_IMPLEMENTED = 6       # capability lands in a later phase
+    POLICY = 7                # mission refused by the safety policy
+    CLARIFICATION = 8         # mission paused: intent must be confirmed or reframed
     INTERNAL = 70             # unexpected failure
 
 
@@ -2557,7 +2583,1209 @@ def doctor_command(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 13. Command: mission
+# 13. Mission safety policy and scope preflight
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Every mission passes through run_preflight() before anything is planned.
+# The policy has three outcomes:
+#
+#   ALLOW  — objective and scope are lawful, authorised and explicit.
+#   PAUSE  — plausible but ambiguous (defensive phrasing, guilt assumptions,
+#            speculative identification): the operator must confirm intent or
+#            adopt an evidence-based reframe.
+#   REFUSE — the request is for unauthorised access, credential theft, evasion,
+#            doxxing, harassment or destructive action.  No flag overrides this.
+#
+# Out-of-scope work cannot reach planning: the mission command evaluates this
+# before rendering a plan, and enforce_preflight() guards the executor seam.
+
+class PolicyOutcome(str, Enum):
+    """Result of evaluating an objective against the safety policy."""
+
+    ALLOW = "allow"
+    PAUSE = "pause"
+    REFUSE = "refuse"
+
+
+class PolicyCategory(str, Enum):
+    """What a request is asking for.
+
+    The first three are the supported, lawful mission types; the rest are
+    refused or paused.
+    """
+
+    PUBLIC_WEB_OSINT = "public-web-osint"
+    OWNED_FORENSIC = "owned-forensic"
+    AUTHORIZED_FORENSIC = "authorized-forensic"
+    UNAUTHORIZED_ACCESS = "unauthorized-access"
+    CREDENTIAL_THEFT = "credential-theft"
+    EVASION = "evasion"
+    DOXXING = "doxxing"
+    HARASSMENT = "harassment"
+    DESTRUCTIVE = "destructive-action"
+    SPECULATIVE_ID = "speculative-identification"
+    GUILT_ASSUMPTION = "guilt-assumption"
+    PERSONAL_DATA = "personal-data-collection"
+
+
+class DataClass(str, Enum):
+    """The kind of evidence a mission is authorised to touch."""
+
+    PUBLIC_WEB = "public-web"                    # published, public sources only
+    OWNED_ARTIFACT = "owned-artifact"            # artefacts you own
+    AUTHORIZED_ARTIFACT = "authorized-artifact"  # artefacts you are permitted to examine
+
+
+#: Data classes that are forensic (local, read-only) rather than web collection.
+ARTIFACT_DATA_CLASSES: frozenset[DataClass] = frozenset(
+    {DataClass.OWNED_ARTIFACT, DataClass.AUTHORIZED_ARTIFACT}
+)
+
+
+@dataclass(frozen=True)
+class PolicyRule:
+    """One detection rule: what it catches, why, and the safe alternative.
+
+    ``patterns`` are case-insensitive regexes matched sentence by sentence.
+    ``defensive_context`` words in the *same sentence* downgrade a REFUSE to a
+    PAUSE, because "detect credential theft" and "steal credentials" must not
+    be treated alike.
+    """
+
+    id: str
+    category: PolicyCategory
+    outcome: PolicyOutcome
+    patterns: tuple[str, ...]
+    rationale: str
+    alternative: str
+    label: str
+    reframable: bool = False
+
+
+@dataclass(frozen=True)
+class ScopeDeclaration:
+    """The explicit boundary a mission may act within.
+
+    Every target must be covered by at least one :attr:`entries` item and by no
+    :attr:`exclusions` item.  Nothing outside this boundary can be planned.
+    """
+
+    targets: tuple[str, ...]
+    entries: tuple[str, ...]
+    exclusions: tuple[str, ...]
+    data_classes: frozenset[DataClass]
+    mode: MissionMode
+    authorized_by: str | None = None
+    authorization_basis: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "targets": list(self.targets),
+            "entries": list(self.entries),
+            "exclusions": list(self.exclusions),
+            "data_classes": sorted(dc.value for dc in self.data_classes),
+            "mode": self.mode.value,
+            "authorized_by": self.authorized_by,
+            "authorization_basis": self.authorization_basis,
+        }
+
+
+@dataclass(frozen=True)
+class PolicyVerdict:
+    """Outcome of scanning an objective string."""
+
+    outcome: PolicyOutcome
+    category: PolicyCategory | None = None
+    rule_id: str | None = None
+    rationale: str = ""
+    alternative: str = ""
+    evidence: tuple[str, ...] = ()          # matched fragments (already bounded)
+    downgraded: bool = False                # REFUSE softened by defensive context
+    notes: tuple[str, ...] = ()
+    reframable: bool = False
+
+    @property
+    def allowed(self) -> bool:
+        return self.outcome is PolicyOutcome.ALLOW
+
+    @property
+    def refused(self) -> bool:
+        return self.outcome is PolicyOutcome.REFUSE
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "outcome": self.outcome.value,
+            "category": self.category.value if self.category else None,
+            "rule_id": self.rule_id,
+            "rationale": redact_text(self.rationale, secrets=known_secrets()),
+            "alternative": redact_text(self.alternative, secrets=known_secrets()),
+            "evidence": [redact_text(e, secrets=known_secrets()) for e in self.evidence],
+            "downgraded_from_refusal": self.downgraded,
+            "notes": list(self.notes),
+            "reframable": self.reframable,
+        }
+
+
+@dataclass(frozen=True)
+class PreflightIssue:
+    """A scope or request-shape problem found before planning."""
+
+    id: str
+    message: str
+    fix: str
+    blocking: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "message": redact_text(self.message, secrets=known_secrets()),
+            "fix": self.fix,
+            "blocking": self.blocking,
+        }
+
+
+@dataclass
+class PreflightReport:
+    """Everything the mission command needs to decide allow / pause / refuse."""
+
+    verdict: PolicyVerdict
+    issues: list[PreflightIssue]
+    scope: ScopeDeclaration | None
+    objective: str                       # effective objective (reframed if adopted)
+    original_objective: str
+    reframed_objective: str | None = None
+    reframe_adopted: bool = False
+    intent_confirmed: bool = False
+
+    @property
+    def blocking_issues(self) -> list[PreflightIssue]:
+        return [i for i in self.issues if i.blocking]
+
+    @property
+    def paused(self) -> bool:
+        """True when the verdict needs confirmation or a reframe."""
+
+        return self.verdict.outcome is PolicyOutcome.PAUSE and not self.resolved
+
+    @property
+    def resolved(self) -> bool:
+        return self.reframe_adopted or self.intent_confirmed
+
+    @property
+    def ok(self) -> bool:
+        """True only when the mission may proceed to planning."""
+
+        return not self.verdict.refused and not self.blocking_issues and not self.paused
+
+    @property
+    def exit_code(self) -> int:
+        """Most severe reason the mission cannot proceed."""
+
+        if self.verdict.refused:
+            return int(ExitCode.POLICY)
+        if self.blocking_issues:
+            return int(ExitCode.USAGE)
+        if self.paused:
+            return int(ExitCode.CLARIFICATION)
+        return int(ExitCode.OK)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "exit_code": self.exit_code,
+            "objective": redact_text(self.objective, secrets=known_secrets()),
+            "original_objective": redact_text(self.original_objective, secrets=known_secrets()),
+            "reframed_objective": (
+                redact_text(self.reframed_objective, secrets=known_secrets())
+                if self.reframed_objective
+                else None
+            ),
+            "reframe_adopted": self.reframe_adopted,
+            "intent_confirmed": self.intent_confirmed,
+            "verdict": self.verdict.to_dict(),
+            "scope": self.scope.to_dict() if self.scope else None,
+            "issues": [i.to_dict() for i in self.issues],
+        }
+
+
+class PolicyViolation(RuntimeError):
+    """Raised at the executor seam when a mission was not cleared to run.
+
+    Phase 3's executor must call :func:`enforce_preflight` before its first
+    tool call, so a refusal cannot be bypassed by a programmatic caller.
+    """
+
+    def __init__(self, message: str, report: PreflightReport) -> None:
+        super().__init__(message)
+        self.report = report
+
+
+# --------------------------------------------------------------------------
+# 13.1 Rulebook
+# --------------------------------------------------------------------------
+
+#: Words that mark a *defensive* sentence ("detect", "protect", "indicators
+#: of").  They soften a refusal into a pause — never the other way round.
+_DEFENSIVE_CONTEXT = re.compile(
+    r"\b(?:detect(?:ion|ing|s)?|defen[cs]e|defend|protect(?:ion|ing)?|prevent(?:ion|ing)?|"
+    r"patch(?:ing|es)?|remediat\w*|mitigat\w*|awareness|training|indicator(?:s)?|"
+    r"evidence of|investigat\w*|audit(?:ing)?|assess\w*|harden\w*|exposure|risk|controls?)\b",
+    re.IGNORECASE,
+)
+
+POLICY_RULES: tuple[PolicyRule, ...] = (
+    # -- refused outright ----------------------------------------------------
+    PolicyRule(
+        id="unauthorized-access",
+        label="unauthorised account or device access",
+        category=PolicyCategory.UNAUTHORIZED_ACCESS,
+        outcome=PolicyOutcome.REFUSE,
+        patterns=(
+            # "hack into X's account", "log into her inbox", "get into the phone"
+            r"\b(?:hack|break|get|log|sign|sneak|tunnel)\s+(?:in)?to\s+(?:[a-z0-9_.@'-]+\s+){0,3}"
+            r"(?:accounts?|inbox|e-?mail|mailbox|phone|device|laptop|server|router|console|"
+            r"profile|instagram|facebook|whatsapp|snapchat|tiktok|telegram|gmail|outlook)\b",
+            # "hack her instagram", "crack my ex's account", "take over someone's profile"
+            r"\b(?:hack|pwn|crack|take over|break into|break)\b[^.?!]{0,25}"
+            r"(?:accounts?|inbox|mailbox|phone|device|profile|instagram|facebook|whatsapp|"
+            r"snapchat|tiktok|telegram|gmail|outlook|i-?cloud|netflix|spotify)\b",
+            # "read her messages", "see his texts without him knowing"
+            r"\b(?:read|see|check|monitor|access)\s+(?:[a-z0-9_.@'-]+\s+){0,2}"
+            r"(?:messages|texts?|dms?|chats?|inbox|e-?mail|call log)\b[^.?!]{0,25}"
+            r"\b(?:without (?:them|him|her|their) knowing|secretly|behind (?:their|his|her) back)\b",
+            r"\b(?:bypass|circumvent|defeat|get past|get around|sidestep)\b[^.?!]{0,40}"
+            r"\b(?:2fa|mfa|two[- ]?factor|authentication|auth|login|password|captcha|access control)\b",
+            r"\bunauthori[sz]ed\s+(?:access|entry|login|intrusion)\b",
+            r"\b(?:brute[- ]?force|password[- ]spray|credential[- ]stuffing)\b[^.?!]{0,40}"
+            r"\b(?:accounts?|login|portal|admin|endpoint|credential)\b",
+            r"\bsim[- ]?swap\b",
+            r"\b(?:session|token|cookie)\s+hijack",
+            r"\b(?:spy on|secretly monitor|track)\b[^.?!]{0,30}"
+            r"\b(?:partner|spouse|ex|boyfriend|girlfriend|husband|wife|employee|child|kid|tenant)\b",
+        ),
+        rationale=(
+            "Entering someone else's account, device or session is unauthorised access, "
+            "which this tool will not plan or assist with."
+        ),
+        alternative=(
+            "Ask the account owner for written consent and have them export the data, or have "
+            "them authorise a forensic review of artefacts they provide (--data-class "
+            "authorized-artifact --mode forensic). We can also examine only what they own."
+        ),
+    ),
+    PolicyRule(
+        id="credential-theft",
+        label="credential or secret capture",
+        category=PolicyCategory.CREDENTIAL_THEFT,
+        outcome=PolicyOutcome.REFUSE,
+        patterns=(
+            r"\b(?:steal|harvest|capture|dump|exfiltrate|grab|extract|obtain|recover)\b[^.?!]{0,40}"
+            r"\b(?:passwords?|passwd|creds|credentials|cookies|session tokens?|api keys?|"
+            r"private keys?|password hashes?|otp|one[- ]time codes?)\b",
+            r"\b(?:keylog(?:ger|ging)?|mimikatz|hashcat|john the ripper|responder|bloodhound)\b",
+            r"\bphish(?:ing)?\s+(?:page|kit|campaign|site|link)\b",
+            r"\bcredential[- ]dump(?:s|ing)?\b",
+            r"\b(?:sniff|intercept)\b[^.?!]{0,25}\b(?:traffic|packets?|session|credentials)\b",
+        ),
+        rationale=(
+            "Capturing passwords, tokens, cookies or keys is credential theft, even when the "
+            "intent is to test a system you do not own."
+        ),
+        alternative=(
+            "Measure exposure without capturing secrets: review authentication logs you own for "
+            "failed-login patterns, check breach-notification services for your own domain, and "
+            "we can document credential-stuffing indicators already present in those logs."
+        ),
+    ),
+    PolicyRule(
+        id="evasion",
+        label="detection evasion or anti-forensics",
+        category=PolicyCategory.EVASION,
+        outcome=PolicyOutcome.REFUSE,
+        patterns=(
+            r"\b(?:evade|avoid|bypass|dodge|defeat|get past|slip past)\b[^.?!]{0,40}"
+            r"\b(?:detection|monitoring|logging|audit(?:ing)?|forensics?|edr|siem|antivirus|"
+            r"anti-virus|waf|ids|ips|tripwire|security team)\b",
+            r"\b(?:cover|erase|wipe|clear|destroy|delete|scrub)\b[^.?!]{0,20}"
+            r"\b(?:tracks|logs?|history|artefacts?|artifacts?|evidence)\b",
+            r"\banti[- ]?forensics?\b",
+            r"\bwithout\s+(?:leaving|being)\s+(?:a\s+)?(?:traces?|detected|noticed|logged)\b",
+            r"\bhide\s+(?:the\s+)?(?:traffic|activity|identity|footprint)\s+from\b",
+        ),
+        rationale=(
+            "Evading detection or destroying logs is anti-forensics: it removes the evidence "
+            "that a lawful investigation depends on."
+        ),
+        alternative=(
+            "We can map your logging and detection coverage, then recommend concrete hardening — "
+            "the opposite of evasion — or preserve evidence read-only for a lawful review."
+        ),
+    ),
+    PolicyRule(
+        id="doxxing",
+        label="doxxing or personal-identifier aggregation",
+        category=PolicyCategory.DOXXING,
+        outcome=PolicyOutcome.REFUSE,
+        patterns=(
+            r"\bdox(?:x|ing|ed)?\b",
+            r"\b(?:home|residential|house|personal|private)\s+address\b",
+            r"\b(?:find|locate|reveal|leak|publish|expose|uncover|get)\b[^.?!]{0,40}"
+            r"\b(?:home address|where (?:he|she|they) lives?|real name|phone number|"
+            r"social security|national id|aadhaar|passport number|family members?|"
+            r"workplace|school (?:of|they))\b",
+            r"\breverse\s+(?:image|phone|address|username)\s+search\b[^.?!]{0,30}"
+            r"\b(?:person|individual|someone|employee|user|neighbou?r)\b",
+        ),
+        rationale=(
+            "Aggregating someone's home address, phone number or family details is doxxing and "
+            "creates a real-world safety risk, whatever the justification."
+        ),
+        alternative=(
+            "If you are documenting a threat to yourself, we can preserve the threatening "
+            "messages with timestamps and provenance for a report to the platform or police — "
+            "without compiling the other party's personal identifiers."
+        ),
+    ),
+    PolicyRule(
+        id="harassment",
+        label="harassment, intimidation or retaliation",
+        category=PolicyCategory.HARASSMENT,
+        outcome=PolicyOutcome.REFUSE,
+        patterns=(
+            r"\b(?:harass|intimidate|threaten|swat(?:ting)?|stalk(?:ing)?|cyberbull(?:y|ying)|"
+            r"brigade|dogpile)\b",
+            r"\b(?:send|deliver|post|leak)\b[^.?!]{0,25}\b(?:threats?|abuse|hate|harassing)\b",
+            r"\b(?:ruin|destroy|end)\b[^.?!]{0,25}\b(?:reputation|lives?|career)\b",
+            r"\b(?:get|take)\s+revenge\b|\bretaliat(?:e|ion)\b",
+            r"\b(?:make|so)\b[^.?!]{0,20}\b(?:life|uncomfortable|hell)\b",
+        ),
+        rationale=(
+            "Harassment, intimidation and retaliation cause direct harm and are outside what "
+            "this tool will support."
+        ),
+        alternative=(
+            "If you are the target, we can preserve the evidence (screenshots, timestamps, "
+            "headers) in a chain-of-custody folder and draft a factual report for the platform "
+            "or law enforcement."
+        ),
+    ),
+    PolicyRule(
+        id="destructive",
+        label="destructive or disruptive action",
+        category=PolicyCategory.DESTRUCTIVE,
+        outcome=PolicyOutcome.REFUSE,
+        patterns=(
+            r"\b(?:ddos|do\s?s|flood|overwhelm)\b[^.?!]{0,25}"
+            r"\b(?:(?:web)?sites?|servers?|services?|endpoints?|networks?|hosts?|infrastructure)\b",
+            r"\b(?:take|bring)\s+(?:down|offline)\b[^.?!]{0,25}"
+            r"\b(?:(?:web)?sites?|servers?|services?|accounts?|networks?|hosts?)\b",
+            r"\b(?:delete|wipe|destroy|corrupt|nuke|brick|ransom|encrypt)\b[^.?!]{0,30}"
+            r"\b(?:\w+\s+){0,2}(?:data|files?|servers?|website|account|backups?|systems?|database)\b",
+            r"\b(?:inject|plant|install|deploy|drop)\b[^.?!]{0,30}"
+            r"\b(?:malware|backdoor|ransomware|rootkit|trojan|worm|keylogger|implant)\b",
+            r"\b(?:sabotage|vandalise|vandalize|deface)\b",
+            r"\b(?:lock|change)\s+(?:them|him|her|the user)\s+out\b",
+        ),
+        rationale=(
+            "Destroying data, disrupting services or planting malicious code is not investigation "
+            "— it destroys evidence and harms third parties."
+        ),
+        alternative=(
+            "We can take a read-only snapshot and inventory to support a lawful takedown request "
+            "or incident report, and document impact without touching the target."
+        ),
+    ),
+    # -- paused pending clarification / reframe ------------------------------
+    PolicyRule(
+        id="guilt-assumption",
+        label="assumes guilt instead of testing hypotheses",
+        category=PolicyCategory.GUILT_ASSUMPTION,
+        outcome=PolicyOutcome.PAUSE,
+        patterns=(
+            r"\b(?:find|identify|catch|nail|expose|prove|confirm|hunt(?: down)?|who is|who are)\b"
+            r"[^.?!]{0,30}\b(?:the\s+)?(?:bad guys?|bad actors?|criminals?|culprits?|"
+            r"guilty (?:party|one)|perpetrators?|attackers?|hackers?|fraudsters?|scammers?|"
+            r"who did (?:it|this))\b",
+            r"\b(?:prove|show|confirm|establish)\b[^.?!]{0,25}"
+            r"\b(?:guilt|that .{0,24} (?:is|was) (?:guilty|responsible|the attacker|the culprit))\b",
+            r"\bfind (?:the )?(?:person|one) (?:responsible|behind)\b",
+        ),
+        rationale=(
+            "The objective names a conclusion ('the bad guys') before any evidence has been "
+            "collected. An investigation should test competing hypotheses, not confirm a "
+            "suspicion, and should never declare an individual guilty."
+        ),
+        alternative=(
+            "Collect and corroborate indicators, test at least one benign alternative "
+            "explanation, and report confidence and residual uncertainty instead of a verdict."
+        ),
+        reframable=True,
+    ),
+    PolicyRule(
+        id="speculative-identification",
+        label="identification based on suspicion alone",
+        category=PolicyCategory.SPECULATIVE_ID,
+        outcome=PolicyOutcome.PAUSE,
+        patterns=(
+            r"\b(?:i|we)\s+(?:think|suspect|believe|reckon|guess|bet|feel)\b[^.?!]{0,40}"
+            r"\b(?:is|are|might be|must be|has to be|could be)\b[^.?!]{0,30}"
+            r"\b(?:criminal|guilty|attacker|hacker|fraudster|scammer|stalker|thief|leaker|"
+            r"insider|spy|culprit|the one)\b",
+            r"\b(?:probably|maybe|likely|must be|has to be|could be|i bet|clearly|obviously)\b"
+            r"[^.?!]{0,30}\b(?:guilty|the culprit|the attacker|the one who|responsible|"
+            r"(?:the|an?) (?:insider|leaker|thief|fraudster|scammer|stalker|spy|hacker))\b",
+            r"\b(?:weak|vague|unconfirmed|gut)\s+(?:suspicion|feeling|hunch)\b",
+            r"\bidentify\b[^.?!]{0,30}\b(?:based (?:only )?on|just because|because of)\b"
+            r"[^.?!]{0,20}\b(?:suspicion|rumou?r|hunch|feeling|association|looks?)\b",
+        ),
+        rationale=(
+            "Attributing conduct from suspicion, association or a hunch risks identifying an "
+            "innocent person and produces findings that cannot be defended."
+        ),
+        alternative=(
+            "Treat the suspicion as one hypothesis among several, define what evidence would "
+            "falsify it, and report only what sources actually support — with uncertainty stated."
+        ),
+        reframable=True,
+    ),
+    PolicyRule(
+        id="personal-data-collection",
+        label="aggregating personal data on individuals",
+        category=PolicyCategory.PERSONAL_DATA,
+        outcome=PolicyOutcome.PAUSE,
+        patterns=(
+            r"\b(?:collect|gather|scrape|aggregate|compile|harvest|build)\b[^.?!]{0,35}"
+            r"\b(?:personal|private|sensitive)\s+(?:data|information|details)\b",
+            r"\b(?:build|create|compile|assemble)\b[^.?!]{0,25}\b(?:dossier|profile|file)\b"
+            r"[^.?!]{0,25}\b(?:on|about|of)\b[^.?!]{0,20}"
+            r"\b(?:individual|person|employee|someone|user|neighbou?r|customer)\b",
+        ),
+        rationale=(
+            "Aggregating personal data on identified individuals needs a documented lawful basis "
+            "and a minimisation plan; without one it risks becoming profiling."
+        ),
+        alternative=(
+            "Name the lawful basis (--authorization-basis) and the minimum fields required, or "
+            "keep the mission at the organisation/publication level rather than the individual."
+        ),
+        reframable=True,
+    ),
+)
+
+#: Lookup by rule id — used by tests and by future audit tooling.
+POLICY_RULES_BY_ID: dict[str, PolicyRule] = {rule.id: rule for rule in POLICY_RULES}
+
+
+_PROVENANCE_STOPWORDS = re.compile(r"[\s,;]+")
+
+
+def _policy_sentences(text: str) -> list[str]:
+    """Split an objective into sentences so context words stay local."""
+
+    return [part.strip() for part in re.split(r"(?<=[.!?;])\s+|\n+", text) if part.strip()]
+
+
+def _remove_spans(sentence: str, matches: Sequence[re.Match[str]]) -> str:
+    """Return *sentence* with the matched spans deleted (context isolation)."""
+
+    out = sentence
+    for match in sorted(matches, key=lambda m: m.start(), reverse=True):
+        out = out[: match.start()] + " " + out[match.end():]
+    return out
+
+
+def _bounded(fragment: str, limit: int = 120) -> str:
+    """Trim a matched fragment for display, collapsing whitespace."""
+
+    collapsed = " ".join(fragment.split())
+    return collapsed if len(collapsed) <= limit else collapsed[: limit - 1] + "…"
+
+
+def evaluate_objective(objective: str) -> PolicyVerdict:
+    """Scan an objective against :data:`POLICY_RULES`.
+
+    The most severe outcome wins: REFUSE over PAUSE over ALLOW.  A refusal that
+    occurs in a sentence containing defensive context (``detect``, ``protect``,
+    ``indicators of``) is downgraded to a PAUSE, because that phrasing usually
+    describes measuring a risk rather than carrying it out.
+    """
+
+    text = objective or ""
+    if not text.strip():
+        return PolicyVerdict(
+            outcome=PolicyOutcome.REFUSE,
+            rationale="An objective is required so that scope and authorisation can be assessed.",
+            alternative="Describe what you want to establish, e.g. 'map the public attack surface of example.com'.",
+        )
+
+    sentences = _policy_sentences(text)
+    refusals: list[tuple[PolicyRule, list[str], bool]] = []
+    pauses: list[tuple[PolicyRule, list[str], bool]] = []
+
+    for rule in POLICY_RULES:
+        fragments: list[str] = []
+        defensive = False
+        for sentence in sentences:
+            matches = [
+                match
+                for pattern in rule.patterns
+                for match in re.finditer(pattern, sentence, re.IGNORECASE)
+            ]
+            if not matches:
+                continue
+            fragments.extend(_bounded(m.group(0)) for m in matches)
+            # Defensive context must come from *outside* the matched phrase:
+            # "evade detection" is not defensive just because it says "detection".
+            residue = _remove_spans(sentence, matches)
+            if _DEFENSIVE_CONTEXT.search(residue):
+                defensive = True
+        if not fragments:
+            continue
+        bucket = refusals if rule.outcome is PolicyOutcome.REFUSE else pauses
+        bucket.append((rule, fragments, defensive))
+
+    # 1. Non-defensive refusals block outright.
+    hard = [item for item in refusals if not item[2]]
+    if hard:
+        rule, fragments, _ = hard[0]
+        return PolicyVerdict(
+            outcome=PolicyOutcome.REFUSE,
+            category=rule.category,
+            rule_id=rule.id,
+            rationale=f"{rule.label.capitalize()}: {rule.rationale}",
+            alternative=rule.alternative,
+            evidence=tuple(dict.fromkeys(fragments))[:5],
+            reframable=rule.reframable,
+        )
+
+    # 2. Defensive-context refusals need confirmation, not a refusal.
+    if refusals:
+        rule, fragments, _ = refusals[0]
+        return PolicyVerdict(
+            outcome=PolicyOutcome.PAUSE,
+            category=rule.category,
+            rule_id=rule.id,
+            rationale=(
+                f"{rule.label.capitalize()} — but the wording is defensive "
+                "(detect/protect/indicators), so this needs confirmation before planning."
+            ),
+            alternative=rule.alternative,
+            evidence=tuple(dict.fromkeys(fragments))[:5],
+            downgraded=True,
+            notes=(f"Confirm with --confirm-intent if this is authorised defensive work.",),
+            reframable=rule.reframable,
+        )
+
+    # 3. Ambiguity: pause with a reframe the operator can adopt.
+    if pauses:
+        rule, fragments, _ = pauses[0]
+        return PolicyVerdict(
+            outcome=PolicyOutcome.PAUSE,
+            category=rule.category,
+            rule_id=rule.id,
+            rationale=f"{rule.label.capitalize()}: {rule.rationale}",
+            alternative=rule.alternative,
+            evidence=tuple(dict.fromkeys(fragments))[:5],
+            notes=(
+                "Use --accept-reframe to adopt the evidence-based objective above, "
+                "or --confirm-intent if the objective already describes authorised work.",
+            ),
+            reframable=rule.reframable,
+        )
+
+    # 4. Nothing matched — allowed, with the supported data classes restated.
+    return PolicyVerdict(
+        outcome=PolicyOutcome.ALLOW,
+        rationale="No prohibited intent detected; the objective reads as investigative and scope-bound.",
+        alternative="",
+        notes=(
+            "Supported: public-web OSINT, and forensic review of owned or explicitly authorised artefacts.",
+        ),
+    )
+
+
+#: The evidence-based wording every reframe is built from.  It states the four
+#: required behaviours: collect indicators, test competing hypotheses, avoid
+#: declaring guilt, report uncertainty.
+REFRAME_TEMPLATE: str = (
+    "Collect and corroborate published indicators about {targets} and test competing "
+    "hypotheses, including at least one benign explanation, rather than assuming "
+    "misconduct. Attribute nothing to any individual: describe behaviour, artefacts and "
+    "sources only. Record provenance (source, timestamp, capture) for every indicator and "
+    "state confidence and residual uncertainty explicitly. Draw no conclusion about intent "
+    "or guilt; the assessment reports what the evidence supports and what remains unknown."
+)
+
+
+def _targets_phrase(targets: Sequence[str]) -> str:
+    cleaned = [t.strip() for t in targets if t and t.strip()]
+    if not cleaned:
+        return "the declared targets"
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} and {cleaned[1]}"
+    return f"{', '.join(cleaned[:-1])} and {cleaned[-1]}"
+
+
+def reframe_objective(objective: str, targets: Sequence[str] = ()) -> str:
+    """Rewrite a guilt-assuming objective as evidence-based investigation language.
+
+    Always returns the canonical evidence-based wording (indicators, competing
+    hypotheses, no guilt declaration, explicit uncertainty) — it never tries to
+    preserve the accusatory framing.
+    """
+
+    return REFRAME_TEMPLATE.format(targets=_targets_phrase(targets))
+
+
+# --------------------------------------------------------------------------
+# 13.2 Scope validation
+# --------------------------------------------------------------------------
+
+
+def _strip_host(raw: str) -> str:
+    """Reduce a URL or host to a bare, lower-case host name.
+
+    ``https://user@api.Example.com:8443/x?y`` becomes ``api.example.com``.
+    """
+
+    value = raw.strip().lower()
+    if "://" in value:
+        value = value.split("://", 1)[1]
+    value = value.split("/", 1)[0]          # drop path
+    value = value.split("?", 1)[0]          # drop query
+    value = value.split("#", 1)[0]          # drop fragment
+    value = value.split("@")[-1]            # drop userinfo
+    if value.count(":") == 1:               # drop :port (not an IPv6 literal)
+        value = value.split(":", 1)[0]
+    return value.rstrip("/.")
+
+
+def _as_network(entry: str):
+    """Return an ``ip_network`` when *entry* is a CIDR block, else ``None``."""
+
+    try:
+        return ipaddress.ip_network(entry.strip(), strict=False)
+    except ValueError:
+        return None
+
+
+def _looks_like_path(value: str) -> bool:
+    """True for filesystem paths, false for URLs and bare host names.
+
+    A URL also contains ``/``, so a naive separator test classifies
+    ``https://api.example.com:8443/x`` as a path and scope coverage silently
+    fails.  URLs are therefore excluded explicitly, and a relative path only
+    counts when its first segment really exists on disk.
+    """
+
+    token = value.strip()
+    if not token or "://" in token:
+        return False
+    if token.startswith(("/", "./", "../", "~")) or re.match(r"^[A-Za-z]:[\\/]", token):
+        return True
+    if os.sep not in token:
+        return False
+    first = token.split(os.sep, 1)[0]
+    try:
+        return bool(first) and Path(first).expanduser().is_dir()
+    except OSError:                                       # pragma: no cover - exotic FS
+        return False
+
+
+def scope_covers(entry: str, target: str) -> bool:
+    """Does one scope *entry* authorise work on *target*?
+
+    Supported forms: exact host, parent domain (``example.com`` covers
+    ``api.example.com``), wildcard subdomain (``*.example.com``), CIDR block for
+    IP targets, and filesystem paths for forensic artefacts.
+    """
+
+    entry = entry.strip()
+    target = target.strip()
+    if not entry or not target:
+        return False
+
+    network = _as_network(entry)
+    if network is not None:
+        try:
+            return ipaddress.ip_address(_strip_host(target)) in network
+        except ValueError:
+            return False
+
+    # A URL/host target must be reduced before suffix comparison.
+    target_host = _strip_host(target)
+
+    if _looks_like_path(entry) or _looks_like_path(target):
+        try:
+            entry_path = Path(entry).expanduser().resolve()
+            target_path = Path(target).expanduser().resolve()
+        except OSError:                                   # pragma: no cover - exotic FS
+            return False
+        return target_path == entry_path or target_path.is_relative_to(entry_path)
+
+    host_entry = _strip_host(entry)
+    host_target = target_host
+    if host_entry.startswith("*."):
+        suffix = host_entry[2:]
+        return host_target == suffix or host_target.endswith("." + suffix)
+    return host_target == host_entry or host_target.endswith("." + host_entry)
+
+
+def build_scope(
+    targets: Sequence[str],
+    entries: Sequence[str],
+    exclusions: Sequence[str],
+    data_classes: Sequence[DataClass],
+    mode: MissionMode,
+    authorized_by: str | None,
+    authorization_basis: str | None,
+) -> ScopeDeclaration:
+    """Assemble a scope declaration, normalising and de-duplicating entries."""
+
+    def unique(values: Sequence[str]) -> tuple[str, ...]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for value in values:
+            key = value.strip()
+            if key and key.lower() not in seen:
+                seen.add(key.lower())
+                out.append(key)
+        return tuple(out)
+
+    return ScopeDeclaration(
+        targets=unique(targets),
+        entries=unique(entries),
+        exclusions=unique(exclusions),
+        data_classes=frozenset(data_classes),
+        mode=mode,
+        authorized_by=(authorized_by or "").strip() or None,
+        authorization_basis=(authorization_basis or "").strip() or None,
+    )
+
+
+def validate_scope(scope: ScopeDeclaration) -> list[PreflightIssue]:
+    """Check that the objective and every target stay inside the boundary.
+
+    Returns blocking issues (which stop the mission) and advisory ones.  A
+    target outside scope is always blocking: nothing may be planned against it.
+    """
+
+    issues: list[PreflightIssue] = []
+
+    # --- the boundary itself ------------------------------------------------
+    if not scope.entries:
+        issues.append(
+            PreflightIssue(
+                "scope.missing",
+                "No explicit scope was declared, so there is no authorised boundary to work within.",
+                "Add --scope <asset> for each in-scope asset (repeatable). Example: --scope example.com",
+            )
+        )
+    for entry in scope.entries:
+        cleaned = entry.strip()
+        if cleaned in {"*", "*.", "0.0.0.0/0", "::/0"}:
+            issues.append(
+                PreflightIssue(
+                    "scope.wildcard",
+                    f"Scope entry {cleaned!r} authorises the entire internet, which is not a scope.",
+                    "Name the specific hosts, domains or paths in scope.",
+                )
+            )
+        elif len(cleaned) < 3:
+            issues.append(
+                PreflightIssue(
+                    "scope.too-broad",
+                    f"Scope entry {cleaned!r} is too short to be a specific asset.",
+                    "Use a fully qualified domain, IP/CIDR block or filesystem path.",
+                )
+            )
+
+    # --- coverage -----------------------------------------------------------
+    for target in scope.targets:
+        if any(scope_covers(entry, target) for entry in scope.exclusions):
+            issues.append(
+                PreflightIssue(
+                    "scope.excluded",
+                    f"Target {target!r} matches an exclusion, so it is out of scope.",
+                    "Remove the exclusion, or drop the target and name one that is in scope.",
+                )
+            )
+            continue
+        if not any(scope_covers(entry, target) for entry in scope.entries):
+            issues.append(
+                PreflightIssue(
+                    "scope.not-covered",
+                    f"Target {target!r} is not covered by the declared scope "
+                    f"({', '.join(scope.entries) if scope.entries else 'none'}).",
+                    f"Add --scope {target} if it is authorised, or remove the target.",
+                )
+            )
+
+    # --- data class and mode compatibility ----------------------------------
+    if not scope.data_classes:
+        issues.append(
+            PreflightIssue(
+                "scope.no-data-class",
+                "No data class was declared, so it is unclear what kind of evidence may be touched.",
+                "Add --data-class public-web (default), or owned-artifact / authorized-artifact "
+                "with --mode forensic.",
+            )
+        )
+
+    artifacts = scope.data_classes & ARTIFACT_DATA_CLASSES
+    if artifacts and scope.mode is not MissionMode.FORENSIC:
+        issues.append(
+            PreflightIssue(
+                "scope.mode-mismatch",
+                "Forensic artefacts require --mode forensic (local, read-only analysis); "
+                f"mode is currently {scope.mode.value!r}.",
+                "Re-run with --mode forensic, or declare --data-class public-web for web collection.",
+            )
+        )
+    if scope.mode is MissionMode.FORENSIC and not artifacts:
+        issues.append(
+            PreflightIssue(
+                "scope.forensic-without-artifact",
+                "Forensic mode needs at least one artefact data class (owned-artifact or "
+                "authorized-artifact).",
+                "Add --data-class owned-artifact (or authorized-artifact) naming the artefacts you hold.",
+            )
+        )
+    if DataClass.AUTHORIZED_ARTIFACT in scope.data_classes and not scope.authorization_basis:
+        issues.append(
+            PreflightIssue(
+                "scope.authorization-basis",
+                "Third-party artefacts need a recorded authorisation basis.",
+                "Add --authorization-basis 'signed engagement 2026-03-01' (who authorised access, and how).",
+            )
+        )
+
+    # --- artefact targets must exist and be readable ------------------------
+    if artifacts:
+        for target in scope.targets:
+            path = Path(target).expanduser()
+            if not path.exists():
+                issues.append(
+                    PreflightIssue(
+                        "scope.artifact-missing",
+                        f"Forensic artefact {target!r} does not exist or is not accessible.",
+                        "Check the path, or copy the artefact into the case directory first.",
+                    )
+                )
+            elif not os.access(path, os.R_OK):
+                issues.append(
+                    PreflightIssue(
+                        "scope.artifact-unreadable",
+                        f"Forensic artefact {target!r} is not readable by this user.",
+                        "Fix the file permissions, or run as the account that owns the evidence.",
+                    )
+                )
+    else:
+        # Public-web only: warn if a target looks like a local path.
+        for target in scope.targets:
+            if _looks_like_path(target):
+                issues.append(
+                    PreflightIssue(
+                        "scope.path-as-web-target",
+                        f"Target {target!r} looks like a local path but the data class is public-web.",
+                        "Use --data-class owned-artifact --mode forensic for local evidence.",
+                        blocking=False,
+                    )
+                )
+
+    # --- active collection needs explicit authority -------------------------
+    if scope.mode is MissionMode.ACTIVE:
+        if not (scope.authorized_by or scope.authorization_basis):
+            issues.append(
+                PreflightIssue(
+                    "scope.active-unattributed",
+                    "Active collection is not attributed to anyone: record who authorised it.",
+                    "Add --authorized-by 'Name, Role' and --authorization-basis 'reason / reference'.",
+                )
+            )
+
+    return issues
+
+
+# --------------------------------------------------------------------------
+# 13.3 Preflight driver
+# --------------------------------------------------------------------------
+
+
+def run_preflight(
+    *,
+    objective: str,
+    targets: Sequence[str],
+    scope_entries: Sequence[str],
+    exclusions: Sequence[str] = (),
+    data_classes: Sequence[DataClass] = (),
+    mode: MissionMode = MissionMode.PASSIVE,
+    authorized_by: str | None = None,
+    authorization_basis: str | None = None,
+    accept_reframe: bool = False,
+    confirm_intent: bool = False,
+) -> PreflightReport:
+    """Evaluate objective + scope.  Side-effect free and always total.
+
+    This is the single gate every mission passes through: the mission command
+    calls it before rendering a plan, and the Phase 3 executor will call
+    :func:`enforce_preflight` before its first tool call.
+    """
+
+    verdict = evaluate_objective(objective)
+    effective_classes = tuple(data_classes) if data_classes else (
+        (DataClass.PUBLIC_WEB,) if mode is not MissionMode.FORENSIC else ()
+    )
+    scope = build_scope(
+        targets=targets,
+        entries=scope_entries,
+        exclusions=exclusions,
+        data_classes=effective_classes,
+        mode=mode,
+        authorized_by=authorized_by,
+        authorization_basis=authorization_basis,
+    )
+    issues = validate_scope(scope)
+
+    # A refusal is never "reframed away": only ambiguous (paused) objectives that
+    # the rulebook marks reframable get an evidence-based replacement.
+    reframed = (
+        reframe_objective(objective, targets)
+        if verdict.outcome is PolicyOutcome.PAUSE and verdict.reframable
+        else None
+    )
+    adopted = bool(accept_reframe and reframed)
+    effective_objective = reframed if adopted else objective
+
+    return PreflightReport(
+        verdict=verdict,
+        issues=issues,
+        scope=scope,
+        objective=effective_objective,
+        original_objective=objective,
+        reframed_objective=reframed,
+        reframe_adopted=adopted,
+        intent_confirmed=bool(confirm_intent),
+    )
+
+
+def enforce_preflight(report: PreflightReport) -> None:
+    """Raise :class:`PolicyViolation` unless the mission is cleared to run.
+
+    Call this immediately before the first model or browser action so that a
+    programmatic caller cannot skip the CLI gate.
+    """
+
+    if report.ok:
+        return
+    if report.verdict.refused:
+        message = f"mission refused by policy ({report.verdict.rule_id}): {report.verdict.rationale}"
+    elif report.blocking_issues:
+        message = "mission out of scope: " + "; ".join(i.message for i in report.blocking_issues)
+    else:
+        message = f"mission paused for clarification ({report.verdict.rule_id})"
+    raise PolicyViolation(message, report)
+
+
+# --------------------------------------------------------------------------
+# 13.4 Rendering
+# --------------------------------------------------------------------------
+
+
+def render_preflight(report: PreflightReport) -> None:
+    """Explain a refusal or pause, and always state the safe alternative."""
+
+    console = get_console()
+    verdict = report.verdict
+    refused = verdict.refused
+
+    title = (
+        "[bold red]mission refused[/bold red]" if refused
+        else "[bold yellow]mission paused — clarification required[/bold yellow]"
+        if report.paused
+        else "[bold red]out of scope[/bold red]"
+    )
+    border = "red" if refused else "yellow"
+    body = Text()
+
+    if refused or verdict.category is not None:
+        if verdict.rule_id:
+            body.append("category  ", style="dim")
+            body.append(f"{verdict.rule_id}", style="bold")
+            body.append(f"  ({verdict.category.value if verdict.category else 'unknown'})\n", style="dim")
+        body.append("reason    ", style="dim")
+        body.append(redact_text(verdict.rationale, secrets=known_secrets()), style="white")
+        body.append("\n")
+        if verdict.evidence:
+            body.append("matched   ", style="dim")
+            body.append("; ".join(f"“{fragment}”" for fragment in verdict.evidence), style="dim italic")
+            body.append("\n")
+
+    if report.blocking_issues:
+        body.append("\n")
+        body.append("scope\n", style="bold")
+        for issue in report.blocking_issues:
+            body.append("  ✘ ", style="red")
+            body.append(redact_text(issue.message, secrets=known_secrets()), style="white")
+            body.append(f"\n    → {redact_text(issue.fix, secrets=known_secrets())}\n", style="cyan")
+
+    if verdict.alternative:
+        body.append("\nsafe alternative\n", style="bold green")
+        body.append(f"  {redact_text(verdict.alternative, secrets=known_secrets())}\n", style="green")
+
+    if report.reframed_objective and not report.reframe_adopted:
+        body.append("\nsuggested objective (evidence-based)\n", style="bold cyan")
+        body.append(f"  {redact_text(report.reframed_objective, secrets=known_secrets())}\n", style="cyan")
+        body.append("  adopt with --accept-reframe\n", style="dim")
+
+    for note in verdict.notes:
+        body.append(f"\n{redact_text(note, secrets=known_secrets())}\n", style="dim")
+
+    console.print()
+    console.print(Panel(body, title=title, title_align="left", border_style=border, expand=False))
+    if report.blocking_issues and not refused:
+        console.print("[dim]Nothing was planned: no Subagents, Workers, model or browser calls were made.[/dim]\n")
+    else:
+        console.print("[dim]Nothing was planned or executed.[/dim]\n")
+
+
+def scope_summary_rows(report: PreflightReport) -> list[tuple[str, str]]:
+    """(label, rich-markup value) pairs describing scope and policy state.
+
+    Returned as plain pairs so the mission plan and the ``policy`` command can
+    each render them into their own table without reaching into Rich internals.
+    """
+
+    scope = report.scope
+    if scope is None:                                    # pragma: no cover - defensive
+        return [("scope", "[red]undeclared[/red]")]
+
+    rows: list[tuple[str, str]] = [
+        ("scope", escape(", ".join(scope.entries)) or "[red]none[/red]"),
+    ]
+    if scope.exclusions:
+        rows.append(("excluded", escape(", ".join(scope.exclusions))))
+    rows.append(
+        ("data class", escape(", ".join(sorted(dc.value for dc in scope.data_classes)) or "—"))
+    )
+    rows.append(
+        (
+            "authorised",
+            escape(scope.authorized_by or "self (public sources only)")
+            + (f"  ·  {escape(scope.authorization_basis)}" if scope.authorization_basis else ""),
+        )
+    )
+    rows.append(
+        (
+            "policy",
+            f"[green]{report.verdict.outcome.value}[/green] · "
+            f"{escape(report.verdict.rule_id or 'no rule matched')}",
+        )
+    )
+    if report.reframe_adopted:
+        rows.append(("objective", "[cyan]reframed to evidence-based wording[/cyan]"))
+    elif report.intent_confirmed and report.verdict.outcome is PolicyOutcome.PAUSE:
+        rows.append(("objective", "[yellow]intent confirmed by operator[/yellow]"))
+    return rows
+
+
+def render_scope_summary(report: PreflightReport) -> Table:
+    """Compact scope/authorisation table (used by the ``policy`` command)."""
+
+    table = Table(box=None, pad_edge=False, show_header=False)
+    table.add_column("field", style="dim", no_wrap=True)
+    table.add_column("value", overflow="fold")
+    for label, value in scope_summary_rows(report):
+        table.add_row(label, value)
+    return table
+
+
+def print_policy_summary(result: PreflightReport) -> None:
+    """Used by the ``policy`` command: verdict, issues and reframe."""
+
+    console = get_console()
+    console.print()
+    console.print(render_scope_summary(result))
+    if result.issues:
+        console.print()
+        for issue in result.issues:
+            glyph = "[yellow]![/yellow]" if not issue.blocking else "[red]✘[/red]"
+            console.print(
+                f"{glyph} {escape(issue.id)}: {escape(redact_text(issue.message, secrets=known_secrets()))}"
+            )
+            console.print(f"   → {escape(redact_text(issue.fix, secrets=known_secrets()))}", style="cyan")
+    if result.reframed_objective and not result.reframe_adopted:
+        console.print()
+        console.print(
+            Panel(
+                Text(redact_text(result.reframed_objective, secrets=known_secrets()), style="cyan"),
+                title="suggested objective (evidence-based)",
+                title_align="left",
+                border_style="cyan",
+                expand=False,
+            )
+        )
+    console.print()
+    if result.ok:
+        console.print("[green]✔ policy preflight passed[/green] — this objective may be planned.")
+    elif result.verdict.refused:
+        console.print(f"[red]✘ refused[/red] — {escape(redact_text(result.verdict.rationale, secrets=known_secrets()))}")
+        if result.verdict.alternative:
+            console.print(f"[green]→ safe alternative:[/green] {escape(redact_text(result.verdict.alternative, secrets=known_secrets()))}")
+    else:
+        console.print("[yellow]! paused[/yellow] — resolve the items above, then re-run.")
+    console.print()
+
+
+@app.command("policy", help="Check an objective and scope against the safety policy (no planning).")
+def policy_command(
+    objective: str = typer.Option(..., "--objective", "-o", help="The objective to evaluate."),
+    target: list[str] = typer.Option(
+        [], "--target", "-t", help="Target asset (repeatable). Used for scope coverage checks."
+    ),
+    scope: list[str] = typer.Option(
+        [], "--scope", "-s", help="Authorised asset boundary (repeatable). Domains, hosts, CIDR, paths."
+    ),
+    exclude: list[str] = typer.Option([], "--exclude", "-x", help="Explicitly out-of-scope asset."),
+    data_class: list[DataClass] = typer.Option(
+        [], "--data-class", "-d", help="public-web | owned-artifact | authorized-artifact."
+    ),
+    mode: MissionMode = typer.Option(MissionMode.PASSIVE, "--mode", "-m", case_sensitive=False),
+    authorized_by: str | None = typer.Option(None, "--authorized-by", help="Who authorised this work."),
+    authorization_basis: str | None = typer.Option(None, "--authorization-basis", help="Why it is authorised."),
+    accept_reframe: bool = typer.Option(
+        False, "--accept-reframe", help="Adopt the evidence-based objective instead of the original wording."
+    ),
+    confirm_intent: bool = typer.Option(
+        False, "--confirm-intent", help="Confirm a paused objective describes authorised defensive work."
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Evaluate only — never plans and never touches the network."""
+
+    result = run_preflight(
+        objective=objective,
+        targets=target or scope,
+        scope_entries=scope,
+        exclusions=exclude,
+        data_classes=data_class,
+        mode=mode,
+        authorized_by=authorized_by,
+        authorization_basis=authorization_basis,
+        accept_reframe=accept_reframe,
+        confirm_intent=confirm_intent,
+    )
+    if as_json:
+        _emit(json.dumps({"ok": result.ok, "preflight": result.to_dict()}, indent=2))
+    else:
+        print_policy_summary(result)
+    raise typer.Exit(result.exit_code)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 14. Command: mission
 # ══════════════════════════════════════════════════════════════════════════
 
 
@@ -2603,7 +3831,9 @@ def _validate_request(request: MissionRequest) -> None:
         raise typer.BadParameter("time budgets must be >= 1 second")
 
 
-def render_mission_plan(request: MissionRequest, settings: Settings) -> None:
+def render_mission_plan(
+    request: MissionRequest, settings: Settings, preflight: PreflightReport | None = None
+) -> None:
     """Show what the Master Agent *would* do.  No collection is performed."""
 
     console = get_console()
@@ -2627,14 +3857,25 @@ def render_mission_plan(request: MissionRequest, settings: Settings) -> None:
     table.add_column("value", overflow="fold")
     table.add_row("objective", escape(request.objective))
     table.add_row("mode", request.mode.value)
-    table.add_row("authorised", "yes" if request.authorised else "no (passive collection only)")
     table.add_row("targets", f"{len(request.targets)}")
     for index, target in enumerate(request.targets, start=1):
-        table.add_row("", f"[bold]{index}.[/bold] {escape(target)}")
+        in_scope = bool(
+            preflight
+            and preflight.scope
+            and any(scope_covers(entry, target) for entry in preflight.scope.entries)
+        )
+        table.add_row(
+            "",
+            f"[bold]{index}.[/bold] {escape(target)}"
+            + ("  [green]in scope[/green]" if in_scope else "  [dim]—[/dim]"),
+        )
+    if preflight is not None:
+        for label, value in scope_summary_rows(preflight):
+            table.add_row(label, value)
+    model_cell = escape(settings.model) if settings.model else "[yellow]unset[/yellow]"
     table.add_row(
         "model",
-        f"{escape(settings.provider)} / {escape(settings.model or '[yellow]unset[/yellow]')}"
-        f"  ·  key {escape(settings.api_key_hint())}",
+        f"{escape(settings.provider)} / {model_cell}  ·  key {escape(settings.api_key_hint())}",
     )
     table.add_row("subagents", f"max {request.max_subagents} (runtime-created)")
     table.add_row(
@@ -2733,6 +3974,47 @@ def mission_command(
     respect_robots: bool | None = typer.Option(
         None, "--respect-robots/--ignore-robots", help="Honour robots.txt."
     ),
+    # --- safety and scope: evaluated before anything is planned ---------------
+    scope: list[str] | None = typer.Option(
+        None,
+        "--scope",
+        "-s",
+        help="Authorised asset boundary (repeatable): domain, host, CIDR or filesystem path.",
+    ),
+    exclude: list[str] | None = typer.Option(
+        None,
+        "--exclude",
+        "-x",
+        help="Asset explicitly out of scope (repeatable). Overrides --scope.",
+    ),
+    data_class: list[DataClass] | None = typer.Option(
+        None,
+        "--data-class",
+        "-d",
+        help="public-web (default) | owned-artifact | authorized-artifact.",
+    ),
+    authorized_by: str | None = typer.Option(
+        None, "--authorized-by", help="Who authorised this mission."
+    ),
+    authorization_basis: str | None = typer.Option(
+        None, "--authorization-basis", help="Why it is authorised (reference, ticket, engagement id)."
+    ),
+    accept_reframe: bool = typer.Option(
+        False,
+        "--accept-reframe",
+        help="Replace a guilt-assuming objective with evidence-based investigation language.",
+    ),
+    confirm_intent: bool = typer.Option(
+        False,
+        "--confirm-intent",
+        help="Confirm a paused objective describes authorised, defensive work.",
+    ),
+    allow_out_of_scope: bool = typer.Option(
+        False,
+        "--allow-out-of-scope",
+        hidden=True,
+        help="(unavailable) Scope refusals cannot be overridden.",
+    ),
     dry_run: bool = typer.Option(
         True,
         "--dry-run/--execute",
@@ -2830,7 +4112,53 @@ def mission_command(
         )
         raise typer.Exit(ExitCode.AUTHORIZATION)
 
-    # 3. Render.  ``settings`` phase is a pure configuration view.
+    # 3. Safety preflight.  This is the gate: an out-of-scope action, a refused
+    #    objective or an unconfirmed intent stops here, before a plan is drawn
+    #    or any Subagent/Worker/model/browser call could exist.
+    if allow_out_of_scope:
+        console.print(
+            "[yellow]note:[/yellow] --allow-out-of-scope is not available; scope refusals "
+            "cannot be overridden. Narrow the scope instead."
+        )
+
+    preflight = run_preflight(
+        objective=objective,
+        targets=request.targets,
+        # Scope defaults to the targets themselves — an explicit boundary is
+        # still required, but naming the targets is the common case.
+        scope_entries=scope if scope else request.targets,
+        exclusions=exclude or (),
+        data_classes=data_class or (),
+        mode=mode,
+        authorized_by=authorized_by,
+        authorization_basis=authorization_basis,
+        accept_reframe=accept_reframe,
+        confirm_intent=confirm_intent,
+    )
+
+    if not preflight.ok:
+        if as_json:
+            _emit(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "stage": "policy",
+                        "planned": False,
+                        "executed": False,
+                        "preflight": preflight.to_dict(),
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            render_preflight(preflight)
+        raise typer.Exit(preflight.exit_code)
+
+    # The reported objective is the cleared one: if a reframe was adopted, the
+    # accusation-framed wording never reaches planning.
+    request.objective = preflight.objective
+
+    # 4. Render.  ``settings`` phase is a pure configuration view.
     if phase is MissionPhase.SETTINGS:
         if as_json:
             _emit(
@@ -2859,6 +4187,7 @@ def mission_command(
                     "executed": False,
                     "request": request.to_dict(),
                     "settings": settings.to_dict(),
+                    "preflight": preflight.to_dict(),
                     "warnings": [p.to_dict() for p in result.problems],
                     "plan": {
                         "subagents": f"runtime-created, max {request.max_subagents}",
@@ -2873,7 +4202,7 @@ def mission_command(
             )
         )
     else:
-        render_mission_plan(request, settings)
+        render_mission_plan(request, settings, preflight)
         if result.problems:
             console.print(render_settings_problems(result.problems, title="configuration notes"))
             console.print()
@@ -2898,7 +4227,7 @@ def mission_command(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 14. Entry point
+# 15. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 

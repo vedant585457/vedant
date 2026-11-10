@@ -12,6 +12,33 @@ python vedant_osint.py doctor                # capability health check (CI gate)
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
+## Safety & scope
+
+Every mission passes a policy preflight **before** anything is planned.
+
+| Exit | Meaning |
+|---|---|
+| `0` | objective and scope cleared |
+| `2` | a target is out of scope (not covered by `--scope`, or matched by `--exclude`) |
+| `7` | refused — unauthorised access, credential theft, evasion, doxxing, harassment, destructive action |
+| `8` | paused — guilt assumption or speculative identification needs `--confirm-intent` or `--accept-reframe` |
+
+```bash
+# evaluate an objective without planning anything
+python vedant_osint.py policy -o "map the public attack surface" --scope example.com
+
+# guilt-assuming wording is paused; adopt evidence-based language to proceed
+python vedant_osint.py mission -t example.com -o "find the bad guys" --accept-reframe
+
+# owned forensic artefacts
+python vedant_osint.py mission -t ./disk.img -o "examine the image we own" \
+        --mode forensic --data-class owned-artifact
+```
+
+A reframe always asks for indicators, competing hypotheses (including a benign
+one), no attribution to individuals, and explicit uncertainty. Refusals cannot
+be overridden by any flag; the safe alternative is always printed.
+
 ## Doctor
 
 `doctor` verifies Python, the five required imports (Typer, Rich, LangGraph,
@@ -67,7 +94,7 @@ Authorised use only — collect from systems you own or are explicitly permitted
 | Phase | Scope | State |
 |-------|-------|-------|
 | 1 | Foundation — CLI skeleton, config probing, version reporting | ✅ done |
-| 2 | Contracts — strict configuration object + `doctor` capability check | ✅ done |
+| 2 | Contracts — strict settings, `doctor`, safety & scope preflight | ✅ done |
 | 3 | Orchestration — LangGraph Master Agent + runtime Subagent factory | ⬜ next |
 | 4 | Browser — browser-use / Playwright sessions and capture | ⬜ |
 | 5 | Collection — passive OSINT sources, artefact hashing | ⬜ |
