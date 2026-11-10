@@ -449,6 +449,40 @@ an optional lifetime cap per kind, and the scheduler records its own ``peak``, s
     python vedant_osint.py sched --demo tight      # caps below the plan's width
     python vedant_osint.py sched --clip forensic --workers 2 --subagents 2
 
+Checkpoints and resumable missions
+----------------------------------
+A mission that takes an hour is a mission that will be interrupted.  The runtime
+keeps its own write-ahead record *beside* this file — under the runtime output
+directory, in ``runs/<mission>/`` — and a resumed run continues from it.  The
+deliverable stays one file; a mission's data never goes into it.
+
+* **Written after every major transition.**  A Worker attempt is recorded before
+  the work and its verdict after it; a Subagent's aggregate, the mission's
+  synthesis and the ledger are transitions of their own.  Every write is atomic
+  (temp file, ``fsync``, ``os.replace``), so a crash leaves the previous state
+  rather than half of the next one.
+* **Completed work is not repeated.**  :class:`ResumePlan` partitions the roster
+  into *adopted* and *re-run* units from the record; a settled Worker is answered
+  from the checkpoint without taking a slot or calling the runner, and an adopted
+  Subagent aggregate keeps its :class:`JoinBarrier`, so the hierarchy survives and
+  not just the evidence.  ``--redo`` is the only way to ask for the work again.
+* **Incomplete work is revalidated, not trusted.**  An outcome with no review, a
+  review that asked for a retry, or a unit that never ran is stale and is re-run;
+  ``--revalidate-after`` re-checks settled results that are old, and a success
+  whose record holds no evidence is re-run rather than believed.
+* **Evidence is never duplicated.**  Ids are content-addressed and merged on id,
+  so re-recording corroborates a source instead of appending a copy.
+* **A finished mission is refused, not replayed**, and a checkpoint from another
+  build, a corrupt file, or a plan whose fingerprint differs is refused with a
+  reason (:class:`ResumeError`, exit ``2``).
+
+::
+
+    python vedant_osint.py resume --demo            # interrupt a run, then resume it
+    python vedant_osint.py resume --self-test       # 49 guarantee checks, offline
+    python vedant_osint.py resume --mission <id>    # what a resume would do, and why
+    python vedant_osint.py flow --demo exposure --checkpoint
+
 Structured model adapter
 ------------------------
 One model-calling interface sits between orchestration and every provider, so
@@ -503,6 +537,10 @@ Usage
     python vedant_osint.py master --self-test           # Master Agent boundaries
     python vedant_osint.py subagents --self-test        # runtime Subagent specifications
     python vedant_osint.py workers --self-test          # runtime Worker specifications
+    python vedant_osint.py flow --self-test             # execution flow, joins, fan-out
+    python vedant_osint.py sched --self-test            # bounded queues, deadlines, licences
+    python vedant_osint.py resume --self-test           # checkpoints and resumable missions
+    python vedant_osint.py resume --demo                # interrupt a run, then resume it
     python vedant_osint.py doctor                       # full capability health check
     python vedant_osint.py policy -o "..." --scope example.com          # safety preflight only
     python vedant_osint.py mission --target example.com -o "map the attack surface"
@@ -601,7 +639,8 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum, IntEnum
 from pathlib import Path
-from typing import Annotated, Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence, TypedDict
+from typing import (Annotated, Any, Callable, ClassVar, Iterable, Iterator, Mapping,
+                    Protocol, Sequence, TypedDict)
 
 # --- third party: CLI surface -------------------------------------------------
 # Typer + Rich are the only hard imports.  They are imported at module level
@@ -634,7 +673,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 15
+VERSION_MINOR: int = 16
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -693,7 +732,7 @@ PHASE_ROADMAP: tuple[tuple[int, str, str], ...] = (
     (4, "Browser", "browser-use/Playwright sessions and capture"),
     (5, "Collection", "passive OSINT sources, artefact hashing/chain of custody"),
     (6, "Synthesis", "cross-source correlation, findings and report export"),
-    (7, "Operations", "resume, budgets, audit trail, hardening"),
+    (7, "Operations", "checkpoints and resumable missions, budgets, audit trail"),
 )
 
 #: Console width used when Rich cannot detect a terminal (pipes, CI logs).
@@ -21889,6 +21928,10 @@ class FlowResult(StrictModel):
     clip: ClipReport | None = None
     #: What the scheduler observed and enforced during this run.
     concurrency: dict[str, Any] = Field(default_factory=dict)
+    #: What a resumed run adopted from an earlier attempt, and why.
+    resume: dict[str, Any] | None = None
+    #: Where this run's checkpoint lives, when it was checkpointed at all.
+    checkpoint: str = ""
 
     @property
     def total_workers(self) -> int:
@@ -21924,6 +21967,8 @@ class FlowResult(StrictModel):
             "retries": self.retries,
             "clip": self.clip.to_dict() if self.clip else None,
             "concurrency": self.concurrency,
+            "resume": self.resume,
+            "checkpoint": self.checkpoint,
             "seconds": round(self.seconds, 3),
             "stage_order": self.stage_order(),
             "trace": self.trace,
@@ -22104,6 +22149,19 @@ class HierarchicalFlow:
         self.clip: ClipReport | None = None
         #: Set by ``build``: the units came from a real specification pipeline.
         self.from_specs = False
+        #: The write-ahead seam, when this run is checkpointed.  ``None`` is the
+        #: ordinary case: a mission with nowhere to persist costs one check.
+        self.resume: "ResumeLedger | None" = None
+        #: What this run decided to adopt from an earlier attempt.
+        self.resume_plan: Any = None
+        #: Adopted Worker results, keyed by worker id: a settled unit is answered
+        #: from here instead of by the runner.
+        self._adopted: dict[str, tuple[WorkerOutcome, ReviewVerdict | None]] = {}
+        #: Adopted Subagent aggregates, keyed by subagent id.
+        self._adopted_reports: dict[str, SubagentOutcome] = {}
+        #: Worker evidence already on record, so an adopted outcome keeps its facts
+        #: even when the caller supplied no store.
+        self._adopted_evidence: dict[str, list[EvidenceItem]] = {}
 
     def _limits_for_run(self) -> ResourceLimits:
         """The mission's limits, derived from the policy when none were given."""
@@ -22442,8 +22500,109 @@ class HierarchicalFlow:
         self._settled["master"].add(subagent.id)
         return admitted
 
+    def attach_resume(self, store: "CheckpointStore", *,
+                      mode: "ResumeMode | None" = None,
+                      revalidate_after_seconds: float = 0.0) -> Any:
+        """Attach a checkpoint store and decide what this run adopts.
+
+        Called before :meth:`run` (``build`` does it automatically when a store
+        was handed to the constructor).  The decision is made here, once, from the
+        recorded state — never in the middle of the graph, where a Worker and the
+        Master would be free to disagree.
+        """
+
+        mode = mode or ResumeMode.RESUME
+        if self.resume is not None and self.resume.store is store \
+                and self.resume_plan is not None and self.resume_plan.mode is mode:
+            # Already attached (a caller may re-use one flow): re-deciding would
+            # open a second run attempt for the same work.
+            return self.resume_plan
+        try:
+            checkpoint = store.load(self.mission_id)
+        except CheckpointMissing:
+            checkpoint = None
+        except CheckpointInvalid as exc:
+            # The mission already finished.  Replaying it is a different request
+            # from continuing it, so it has to be asked for explicitly.
+            if mode is not ResumeMode.REDO:
+                raise ResumeError(str(exc)) from exc
+            checkpoint = None
+        fingerprint = plan_fingerprint(self.subagents, self.context.objective)
+        plan = resume_plan(self.subagents, checkpoint, mode=mode,
+                           revalidate_after_seconds=revalidate_after_seconds,
+                           fingerprint=fingerprint, mission_id=self.mission_id)
+        state = store.begin(
+            self.mission_id, objective=self.context.objective,
+            context=json.loads(model_to_json(self.context)),
+            policy=json.loads(model_to_json(self.policy)),
+            limits=json.loads(model_to_json(self.runtime.limits)),
+            plan=self.clip, fingerprint=fingerprint,
+            workers=[(subagent.id, worker.id) for subagent in self.subagents
+                     for worker in subagent.workers],
+            subagents=[(subagent.id, subagent.role, [worker.id for worker in subagent.workers])
+                       for subagent in self.subagents],
+            resume=checkpoint if mode is not ResumeMode.REDO else None,
+        )
+        self.resume = ResumeLedger(store, self.mission_id, plan=plan)
+        self.resume_plan = plan
+        self._adopted = {}
+        self._adopted_reports = {}
+        self._adopted_evidence = {}
+        if checkpoint is not None and mode in {ResumeMode.RESUME, ResumeMode.REDO}:
+            evidence = {item.id: item for item in state.evidence}
+            for worker_id in plan.adopted_workers:
+                record = state.worker(worker_id)
+                if record is None or record.outcome is None:
+                    continue
+                self._adopted[worker_id] = (record.outcome, record.review)
+                self._adopted_evidence[worker_id] = [
+                    evidence[item_id] for item_id in record.evidence_ids if item_id in evidence]
+            for subagent_id in plan.adopted_subagents:
+                record = state.subagent(subagent_id)
+                if record is not None and record.report is not None:
+                    self._adopted_reports[subagent_id] = record.report
+        return plan
+
+    def _adopt_worker(self, subagent: FlowSubagent,
+                      worker: FlowWorker) -> tuple[WorkerOutcome, ReviewVerdict | None] | None:
+        """An adopted Worker: what it produced last time, announced, not re-run.
+
+        The record is adopted *as recorded* — same attempt number, same task id,
+        same evidence ids — so the resumed run's ledger and the original run's
+        transcript agree about what happened.
+        """
+
+        adopted = self._adopted.get(worker.id)
+        if adopted is None:
+            return None
+        outcome, verdict = adopted
+        self._settled.setdefault(subagent.id, set()).add(worker.id)
+        self._gates[worker.id] = FlowGate.NONE if (verdict is not None and verdict.approved) \
+            else FlowGate.REVIEW_REJECTED
+        self._record(FlowStage.WORKER, unit=worker.id, parent=subagent.id,
+                     detail=f"attempt {outcome.attempt}: adopted from checkpoint "
+                            f"({len(outcome.evidence_ids)} evidence id(s))")
+        return outcome, verdict
+
     def _admit_subagent(self, subagent: FlowSubagent, wave: int = 0) -> dict[str, Any]:
-        """Run one Subagent's graph while holding a Subagent slot."""
+        """Run one Subagent's graph while holding a Subagent slot.
+
+        A Subagent whose aggregate is already on record does not compile-run at
+        all: its Workers have nothing to do, and re-entering the graph to discover
+        that would spend a slot to prove it.  The adopted report is returned with
+        its barrier intact, and each adopted Worker is named in the ledger.
+        """
+
+        recorded = self._adopted_reports.get(subagent.id)
+        if recorded is not None:
+            for worker in subagent.workers:
+                self._settled.setdefault(subagent.id, set()).add(worker.id)
+                self._record(FlowStage.WORKER, unit=worker.id, parent=subagent.id,
+                             detail="adopted from checkpoint with its subagent")
+            self._record(FlowStage.SUBAGENT_AGGREGATE, unit=subagent.id, parent="master",
+                         detail=f"adopted from checkpoint: {len(recorded.evidence)} evidence "
+                                f"item(s), {len(recorded.gaps)} gap(s)")
+            return {"reports": [json.loads(model_to_json(recorded))]}
 
         with self.runtime.slot(ResourceKind.SUBAGENT, unit=subagent.id,
                                deadline=self.runtime.deadline):
@@ -22516,6 +22675,15 @@ class HierarchicalFlow:
         if gate is not FlowGate.NONE:
             return {"outcomes": [json.loads(model_to_json(
                         self._blocked_outcome(subagent, worker, gate)))], "reviews": []}
+
+        # A resumed run answers a settled unit from its record: no slot, no
+        # runner, no second copy of the evidence.
+        adopted = self._adopt_worker(subagent, worker)
+        if adopted is not None:
+            outcome, verdict = adopted
+            return {"outcomes": [json.loads(model_to_json(outcome))],
+                    "reviews": ([] if verdict is None
+                                else [json.loads(model_to_json(verdict))])}
 
         try:
             # The Worker holds one worker slot for its whole attempt→review loop;
@@ -22641,6 +22809,12 @@ class HierarchicalFlow:
                 "task_id": outcome.task_id or content_id("task", subagent.id, worker.id, attempt),
                 "seconds": outcome.seconds or (time.monotonic() - started)})
         self.last_outcome = outcome
+        if self.resume is not None:
+            # Written *before* the review, so a crash between the two leaves a
+            # finished outcome with no verdict: exactly the state a resume knows
+            # to revalidate rather than trust.
+            self.resume.attempt(subagent.id, worker.id, attempt=attempt,
+                                round_number=int(state.get("round") or 1))
         return {"outcome": json.loads(model_to_json(outcome)), "round": attempt,
                 "attempts": [{"attempt": attempt, "task_id": outcome.task_id,
                               "status": outcome.status.value}]}
@@ -22668,6 +22842,11 @@ class HierarchicalFlow:
             self.tracker.review(subagent.id, verdict=verdict.verdict,
                                 criterion=(verdict.criteria or ["completion"])[0],
                                 note=f"{worker.name}: {verdict.guidance}")
+        if self.resume is not None:
+            produced = [EvidenceItem.model_validate(payload)
+                        for payload in outcome.payload.get("evidence", [])]
+            self.resume.settle_worker(subagent.id, worker.id, outcome=outcome,
+                                      review=verdict, evidence=produced)
         return {"verdict": json.loads(model_to_json(verdict)),
                 "reviews": [json.loads(model_to_json(verdict))]}
 
@@ -22689,6 +22868,14 @@ class HierarchicalFlow:
         """Aggregate one Subagent — only after every one of its Workers settled."""
 
         subagent = self._by_id[str(state.get("subagent"))]
+        # An aggregate recorded by an earlier attempt is a fact with its own
+        # barrier; recomputing it would replace the record with a new opinion.
+        recorded = self._adopted_reports.get(subagent.id)
+        if recorded is not None:
+            self._record(FlowStage.SUBAGENT_AGGREGATE, unit=subagent.id, parent="master",
+                         detail=f"adopted from checkpoint: {len(recorded.evidence)} evidence "
+                                f"item(s), {len(recorded.gaps)} gap(s)")
+            return {"report": json.loads(model_to_json(recorded))}
         outcomes = [WorkerOutcome.model_validate(item) for item in state.get("outcomes") or []]
         reviews = [ReviewVerdict.model_validate(item) for item in state.get("reviews") or []]
         expected = [worker.id for worker in subagent.workers]
@@ -22708,8 +22895,15 @@ class HierarchicalFlow:
                            for review in reviews)
             if outcome is not None:
                 retries += max(0, outcome.attempt - 1)
-                for payload in outcome.payload.get("evidence", []):
-                    evidence.append(EvidenceItem.model_validate(payload))
+                if worker.id in self._adopted:
+                    # The adopted outcome keeps its recorded evidence *ids*; the
+                    # items themselves are the ones already on record, so adding
+                    # them again here would duplicate the evidence this whole
+                    # section exists to protect.
+                    evidence.extend(self._adopted_evidence.get(worker.id, []))
+                else:
+                    for payload in outcome.payload.get("evidence", []):
+                        evidence.append(EvidenceItem.model_validate(payload))
             if not approved:
                 gate = self._gates.get(worker.id) or FlowGate.REVIEW_REJECTED
                 gaps.append(UnknownValue(
@@ -22745,6 +22939,8 @@ class HierarchicalFlow:
                     self.store.add_evidence(item, actor=subagent.id)
                 except (StateError, ValueError):     # pragma: no cover - defensive
                     pass
+        if self.resume is not None:
+            self.resume.settle_subagent(report)
         return {"report": json.loads(model_to_json(report))}
 
     def _record_in_store(self, subagent: FlowSubagent, worker: FlowWorker,
@@ -22831,6 +23027,8 @@ class HierarchicalFlow:
         self._record(FlowStage.MASTER_SYNTHESIZE,
                      detail=f"{barrier.describe()}; {len(synthesis.sourced_claims)} sourced "
                             f"claim(s), {len(synthesis.gaps)} gap(s)")
+        if self.resume is not None:
+            self.resume.synthesis(synthesis)
         return {"synthesis": json.loads(model_to_json(synthesis))}
 
     # -- running -------------------------------------------------------------
@@ -22846,10 +23044,18 @@ class HierarchicalFlow:
         self._gates = {}
         if self.detach_note:
             self._record(FlowStage.PLAN, detail=self.detach_note)
+        if self.resume is not None:
+            self._announce_resume()
         started = time.monotonic()
         final = self._top_graph.invoke({**_master_state(self.mission_id, self.context.objective),
                                         "reports": [], "stopped": False, "stop_reason": ""})
         elapsed = time.monotonic() - started
+        if self.resume is not None:
+            # The plan and the trace are the two things a resume cannot rebuild.
+            self.resume.trace(self.trace.to_list())
+            self.resume.stage(FlowStage.MASTER_SYNTHESIZE.value,
+                              note=("synthesised" if final.get("synthesis")
+                                    else "stopped before synthesis"))
         reports = [SubagentOutcome.model_validate(item) for item in final.get("reports") or []]
         ordered = [next((report for report in reports if report.subagent_id == subagent.id), None)
                    for subagent in self.subagents]
@@ -22867,6 +23073,9 @@ class HierarchicalFlow:
             structure=self.structure(),
             clip=self.clip,
             concurrency=self.runtime.scheduler.snapshot(),
+            resume=self.resume_plan.to_dict() if self.resume_plan else None,
+            checkpoint=(str(self.resume.store.path_for(self.mission_id))
+                        if self.resume is not None else ""),
         )
         if self.logger is not None:
             self.logger.log(
@@ -22876,7 +23085,30 @@ class HierarchicalFlow:
                       "attempts": result.worker_attempts, "retries": result.retries,
                       "stopped": result.stopped, "peak": self.trace.max_concurrency()},
             )
+        if self.resume is not None and not result.stopped:
+            # A mission that stopped is deliberately *not* archived: it is the
+            # one a resume is for.
+            self.resume.finish()
         return result
+
+    def _announce_resume(self) -> None:
+        """Say what the resume adopted, before any unit runs.
+
+        A resumed mission has to be auditable: which units were answered from the
+        record, which are being repeated and why, and how much evidence came with
+        them.
+        """
+
+        plan = self.resume_plan
+        if plan is None:
+            return
+        for worker_id in plan.adopted_workers:
+            self._record(FlowStage.PLAN, unit=worker_id,
+                         detail=f"adopted: {plan.reasons.get(worker_id, 'settled earlier')}")
+        for worker_id in plan.rerun_workers:
+            self._record(FlowStage.PLAN, unit=worker_id,
+                         detail=f"re-run: {plan.reasons.get(worker_id, 'not settled')}")
+        self._record(FlowStage.PLAN, detail=plan.summary())
 
 
 # --------------------------------------------------------------------------
@@ -23297,13 +23529,36 @@ def run_flow_self_test(console: "Console | None" = None) -> list[FlowCheck]:
 # --------------------------------------------------------------------------
 
 
+def _flow_checkpoint_options(checkpoint: bool, resume_id: str | None,
+                             redo: bool) -> tuple["CheckpointStore | None", "ResumeMode | None"]:
+    """Turn the flow command's persistence flags into a store and a mode.
+
+    ``--resume ID`` implies ``--checkpoint``: continuing a mission and then not
+    writing it would lose the work a second time.
+    """
+
+    if not (checkpoint or resume_id or redo):
+        return None, None
+    store = CheckpointStore(_default_runs_dir())
+    if redo:
+        return store, ResumeMode.REDO
+    if resume_id:
+        return store, ResumeMode.RESUME
+    return store, ResumeMode.RESUME
+
+
 def _flow_demo(objective_key: str, *, out_dir: Path | None = None,
-               delay: float = 0.05) -> dict[str, Any]:
+               delay: float = 0.05, store: "CheckpointStore | None" = None,
+               mode: "ResumeMode | None" = None) -> dict[str, Any]:
     """Run one scripted objective through the real graph, offline.
 
     The runner is deterministic and says so: the evidence it produces is
     labelled synthetic, so the demo demonstrates the *flow* — fan-out, review,
     retry, both joins, synthesis — and cannot be mistaken for a finding.
+
+    ``store`` turns the same run into a checkpointed one: the scripted objective
+    has a stable mission id, so a second invocation with the same store resumes
+    the first instead of repeating it.
     """
 
     context = _selftest_context(objective_key)
@@ -23318,6 +23573,8 @@ def _flow_demo(objective_key: str, *, out_dir: Path | None = None,
         policy=FlowPolicy.from_context(context, stage_delay_seconds=delay,
                                        max_parallel_workers=4, max_parallel_subagents=4),
     )
+    if store is not None:
+        flow.attach_resume(store, mode=mode)
     result = flow.run()
     if logger is not None:
         logger.close()
@@ -23325,6 +23582,9 @@ def _flow_demo(objective_key: str, *, out_dir: Path | None = None,
     payload: dict[str, Any] = {
         "objective_key": objective_key,
         "objective": context.objective,
+        "mission_id": flow.mission_id,
+        "resume": result.resume,
+        "checkpoint": result.checkpoint,
         "structure": flow.structures(),
         "waves": result.waves,
         "subagents": [
@@ -23437,6 +23697,15 @@ def flow_command(
         None, "--parallel-workers", help="Workers to run at once."),
     trace_limit: int = typer.Option(24, "--trace", help="Ledger rows to print."),
     out_dir: str | None = typer.Option(None, "--out-dir", help="Write artefacts here."),
+    checkpoint: bool = typer.Option(
+        False, "--checkpoint", help="Persist mission state after every major transition."),
+    resume_id: str | None = typer.Option(
+        None, "--resume", help="Continue an interrupted mission by id.", show_default=False),
+    redo: bool = typer.Option(
+        False, "--redo", help="Re-run every unit of a checkpointed mission."),
+    revalidate_after: float = typer.Option(
+        0.0, "--revalidate-after",
+        help="Re-check settled results older than this many seconds."),
     as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """Build and run the hierarchical graph.  Offline unless a target is given."""
@@ -23496,7 +23765,12 @@ def flow_command(
             console.print(f"[red]✘[/red] unknown demo {escape(repr(demo))}; choose from: "
                           f"{', '.join([*_SELFTEST_OBJECTIVES, 'compare'])}")
             raise typer.Exit(ExitCode.USAGE)
-        payload = _flow_demo(key, out_dir=directory)
+        store, mode = _flow_checkpoint_options(checkpoint, resume_id, redo)
+        try:
+            payload = _flow_demo(key, out_dir=directory, store=store, mode=mode)
+        except ResumeError as exc:
+            console.print(f"[red]✘[/red] {escape(str(exc))}")
+            raise typer.Exit(ExitCode.USAGE) from exc
         if as_json:
             _emit(json.dumps(payload, indent=2, default=str))
             raise typer.Exit(ExitCode.OK)
@@ -23559,11 +23833,21 @@ def flow_command(
         flow = build_mission_flow(
             context, _drafts_for_objective(context), policy=policy, logger=logger,
             tracker=tracker, runner=DeterministicRunner(scope=[target]))
+        live_store, live_mode = _flow_checkpoint_options(checkpoint, resume_id, redo)
+        if live_store is not None:
+            try:
+                flow.attach_resume(live_store, mode=live_mode,
+                                   revalidate_after_seconds=revalidate_after)
+            except ResumeError as exc:
+                console.print(f"[red]✘[/red] {escape(str(exc))}")
+                raise typer.Exit(ExitCode.USAGE) from exc
         result = flow.run()
         if logger is not None:
             logger.close()
         payload = {
             "objective_key": "live", "objective": objective, "structure": flow.structures(),
+            "mission_id": flow.mission_id, "resume": result.resume,
+            "checkpoint": result.checkpoint,
             "waves": result.waves,
             "subagents": [
                 {"id": subagent.id, "role": subagent.role,
@@ -23967,8 +24251,1537 @@ def sched_command(
     raise typer.Exit(ExitCode.OK)
 
 
+# --------------------------------------------------------------------------
+# 26. Checkpoints and resumable missions
+# --------------------------------------------------------------------------
+#
+# A mission that takes an hour is a mission that will be interrupted.  The
+# runtime therefore keeps its own write-ahead record *beside* this file — in the
+# runtime output directory, never inside the deliverable — and a resumed run
+# continues from it instead of starting again.
+#
+# Three rules make a resume safe:
+#
+# *   **Completed work is not repeated.**  A Worker that finished and was
+#     approved is settled in the record; the resumed graph adopts its outcome and
+#     its evidence rather than calling the runner again.  ``--redo`` is the only
+#     way to ask for it, and it is explicit.
+# *   **Incomplete work is revalidated, not trusted.**  An outcome with no
+#     review, a review that asked for a retry, or a unit that never ran is
+#     *stale*: the resume re-runs it (and, by default, re-checks it) rather than
+#     treating half a result as a result.
+# *   **Evidence is never duplicated.**  Evidence ids are content-addressed, and
+#     the store merges on id, so re-recording an item corroborates its sources
+#     instead of appending a second copy.  The checkpoint is written after every
+#     major transition, atomically, so a crash loses at most one unit.
+#
+# The file format is versioned and self-describing: a checkpoint from an older
+# build is refused with a reason rather than half-read.
+
+
+class CheckpointKind(str, Enum):
+    """What a checkpoint file records.
+
+    ``MISSION`` is the live graph state — what a resume reads.  ``ARCHIVE`` is
+    proof that a run finished; resuming from one is refused, because replaying a
+    completed mission is a different request (``--redo``).
+    """
+
+    MISSION = "mission"
+    ARCHIVE = "archive"
+
+
+class ResumeError(CheckpointError):
+    """A mission checkpoint could not be written, read, or trusted."""
+
+
+class CheckpointMissing(ResumeError):
+    """No checkpoint exists for the mission id that was asked for."""
+
+
+class CheckpointInvalid(ResumeError):
+    """The checkpoint exists but this build cannot reconstruct a run from it."""
+
+
+def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> Path:
+    """Write JSON so a crash cannot leave a half-written checkpoint.
+
+    Temp file in the same directory, ``fsync``, then ``os.replace`` — the rename
+    is atomic within a filesystem, so a reader sees either the old file or the
+    new one and never a truncated one.
+    """
+
+    target = Path(path)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        handle = tempfile.NamedTemporaryFile(
+            "w", dir=target.parent, prefix=f".{target.name}.", suffix=".tmp",
+            delete=False, encoding="utf-8")
+        try:
+            with handle as stream:
+                json.dump(payload, stream, indent=2, sort_keys=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(handle.name, target)
+        finally:
+            if os.path.exists(handle.name):
+                os.unlink(handle.name)
+    except OSError as exc:
+        raise ResumeError(f"could not write {target}: {exc}") from exc
+    return target
+
+
+class WorkerRecord(StrictModel):
+    """One Worker's durable state: the last outcome, its review, and the stamps.
+
+    This is the unit of resume.  ``settled`` means "finished *and* approved", the
+    only state a resumed run is allowed to skip.  Everything else is stale and is
+    re-run, with the reason kept here so the run's own ledger can say why.
+    """
+
+    worker_id: str = Field(min_length=1)
+    subagent_id: str = Field(min_length=1)
+    attempts: int = Field(default=0, ge=0)
+    rounds: int = Field(default=0, ge=0)
+    #: The outcome of the last attempt, as the runner returned it.
+    outcome: WorkerOutcome | None = None
+    review: ReviewVerdict | None = None
+    #: Evidence ids this Worker produced.  Ids only: the items live in the store.
+    evidence_ids: list[str] = Field(default_factory=list)
+    settled: bool = False
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    #: Why this unit will be re-run, when ``settled`` is false.
+    stale: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "worker_id": self.worker_id, "subagent_id": self.subagent_id,
+            "attempts": self.attempts, "rounds": self.rounds, "settled": self.settled,
+            "evidence_ids": list(self.evidence_ids), "stale": self.stale,
+            "outcome": (json.loads(model_to_json(self.outcome)) if self.outcome else None),
+            "review": (json.loads(model_to_json(self.review)) if self.review else None),
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "finished_at": self.finished_at.isoformat() if self.finished_at else None,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "WorkerRecord":
+        return cls(
+            worker_id=str(raw["worker_id"]), subagent_id=str(raw["subagent_id"]),
+            attempts=int(raw.get("attempts") or 0), rounds=int(raw.get("rounds") or 0),
+            outcome=(WorkerOutcome.model_validate(raw["outcome"])
+                     if raw.get("outcome") else None),
+            review=(ReviewVerdict.model_validate(raw["review"]) if raw.get("review") else None),
+            evidence_ids=[str(item) for item in raw.get("evidence_ids") or []],
+            settled=bool(raw.get("settled")), stale=str(raw.get("stale") or ""),
+            started_at=(datetime.fromisoformat(raw["started_at"])
+                        if raw.get("started_at") else None),
+            finished_at=(datetime.fromisoformat(raw["finished_at"])
+                         if raw.get("finished_at") else None),
+        )
+
+
+class SubagentRecord(StrictModel):
+    """One Subagent's durable state: its unit roster and its aggregate, if any."""
+
+    subagent_id: str = Field(min_length=1)
+    role: str = ""
+    worker_ids: list[str] = Field(default_factory=list)
+    #: The aggregate, present only when the Subagent finished *and* was recorded.
+    report: SubagentOutcome | None = None
+    settled: bool = False
+    stale: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "subagent_id": self.subagent_id, "role": self.role,
+            "worker_ids": list(self.worker_ids), "settled": self.settled,
+            "stale": self.stale,
+            "report": (json.loads(model_to_json(self.report)) if self.report else None),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "SubagentRecord":
+        return cls(
+            subagent_id=str(raw["subagent_id"]), role=str(raw.get("role") or ""),
+            worker_ids=[str(item) for item in raw.get("worker_ids") or []],
+            report=(SubagentOutcome.model_validate(raw["report"])
+                    if raw.get("report") else None),
+            settled=bool(raw.get("settled")), stale=str(raw.get("stale") or ""),
+        )
+
+
+#: The on-disk schema name and payload version.  Kept as module constants because
+#: they describe a *file*, not a record: a checkpoint from another build must be
+#: recognised and refused, which is not behaviour any record can have.
+CHECKPOINT_SCHEMA: str = "argus-mission-checkpoint"
+CHECKPOINT_VERSION: int = 1
+
+
+class MissionCheckpoint(StrictModel):
+    """The whole durable state of one mission, as it sits on disk.
+
+    This is deliberately *runtime* data, not application data: it changes shape
+    whenever the graph does, so it carries its own schema and version and is
+    written by :class:`CheckpointStore` rather than by the single source file's
+    models.  Nothing here is needed to *describe* a mission; it is needed to
+    continue one.
+    """
+
+    #: Bumped when this payload shape changes.  A mismatch is refused, not patched.
+    SCHEMA: ClassVar[str] = CHECKPOINT_SCHEMA
+    VERSION: ClassVar[int] = CHECKPOINT_VERSION
+
+    mission_id: str = Field(min_length=1)
+    kind: CheckpointKind = CheckpointKind.MISSION
+    objective: str = ""
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    #: Which run produced this file, and how many attempts it has had.
+    run_attempt: int = Field(default=1, ge=1)
+    #: The units the run was planned with, so a resume can prove it is continuing
+    #: the *same* hierarchy rather than a different one that happens to share an id.
+    fingerprint: str = ""
+    #: The context the mission was built from.  A resume does not re-plan.
+    context: dict[str, Any] = Field(default_factory=dict)
+    policy: dict[str, Any] = Field(default_factory=dict)
+    limits: dict[str, Any] = Field(default_factory=dict)
+    plan: ClipReport | None = None
+    subagents: list[SubagentRecord] = Field(default_factory=list)
+    workers: list[WorkerRecord] = Field(default_factory=list)
+    #: Evidence as it stood, so a resume with no store still has the facts.
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    #: The mission-level answer, once it exists.
+    synthesis: MasterSynthesis | None = None
+    #: Stages that have completed, in order: the hierarchy's own position.
+    stages: list[str] = Field(default_factory=list)
+    #: The ledger, so a resumed run's trace continues rather than restarts.
+    trace: list[dict[str, Any]] = Field(default_factory=list)
+    #: Free-form notes: why a resume happened, what it decided to re-run.
+    notes: list[str] = Field(default_factory=list)
+
+    @field_validator("created_at", "updated_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> datetime:
+        return normalise_datetime(value)
+
+    # -- lookup -------------------------------------------------------------
+
+    def worker(self, worker_id: str) -> WorkerRecord | None:
+        return next((record for record in self.workers if record.worker_id == worker_id), None)
+
+    def subagent(self, subagent_id: str) -> SubagentRecord | None:
+        return next((record for record in self.subagents
+                     if record.subagent_id == subagent_id), None)
+
+    # -- derived facts ------------------------------------------------------
+
+    @property
+    def settled_workers(self) -> list[str]:
+        return [record.worker_id for record in self.workers if record.settled]
+
+    @property
+    def stale_workers(self) -> list[str]:
+        return [record.worker_id for record in self.workers if not record.settled]
+
+    def evidence_ids(self) -> list[str]:
+        return [item.id for item in self.evidence]
+
+    def progress(self) -> dict[str, Any]:
+        """How far the mission got, as counts a CLI can print."""
+
+        total_workers = sum(len(record.worker_ids) for record in self.subagents) or len(self.workers)
+        return {
+            "mission_id": self.mission_id,
+            "workers": total_workers,
+            "settled": len(self.settled_workers),
+            "stale": len(self.stale_workers),
+            "subagents": len(self.subagents),
+            "subagents_settled": sum(1 for record in self.subagents if record.settled),
+            "evidence": len(self.evidence),
+            "synthesised": self.synthesis is not None,
+            "percent": (round(100 * len(self.settled_workers) / total_workers)
+                        if total_workers else 0),
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.SCHEMA,
+            "version": self.VERSION,
+            "mission_id": self.mission_id,
+            "kind": self.kind.value,
+            "objective": self.objective,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "run_attempt": self.run_attempt,
+            "fingerprint": self.fingerprint,
+            "context": self.context,
+            "policy": self.policy,
+            "limits": self.limits,
+            "plan": self.plan.to_dict() if self.plan else None,
+            "subagents": [record.to_dict() for record in self.subagents],
+            "workers": [record.to_dict() for record in self.workers],
+            "evidence": [json.loads(model_to_json(item)) for item in self.evidence],
+            "synthesis": (json.loads(model_to_json(self.synthesis)) if self.synthesis else None),
+            "stages": list(self.stages),
+            "trace": [dict(event) for event in self.trace],
+            "notes": list(self.notes),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "MissionCheckpoint":
+        """Rebuild, validating every record.  Never guesses at a damaged file."""
+
+        if raw.get("schema") != cls.SCHEMA:
+            raise CheckpointInvalid(
+                f"not a mission checkpoint (schema={raw.get('schema')!r})")
+        version = raw.get("version")
+        if version != cls.VERSION:
+            raise CheckpointInvalid(
+                f"checkpoint version {version!r} is not supported (expected {cls.VERSION}); "
+                f"resume it with the build that wrote it, or start a new mission")
+        try:
+            return cls(
+                mission_id=str(raw["mission_id"]),
+                kind=CheckpointKind(str(raw.get("kind") or CheckpointKind.MISSION.value)),
+                objective=str(raw.get("objective") or ""),
+                created_at=raw.get("created_at") or utc_now(),
+                updated_at=raw.get("updated_at") or utc_now(),
+                run_attempt=int(raw.get("run_attempt") or 1),
+                fingerprint=str(raw.get("fingerprint") or ""),
+                context=dict(raw.get("context") or {}),
+                policy=dict(raw.get("policy") or {}),
+                limits=dict(raw.get("limits") or {}),
+                plan=(ClipReport.model_validate(raw["plan"]) if raw.get("plan") else None),
+                subagents=[SubagentRecord.from_dict(item) for item in raw.get("subagents") or []],
+                workers=[WorkerRecord.from_dict(item) for item in raw.get("workers") or []],
+                evidence=[EvidenceItem.model_validate(item) for item in raw.get("evidence") or []],
+                synthesis=(MasterSynthesis.model_validate(raw["synthesis"])
+                           if raw.get("synthesis") else None),
+                stages=[str(item) for item in raw.get("stages") or []],
+                trace=[dict(item) for item in raw.get("trace") or []],
+                notes=[str(item) for item in raw.get("notes") or []],
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            raise CheckpointInvalid(
+                f"checkpoint for {raw.get('mission_id')!r} is corrupt: "
+                f"{type(exc).__name__}: {exc}") from exc
+
+
+class CheckpointStore:
+    """The mission's write-ahead record, on disk, outside the source file.
+
+    One directory per mission: ``runs/<mission>/checkpoint.json`` is the live
+    state a resume reads, ``runs/<mission>/archive.json`` is the finished record,
+    and ``runs/<mission>/resume-<n>.json`` keeps the checkpoint each resume
+    started from.  Writes are atomic and serialised, so a checkpoint taken by the
+    main thread cannot interleave with one taken by a Worker.
+
+    The store is a log of *transitions*, not a snapshot of method calls: the flow
+    calls :meth:`begin`, then :meth:`settle_worker` / :meth:`settle_subagent` /
+    :meth:`set_synthesis`, and the file on disk is always a consistent state.
+    """
+
+    #: Where mission checkpoints live under the runtime output directory.
+    DIRNAME: str = "runs"
+
+    def __init__(self, root: str | Path, *, clock: "Callable[[], datetime] | None" = None) -> None:
+        self.root = Path(root).expanduser()
+        self._clock: Callable[[], datetime] = clock or utc_now
+        self._lock = threading.RLock()
+        #: Every transition this store has written, for the CLI and the self-test.
+        self.writes: list[str] = []
+        #: Writes that failed, and why.  A mission can run without durability.
+        self.failures: list[str] = []
+        self._state: dict[str, MissionCheckpoint] = {}
+
+    # -- paths ---------------------------------------------------------------
+
+    def mission_dir(self, mission_id: str) -> Path:
+        return self.root / self.DIRNAME / mission_id
+
+    def path_for(self, mission_id: str, kind: CheckpointKind = CheckpointKind.MISSION) -> Path:
+        name = "checkpoint.json" if kind is CheckpointKind.MISSION else "archive.json"
+        return self.mission_dir(mission_id) / name
+
+    def resume_path_for(self, mission_id: str, attempt: int) -> Path:
+        return self.mission_dir(mission_id) / f"resume-{attempt}.json"
+
+    def list_missions(self) -> list[str]:
+        """Mission ids that have a checkpoint on disk, newest first."""
+
+        base = self.root / self.DIRNAME
+        if not base.is_dir():
+            return []
+        found = [path.name for path in base.iterdir()
+                 if path.is_dir() and (path / "checkpoint.json").exists()]
+        return sorted(found, key=lambda name: (base / name / "checkpoint.json").stat().st_mtime,
+                      reverse=True)
+
+    # -- lifecycle -----------------------------------------------------------
+
+    def begin(
+        self,
+        mission_id: str,
+        *,
+        objective: str = "",
+        context: Mapping[str, Any] | None = None,
+        policy: Mapping[str, Any] | None = None,
+        limits: Mapping[str, Any] | None = None,
+        plan: ClipReport | None = None,
+        fingerprint: str = "",
+        workers: Sequence[tuple[str, str]] = (),
+        subagents: Sequence[tuple[str, str, Sequence[str]]] = (),
+        resume: MissionCheckpoint | None = None,
+    ) -> MissionCheckpoint:
+        """Open (or re-open) a mission.
+
+        ``resume`` is the checkpoint a resume started from: the run attempt is
+        incremented, a copy of the incoming file is kept as ``resume-<n>.json``,
+        and the previous run's workers come back with it.  Otherwise the units
+        named here are recorded as pending, so a crash before any work has still
+        left a complete picture of what was planned.
+        """
+
+        with self._lock:
+            now = self._clock()
+            if resume is not None:
+                previous = resume
+                try:
+                    _atomic_write_json(self.resume_path_for(mission_id, previous.run_attempt),
+                                       previous.to_dict())
+                except ResumeError as exc:
+                    self.failures.append(f"resume-copy: {exc}")
+                state = previous.model_copy(deep=True)
+                state.run_attempt = previous.run_attempt + 1
+                state.updated_at = now
+                state.kind = CheckpointKind.MISSION
+                if objective:
+                    state.objective = objective
+                known = {(record.subagent_id, record.worker_id) for record in state.workers}
+                for subagent_id, worker_id in workers:
+                    if (subagent_id, worker_id) not in known:
+                        state.workers.append(WorkerRecord(
+                            worker_id=worker_id, subagent_id=subagent_id,
+                            stale="planned by the resumed build, never ran"))
+                for subagent_id, role, worker_ids in subagents:
+                    if state.subagent(subagent_id) is None:
+                        state.subagents.append(SubagentRecord(
+                            subagent_id=subagent_id, role=role,
+                            worker_ids=list(worker_ids),
+                            stale="planned by the resumed build, never ran"))
+                state.fingerprint = fingerprint or previous.fingerprint
+                state.plan = plan or previous.plan
+            else:
+                state = MissionCheckpoint(
+                    mission_id=mission_id, objective=objective, created_at=now, updated_at=now,
+                    context=dict(context or {}), policy=dict(policy or {}),
+                    limits=dict(limits or {}), plan=plan, fingerprint=fingerprint,
+                    subagents=[SubagentRecord(subagent_id=sid, role=role,
+                                              worker_ids=list(wids),
+                                              stale="planned, never ran")
+                               for sid, role, wids in subagents],
+                    workers=[WorkerRecord(worker_id=wid, subagent_id=sid,
+                                          stale="planned, never ran")
+                             for sid, wid in workers],
+                )
+            self._state[mission_id] = state
+            self._write("begin", state)
+            return state.model_copy(deep=True)
+
+    # -- transitions ---------------------------------------------------------
+
+    def record_stage(self, mission_id: str, stage: str, *, note: str = "") -> MissionCheckpoint:
+        """A major transition happened: persist the hierarchy's position."""
+
+        with self._lock:
+            state = self._require(mission_id)
+            if stage not in state.stages:
+                state.stages.append(stage)
+            if note:
+                state.notes.append(note)
+            return self._write(f"stage:{stage}", state)
+
+    def record_attempt(self, mission_id: str, subagent_id: str, worker_id: str,
+                       *, attempt: int, round_number: int = 1) -> MissionCheckpoint:
+        """An attempt *started*.  Written before the work, so a crash is visible."""
+
+        with self._lock:
+            state = self._require(mission_id)
+            record = self._worker(state, subagent_id, worker_id)
+            record.attempts = max(record.attempts, attempt)
+            record.rounds = max(record.rounds, round_number)
+            record.started_at = state.updated_at if record.started_at is None else record.started_at
+            record.stale = ""            # in flight, not stale
+            return self._write(f"attempt:{worker_id}:{attempt}", state)
+
+    def settle_worker(self, mission_id: str, subagent_id: str, worker_id: str, *,
+                      outcome: WorkerOutcome, review: ReviewVerdict | None,
+                      evidence: Sequence[EvidenceItem] = ()) -> MissionCheckpoint:
+        """Record a finished attempt and its verdict.
+
+        ``settled`` is only true when a review approved it: a rejected or
+        unreviewed outcome is durable *and* stale, which is exactly what a resume
+        needs to know to re-run it.
+        """
+
+        with self._lock:
+            state = self._require(mission_id)
+            record = self._worker(state, subagent_id, worker_id)
+            record.outcome = outcome
+            record.review = review
+            record.attempts = max(record.attempts, outcome.attempt)
+            record.evidence_ids = list(dict.fromkeys([*record.evidence_ids, *outcome.evidence_ids]))
+            record.finished_at = self._clock()
+            approved = review is not None and review.approved
+            record.settled = bool(approved and outcome.status is EntityStatus.SUCCEEDED)
+            record.stale = "" if record.settled else (
+                "review asked for a retry" if review is not None and review.retry
+                else "not approved" if review is not None
+                else "finished without a review")
+            for item in evidence:
+                self._merge_evidence(state, item)
+            return self._write(f"worker:{worker_id}", state)
+
+    def settle_subagent(self, mission_id: str, report: SubagentOutcome) -> MissionCheckpoint:
+        """Record a Subagent's aggregate — the level a resume must not lose."""
+
+        with self._lock:
+            state = self._require(mission_id)
+            record = state.subagent(report.subagent_id)
+            if record is None:
+                record = SubagentRecord(subagent_id=report.subagent_id, role=report.role,
+                                        worker_ids=[outcome.worker_id
+                                                    for outcome in report.outcomes])
+                state.subagents.append(record)
+            record.report = report
+            record.role = report.role or record.role
+            record.settled = True
+            record.stale = ""
+            for item in report.evidence:
+                self._merge_evidence(state, item)
+            return self._write(f"subagent:{report.subagent_id}", state)
+
+    def set_synthesis(self, mission_id: str, synthesis: MasterSynthesis) -> MissionCheckpoint:
+        with self._lock:
+            state = self._require(mission_id)
+            state.synthesis = synthesis
+            return self._write("synthesis", state)
+
+    def append_trace(self, mission_id: str, events: Sequence[Mapping[str, Any]]) -> MissionCheckpoint:
+        """Extend the ledger.  Trace is evidence of order; it is never rewritten."""
+
+        with self._lock:
+            state = self._require(mission_id)
+            state.trace.extend(dict(event) for event in events)
+            return self._write("trace", state)
+
+    def mark_stale(self, mission_id: str, worker_id: str, why: str) -> MissionCheckpoint:
+        """Say explicitly why a unit will be re-run."""
+
+        with self._lock:
+            state = self._require(mission_id)
+            record = next((item for item in state.workers if item.worker_id == worker_id), None)
+            if record is not None:
+                record.settled = False
+                record.stale = why
+            return self._write(f"stale:{worker_id}", state)
+
+    def note(self, mission_id: str, message: str) -> MissionCheckpoint:
+        with self._lock:
+            state = self._require(mission_id)
+            state.notes.append(message)
+            return self._write("note", state)
+
+    def finish(self, mission_id: str) -> Path:
+        """Close the mission: the live checkpoint becomes the archive.
+
+        The live file is removed only after the archive is written, so there is no
+        window in which neither exists.
+        """
+
+        with self._lock:
+            state = self._require(mission_id)
+            state.kind = CheckpointKind.ARCHIVE
+            state.updated_at = self._clock()
+            self._write("finish", state)
+            try:
+                archive = _atomic_write_json(self.path_for(mission_id, CheckpointKind.ARCHIVE),
+                                             state.to_dict())
+            except ResumeError as exc:
+                self.failures.append(f"archive: {exc}")
+                return None
+            live = self.path_for(mission_id)
+            if live.exists():
+                live.unlink()
+            # The in-memory copy described a live mission; it is archived now, and
+            # a cached "live" state would let a resume slip past the refusal.
+            self._state.pop(mission_id, None)
+            return archive
+
+    # -- reads ---------------------------------------------------------------
+
+    def load(self, mission_id: str) -> MissionCheckpoint:
+        """Read one mission's live checkpoint, or raise with the reason."""
+
+        with self._lock:
+            if mission_id in self._state:
+                return self._state[mission_id].model_copy(deep=True)
+        path = self.path_for(mission_id)
+        if not path.exists():
+            archive = self.path_for(mission_id, CheckpointKind.ARCHIVE)
+            if archive.exists():
+                raise CheckpointInvalid(
+                    f"mission {mission_id!r} has already finished ({archive}); "
+                    f"resuming it would replay completed work — pass --redo to run it again")
+            raise CheckpointMissing(f"no checkpoint for mission {mission_id!r} under {self.root}")
+        return self.load_path(path)
+
+    @classmethod
+    def load_path(cls, path: str | Path) -> MissionCheckpoint:
+        source = Path(path).expanduser()
+        try:
+            raw = json.loads(source.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CheckpointInvalid(f"could not read {source}: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise CheckpointInvalid(f"{source} does not contain a checkpoint object")
+        return MissionCheckpoint.from_dict(raw)
+
+    def snapshot(self, mission_id: str) -> dict[str, Any]:
+        return self.load(mission_id).progress()
+
+    # -- internals -----------------------------------------------------------
+
+    def _require(self, mission_id: str) -> MissionCheckpoint:
+        state = self._state.get(mission_id)
+        if state is None:
+            raise CheckpointMissing(f"mission {mission_id!r} was never begun in this store")
+        return state
+
+    def _worker(self, state: MissionCheckpoint, subagent_id: str,
+                worker_id: str) -> WorkerRecord:
+        record = state.worker(worker_id)
+        if record is None:
+            record = WorkerRecord(worker_id=worker_id, subagent_id=subagent_id,
+                                  stale="planned by the resumed build, never ran")
+            state.workers.append(record)
+        return record
+
+    def _merge_evidence(self, state: MissionCheckpoint, item: EvidenceItem) -> None:
+        """Merge on id: re-recording corroborates, it never appends a duplicate."""
+
+        existing = next((known for known in state.evidence if known.id == item.id), None)
+        if existing is None:
+            state.evidence.append(item)
+            return
+        merged = {source.id: source for source in existing.sources}
+        for source in item.sources:
+            merged.setdefault(source.id, source)
+        index = state.evidence.index(existing)
+        state.evidence[index] = existing.model_copy(update={
+            "sources": list(merged.values()),
+            "supports": list(dict.fromkeys([*existing.supports, *item.supports])),
+            "contradicts": list(dict.fromkeys([*existing.contradicts, *item.contradicts])),
+            "tags": list(dict.fromkeys([*existing.tags, *item.tags])),
+        })
+
+    def _flush(self, state: MissionCheckpoint, why: str) -> MissionCheckpoint:
+        state.updated_at = self._clock()
+        _atomic_write_json(self.path_for(state.mission_id), state.to_dict())
+        self.writes.append(why)
+        return state.model_copy(deep=True)
+
+    def _write(self, why: str, state: MissionCheckpoint) -> MissionCheckpoint:
+        """Flush, or record the failure and keep the in-memory state.
+
+        Durability is best-effort at every layer: a mission that cannot write its
+        checkpoint is running without a safety net, which is worth saying loudly —
+        but it is not a reason to stop the mission.
+        """
+
+        try:
+            return self._flush(state, why)
+        except ResumeError as exc:
+            self.failures.append(f"{why}: {exc}")
+            return state.model_copy(deep=True)
+
+
+class ResumeMode(str, Enum):
+    """What a run should do with a checkpoint it finds.
+
+    ``FRESH`` ignores one (and overwrites it), ``RESUME`` continues it, and
+    ``REDO`` re-runs the work *without* discarding the record — the difference
+    between "I lost the output" and "I want it done again" is exactly whether the
+    existing evidence stays.
+    """
+
+    FRESH = "fresh"
+    RESUME = "resume"
+    REDO = "redo"
+
+
+def plan_fingerprint(subagents: Sequence[FlowSubagent], objective: str) -> str:
+    """A stable digest of *what the mission is*, not of how far it got.
+
+    A resume is only meaningful against the same hierarchy: if the plan changed,
+    the checkpoint's worker ids describe units that no longer exist, and adopting
+    them would be inventing work.  The digest therefore covers the objective and
+    the full unit roster — ids, roles, slices and dependencies — and nothing that
+    changes as the run proceeds.
+    """
+
+    shape = [objective.strip().lower()]
+    for subagent in subagents:
+        shape.append(f"S|{subagent.id}|{subagent.role}|{subagent.objective}|"
+                     + ",".join(subagent.depends_on))
+        for worker in subagent.workers:
+            shape.append(f"W|{worker.id}|{worker.name}|{worker.work_unit}|"
+                         + ",".join(worker.depends_on))
+    return content_id("plan", *shape)
+
+
+class ResumePlan(StrictModel):
+    """What one resume decided, and why.  Printed before it does anything.
+
+    The plan is the resume's contract: every unit is either *adopted* (it had
+    finished and been approved) or *re-run*, and a re-run always carries a
+    reason.  A unit can never be silently missing from both lists.
+    """
+
+    mission_id: str = ""
+    mode: ResumeMode = ResumeMode.RESUME
+    attempt: int = Field(default=1, ge=1)
+    adopted_workers: list[str] = Field(default_factory=list)
+    rerun_workers: list[str] = Field(default_factory=list)
+    reasons: dict[str, str] = Field(default_factory=dict)
+    adopted_subagents: list[str] = Field(default_factory=list)
+    #: Evidence already on record: adopted, never re-collected.
+    evidence_ids: list[str] = Field(default_factory=list)
+    #: Revalidation: adopted outcomes whose unit is past its freshness window.
+    revalidated: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+    @property
+    def resumed(self) -> bool:
+        """True when this plan continues earlier work rather than starting over."""
+
+        return bool(self.adopted_workers or self.adopted_subagents)
+
+    @property
+    def runs_nothing(self) -> bool:
+        return not self.rerun_workers
+
+    def summary(self) -> str:
+        if not self.resumed:
+            return f"fresh run: {len(self.rerun_workers)} unit(s) to do"
+        return (f"resume attempt {self.attempt}: {len(self.adopted_workers)} unit(s) adopted, "
+                f"{len(self.rerun_workers)} re-run, {len(self.evidence_ids)} evidence item(s) kept")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mission_id": self.mission_id, "mode": self.mode.value, "attempt": self.attempt,
+            "adopted_workers": list(self.adopted_workers),
+            "rerun_workers": list(self.rerun_workers),
+            "adopted_subagents": list(self.adopted_subagents),
+            "reasons": dict(self.reasons), "evidence": len(self.evidence_ids),
+            "revalidated": list(self.revalidated),
+            "notes": list(self.notes), "summary": self.summary(),
+        }
+
+
+def resume_plan(
+    subagents: Sequence[FlowSubagent],
+    checkpoint: MissionCheckpoint | None,
+    *,
+    mode: ResumeMode = ResumeMode.RESUME,
+    revalidate_after_seconds: float = 0.0,
+    now: datetime | None = None,
+    fingerprint: str = "",
+    mission_id: str = "",
+) -> ResumePlan:
+    """Decide, unit by unit, what a resumed run adopts and what it repeats.
+
+    Order of authority, first match wins:
+
+    1.  ``FRESH`` or ``REDO`` — nothing is adopted; ``REDO`` keeps the record.
+    2.  A different plan (the fingerprint does not match) — nothing is adopted,
+        because the checkpoint describes a different hierarchy.
+    3.  A unit recorded as settled — adopted, *unless* it is older than
+        ``revalidate_after_seconds``, in which case it is revalidated: adopted
+        only if its outcome still carries evidence, and marked so the run says it
+        looked.
+    4.  Anything else — re-run, with the record's own reason attached.
+
+    The result always partitions the roster: every unit appears in exactly one of
+    ``adopted_workers`` and ``rerun_workers``.
+    """
+
+    plan = ResumePlan(mission_id=(checkpoint.mission_id if checkpoint else mission_id),
+                      mode=mode, attempt=(checkpoint.run_attempt if checkpoint else 1))
+    if checkpoint is not None and fingerprint and checkpoint.fingerprint \
+            and checkpoint.fingerprint != fingerprint:
+        plan.mode = ResumeMode.FRESH
+        plan.notes.append("the checkpoint describes a different plan; starting clean "
+                          "(the old record is kept under runs/<mission>/)")
+        checkpoint = None
+    if checkpoint is None or mode in {ResumeMode.FRESH, ResumeMode.REDO}:
+        why = ("first attempt: nothing is on record yet" if checkpoint is None
+               else f"{mode.value}: the existing record is kept, nothing is adopted")
+        plan.mode = ResumeMode.FRESH if checkpoint is None else mode
+        plan.notes.append(why)
+        plan.rerun_workers = [worker.id for subagent in subagents
+                              for worker in subagent.workers]
+        plan.reasons = {worker.id: why for subagent in subagents
+                        for worker in subagent.workers}
+        return plan
+
+    moment = now or utc_now()
+    known_subagents = {record.subagent_id: record for record in checkpoint.subagents}
+    for subagent in subagents:
+        record = known_subagents.get(subagent.id)
+        if record is not None and record.settled and record.report is not None:
+            # A settled Subagent is adopted whole: its aggregate already carries
+            # its barrier and its evidence, so recomputing it would replace a
+            # recorded fact with a fresh opinion.
+            plan.adopted_subagents.append(subagent.id)
+            plan.notes.append(f"{subagent.role}: aggregate adopted from attempt "
+                              f"{checkpoint.run_attempt}")
+        for worker in subagent.workers:
+            known = checkpoint.worker(worker.id)
+            if known is None:
+                plan.rerun_workers.append(worker.id)
+                plan.reasons[worker.id] = "not in the checkpoint: planned after it was written"
+                continue
+            if not known.settled:
+                plan.rerun_workers.append(worker.id)
+                plan.reasons[worker.id] = known.stale or "recorded as unfinished"
+                continue
+            age = (moment - known.finished_at).total_seconds() if known.finished_at else None
+            if revalidate_after_seconds and (age is None or age > revalidate_after_seconds):
+                produced = bool(known.evidence_ids)
+                plan.revalidated.append(worker.id)
+                if produced:
+                    plan.adopted_workers.append(worker.id)
+                    plan.reasons[worker.id] = (
+                        f"revalidated: {age:.0f}s old, still carries "
+                        f"{len(known.evidence_ids)} evidence id(s)")
+                else:
+                    plan.rerun_workers.append(worker.id)
+                    plan.reasons[worker.id] = (
+                        f"stale after {age:.0f}s: the record claims success but holds no evidence")
+                continue
+            plan.adopted_workers.append(worker.id)
+            plan.reasons[worker.id] = "settled and approved in an earlier attempt"
+    plan.evidence_ids = checkpoint.evidence_ids()
+    return plan
+
+
+class ResumeLedger:
+    """The flow's write-ahead seam: the only place the graph touches a checkpoint.
+
+    Keeping it in one object means the graph nodes keep their one-line shape, and
+    a mission without a store costs a single ``is None`` check rather than a
+    branch per transition.
+    """
+
+    def __init__(self, store: CheckpointStore, mission_id: str, *,
+                 plan: ResumePlan | None = None) -> None:
+        self.store = store
+        self.mission_id = mission_id
+        self.plan = plan or ResumePlan(mission_id=mission_id)
+        #: Transitions this run asked the store to write, in order.
+        self.transitions: list[str] = []
+        #: Writes that failed.  Durability is best-effort; losing the run is not.
+        self.errors: list[str] = []
+        self._lock = threading.RLock()
+
+    # -- pass-throughs, so a node never holds a raw store --------------------
+
+    def _write(self, what: str, action: Callable[[], Any]) -> None:
+        """Run one store transition, and remember whether it reached the disk.
+
+        A checkpoint that cannot be written must not stop the mission: losing
+        durability is bad, losing the run is worse.  The store records its own
+        failures, so the seam watches its counter rather than guessing.
+        """
+
+        with self._lock:
+            before = len(self.store.failures)
+            try:
+                action()
+            except CheckpointError as exc:
+                self.errors.append(f"{what}: {exc}")
+                return
+            if len(self.store.failures) > before:
+                self.errors.append(self.store.failures[-1])
+                return
+            self.transitions.append(what)
+
+    def attempt(self, subagent_id: str, worker_id: str, *, attempt: int,
+                round_number: int) -> None:
+        self._write(f"attempt:{worker_id}:{attempt}",
+                    lambda: self.store.record_attempt(self.mission_id, subagent_id, worker_id,
+                                                      attempt=attempt,
+                                                      round_number=round_number))
+
+    def settle_worker(self, subagent_id: str, worker_id: str, *,
+                      outcome: WorkerOutcome, review: ReviewVerdict | None,
+                      evidence: Sequence[EvidenceItem] = ()) -> None:
+        self._write(f"worker:{worker_id}",
+                    lambda: self.store.settle_worker(self.mission_id, subagent_id, worker_id,
+                                                     outcome=outcome, review=review,
+                                                     evidence=evidence))
+
+    def settle_subagent(self, report: SubagentOutcome) -> None:
+        self._write(f"subagent:{report.subagent_id}",
+                    lambda: self.store.settle_subagent(self.mission_id, report))
+
+    def synthesis(self, synthesis: MasterSynthesis) -> None:
+        self._write("synthesis", lambda: self.store.set_synthesis(self.mission_id, synthesis))
+
+    def stage(self, name: str, *, note: str = "") -> None:
+        self._write(f"stage:{name}",
+                    lambda: self.store.record_stage(self.mission_id, name, note=note))
+
+    def trace(self, events: Sequence[Mapping[str, Any]]) -> None:
+        if events:
+            self._write("trace", lambda: self.store.append_trace(self.mission_id, events))
+
+    def finish(self) -> Path | None:
+        """Archive the mission.  Returns the archive path, or ``None`` on failure."""
+
+        try:
+            return self.store.finish(self.mission_id)
+        except CheckpointError:
+            self.errors.append("finish")
+            return None
+
+
+# --------------------------------------------------------------------------
+# 26.1 Self-test — interruption, resume, and the evidence ledger
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ResumeCheck:
+    """One claim about checkpointing, and the evidence for it."""
+
+    name: str
+    ok: bool
+    detail: str = ""
+
+
+class _SparkRunner(DeterministicRunner):
+    """A runner that records what it was asked to do, and dies when told to.
+
+    ``limit`` simulates the interruption: the process is gone after that many
+    Worker calls, exactly as a power cut would leave it — no cleanup, no
+    exception handling inside the graph, nothing flushed by the runner itself.
+    """
+
+    def __init__(self, *, limit: int | None = None, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.limit = limit
+        self.calls: list[tuple[str, int]] = []
+        self._lock = threading.Lock()
+
+    def run_worker(self, subagent: FlowSubagent, worker: FlowWorker, *,
+                   attempt: int, guidance: str = "") -> WorkerOutcome:
+        with self._lock:
+            self.calls.append((worker.id, attempt))
+            count = len(self.calls)
+        if self.limit is not None and count > self.limit:
+            raise KeyboardInterrupt("simulated power loss")
+        return super().run_worker(subagent, worker, attempt=attempt, guidance=guidance)
+
+
+def resume_demo_context() -> MasterContext:
+    """The scripted mission the resume self-test interrupts and continues."""
+
+    return _selftest_context("forensic")
+
+
+def _resume_units(context: MasterContext) -> list[FlowSubagent]:
+    """The scripted team for ``context``, rebuilt from its own objective."""
+
+    key = next((name for name, spec in _SELFTEST_OBJECTIVES.items()
+                if spec["objective"] == context.objective), "forensic")
+    return flow_units_for(context, key)
+
+
+def interrupt_then_resume(root: Path, *, limit: int = 2) -> tuple[
+        MissionCheckpoint, FlowResult, ResumePlan, list[tuple[str, int]]]:
+    """Interrupt a mission after ``limit`` Worker calls, then resume it.
+
+    Returns the checkpoint taken at the moment of the crash, the resumed result,
+    the decision the resume made, and the ``(worker, attempt)`` calls the resumed
+    runner was actually asked for — the ground truth for "nothing was repeated".
+    """
+
+    context = resume_demo_context()
+    units = _resume_units(context)
+    store = CheckpointStore(root)
+    crasher = _SparkRunner(scope=context.scope_entries, limit=limit)
+    flow = HierarchicalFlow(context=context, subagents=units, runner=crasher,
+                            runtime=ConcurrencyRuntime(ResourceLimits(
+                                max_concurrent_workers=1, max_concurrent_subagents=1)))
+    flow.attach_resume(store)
+    try:
+        flow.run()
+    except KeyboardInterrupt:
+        pass
+    else:                                     # pragma: no cover - the crash is the point
+        raise AssertionError("the run was expected to be interrupted")
+    crash_state = store.load(flow.mission_id)
+
+    runner = _SparkRunner(scope=context.scope_entries)
+    resumed = HierarchicalFlow(context=context, subagents=units, runner=runner,
+                               runtime=ConcurrencyRuntime(ResourceLimits(
+                                   max_concurrent_workers=1, max_concurrent_subagents=1)))
+    decision = resumed.attach_resume(store)
+    result = resumed.run()
+    return crash_state, result, decision, runner.calls
+
+
+def run_resume_self_test() -> list[ResumeCheck]:
+    """Prove the acceptance criterion: an interruption resumes without loss.
+
+    Everything here runs offline against a temporary directory, and every check
+    is a property of the checkpoint machinery rather than of one run's timing.
+    """
+
+    checks: list[ResumeCheck] = []
+
+    def add(name: str, ok: bool, detail: Any = "") -> None:
+        checks.append(ResumeCheck(name=name, ok=bool(ok), detail=str(detail)[:150]))
+
+    def raises(fn: Callable[[], Any], exc: type[BaseException]) -> bool:
+        try:
+            fn()
+        except exc:
+            return True
+        except Exception:
+            return False
+        return False
+
+    # ---- 1. the record lives outside the deliverable ---------------------
+    root = Path(tempfile.mkdtemp(prefix="argus-resume-"))
+    store = CheckpointStore(root)
+    context = resume_demo_context()
+    units = _resume_units(context)
+    workers = [(subagent.id, worker.id) for subagent in units for worker in subagent.workers]
+    state = store.begin("mission-1", objective=context.objective,
+                        context=json.loads(model_to_json(context)),
+                        workers=workers,
+                        subagents=[(s.id, s.role, [w.id for w in s.workers]) for s in units])
+    path = store.path_for("mission-1")
+    add("a checkpoint is written to the runtime directory",
+        path.exists() and root in path.parents, str(path))
+    add("the source file is never written to", path.suffix == ".json" and "vedant_osint" not in str(path))
+    add("the record names every planned unit", len(state.workers) == len(workers), len(state.workers))
+    add("nothing is settled before it runs", not state.settled_workers, state.settled_workers)
+    add("every unrun unit is stale with a reason",
+        all(record.stale for record in state.workers), [r.stale for r in state.workers][:2])
+    add("a fresh mission does not claim to be a resume", not state.progress()["synthesised"])
+    add("the mission is discoverable by id", "mission-1" in store.list_missions(),
+        store.list_missions())
+
+    # ---- 2. transitions are persisted atomically and in order ------------
+    from_live = CheckpointStore.load_path(path)
+    add("a checkpoint round-trips through disk",
+        from_live.mission_id == "mission-1" and len(from_live.workers) == len(state.workers))
+    add("the payload is self-describing",
+        json.loads(path.read_text())["schema"] == CHECKPOINT_SCHEMA
+        and json.loads(path.read_text())["version"] == CHECKPOINT_VERSION)
+    add("no temporary file is left behind",
+        not [item for item in path.parent.iterdir() if item.suffix == ".tmp"],
+        [item.name for item in path.parent.iterdir()])
+    broken = root / "runs" / "mission-1" / "broken.json"
+    broken.write_text("{not json")
+    add("a corrupt checkpoint is refused with a reason",
+        raises(lambda: CheckpointStore.load_path(broken), CheckpointInvalid))
+    older = root / "runs" / "mission-1" / "older.json"
+    older.write_text(json.dumps({"schema": CHECKPOINT_SCHEMA, "version": 99,
+                                 "mission_id": "mission-1"}))
+    add("a checkpoint from another build is refused",
+        raises(lambda: CheckpointStore.load_path(older), CheckpointInvalid))
+
+    # ---- 3. a crash leaves a complete, resumable record ------------------
+    crash_root = Path(tempfile.mkdtemp(prefix="argus-crash-"))
+    crash_state, result, decision, runner_calls = interrupt_then_resume(crash_root, limit=2)
+    add("an interrupted mission leaves a live checkpoint",
+        crash_state.settled_workers, crash_state.progress())
+    add("the crash is visible as unfinished work",
+        crash_state.progress()["settled"] < crash_state.progress()["workers"],
+        crash_state.progress())
+    add("the interrupted units say why they will run again",
+        all(record.stale for record in crash_state.workers if not record.settled),
+        [r.stale for r in crash_state.workers if not r.settled][:2])
+    add("a finished unit was recorded before the crash", len(crash_state.evidence) >= 1,
+        len(crash_state.evidence))
+
+    # ---- 4. the resume adopts, and does not repeat ----------------------
+    add("the resume adopts the units that had settled", decision.resumed
+        and decision.adopted_workers, decision.summary())
+    add("only the unfinished units are re-run",
+        len(decision.rerun_workers) == crash_state.progress()["stale"],
+        f"{len(decision.rerun_workers)} vs {crash_state.progress()['stale']}")
+    add("every re-run carries a reason",
+        all(decision.reasons.get(worker_id) for worker_id in decision.rerun_workers),
+        {k: v for k, v in list(decision.reasons.items())[:2]})
+    resumed_calls = [worker_id for worker_id, _attempt in runner_calls]
+    add("an adopted unit is not sent to the runner again",
+        not set(decision.adopted_workers) & set(resumed_calls),
+        f"adopted {len(decision.adopted_workers)}, called {resumed_calls}")
+    add("the resume spends calls only on the units it repeats",
+        len(runner_calls) >= 1 and len(runner_calls) == len(decision.rerun_workers),
+        f"{len(runner_calls)} call(s), {len(decision.rerun_workers)} re-run")
+    add("the resumed mission completes", result.synthesis is not None
+        or not result.reports == [], len(result.reports))
+
+    # ---- 5. evidence is neither duplicated nor lost ---------------------
+    fresh = HierarchicalFlow(context=context, subagents=_resume_units(context),
+                             runner=DeterministicRunner(scope=context.scope_entries),
+                             runtime=ConcurrencyRuntime(ResourceLimits())).run()
+    baseline = sorted(item.id for item in fresh.evidence)
+    resumed_ids = sorted(item.id for item in result.evidence)
+    add("a resumed mission ends with the same evidence as an uninterrupted one",
+        resumed_ids == baseline, f"{len(resumed_ids)} vs {len(baseline)}")
+    add("no evidence id appears twice in the resumed result",
+        len(resumed_ids) == len(set(resumed_ids)), len(resumed_ids))
+    archive = CheckpointStore.load_path(
+        CheckpointStore(crash_root).path_for(crash_state.mission_id, CheckpointKind.ARCHIVE))
+    add("the persisted evidence is deduplicated too",
+        len(archive.evidence) == len({item.id for item in archive.evidence}),
+        len(archive.evidence))
+    add("the persisted evidence matches the run",
+        sorted(item.id for item in archive.evidence) == baseline,
+        f"{len(archive.evidence)} vs {len(baseline)}")
+    add("a finished mission is archived, not left live",
+        not CheckpointStore(crash_root).path_for(crash_state.mission_id).exists())
+
+    # ---- 6. the hierarchy survives, not just the evidence --------------
+    add("the resumed run keeps the subagent count", len(result.reports) == len(units),
+        f"{len(result.reports)}/{len(units)}")
+    add("the resumed aggregates keep their barriers",
+        all(report.aggregate_basis is not None for report in result.reports))
+    add("the run attempt is recorded", decision.attempt >= 1, decision.attempt)
+    add("the resume is announced in the ledger",
+        any("adopted" in str(event.get("detail", "")) for event in result.trace),
+        len(result.trace))
+
+    # ---- 6b. a re-attached plan is not a second attempt -----------------
+    again_root = Path(tempfile.mkdtemp(prefix="argus-again-"))
+    again_store = CheckpointStore(again_root)
+    again = HierarchicalFlow(context=context, subagents=_resume_units(context),
+                             runner=DeterministicRunner(scope=context.scope_entries),
+                             runtime=ConcurrencyRuntime(ResourceLimits()))
+    first_plan = again.attach_resume(again_store)
+    second_plan = again.attach_resume(again_store)
+    add("attaching the same store twice does not open a second attempt",
+        first_plan.attempt == second_plan.attempt, f"{first_plan.attempt}/{second_plan.attempt}")
+    again.run()
+    again_archive = CheckpointStore.load_path(
+        again_store.path_for(again.mission_id, CheckpointKind.ARCHIVE))
+    add("an adopted outcome does not duplicate its evidence",
+        len(again_archive.evidence) == len({item.id for item in again_archive.evidence}),
+        len(again_archive.evidence))
+
+    # ---- 7. resuming a finished mission is refused ---------------------
+    finished = CheckpointStore(crash_root)
+    add("a finished mission cannot be resumed silently",
+        raises(lambda: finished.load(crash_state.mission_id), CheckpointInvalid))
+    add("the refusal names the archive and the way out",
+        "redo" in _capture(lambda: finished.load(crash_state.mission_id)).lower(),
+        _capture(lambda: finished.load(crash_state.mission_id))[:90])
+    # The CLI's path: a flow that is told to resume a finished mission must refuse
+    # it as a usage problem, not run it again and not crash.
+    closed = HierarchicalFlow(context=context, subagents=_resume_units(context),
+                              runner=DeterministicRunner(scope=context.scope_entries),
+                              runtime=ConcurrencyRuntime(ResourceLimits()))
+    add("a finished mission cannot be resumed through the flow",
+        raises(lambda: closed.attach_resume(finished), ResumeError),
+        _capture(lambda: closed.attach_resume(finished))[:80])
+    add("and the archive is readable",
+        finished.path_for(crash_state.mission_id, CheckpointKind.ARCHIVE).exists())
+
+    # ---- 8. redo, and stale work ------------------------------------
+    redo_root = Path(tempfile.mkdtemp(prefix="argus-redo-"))
+    redo_store = CheckpointStore(redo_root)
+    first = HierarchicalFlow(context=context, subagents=_resume_units(context),
+                             runner=DeterministicRunner(scope=context.scope_entries),
+                             runtime=ConcurrencyRuntime(ResourceLimits()))
+    first.attach_resume(redo_store)
+    first.run()
+    archive_ids = sorted(item.id for item in
+                         CheckpointStore.load_path(redo_store.path_for(
+                             first.mission_id, CheckpointKind.ARCHIVE)).evidence)
+    redo_runner = _SparkRunner(scope=context.scope_entries)
+    redo = HierarchicalFlow(context=context, subagents=_resume_units(context),
+                            runner=redo_runner,
+                            runtime=ConcurrencyRuntime(ResourceLimits()))
+    redo_decision = redo.attach_resume(redo_store, mode=ResumeMode.REDO)
+    redo_result = redo.run()
+    add("redo re-runs every unit", not redo_decision.adopted_workers
+        and len(redo_decision.rerun_workers) == len(
+            [worker for subagent in _resume_units(context) for worker in subagent.workers]),
+        redo_decision.summary())
+    add("redo keeps the earlier evidence rather than starting empty",
+        sorted(item.id for item in redo_result.evidence) == archive_ids,
+        f"{len(redo_result.evidence)}")
+    add("redo really called the runner", bool(redo_runner.calls), len(redo_runner.calls))
+
+    # a revalidated (stale) outcome is adopted only if it still carries evidence
+    stale_root = Path(tempfile.mkdtemp(prefix="argus-stale-"))
+    stale_store = CheckpointStore(stale_root)
+    owner = HierarchicalFlow(context=context, subagents=_resume_units(context),
+                             runner=DeterministicRunner(scope=context.scope_entries),
+                             runtime=ConcurrencyRuntime(ResourceLimits()))
+    owner.attach_resume(stale_store, mode=ResumeMode.REDO)
+    owner.run()
+    # forge a settled unit with no evidence, then revalidate it
+    forged = CheckpointStore.load_path(stale_store.path_for(owner.mission_id,
+                                                            CheckpointKind.ARCHIVE))
+    victim = forged.workers[0]
+    forged.workers[0] = victim.model_copy(update={"evidence_ids": []})
+    stale_store.begin(forged.mission_id, resume=forged,
+                      workers=[(record.subagent_id, record.worker_id)
+                               for record in forged.workers])
+    stale_plan = resume_plan(_resume_units(context), stale_store.load(forged.mission_id),
+                             revalidate_after_seconds=0.0001)
+    add("a stale success with no evidence is re-run, not trusted",
+        victim.worker_id in stale_plan.rerun_workers, stale_plan.reasons.get(victim.worker_id))
+    add("revalidation is reported, not silent", victim.worker_id in stale_plan.revalidated,
+        stale_plan.revalidated)
+    roomy = resume_plan(_resume_units(context), stale_store.load(forged.mission_id),
+                        revalidate_after_seconds=10_000)
+    add("a fresh-enough result is adopted without revalidation",
+        victim.worker_id in roomy.adopted_workers and not roomy.revalidated, roomy.summary())
+
+    # ---- 9. a different plan is not resumed ----------------------------
+    other = _resume_units(_selftest_context("exposure"))
+    mismatch = resume_plan(other, stale_store.load(forged.mission_id),
+                           fingerprint=plan_fingerprint(other, "a different objective"))
+    add("a checkpoint for a different plan is not adopted",
+        not mismatch.resumed and mismatch.rerun_workers, mismatch.notes)
+    add("the mismatch is explained", any("different plan" in note
+                                         for note in mismatch.notes), mismatch.notes)
+    same = plan_fingerprint(_resume_units(context), context.objective)
+    add("the fingerprint ignores progress, not the plan",
+        same == plan_fingerprint(_resume_units(context), context.objective))
+    add("a reshaped plan produces a different fingerprint",
+        same != plan_fingerprint(_resume_units(context)[:-1], context.objective))
+
+    # ---- 10. the mission keeps going when the disk does not ------------
+    # A file where the directory should be: the store can be constructed, and
+    # every write fails the way a full or read-only disk would.
+    blocked = Path(tempfile.mkdtemp(prefix="argus-dead-")) / "not-a-directory"
+    blocked.write_text("in the way")
+    dead = CheckpointStore(blocked)
+    fragile = HierarchicalFlow(context=context, subagents=_resume_units(context),
+                               runner=DeterministicRunner(scope=context.scope_entries),
+                               runtime=ConcurrencyRuntime(ResourceLimits()))
+    fragile.attach_resume(dead)
+    fragile_result = fragile.run()
+    add("an unwritable checkpoint does not stop the mission",
+        len(fragile_result.reports) == len(_resume_units(context)),
+        len(fragile_result.reports))
+    add("the failed writes are recorded",
+        bool(dead.failures) and bool(fragile.resume.errors),
+        dead.failures[:1] or fragile.resume.errors[:1])
+    return checks
+
+
+def _capture(fn: Callable[[], Any]) -> str:
+    """The message of the exception ``fn`` raises, or an empty string."""
+
+    try:
+        fn()
+    except BaseException as exc:               # noqa: BLE001 - the message is the point
+        return str(exc)
+    return ""
+
+
+# --------------------------------------------------------------------------
+# 26.2 Demo and CLI — an interrupted mission, continued
+# --------------------------------------------------------------------------
+
+
+def render_resume_summary(payload: Mapping[str, Any]) -> Group:
+    """One resume as a screen: what was kept, what was repeated, what it cost."""
+
+    progress = payload["progress"]
+    rows: list[Any] = []
+    table = Table(title="checkpoint — what survived the interruption", title_justify="left",
+                  box=None, pad_edge=False)
+    table.add_column("", no_wrap=True)
+    table.add_column("value", overflow="fold")
+    for label, value in (
+        ("mission", payload["mission_id"]),
+        ("checkpoint", payload["checkpoint"]),
+        ("planned", f"{progress['workers']} worker(s) in {progress['subagents']} subagent(s)"),
+        ("at the crash", f"{progress['settled']} settled · {progress['stale']} unfinished · "
+                         f"{progress['evidence']} evidence item(s)"),
+        ("decision", payload["plan"]["summary"]),
+        ("runner calls", str(payload["calls"])),
+        ("evidence kept", f"{payload['evidence_kept']} of {payload['evidence_total']}"),
+        ("archive", payload["archive"] or "—"),
+    ):
+        table.add_row(escape(label), escape(str(value)))
+    rows.append(table)
+
+    if payload["adopted"]:
+        rows.append(Text("\nadopted (not run again):", style="dim"))
+        for worker_id in payload["adopted"][:8]:
+            rows.append(Text(f"  ✔ {worker_id}  {payload['plan']['reasons'].get(worker_id, '')}"[:110],
+                             style="dim"))
+    if payload["rerun"]:
+        rows.append(Text("\nre-run (and why):", style="dim"))
+        for worker_id in payload["rerun"][:8]:
+            rows.append(Text(f"  ↻ {worker_id}  {payload['plan']['reasons'].get(worker_id, '')}"[:110],
+                             style="dim"))
+    rows.append(Text(f"\n{payload['duplicates']} duplicated evidence id(s) · "
+                     f"{payload['subagents_resumed']} subagent aggregate(s) resumed",
+                     style="dim"))
+    return Group(*rows)
+
+
+def _resume_demo(*, limit: int = 2) -> dict[str, Any]:
+    """Interrupt a scripted mission, resume it, and report both halves.
+
+    The interruption is a real one: the runner raises ``KeyboardInterrupt``
+    part-way through, no node catches it, and the checkpoint on disk is whatever
+    the last transition wrote.  Nothing here is staged for the demo.
+    """
+
+    root = Path(tempfile.mkdtemp(prefix="argus-resume-demo-"))
+    context = resume_demo_context()
+    units = _resume_units(context)
+    store = CheckpointStore(root)
+
+    crasher = _SparkRunner(scope=context.scope_entries, limit=limit)
+    flow = HierarchicalFlow(context=context, subagents=units, runner=crasher,
+                            runtime=ConcurrencyRuntime(ResourceLimits()))
+    flow.attach_resume(store)
+    interrupted = True
+    try:
+        flow.run()
+    except KeyboardInterrupt:
+        pass
+    else:                                     # pragma: no cover - the crash is the point
+        interrupted = False
+    crash_state = store.load(flow.mission_id)
+
+    runner = _SparkRunner(scope=context.scope_entries)
+    resumed = HierarchicalFlow(context=context, subagents=units, runner=runner,
+                               runtime=ConcurrencyRuntime(ResourceLimits()))
+    plan = resumed.attach_resume(store)
+    result = resumed.run()
+    archive = store.path_for(resumed.mission_id, CheckpointKind.ARCHIVE)
+    evidence_ids = [item.id for item in result.evidence]
+    return {
+        "mission_id": resumed.mission_id,
+        "objective": context.objective,
+        "interrupted": interrupted,
+        "checkpoint": str(store.path_for(resumed.mission_id)),
+        "archive": str(archive) if archive.exists() else "",
+        "progress": crash_state.progress(),
+        "plan": plan.to_dict(),
+        "adopted": list(plan.adopted_workers),
+        "rerun": list(plan.rerun_workers),
+        "calls": len(runner.calls),
+        "evidence_kept": len(crash_state.evidence),
+        "evidence_total": len(evidence_ids),
+        "duplicates": len(evidence_ids) - len(set(evidence_ids)),
+        "subagents_resumed": len(plan.adopted_subagents),
+        "reports": [{"role": report.role, "status": report.status.value,
+                     "evidence": len(report.evidence), "gaps": len(report.gaps)}
+                    for report in result.reports],
+        "seconds": round(result.seconds, 3),
+    }
+
+
+@app.command("resume", help="Persist mission state and continue an interrupted run by id.")
+def resume_command(
+    self_test: bool = typer.Option(False, "--self-test",
+                                   help="Verify the resume guarantees offline."),
+    mission_id: str | None = typer.Option(
+        None, "--mission", help="Mission id to inspect or continue.", show_default=False),
+    demo: bool = typer.Option(False, "--demo",
+                              help="Interrupt a scripted mission, then resume it."),
+    list_runs: bool = typer.Option(False, "--list", help="Mission ids with a checkpoint."),
+    show: bool = typer.Option(False, "--show", help="Print one checkpoint's progress."),
+    revalidate_after: float = typer.Option(
+        0.0, "--revalidate-after",
+        help="Treat settled results older than this many seconds as suspect."),
+    runs_dir: str | None = typer.Option(None, "--runs-dir",
+                                        help="Checkpoint directory (default: the output dir)."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Show, and prove, that an interrupted mission can be continued."""
+
+    console = get_console()
+
+    if self_test:
+        results = run_resume_self_test()
+        failures = [result for result in results if not result.ok]
+        if as_json:
+            _emit(json.dumps({"ok": not failures,
+                              "checks": [asdict(result) for result in results]}, indent=2))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        console.print()
+        table = Table(title="resume self-test", title_justify="left", box=None, pad_edge=False)
+        table.add_column("", width=2)
+        table.add_column("check", no_wrap=True)
+        table.add_column("detail", overflow="fold")
+        for result in results:
+            glyph, colour = ("✔", "green") if result.ok else ("✘", "red")
+            table.add_row(f"[{colour}]{glyph}[/{colour}]", escape(result.name),
+                          escape(result.detail))
+        console.print(table)
+        colour = "green" if not failures else "red"
+        console.print(f"\n[{colour}]{len(results) - len(failures)} passed[/] · "
+                      f"{len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    if demo:
+        payload = _resume_demo()
+        if as_json:
+            _emit(json.dumps(payload, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(render_resume_summary(payload))
+        console.print()
+        table = Table(title=f"units — {len(payload['reports'])} subagent(s)",
+                      title_justify="left", box=None, pad_edge=False)
+        table.add_column("role", no_wrap=True)
+        table.add_column("status", no_wrap=True)
+        table.add_column("evidence", justify="right")
+        table.add_column("gaps", justify="right")
+        for report in payload["reports"]:
+            colour = "green" if report["status"] == "succeeded" else "yellow"
+            table.add_row(escape(report["role"]),
+                          f"[{colour}]{report['status']}[/{colour}]",
+                          str(report["evidence"]), str(report["gaps"]))
+        console.print(table)
+        console.print("\n[dim]The interruption was real: the runner raised part-way through and "
+                      "nothing caught it. The resumed run adopted what had settled and re-ran "
+                      "only the rest — with no duplicated evidence.[/dim]\n")
+        raise typer.Exit(ExitCode.OK)
+
+    root = Path(runs_dir).expanduser() if runs_dir else _default_runs_dir()
+    store = CheckpointStore(root)
+
+    if list_runs:
+        missions = store.list_missions()
+        if as_json:
+            _emit(json.dumps({"root": str(root), "missions": missions}, indent=2))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        if not missions:
+            console.print(f"[dim]no mission checkpoints under {escape(str(root))}[/dim]\n")
+            raise typer.Exit(ExitCode.OK)
+        table = Table(title=f"missions under {root}", title_justify="left", box=None,
+                      pad_edge=False)
+        table.add_column("mission", no_wrap=True)
+        table.add_column("objective", overflow="fold")
+        table.add_column("done", justify="right")
+        table.add_column("evidence", justify="right")
+        for name in missions:
+            try:
+                state = store.load(name)
+            except CheckpointError as exc:
+                table.add_row(escape(name), f"[red]{escape(str(exc)[:40])}[/red]", "—", "—")
+                continue
+            progress = state.progress()
+            table.add_row(escape(name), escape(state.objective[:60]),
+                          f"{progress['settled']}/{progress['workers']}",
+                          str(progress["evidence"]))
+        console.print(table)
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    if not mission_id:
+        console.print("[red]✘[/red] name a mission with --mission ID, or use --demo/--list")
+        raise typer.Exit(ExitCode.USAGE)
+
+    try:
+        state = store.load(mission_id)
+    except CheckpointError as exc:
+        console.print(f"[red]✘[/red] {escape(str(exc))}")
+        raise typer.Exit(ExitCode.USAGE) from exc
+
+    if show or not as_json:
+        console.print()
+        console.print(render_checkpoint(state, revalidate_after=revalidate_after))
+        console.print()
+    if as_json:
+        _emit(json.dumps({"progress": state.progress(), "checkpoint": state.to_dict()},
+                         indent=2, default=str))
+    raise typer.Exit(ExitCode.OK)
+
+
+def render_checkpoint(state: MissionCheckpoint, *, revalidate_after: float = 0.0) -> Group:
+    """One checkpoint on screen: progress, the roster, and what a resume would do."""
+
+    progress = state.progress()
+    table = Table(title=f"checkpoint — {state.mission_id}", title_justify="left", box=None,
+                  pad_edge=False)
+    table.add_column("", no_wrap=True)
+    table.add_column("value", overflow="fold")
+    for label, value in (
+        ("objective", state.objective or "—"),
+        ("attempt", str(state.run_attempt)),
+        ("written", state.updated_at.isoformat()),
+        ("progress", f"{progress['settled']}/{progress['workers']} worker(s) settled "
+                     f"({progress['percent']}%)"),
+        ("subagents", f"{progress['subagents_settled']}/{progress['subagents']} aggregated"),
+        ("evidence", f"{progress['evidence']} item(s)"),
+        ("stages", ", ".join(state.stages) or "—"),
+        ("synthesis", "recorded" if progress["synthesised"] else "not yet"),
+    ):
+        table.add_row(escape(label), escape(value))
+    rows: list[Any] = [table]
+
+    open_work = [record for record in state.workers if not record.settled]
+    if open_work:
+        rows.append(Text("\nwaiting:", style="dim"))
+        for record in open_work[:10]:
+            rows.append(Text(f"  · {record.worker_id}  {record.stale or 'not started'}"[:110],
+                             style="dim"))
+    settled = [record.worker_id for record in state.workers if record.settled]
+    if settled:
+        rows.append(Text(f"\nsettled: {len(settled)} unit(s) a resume would adopt, "
+                         f"not repeat", style="dim"))
+    if revalidate_after:
+        rows.append(Text(f"revalidation: results older than {revalidate_after:.0f}s will be "
+                         f"re-checked", style="dim"))
+    if state.notes:
+        rows.append(Text("\nnotes:", style="dim"))
+        for note in state.notes[-4:]:
+            rows.append(Text(f"  · {note}"[:110], style="dim"))
+    return Group(*rows)
+
+
+def _default_runs_dir() -> Path:
+    """Where mission checkpoints live when the operator does not say.
+
+    The runtime output directory from the settings — deliberately *not* next to
+    the source file: the deliverable stays one file, and a mission's data stays
+    out of it.
+    """
+
+    try:
+        settings = build_settings(None).settings
+        return Path(settings.output_dir).expanduser()
+    except Exception:                          # pragma: no cover - settings always build
+        return Path(DEFAULT_HOME_DIRNAME) / DEFAULT_OUTPUT_DIRNAME
+
+
 # ══════════════════════════════════════════════════════════════════════════
-# 26. Entry point
+# 27. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 

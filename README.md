@@ -16,6 +16,7 @@ python vedant_osint.py subagents --self-test  # runtime Subagent specifications
 python vedant_osint.py workers --self-test    # runtime Worker specifications
 python vedant_osint.py flow --self-test       # LangGraph execution flow
 python vedant_osint.py sched --self-test      # bounded queues, deadlines, licences
+python vedant_osint.py resume --self-test     # checkpointing and resumable missions
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -418,6 +419,49 @@ python vedant_osint.py sched --demo tight --json          # the whole snapshot
   gap naming the unit and the reason. The mission still joins, and a cancelled
   mission stops before synthesis instead of presenting a partial answer.
 
+## Checkpoints and resumable missions
+
+A mission that takes an hour will be interrupted, so the runtime keeps its own
+write-ahead record **beside** this file — under the runtime output directory,
+`runs/<mission>/` — and a resumed run continues from it. The deliverable stays a
+single file; a mission's data never goes into it.
+
+```bash
+python vedant_osint.py resume --demo                 # interrupt a real run, then resume it
+python vedant_osint.py resume --self-test            # 49 guarantee checks, offline
+python vedant_osint.py resume --list                 # missions with a checkpoint
+python vedant_osint.py resume --mission flow-a995e   # what a resume would do, and why
+python vedant_osint.py flow --demo exposure --checkpoint   # run with persistence on
+python vedant_osint.py flow --demo exposure --checkpoint --redo      # do it again anyway
+```
+
+- **Written after every major transition.** A Worker attempt is recorded *before*
+  the work and its verdict after it; a Subagent's aggregate, the sync thesis and
+  the ledger are each a transition of their own. Every write is atomic (temp
+  file, `fsync`, `os.replace`), so a crash leaves the previous state, never a
+  half-written one.
+- **Completed work is not repeated.** A Worker that finished *and* was approved is
+  settled; a resumed graph answers it from the record — no slot, no runner call —
+  and an adopted Subagent aggregate is returned with its own `JoinBarrier`, so
+  the hierarchy (not just the evidence) survives. `--redo` is the only way to ask
+  for the work again, and it keeps the record rather than emptying it.
+- **Incomplete work is revalidated, not trusted.** An outcome with no review, a
+  review that asked for a retry, or a unit that never ran is *stale*: the resume
+  re-runs it. `--revalidate-after SECONDS` additionally re-checks settled results
+  that are old, and a success whose record holds no evidence is re-run rather than
+  believed.
+- **Evidence is never duplicated.** Evidence ids are content-addressed and merged
+  on id, so re-recording corroborates sources instead of appending a copy — a
+  resumed mission ends with exactly the evidence an uninterrupted one would, and
+  the self-test compares the two id lists.
+- **A finished mission is refused, not replayed.** The live checkpoint becomes
+  `archive.json` on completion; resuming it is a usage error that names the archive
+  and says how to ask again. A checkpoint from another build, a corrupt file, or a
+  job for a *different* plan (fingerprint mismatch) is refused with a reason too.
+- **Persistence never becomes the mission's problem.** A store that cannot write
+  records the failure and the mission carries on; losing durability is bad,
+  losing the run is worse.
+
 ## Status
 
 | Phase | Scope | State |
@@ -428,7 +472,7 @@ python vedant_osint.py sched --demo tight --json          # the whole snapshot
 | 4 | Browser — browser-use / Playwright sessions and capture | ⬜ |
 | 5 | Collection — passive OSINT sources, artefact hashing | ⬜ |
 | 6 | Synthesis — cross-source correlation and reporting | ⬜ |
-| 7 | Operations — resume, budgets, audit trail, hardening | ⬜ |
+| 7 | Operations — resume, budgets, audit trail, hardening | 🟡 started (checkpoints, resumable missions, budgets) |
 
 ## Install
 
