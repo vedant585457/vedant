@@ -26,6 +26,25 @@ excerpt and SHA-256, plus chain-of-custody metadata. Missing data is an explicit
 `UnknownValue(reason=...)`, and `null` keys survive serialisation, so a missing
 key and a null stay distinguishable.
 
+## Run state
+
+`RunStateStore` is the single source of truth for a mission in flight: objective,
+normalised scope, dynamic hierarchy, assignments, results, evidence, reviews,
+retries, budget, events and final status.
+
+```bash
+python vedant_osint.py state --demo --checkpoint case/state.json
+python vedant_osint.py state --load case/state.json
+python vedant_osint.py state --stress        # parallel-writer self-test
+```
+
+Every mutation takes one `RLock`; evidence **merges** by id instead of replacing;
+records are revision-guarded (`StaleWriteError` on a stale write); readers get
+deep-copied snapshots; results are keyed by `(task_id, attempt)` so a retry keeps
+the failure; progress is derived from records, never counted. Checkpoints are
+versioned JSON written atomically (temp file + `os.replace`) and re-validated
+through the typed models on load.
+
 ## Safety & scope
 
 Every mission passes a policy preflight **before** anything is planned.
@@ -108,7 +127,7 @@ Authorised use only — collect from systems you own or are explicitly permitted
 | Phase | Scope | State |
 |-------|-------|-------|
 | 1 | Foundation — CLI skeleton, config probing, version reporting | ✅ done |
-| 2 | Contracts — strict settings, `doctor`, preflight, typed models | ✅ done |
+| 2 | Contracts — settings, `doctor`, preflight, models, run-state store | ✅ done |
 | 3 | Orchestration — LangGraph Master Agent + runtime Subagent factory | ⬜ next |
 | 4 | Browser — browser-use / Playwright sessions and capture | ⬜ |
 | 5 | Collection — passive OSINT sources, artefact hashing | ⬜ |

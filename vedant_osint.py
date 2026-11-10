@@ -117,6 +117,30 @@ Missing data is an explicit ``UnknownValue(reason=...)`` rather than an empty
 string, ``null`` keys are preserved on serialisation (a missing key and a null
 are different claims), and models reject unknown fields so a typo cannot vanish.
 
+Run state
+---------
+``RunStateStore`` is the single source of truth for a mission in flight.  It
+tracks the objective, normalised scope, dynamic agent hierarchy, assignments,
+results, evidence, reviews, retries, budget ledger, append-only events and the
+final status.  Concurrency contract:
+
+* one ``RLock`` guards every mutation, so no record is ever half-updated;
+* adding evidence **merges** by id (sources, links and tags are unioned) instead
+  of replacing the record, so two Workers cannot clobber each other;
+* records carry revisions — pass ``expected_revision`` and a stale writer gets
+  ``StaleWriteError`` rather than silently discarding newer work;
+* readers get deep-copied snapshots taken under the lock, so they never see a
+  torn state;
+* results are keyed by ``(task_id, attempt)`` so a retry preserves the failure;
+* progress is *derived* from the records, never from a drifting counter.
+
+Checkpoints are versioned JSON written atomically (temp file + ``os.replace``)
+and re-validated through the typed models on load::
+
+    python vedant_osint.py state --demo --checkpoint case/state.json
+    python vedant_osint.py state --load case/state.json
+    python vedant_osint.py state --stress        # concurrency self-test
+
 Usage
 -----
 ::
@@ -126,6 +150,7 @@ Usage
     python vedant_osint.py config
     python vedant_osint.py config --settings            # merged, redacted view
     python vedant_osint.py models                       # typed model catalogue + self-test
+    python vedant_osint.py state --stress               # run-state concurrency self-test
     python vedant_osint.py doctor                       # full capability health check
     python vedant_osint.py policy -o "..." --scope example.com          # safety preflight only
     python vedant_osint.py mission --target example.com -o "map the attack surface"
@@ -206,6 +231,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import uuid
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -243,7 +269,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 5
+VERSION_MINOR: int = 6
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -296,7 +322,7 @@ BUILD_PHASE_NAME: str = "Contracts"
 #: Section banners shared by the banner panel and ``version --json``.
 PHASE_ROADMAP: tuple[tuple[int, str, str], ...] = (
     (1, "Foundation", "CLI skeleton, config probing, version reporting"),
-    (2, "Contracts", "Strict settings, doctor, policy preflight, typed models"),
+    (2, "Contracts", "Settings, doctor, preflight, typed models, run-state store"),
     (3, "Orchestration", "LangGraph Master Agent + runtime Subagent factory"),
     (4, "Browser", "browser-use/Playwright sessions and capture"),
     (5, "Collection", "passive OSINT sources, artefact hashing/chain of custody"),
@@ -4508,6 +4534,12 @@ class Confidence(str, Enum):
             Confidence.HIGH: 0.85,
         }[self]
 
+    @property
+    def rank(self) -> int:
+        """Ordinal used when merging records seen by several workers."""
+
+        return {Confidence.UNKNOWN: 0, Confidence.LOW: 1, Confidence.MEDIUM: 2, Confidence.HIGH: 3}[self]
+
 
 class PreservationStatus(str, Enum):
     """How well an artefact's integrity is assured.  Never assumed."""
@@ -5830,7 +5862,1261 @@ def run_model_self_test() -> list[ModelTestResult]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 16. Entry point
+# 16. Unified run-state store
+# ══════════════════════════════════════════════════════════════════════════
+#
+# One authoritative, thread-safe record of a mission in flight.  Phase 3's
+# Master Agent, the runtime Subagents and every Worker read and write *this*
+# object; nothing else holds mission truth.
+#
+# Concurrency contract
+# --------------------
+# Subagents and Workers run in parallel, so "read, mutate, write back" is unsafe
+# by default.  The store therefore provides four guarantees:
+#
+#   1. ONE LOCK.  Every mutation happens under a single re-entrant lock, so a
+#      record is never half-updated.
+#   2. MERGE, NEVER REPLACE.  Adding evidence or a result merges into the
+#      existing record by id; it cannot clobber an unrelated entry because it
+#      never writes a whole collection — only the one key it owns.
+#   3. REVISION CHECKS.  Records carry a revision counter.  An update may pass
+#      ``expected_revision``; a mismatch raises StaleWriteError instead of
+#      silently discarding someone else's work.
+#   4. IMMUTABLE SNAPSHOTS.  Readers get a deep copy taken under the lock, so a
+#      renderer can never observe a torn state (e.g. a result whose assignment
+#      has not yet landed).
+#
+# Checkpoints
+# -----------
+# ``to_checkpoint()`` produces a JSON-safe dict; ``save_checkpoint`` writes it
+# atomically (temp file + ``os.replace``) so a crash mid-write cannot leave a
+# truncated case file.  ``load_checkpoint`` rebuilds a store and re-validates
+# every record through the Task 5 models.
+
+class StateError(RuntimeError):
+    """Base class for run-state failures."""
+
+
+class StaleWriteError(StateError):
+    """An update was based on an out-of-date revision of a record."""
+
+
+class BudgetExceeded(StateError):
+    """A budget (time, tasks, retries) would be exceeded by this operation."""
+
+
+class CheckpointError(StateError):
+    """A checkpoint could not be written or read back."""
+
+
+class EventKind(str, Enum):
+    """What happened.  Events are the audit trail, not the state itself."""
+
+    MISSION_CREATED = "mission-created"
+    STATUS_CHANGED = "status-changed"
+    SUBAGENT_ADDED = "subagent-added"
+    WORKER_ADDED = "worker-added"
+    TASK_ASSIGNED = "task-assigned"
+    TASK_STARTED = "task-started"
+    TASK_FINISHED = "task-finished"
+    EVIDENCE_ADDED = "evidence-added"
+    EVIDENCE_MERGED = "evidence-merged"
+    REVIEW_RECORDED = "review-recorded"
+    RETRY_RECORDED = "retry-recorded"
+    BUDGET_CONSUMED = "budget-consumed"
+    BUDGET_EXCEEDED = "budget-exceeded"
+    CONFLICT = "conflict"
+    CHECKPOINT_SAVED = "checkpoint-saved"
+    CHECKPOINT_LOADED = "checkpoint-loaded"
+    ERROR = "error"
+
+
+class StateEvent(StrictModel):
+    """One append-only event.  ``seq`` is monotonic within a store."""
+
+    seq: int = Field(ge=1)
+    kind: EventKind
+    message: str = Field(min_length=1)
+    at: datetime = Field(default_factory=utc_now)
+    actor: str | None = None            # subagent/worker id, or "operator"
+    entity_type: str | None = None
+    entity_id: str | None = None
+    data: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> datetime:
+        return normalise_datetime(value)
+
+    @field_validator("message")
+    @classmethod
+    def _redact(cls, value: str) -> str:
+        return redact_text(value, secrets=known_secrets())
+
+
+class Progress(StrictModel):
+    """Derived view of how far along a mission is.  Never stored as truth."""
+
+    status: EntityStatus
+    tasks_total: int = 0
+    tasks_succeeded: int = 0
+    tasks_failed: int = 0
+    tasks_running: int = 0
+    tasks_skipped: int = 0
+    tasks_pending: int = 0
+    percent_complete: float = 0.0
+    subagents_total: int = 0
+    workers_total: int = 0
+    evidence_total: int = 0
+    observations: int = 0
+    inferences: int = 0
+    allegations: int = 0
+    reviews_total: int = 0
+    retries_used: int = 0
+    seconds_used: float = 0.0
+    seconds_limit: int | None = None
+    events: int = 0
+    conflicts: int = 0
+    updated_at: datetime = Field(default_factory=utc_now)
+
+    @field_validator("updated_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> datetime:
+        return normalise_datetime(value)
+
+    @property
+    def budget_used_percent(self) -> float | None:
+        if not self.seconds_limit:
+            return None
+        return round(100.0 * self.seconds_used / self.seconds_limit, 1)
+
+
+class BudgetLedger(StrictModel):
+    """Monotonic budget accounting.  Consumption never goes backwards."""
+
+    seconds_used: float = Field(default=0.0, ge=0)
+    seconds_limit: int | None = Field(default=None, ge=1)
+    tasks_started: int = Field(default=0, ge=0)
+    tasks_limit: int | None = Field(default=None, ge=1)
+    retries_used: int = Field(default=0, ge=0)
+    retries_limit: int | None = Field(default=None, ge=0)
+    exhausted: bool = False
+
+    def check(self, *, seconds: float = 0.0, task: bool = False, retry: bool = False) -> None:
+        """Raise :class:`BudgetExceeded` *before* the work is done."""
+
+        if self.seconds_limit is not None and self.seconds_used + seconds > self.seconds_limit:
+            raise BudgetExceeded(
+                f"mission time budget exhausted: {self.seconds_used:.0f}s of {self.seconds_limit}s used"
+            )
+        if task and self.tasks_limit is not None and self.tasks_started + 1 > self.tasks_limit:
+            raise BudgetExceeded(f"task budget exhausted: {self.tasks_started} of {self.tasks_limit} used")
+        if retry and self.retries_limit is not None and self.retries_used + 1 > self.retries_limit:
+            raise BudgetExceeded(f"retry budget exhausted: {self.retries_used} of {self.retries_limit} used")
+
+    def consume(self, *, seconds: float = 0.0, task: bool = False, retry: bool = False) -> None:
+        """Check, then apply.  Atomic from the caller's point of view."""
+
+        self.check(seconds=seconds, task=task, retry=retry)
+        self.seconds_used = round(self.seconds_used + max(0.0, seconds), 3)
+        if task:
+            self.tasks_started += 1
+        if retry:
+            self.retries_used += 1
+
+
+class RunStateStore:
+    """Thread-safe, checkpointable mission state.
+
+    Every public mutator takes the lock, validates through the Task 5 models,
+    and appends an event.  Every reader returns a deep copy.  The store is
+    deliberately not a Pydantic model: it owns a lock and mutable collections,
+    and hiding those behind model validation would invite torn reads.
+    """
+
+    #: Bumped when the checkpoint payload shape changes.
+    CHECKPOINT_VERSION: int = 1
+
+    def __init__(
+        self,
+        mission: Mission,
+        *,
+        clock: "Callable[[], datetime] | None" = None,
+    ) -> None:
+        self._lock = threading.RLock()
+        self._clock: Callable[[], datetime] = clock or utc_now
+        self._mission: Mission = mission.model_copy(deep=True)
+        self._scope: Scope = self._mission.scope.model_copy(deep=True)
+        self._status: EntityStatus = self._mission.status
+
+        self._subagents: dict[str, SubagentSpec] = {}
+        self._workers: dict[str, WorkerSpec] = {}
+        self._assignments: dict[str, TaskAssignment] = {}
+        self._results: dict[str, TaskResult] = {}
+        self._evidence: dict[str, EvidenceItem] = {}
+        self._reviews: dict[str, QualityReview] = {}
+        self._retries: dict[str, int] = {}
+        self._revisions: dict[tuple[str, str], int] = {}
+        self._events: list[StateEvent] = []
+        self._seq = 0
+        self._conflicts: list[str] = []
+
+        limits = self._mission.limits or {}
+        self._budget = BudgetLedger(
+            seconds_limit=limits.get("mission_budget_seconds"),
+            retries_limit=limits.get("max_total_workers"),
+        )
+
+        for subagent in self._mission.subagents:
+            self._subagents[subagent.id] = subagent.model_copy(deep=True)
+        self._event(EventKind.MISSION_CREATED, f"state created for {self._mission.id}", actor="system")
+
+    # ------------------------------------------------------------------
+    # 16.1 Internals — always called with the lock held
+    # ------------------------------------------------------------------
+
+    @property
+    def _now(self) -> datetime:
+        return self._clock()
+
+    def _event(
+        self,
+        kind: EventKind,
+        message: str,
+        *,
+        actor: str | None = None,
+        entity_type: str | None = None,
+        entity_id: str | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> StateEvent:
+        self._seq += 1
+        event = StateEvent(
+            seq=self._seq,
+            kind=kind,
+            message=message,
+            at=self._now,
+            actor=actor,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            data=data or {},
+        )
+        self._events.append(event)
+        return event
+
+    def _revision_of(self, kind: str, key: str) -> int:
+        return self._revisions.get((kind, key), 0)
+
+    def _bump(self, kind: str, key: str) -> int:
+        revision = self._revision_of(kind, key) + 1
+        self._revisions[(kind, key)] = revision
+        return revision
+
+    def _guard_revision(self, kind: str, key: str, expected: int | None) -> None:
+        if expected is None:
+            return
+        current = self._revision_of(kind, key)
+        if current != expected:
+            raise StaleWriteError(
+                f"{kind} {key!r} is at revision {current}, caller expected {expected}; "
+                "re-read the record and retry"
+            )
+
+    def _conflict(self, message: str, *, actor: str | None = None) -> None:
+        self._conflicts.append(message)
+        self._event(EventKind.CONFLICT, message, actor=actor)
+
+    # ------------------------------------------------------------------
+    # 16.2 Reads — deep copies under the lock
+    # ------------------------------------------------------------------
+
+    def snapshot(self) -> dict[str, Any]:
+        """A consistent, fully detached view of the state."""
+
+        with self._lock:
+            return {
+                "mission": self._mission.model_copy(deep=True),
+                "status": self._status,
+                "evidence": [item.model_copy(deep=True) for item in self._evidence.values()],
+                "subagents": [s.model_copy(deep=True) for s in self._subagents.values()],
+                "workers": [w.model_copy(deep=True) for w in self._workers.values()],
+                "assignments": [a.model_copy(deep=True) for a in self._assignments.values()],
+                "results": [r.model_copy(deep=True) for r in self._results.values()],
+                "reviews": [r_.model_copy(deep=True) for r_ in self._reviews.values()],
+                "retries": dict(self._retries),
+                "budget": self._budget.model_copy(deep=True),
+                "events": [e.model_copy(deep=True) for e in self._events],
+                "conflicts": list(self._conflicts),
+            }
+
+    def mission(self) -> Mission:
+        with self._lock:
+            return self._mission.model_copy(deep=True)
+
+    def scope(self) -> Scope:
+        with self._lock:
+            return self._scope.model_copy(deep=True)
+
+    @property
+    def status(self) -> EntityStatus:
+        with self._lock:
+            return self._status
+
+    def evidence(self) -> list[EvidenceItem]:
+        with self._lock:
+            return [item.model_copy(deep=True) for item in self._evidence.values()]
+
+    def events(self, *, since: int = 0, limit: int | None = None) -> list[StateEvent]:
+        with self._lock:
+            selected = [e.model_copy(deep=True) for e in self._events if e.seq > since]
+            return selected[-limit:] if limit else selected
+
+    def budget(self) -> BudgetLedger:
+        with self._lock:
+            return self._budget.model_copy(deep=True)
+
+    # ------------------------------------------------------------------
+    # 16.3 Writes — validated, locked, event-logged
+    # ------------------------------------------------------------------
+
+    def set_status(self, status: EntityStatus, *, actor: str | None = None, note: str | None = None) -> None:
+        """Move the mission's lifecycle forward.  Terminal states are final."""
+
+        with self._lock:
+            if self._status.terminal and status is not self._status:
+                raise StateError(f"mission is already {self._status.value}; cannot move to {status.value}")
+            previous = self._status
+            self._status = status
+            if status is EntityStatus.RUNNING and self._mission.started_at is None:
+                self._mission = self._mission.model_copy(update={"started_at": self._now})
+            if status.terminal:
+                self._mission = self._mission.model_copy(update={"finished_at": self._now})
+            self._event(
+                EventKind.STATUS_CHANGED,
+                note or f"status {previous.value} → {status.value}",
+                actor=actor,
+                entity_type="mission",
+                entity_id=self._mission.id,
+                data={"from": previous.value, "to": status.value},
+            )
+
+    def add_subagent(self, spec: SubagentSpec, *, actor: str | None = None) -> SubagentSpec:
+        """Register a runtime-created Subagent (idempotent by id)."""
+
+        with self._lock:
+            if spec.mission_id and spec.mission_id != self._mission.id:
+                raise StateError(f"subagent {spec.id} belongs to mission {spec.mission_id}, not {self._mission.id}")
+            existing = self._subagents.get(spec.id)
+            if existing is not None:
+                if existing.objective != spec.objective:
+                    self._conflict(
+                        f"subagent {spec.id} re-registered with a different objective; keeping the first",
+                        actor=actor,
+                    )
+                return existing.model_copy(deep=True)
+            stored = spec.model_copy(update={"mission_id": self._mission.id}, deep=True)
+            self._subagents[spec.id] = stored
+            self._bump("subagent", spec.id)
+            for worker in spec.workers:
+                self._workers.setdefault(worker.id, worker.model_copy(deep=True))
+            self._event(
+                EventKind.SUBAGENT_ADDED,
+                f"subagent '{stored.name}' added ({len(stored.workers)} worker(s))",
+                actor=actor,
+                entity_type="subagent",
+                entity_id=stored.id,
+            )
+            return stored.model_copy(deep=True)
+
+    def add_worker(self, spec: WorkerSpec, *, actor: str | None = None) -> WorkerSpec:
+        """Register a task-specific Worker created by a Subagent."""
+
+        with self._lock:
+            if spec.subagent_id and spec.subagent_id not in self._subagents:
+                raise StateError(f"worker {spec.id} references unknown subagent {spec.subagent_id}")
+            existing = self._workers.get(spec.id)
+            if existing is not None:
+                if existing.objective != spec.objective:
+                    self._conflict(
+                        f"worker {spec.id} re-registered with a different objective; keeping the first",
+                        actor=actor,
+                    )
+                return existing.model_copy(deep=True)
+            self._workers[spec.id] = spec.model_copy(deep=True)
+            self._bump("worker", spec.id)
+            self._event(
+                EventKind.WORKER_ADDED,
+                f"worker '{spec.name}' added under {spec.subagent_id or 'unassigned'}",
+                actor=actor,
+                entity_type="worker",
+                entity_id=spec.id,
+            )
+            return spec.model_copy(deep=True)
+
+    def assign_task(self, assignment: TaskAssignment, *, actor: str | None = None) -> TaskAssignment:
+        """Hand work to a Worker.  Re-assignment bumps the attempt, not the id."""
+
+        with self._lock:
+            if assignment.worker_id and assignment.worker_id not in self._workers:
+                raise StateError(f"task {assignment.id} references unknown worker {assignment.worker_id}")
+            existing = self._assignments.get(assignment.id)
+            stored = assignment.model_copy(update={"mission_id": self._mission.id}, deep=True)
+            if existing is None:
+                self._assignments[stored.id] = stored
+                self._event(
+                    EventKind.TASK_ASSIGNED,
+                    f"task assigned to {stored.worker_id or 'unassigned'} (attempt {stored.attempt})",
+                    actor=actor,
+                    entity_type="task",
+                    entity_id=stored.id,
+                )
+            else:
+                self._guard_revision("task", assignment.id, assignment.attempt - 1 if assignment.attempt > 1 else None)
+                self._assignments[stored.id] = stored
+                self._event(
+                    EventKind.TASK_ASSIGNED,
+                    f"task re-assigned (attempt {stored.attempt})",
+                    actor=actor,
+                    entity_type="task",
+                    entity_id=stored.id,
+                )
+            self._bump("task", stored.id)
+            return stored.model_copy(deep=True)
+
+    def start_task(self, task_id: str, *, actor: str | None = None, seconds_estimate: float = 0.0) -> TaskAssignment:
+        """Mark a task running and account for budget *before* the work starts."""
+
+        with self._lock:
+            assignment = self._assignments.get(task_id)
+            if assignment is None:
+                raise StateError(f"unknown task {task_id!r}")
+            try:
+                self._budget.consume(seconds=seconds_estimate, task=True)
+            except BudgetExceeded as exc:
+                self._event(EventKind.BUDGET_EXCEEDED, str(exc), actor=actor, entity_type="task", entity_id=task_id)
+                raise
+            updated = assignment.model_copy(update={"status": EntityStatus.RUNNING}, deep=True)
+            self._assignments[task_id] = updated
+            self._bump("task", task_id)
+            if seconds_estimate:
+                self._event(
+                    EventKind.BUDGET_CONSUMED,
+                    f"{seconds_estimate:.1f}s reserved for {task_id}",
+                    actor=actor,
+                    entity_type="task",
+                    entity_id=task_id,
+                )
+            self._event(EventKind.TASK_STARTED, f"task {task_id} started", actor=actor, entity_type="task", entity_id=task_id)
+            return updated.model_copy(deep=True)
+
+    def record_result(self, result: TaskResult, *, actor: str | None = None) -> TaskResult:
+        """Store a Worker outcome.  Keyed by ``(task_id, attempt)`` so a retry
+        never overwrites the earlier attempt."""
+
+        with self._lock:
+            key = f"{result.task_id}@{result.attempts}"
+            existing = self._results.get(key)
+            if existing is not None:
+                if existing.id == result.id:
+                    return existing.model_copy(deep=True)     # idempotent replay
+                self._conflict(
+                    f"result for {key} already recorded by another worker; keeping both in the event log",
+                    actor=actor,
+                )
+            self._results[key] = result.model_copy(deep=True)
+            assignment = self._assignments.get(result.task_id)
+            if assignment is not None:
+                self._assignments[result.task_id] = assignment.model_copy(
+                    update={"status": result.status}, deep=True
+                )
+                self._bump("task", result.task_id)
+            else:
+                self._conflict(f"result arrived for unknown task {result.task_id}", actor=actor)
+            self._bump("result", key)
+            self._event(
+                EventKind.TASK_FINISHED,
+                f"task {result.task_id} finished: {result.status.value}",
+                actor=actor,
+                entity_type="task",
+                entity_id=result.task_id,
+                data={"result_id": result.id, "attempt": result.attempts},
+            )
+            return result.model_copy(deep=True)
+
+    def add_evidence(self, item: EvidenceItem, *, actor: str | None = None) -> EvidenceItem:
+        """Add evidence, or merge into the existing record with the same id.
+
+        Merging unions sources, links and tags instead of replacing them, so two
+        Workers that corroborate the same observation end up with *both*
+        sources rather than whichever wrote last.
+        """
+
+        with self._lock:
+            existing = self._evidence.get(item.id)
+            if existing is None:
+                self._evidence[item.id] = item.model_copy(deep=True)
+                self._bump("evidence", item.id)
+                self._event(
+                    EventKind.EVIDENCE_ADDED,
+                    f"{item.kind.value} recorded: {item.statement[:80]}",
+                    actor=actor or item.collected_by,
+                    entity_type="evidence",
+                    entity_id=item.id,
+                )
+                return item.model_copy(deep=True)
+
+            # Source ids include the retrieval time, so two fetches of the same
+            # URL are distinct records (the page may have changed).  Both are
+            # kept for the audit trail, but only a *new locator* counts as
+            # independent corroboration — re-fetching cannot raise confidence.
+            merged_sources = {s.id: s for s in existing.sources}
+            known_locators = {s.locator for s in existing.sources}
+            added = 0
+            for source in item.sources:
+                if source.id not in merged_sources:
+                    merged_sources[source.id] = source
+                    if source.locator not in known_locators:
+                        added += 1
+                        known_locators.add(source.locator)
+            merged = existing.model_copy(
+                update={
+                    "sources": list(merged_sources.values()),
+                    "supports": list(dict.fromkeys([*existing.supports, *item.supports])),
+                    "contradicts": list(dict.fromkeys([*existing.contradicts, *item.contradicts])),
+                    "tags": list(dict.fromkeys([*existing.tags, *item.tags])),
+                    "missing": [*existing.missing, *item.missing],
+                    # Confidence is merged by rank, never replaced.  A bare
+                    # default (UNKNOWN) from another worker must not erase a
+                    # justified HIGH, and a raise needs a *new* source to back it.
+                    "confidence": (
+                        item.confidence
+                        if added and item.confidence.rank > existing.confidence.rank
+                        else existing.confidence
+                    ),
+                    "confidence_basis": (
+                        item.confidence_basis
+                        if added and item.confidence.rank > existing.confidence.rank and item.confidence_basis
+                        else existing.confidence_basis
+                    ),
+                },
+                deep=True,
+            )
+            self._evidence[item.id] = merged
+            self._bump("evidence", item.id)
+            self._event(
+                EventKind.EVIDENCE_MERGED,
+                f"evidence {item.id} merged (+{added} source(s))",
+                actor=actor,
+                entity_type="evidence",
+                entity_id=item.id,
+            )
+            return merged.model_copy(deep=True)
+
+    def record_review(self, review: QualityReview, *, actor: str | None = None) -> QualityReview:
+        """Append a review round.  Rounds with the same number are kept separately
+        so a re-review cannot erase the first verdict."""
+
+        with self._lock:
+            key = f"{review.subagent_id}@r{review.round}"
+            existing = self._reviews.get(key)
+            if existing is not None and existing.verdict != review.verdict:
+                self._conflict(
+                    f"review round {review.round} for {review.subagent_id} already recorded as "
+                    f"{existing.verdict!r}; the first verdict is preserved",
+                    actor=actor,
+                )
+                key = f"{key}#{review.id}"
+            self._reviews[key] = review.model_copy(deep=True)
+            self._bump("review", key)
+            self._event(
+                EventKind.REVIEW_RECORDED,
+                f"review round {review.round} for {review.subagent_id}: {review.verdict}",
+                actor=actor or review.reviewer,
+                entity_type="review",
+                entity_id=review.id,
+            )
+            return review.model_copy(deep=True)
+
+    def record_retry(self, task_id: str, *, reason: str, actor: str | None = None) -> int:
+        """Count a retry against the task and the retry budget."""
+
+        with self._lock:
+            try:
+                self._budget.consume(retry=True)
+            except BudgetExceeded as exc:
+                self._event(EventKind.BUDGET_EXCEEDED, str(exc), actor=actor, entity_type="task", entity_id=task_id)
+                raise
+            self._retries[task_id] = self._retries.get(task_id, 0) + 1
+            self._bump("retry", task_id)
+            self._event(
+                EventKind.RETRY_RECORDED,
+                f"retry {self._retries[task_id]} for {task_id}: {reason}",
+                actor=actor,
+                entity_type="task",
+                entity_id=task_id,
+            )
+            return self._retries[task_id]
+
+    def record_error(self, error: ErrorInfo, *, actor: str | None = None, entity_id: str | None = None) -> None:
+        with self._lock:
+            self._event(
+                EventKind.ERROR,
+                f"{error.code}: {error.message}",
+                actor=actor,
+                entity_type="error",
+                entity_id=entity_id,
+                data={"retryable": error.retryable, "attempt": error.attempt},
+            )
+
+    def consume_seconds(self, seconds: float, *, actor: str | None = None, reason: str = "") -> None:
+        """Charge elapsed time to the mission budget."""
+
+        with self._lock:
+            try:
+                self._budget.consume(seconds=seconds)
+            except BudgetExceeded as exc:
+                self._event(EventKind.BUDGET_EXCEEDED, str(exc), actor=actor)
+                raise
+            self._event(
+                EventKind.BUDGET_CONSUMED,
+                f"{seconds:.1f}s consumed" + (f" ({reason})" if reason else ""),
+                actor=actor,
+            )
+
+    def update_evidence_confidence(
+        self,
+        evidence_id: str,
+        confidence: Confidence,
+        *,
+        basis: str,
+        actor: str | None = None,
+        expected_revision: int | None = None,
+    ) -> EvidenceItem:
+        """Revision-guarded confidence change — the canonical stale-write path."""
+
+        with self._lock:
+            existing = self._evidence.get(evidence_id)
+            if existing is None:
+                raise StateError(f"unknown evidence {evidence_id!r}")
+            self._guard_revision("evidence", evidence_id, expected_revision)
+            updated = existing.model_copy(update={"confidence": confidence, "confidence_basis": basis}, deep=True)
+            self._evidence[evidence_id] = updated
+            self._bump("evidence", evidence_id)
+            self._event(
+                EventKind.EVIDENCE_ADDED,
+                f"confidence for {evidence_id} set to {confidence.value}: {basis}",
+                actor=actor,
+                entity_type="evidence",
+                entity_id=evidence_id,
+            )
+            return updated.model_copy(deep=True)
+
+    def revision_of(self, entity_type: str, key: str) -> int:
+        """Public accessor so a Worker can capture the revision it read."""
+
+        with self._lock:
+            return self._revision_of(entity_type, key)
+
+    # ------------------------------------------------------------------
+    # 16.4 Progress
+    # ------------------------------------------------------------------
+
+    def progress(self) -> Progress:
+        """Compute completion from the records themselves, not a counter.
+
+        Deriving avoids the classic bug where a counter drifts from reality
+        after a retry or a conflict.
+        """
+
+        with self._lock:
+            assignments = list(self._assignments.values())
+            results = list(self._results.values())
+            statuses = [a.status for a in assignments]
+            evidence = list(self._evidence.values())
+
+            terminal = [s for s in statuses if s in {EntityStatus.SUCCEEDED, EntityStatus.FAILED, EntityStatus.SKIPPED, EntityStatus.CANCELLED, EntityStatus.BUDGET_EXCEEDED}]
+            total = len(assignments)
+            percent = round(100.0 * len(terminal) / total, 1) if total else 0.0
+            if self._status.terminal and total:
+                percent = 100.0
+
+            return Progress(
+                status=self._status,
+                tasks_total=total,
+                tasks_succeeded=sum(1 for s in statuses if s is EntityStatus.SUCCEEDED),
+                tasks_failed=sum(1 for s in statuses if s is EntityStatus.FAILED),
+                tasks_running=sum(1 for s in statuses if s is EntityStatus.RUNNING),
+                tasks_skipped=sum(1 for s in statuses if s is EntityStatus.SKIPPED),
+                tasks_pending=sum(1 for s in statuses if s in {EntityStatus.PENDING, EntityStatus.READY}),
+                percent_complete=percent,
+                subagents_total=len(self._subagents),
+                workers_total=len(self._workers),
+                evidence_total=len(evidence),
+                observations=sum(1 for e in evidence if e.kind is EvidenceKind.OBSERVATION),
+                inferences=sum(1 for e in evidence if e.kind is EvidenceKind.INFERENCE),
+                allegations=sum(1 for e in evidence if e.kind is EvidenceKind.ALLEGATION),
+                reviews_total=len(self._reviews),
+                retries_used=sum(self._retries.values()),
+                seconds_used=self._budget.seconds_used,
+                seconds_limit=self._budget.seconds_limit,
+                events=len(self._events),
+                conflicts=len(self._conflicts),
+                updated_at=self._now,
+            )
+
+    # ------------------------------------------------------------------
+    # 16.5 Checkpointing
+    # ------------------------------------------------------------------
+
+    def to_checkpoint(self) -> dict[str, Any]:
+        """JSON-safe, versioned payload.  Every model is serialised in full."""
+
+        with self._lock:
+            payload = {
+                "schema": "argus-run-state",
+                "version": self.CHECKPOINT_VERSION,
+                "saved_at": self._now.isoformat(),
+                "mission": json.loads(model_to_json(self._mission)),
+                "scope": json.loads(model_to_json(self._scope)),
+                "status": self._status.value,
+                "evidence": [json.loads(model_to_json(e)) for e in self._evidence.values()],
+                "subagents": [json.loads(model_to_json(s)) for s in self._subagents.values()],
+                "workers": [json.loads(model_to_json(w)) for w in self._workers.values()],
+                "assignments": [json.loads(model_to_json(a)) for a in self._assignments.values()],
+                "results": [json.loads(model_to_json(r)) for r in self._results.values()],
+                "reviews": [json.loads(model_to_json(v)) for v in self._reviews.values()],
+                "retries": dict(self._retries),
+                "budget": json.loads(model_to_json(self._budget)),
+                "events": [json.loads(model_to_json(e)) for e in self._events],
+                "revisions": {f"{k[0]}:{k[1]}": v for k, v in self._revisions.items()},
+                "conflicts": list(self._conflicts),
+                "seq": self._seq,
+            }
+            return payload
+
+    def save_checkpoint(self, path: str | Path) -> Path:
+        """Write atomically: a crash cannot leave a half-written case file."""
+
+        target = Path(path).expanduser()
+        payload = self.to_checkpoint()
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # Unique temp name so concurrent savers cannot collide.
+            handle = tempfile.NamedTemporaryFile(
+                "w", dir=target.parent, prefix=f".{target.name}.", suffix=".tmp", delete=False, encoding="utf-8"
+            )
+            try:
+                with handle as stream:
+                    json.dump(payload, stream, indent=2)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(handle.name, target)
+            finally:
+                if os.path.exists(handle.name):
+                    os.unlink(handle.name)
+        except OSError as exc:
+            raise CheckpointError(f"could not write checkpoint {target}: {exc}") from exc
+        with self._lock:
+            self._event(EventKind.CHECKPOINT_SAVED, f"checkpoint written to {target}", actor="system")
+        return target
+
+    @classmethod
+    def load_checkpoint(cls, path: str | Path, *, clock: "Callable[[], datetime] | None" = None) -> "RunStateStore":
+        """Rebuild a store from a checkpoint, re-validating every record."""
+
+        source = Path(path).expanduser()
+        try:
+            raw = json.loads(source.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CheckpointError(f"could not read checkpoint {source}: {exc}") from exc
+
+        if raw.get("schema") != "argus-run-state":
+            raise CheckpointError(f"{source} is not a run-state checkpoint (schema={raw.get('schema')!r})")
+        if raw.get("version") != cls.CHECKPOINT_VERSION:
+            raise CheckpointError(
+                f"checkpoint version {raw.get('version')} is not supported (expected {cls.CHECKPOINT_VERSION})"
+            )
+
+        try:
+            mission = Mission.model_validate(raw["mission"])
+            store = cls(mission, clock=clock)
+            store._scope = Scope.model_validate(raw["scope"])
+            store._status = EntityStatus(raw["status"])
+            store._evidence = {
+                item.id: item for item in (EvidenceItem.model_validate(p) for p in raw.get("evidence", []))
+            }
+            store._subagents = {
+                s.id: s for s in (SubagentSpec.model_validate(p) for p in raw.get("subagents", []))
+            }
+            store._workers = {w.id: w for w in (WorkerSpec.model_validate(p) for p in raw.get("workers", []))}
+            store._assignments = {
+                a.id: a for a in (TaskAssignment.model_validate(p) for p in raw.get("assignments", []))
+            }
+            store._results = {
+                f"{r.task_id}@{r.attempts}": r
+                for r in (TaskResult.model_validate(p) for p in raw.get("results", []))
+            }
+            store._reviews = {
+                f"{v.subagent_id}@r{v.round}": v
+                for v in (QualityReview.model_validate(p) for p in raw.get("reviews", []))
+            }
+            store._retries = {k: int(v) for k, v in raw.get("retries", {}).items()}
+            store._budget = BudgetLedger.model_validate(raw.get("budget", {}))
+            store._revisions = {}
+            for composite, revision in raw.get("revisions", {}).items():
+                kind, _, key = composite.partition(":")
+                store._revisions[(kind, key)] = int(revision)
+            store._conflicts = list(raw.get("conflicts", []))
+            store._seq = max([int(raw.get("seq", 0)), *[int(e["seq"]) for e in raw.get("events", [])]] or [0])
+            store._events = [StateEvent.model_validate(p) for p in raw.get("events", [])]
+        except (KeyError, ValueError, TypeError) as exc:
+            raise CheckpointError(f"checkpoint {source} is corrupt: {type(exc).__name__}: {exc}") from exc
+
+        store._event(EventKind.CHECKPOINT_LOADED, f"state restored from {source}", actor="system")
+        return store
+
+
+# --------------------------------------------------------------------------
+# 16.6 Rendering and the ``state`` command
+# --------------------------------------------------------------------------
+
+
+def render_progress(progress: Progress) -> Table:
+    table = Table(box=None, pad_edge=False, show_header=False)
+    table.add_column("metric", style="dim", no_wrap=True)
+    table.add_column("value", overflow="fold")
+    table.add_row("status", f"[bold]{progress.status.value}[/bold]")
+    table.add_row(
+        "tasks",
+        f"{progress.tasks_succeeded} succeeded · {progress.tasks_failed} failed · "
+        f"{progress.tasks_running} running · {progress.tasks_pending} pending "
+        f"(of {progress.tasks_total})",
+    )
+    table.add_row("progress", f"{progress.percent_complete:.1f}%")
+    table.add_row("agents", f"{progress.subagents_total} subagent(s), {progress.workers_total} worker(s)")
+    table.add_row(
+        "evidence",
+        f"{progress.evidence_total} item(s) — {progress.observations} observation(s), "
+        f"{progress.inferences} inference(s), {progress.allegations} allegation(s)",
+    )
+    table.add_row("reviews", f"{progress.reviews_total} round(s), {progress.retries_used} retry(ies)")
+    budget = f"{progress.seconds_used:.1f}s"
+    if progress.seconds_limit:
+        budget += f" of {progress.seconds_limit}s ({progress.budget_used_percent}%)"
+    table.add_row("budget", budget)
+    table.add_row("events", f"{progress.events}" + (f" · {progress.conflicts} conflict(s)" if progress.conflicts else ""))
+    return table
+
+
+def _demo_state_tree(store: RunStateStore, *, subagents: int = 2, workers_each: int = 2, tasks_each: int = 2) -> None:
+    """Populate a store with a plausible dynamic hierarchy for demonstration."""
+
+    mission = store.mission()
+    for s_index in range(1, subagents + 1):
+        subagent = SubagentSpec(
+            mission_id=mission.id,
+            name=f"rt-subagent-{s_index}",
+            objective=f"Runtime-chosen investigation area {s_index}",
+            scope_entries=store.scope().includes,
+        )
+        store.add_subagent(subagent)
+        for w_index in range(1, workers_each + 1):
+            worker = WorkerSpec(
+                subagent_id=subagent.id,
+                name=f"rt-worker-{s_index}-{w_index}",
+                objective=f"Task-specific worker {w_index} for area {s_index}",
+            )
+            store.add_worker(worker)
+            for t_index in range(1, tasks_each + 1):
+                store.assign_task(
+                    TaskAssignment(
+                        mission_id=mission.id,
+                        subagent_id=subagent.id,
+                        worker_id=worker.id,
+                        objective=f"collect target set {s_index}.{w_index}.{t_index}",
+                    )
+                )
+
+
+def run_concurrency_self_test(threads: int = 12, items_per_thread: int = 40) -> list[ModelTestResult]:
+    """Prove the acceptance criterion: parallel updates never lose work.
+
+    Three independent races are exercised: distinct records added in parallel
+    (no lost writes), the *same* record corroborated in parallel (sources are
+    merged, not replaced), and revision-guarded updates (a stale writer is
+    rejected rather than silently winning).
+    """
+
+    results: list[ModelTestResult] = []
+
+    def record(name: str, ok: bool, detail: str) -> None:
+        results.append(ModelTestResult(name, ok, detail))
+
+    mission = Mission(
+        objective="Concurrency self-test",
+        scope=Scope(entries=[ScopeEntry(pattern="example.com")], data_classes=[DataClass.PUBLIC_WEB]),
+        limits={"mission_budget_seconds": 3600},
+    )
+
+    # --- 1. parallel distinct writes --------------------------------------
+    store = RunStateStore(mission)
+    errors: list[str] = []
+
+    def writer(index: int) -> None:
+        try:
+            for n in range(items_per_thread):
+                store.add_evidence(
+                    EvidenceItem(
+                        kind=EvidenceKind.OBSERVATION,
+                        statement=f"thread {index} observed item {n}",
+                        sources=[
+                            SourceReference(
+                                kind=SourceKind.PUBLIC_WEB,
+                                url=f"https://example.com/{index}/{n}",
+                                retrieval_method=RetrievalMethod.HTTP,
+                            )
+                        ],
+                    ),
+                    actor=f"worker-{index}",
+                )
+        except Exception as exc:                       # pragma: no cover - failure path
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    pool = [threading.Thread(target=writer, args=(i,)) for i in range(threads)]
+    for thread in pool:
+        thread.start()
+    for thread in pool:
+        thread.join()
+
+    expected = threads * items_per_thread
+    actual = len(store.evidence())
+    record(
+        "parallel writes: no lost updates",
+        not errors and actual == expected,
+        f"{actual}/{expected} records" + (f"; errors: {errors[:2]}" if errors else ""),
+    )
+    record(
+        "parallel writes: unique ids",
+        len({e.id for e in store.evidence()}) == actual,
+        f"{len({e.id for e in store.evidence()})} unique of {actual}",
+    )
+    record(
+        "parallel writes: event log ordered",
+        [e.seq for e in store.events()] == list(range(1, len(store.events()) + 1)),
+        f"{len(store.events())} events",
+    )
+
+    # --- 2. concurrent corroboration of ONE record -------------------------
+    shared = EvidenceItem(
+        kind=EvidenceKind.OBSERVATION,
+        statement="The same fact, observed independently.",
+        sources=[
+            SourceReference(kind=SourceKind.PUBLIC_WEB, url="https://example.com/base",
+                            retrieval_method=RetrievalMethod.HTTP)
+        ],
+    )
+    store.add_evidence(shared)
+    merge_errors: list[str] = []
+
+    def corroborator(index: int) -> None:
+        try:
+            store.add_evidence(
+                EvidenceItem(
+                    kind=EvidenceKind.OBSERVATION,
+                    statement=shared.statement,
+                    sources=[
+                        SourceReference(
+                            kind=SourceKind.ARCHIVE,
+                            url=f"https://archive.example/{index}",
+                            retrieval_method=RetrievalMethod.HTTP,
+                        )
+                    ],
+                    tags=[f"source-{index}"],
+                ),
+                actor=f"worker-{index}",
+            )
+        except Exception as exc:                       # pragma: no cover
+            merge_errors.append(f"{type(exc).__name__}: {exc}")
+
+    readers = [threading.Thread(target=corroborator, args=(i,)) for i in range(threads)]
+    for thread in readers:
+        thread.start()
+    for thread in readers:
+        thread.join()
+
+    merged = next(e for e in store.evidence() if e.id == shared.id)
+    record(
+        "merge: every corroborating source kept",
+        not merge_errors and len(merged.sources) == threads + 1,
+        f"{len(merged.sources)} source(s), expected {threads + 1}",
+    )
+    record(
+        "merge: tags unioned",
+        len(merged.tags) == threads,
+        f"{len(merged.tags)} tag(s)",
+    )
+    record(
+        "merge: statement not duplicated",
+        len([e for e in store.evidence() if e.statement == shared.statement]) == 1,
+        "one record",
+    )
+
+    # --- 3. stale writes are rejected -------------------------------------
+    revision = store.revision_of("evidence", shared.id)
+    store.update_evidence_confidence(shared.id, Confidence.MEDIUM, basis="two independent sources",
+                                     expected_revision=revision)
+    stale_raised = False
+    try:
+        store.update_evidence_confidence(shared.id, Confidence.HIGH, basis="stale writer",
+                                         expected_revision=revision)
+    except StaleWriteError:
+        stale_raised = True
+    record("revisions: stale writer rejected", stale_raised, "StaleWriteError raised")
+
+    # A corroborating merge must not silently downgrade a justified confidence.
+    confirm_store = RunStateStore(Mission(objective="merge confidence", scope=Scope(entries=[ScopeEntry(pattern="example.com")])))
+    confirmed = EvidenceItem(
+        kind=EvidenceKind.OBSERVATION,
+        statement="Confirmed by one strong source.",
+        sources=[SourceReference(kind=SourceKind.PUBLIC_WEB, url="https://example.com/strong",
+                                 retrieval_method=RetrievalMethod.HTTP)],
+        confidence=Confidence.HIGH,
+        confidence_basis="first-party signed advisory",
+    )
+    confirm_store.add_evidence(confirmed)
+    confirm_store.add_evidence(
+        EvidenceItem(
+            kind=EvidenceKind.OBSERVATION,
+            statement=confirmed.statement,
+            sources=[SourceReference(kind=SourceKind.API, url="https://api.example/echo",
+                                     retrieval_method=RetrievalMethod.API_CALL)],
+        )
+    )
+    kept = next(e for e in confirm_store.evidence() if e.id == confirmed.id)
+    record(
+        "merge: a bare re-submission cannot erase confidence",
+        kept.confidence is Confidence.HIGH,
+        kept.confidence.value,
+    )
+
+    # --- 4. budget accounting under contention ----------------------------
+    budget_store = RunStateStore(
+        Mission(objective="budget test", scope=Scope(entries=[ScopeEntry(pattern="example.com")]),
+                limits={"mission_budget_seconds": 10})
+    )
+    task = TaskAssignment(worker_id="", objective="work")
+    budget_store.assign_task(task)
+    allowed = 0
+    denied = 0
+    lock = threading.Lock()
+
+    def spender() -> None:
+        nonlocal allowed, denied
+        try:
+            budget_store.consume_seconds(1.0)
+            with lock:
+                allowed += 1
+        except BudgetExceeded:
+            with lock:
+                denied += 1
+
+    spenders = [threading.Thread(target=spender) for _ in range(20)]
+    for thread in spenders:
+        thread.start()
+    for thread in spenders:
+        thread.join()
+    record(
+        "budget: never overspends under contention",
+        allowed == 10 and denied == 10 and budget_store.budget().seconds_used == 10.0,
+        f"allowed={allowed} denied={denied} used={budget_store.budget().seconds_used}",
+    )
+
+    # --- 5. progress is derived, not counted ------------------------------
+    snapshot_before = store.progress()
+    store.add_evidence(
+        EvidenceItem(
+            kind=EvidenceKind.OBSERVATION,
+            statement="late addition",
+            sources=[SourceReference(kind=SourceKind.PUBLIC_WEB, url="https://example.com/late",
+                                     retrieval_method=RetrievalMethod.HTTP)],
+        )
+    )
+    record(
+        "progress: recomputed from records",
+        store.progress().evidence_total == snapshot_before.evidence_total + 1,
+        f"{snapshot_before.evidence_total} → {store.progress().evidence_total}",
+    )
+
+    # --- 6. checkpoint round-trip -----------------------------------------
+    try:
+        store.set_status(EntityStatus.RUNNING)
+        store.record_retry(next(iter(store.snapshot()["assignments"])).id if store.snapshot()["assignments"] else "task-x",
+                           reason="self-test")
+    except Exception:                                   # pragma: no cover - optional in demo
+        pass
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "state.json"
+        store.save_checkpoint(path)
+        restored = RunStateStore.load_checkpoint(path)
+        before_progress = store.progress()
+        after_progress = restored.progress()
+        record(
+            "checkpoint: evidence count survives",
+            after_progress.evidence_total == before_progress.evidence_total,
+            f"{after_progress.evidence_total} items",
+        )
+        record(
+            "checkpoint: sources survive",
+            len(next(e for e in restored.evidence() if e.id == shared.id).sources) == threads + 1,
+            "merged sources intact",
+        )
+        record(
+            "checkpoint: budget survives",
+            restored.budget().seconds_used == store.budget().seconds_used,
+            f"{restored.budget().seconds_used}s",
+        )
+        record(
+            "checkpoint: status survives",
+            restored.status is store.status,
+            restored.status.value,
+        )
+        restored_events = restored.events()
+        record(
+            # The save event is logged after the payload is written, so a restored
+            # store legitimately resumes at the same seq.  The invariant that
+            # matters is that the log stays contiguous and records the load.
+            "checkpoint: event log stays contiguous",
+            [e.seq for e in restored_events] == list(range(1, len(restored_events) + 1))
+            and restored_events[-1].kind is EventKind.CHECKPOINT_LOADED,
+            f"{len(restored_events)} events, last {restored_events[-1].kind.value}",
+        )
+        record(
+            "checkpoint: revisions preserved",
+            restored.revision_of("evidence", shared.id) == store.revision_of("evidence", shared.id),
+            str(restored.revision_of("evidence", shared.id)),
+        )
+
+    return results
+
+
+@app.command("state", help="Inspect, exercise and checkpoint the unified run-state store.")
+def state_command(
+    objective: str = typer.Option(
+        "Map the public attack surface of example.com", "--objective", "-o", help="Objective for the demo state."
+    ),
+    target: list[str] | None = typer.Option(None, "--target", "-t", help="Target (repeatable)."),
+    stress: bool = typer.Option(
+        False, "--stress", help="Run the concurrency self-test (parallel writers, merges, budgets)."
+    ),
+    threads: int = typer.Option(12, "--threads", min=2, max=64, help="Writer threads for --stress."),
+    items: int = typer.Option(40, "--items", min=1, max=2000, help="Records per writer thread."),
+    checkpoint: str | None = typer.Option(None, "--checkpoint", help="Write a checkpoint JSON file here."),
+    load: str | None = typer.Option(None, "--load", help="Load a checkpoint and report its state."),
+    demo: bool = typer.Option(False, "--demo", help="Populate a sample hierarchy before reporting."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Pure local state work: no network, no model, no browser."""
+
+    console = get_console()
+
+    if load:
+        try:
+            store = RunStateStore.load_checkpoint(load)
+        except CheckpointError as exc:
+            console.print(f"[red]checkpoint error:[/red] {escape(str(exc))}")
+            raise typer.Exit(ExitCode.CONFIG) from exc
+        if as_json:
+            _emit(
+                json.dumps(
+                    {
+                        "loaded_from": str(load),
+                        "progress": json.loads(model_to_json(store.progress())),
+                        "checkpoint": store.to_checkpoint(),
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            console.print()
+            console.print(Panel(Text(f"state restored from {load}", style="green"), border_style="green", expand=False))
+            console.print(render_progress(store.progress()))
+            console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    # Build a state from a real preflight so scope and objective are honest.
+    targets = _normalise_targets(target or ["example.com"])
+    preflight = run_preflight(objective=objective, targets=targets, scope_entries=targets)
+    if not preflight.ok:
+        render_preflight(preflight)
+        raise typer.Exit(preflight.exit_code)
+
+    request = MissionRequest(targets=targets, objective=objective, dry_run=True)
+    mission = Mission.from_preflight(
+        request=request, preflight=preflight, settings=build_settings({}, {}).settings
+    )
+    store = RunStateStore(mission)
+
+    if demo:
+        _demo_state_tree(store)
+    if stress:
+        store.set_status(EntityStatus.RUNNING)
+
+    results = run_concurrency_self_test(threads=threads, items_per_thread=items) if stress else []
+    failures = [r for r in results if not r.ok]
+    saved_path: Path | None = None
+
+    if checkpoint:
+        target_path = Path(checkpoint).expanduser()
+        try:
+            saved_path = store.save_checkpoint(target_path)
+        except CheckpointError as exc:
+            console.print(f"[red]checkpoint error:[/red] {escape(str(exc))}")
+            raise typer.Exit(ExitCode.CONFIG) from exc
+
+    payload = {
+        "mission_id": mission.id,
+        "progress": json.loads(model_to_json(store.progress())),
+        "self_test": [{"check": r.name, "ok": r.ok, "detail": r.detail} for r in results],
+        "checkpoint": str(saved_path) if saved_path else None,
+        "ok": not failures,
+    }
+
+    if as_json:
+        _emit(json.dumps(payload, indent=2))
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    console.print()
+    console.print(
+        Panel(
+            Text(f"{mission.id}\n{mission.objective}", style="white"),
+            title=f"[bold cyan]{APP_TITLE} run state[/bold cyan]",
+            title_align="left",
+            border_style="cyan",
+            expand=False,
+        )
+    )
+    console.print(render_progress(store.progress()))
+
+    if results:
+        console.print()
+        table = Table(title="concurrency self-test", title_justify="left", box=None, pad_edge=False)
+        table.add_column("", width=2)
+        table.add_column("check", style="bold", no_wrap=True)
+        table.add_column("detail", overflow="fold")
+        for result in results:
+            glyph, colour = ("✔", "green") if result.ok else ("✘", "red")
+            table.add_row(f"[{colour}]{glyph}[/{colour}]", escape(result.name), escape(result.detail))
+        console.print(table)
+        console.print(f"[{'green' if not failures else 'red'}]{len(results) - len(failures)} passed[/] · {len(failures)} failed")
+
+    if saved_path:
+        console.print(f"[green]checkpoint[/green] written to {escape(str(saved_path))}")
+    console.print()
+
+    raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 17. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 
