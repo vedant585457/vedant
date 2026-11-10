@@ -9,6 +9,7 @@ python vedant_osint.py config        # interpreter / dependency / env probes
 python vedant_osint.py mission -t example.com -o "map the attack surface"
 python vedant_osint.py config --settings     # merged config, secrets masked
 python vedant_osint.py doctor                # capability health check (CI gate)
+python vedant_osint.py resilience --self-test # logging, cancellation, cleanup
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -65,6 +66,38 @@ shares one transient line carrying counters and elapsed time, so permanent lines
 grow with transitions, not ticks. Ctrl-C, exceptions, cancellation and
 `shutdown()` (also via `atexit`) all close open records — an interrupted run
 never leaves a spinner running.
+
+## Resilience
+
+`MissionRun` supervises a mission so that Ctrl-C, a budget timeout or an
+unexpected exception all end the same way: readable output, a valid checkpoint,
+and a partial report that keeps everything already collected.
+
+```bash
+python vedant_osint.py resilience --self-test             # 75 guarantee checks
+python vedant_osint.py resilience --demo sigint           # Ctrl-C mid-mission
+python vedant_osint.py resilience --demo timeout --json   # budget exhaustion
+python vedant_osint.py resilience --demo exception        # recursive failure
+```
+
+- **Optional JSONL logging** — `MissionLogger` writes one redacted JSON object per
+  line, or is cleanly disabled when no path is given. An unwritable path disables
+  logging instead of failing the mission; keys that name a secret are replaced
+  wholesale.
+- **Cancellation** — `CancellationToken` is first-wins, runs cleanups in order,
+  and pending work stops at its next `raise_if_cancelled()` checkpoint.
+  `CancellationGuard` maps the first SIGINT/SIGTERM to cancellation, the second
+  to a hard abort, and restores the previous handlers on exit.
+- **Cleanup** — `BrowserReaper` closes pages, contexts and browsers in reverse
+  order and is idempotent; `ResourceStack` removes temporary profiles.
+- **Partial reports** — completed evidence is preserved verbatim; unfinished
+  assignments become explicit gaps and the uncertainty statement is marked
+  `PARTIAL`. The checkpoint is written before the report.
+- **Attributed errors** — `AgentError` carries agent, assignment and delegation
+  chain identifiers and has **no field for prompts or working memory**.
+
+Exit status follows convention: `130` interrupted, `124` timeout, `70` internal
+error.
 
 ## Run state
 
@@ -167,7 +200,7 @@ Authorised use only — collect from systems you own or are explicitly permitted
 | Phase | Scope | State |
 |-------|-------|-------|
 | 1 | Foundation — CLI skeleton, config probing, version reporting | ✅ done |
-| 2 | Contracts — settings, `doctor`, preflight, models, state, renderer, lifecycle | ✅ done |
+| 2 | Contracts — settings, `doctor`, preflight, models, state, renderer, lifecycle, resilience | ✅ done |
 | 3 | Orchestration — LangGraph Master Agent + runtime Subagent factory | ⬜ next |
 | 4 | Browser — browser-use / Playwright sessions and capture | ⬜ |
 | 5 | Collection — passive OSINT sources, artefact hashing | ⬜ |

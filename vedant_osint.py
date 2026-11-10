@@ -204,6 +204,56 @@ merge and completion.  Reusable methods: ``spawn``, ``delegate``,
     python vedant_osint.py lifecycle --self-test     # 33 guarantee checks
     python vedant_osint.py lifecycle --json          # records + counters + events
 
+Resilience
+----------
+A mission is a long-running, partially external process: the operator hits
+Ctrl-C, a provider stalls, a parser throws.  ``MissionRun`` is the supervisor
+that turns any of those into a readable ending plus an artefact set you can
+resume from.
+
+* **Structured JSONL logging is optional.**  ``MissionLogger`` writes one JSON
+  object per line (timestamp, level, event, ``mission_id``, ``agent_id``,
+  ``agent_kind``, ``assignment_id``, attempt, duration, error code, payload) or
+  is simply disabled when no ``--log-file`` is given.  Every string passes the
+  Task 2 redactor, and keys that *name* a secret (``api_key``, ``token``,
+  ``password``, ``authorization``…) are replaced wholesale — the value never
+  reaches the file even if it does not match a pattern.  An unwritable log path
+  degrades to logging-off instead of failing the mission.
+* **Cancellation is a token, not an exception thrown at a thread.**
+  ``CancellationToken.cancel()`` is first-wins, runs registered cleanups in
+  order, records (does not raise) a failing cleanup, and pending tasks stop at
+  their next ``raise_if_cancelled()`` / ``guarded`` checkpoint.  ``guard()``
+  wraps a block so a cancellation unwinds through normal cleanup.
+* **Signals are restored.**  ``CancellationGuard`` maps the first SIGINT/SIGTERM
+  to cancellation and installs a *second*-SIGINT hard abort, then restores the
+  previous handlers on exit — so embedding the mission in another tool does not
+  hijack its signal handling.
+* **Browsers cannot leak.**  ``BrowserReaper`` closes tracked pages, contexts and
+  browsers in reverse creation order and is idempotent (also reachable from
+  ``atexit``); ``ResourceStack`` removes temporary profiles and directories.
+  Both record failures instead of raising during shutdown.
+* **A partial report always exists.**  Evidence already collected is preserved
+  verbatim; unfinished assignments, open hypotheses and the cancellation reason
+  become explicit ``gaps``, the uncertainty statement is prefixed ``PARTIAL``,
+  and the checkpoint is written *before* the report so a resume loses nothing.
+* **Errors name agents, never prompts.**  ``AgentError`` carries
+  ``agent_id``/``assignment_id``/``agent_kind``/``attempt`` and the delegation
+  chain (``master → sa-1 → wrk-3``).  It has no field for a prompt, scratchpad
+  or working memory: sensitive case instructions cannot travel up the stack, into
+  a log or into a report.
+
+::
+
+    python vedant_osint.py resilience --self-test            # 75 guarantee checks
+    python vedant_osint.py resilience --demo sigint          # Ctrl-C mid-mission
+    python vedant_osint.py resilience --demo timeout --json  # budget exhaustion
+    python vedant_osint.py resilience --demo exception        # recursive failure
+
+The demo kinds are ``sigint``, ``timeout``, ``exception`` and ``operator``
+(programmatic cancellation); each exits with its conventional status — ``130``,
+``124``, ``70`` and ``130`` — after printing the outcome, the checkpoint and
+report paths, and the count of preserved evidence items.
+
 Usage
 -----
 ::
@@ -216,6 +266,7 @@ Usage
     python vedant_osint.py state --stress               # run-state concurrency self-test
     python vedant_osint.py renderer --self-test         # CLI-only renderer guarantees
     python vedant_osint.py lifecycle --self-test        # lifecycle animation guarantees
+    python vedant_osint.py resilience --self-test       # logging, cancellation, cleanup
     python vedant_osint.py doctor                       # full capability health check
     python vedant_osint.py policy -o "..." --scope example.com          # safety preflight only
     python vedant_osint.py mission --target example.com -o "map the attack surface"
@@ -270,7 +321,9 @@ See :class:`ExitCode`.  ``config`` and ``doctor`` return ``3`` (CONFIG) when a
 *required* capability is missing — usable as CI/installation gates — and ``0``
 when only optional capabilities are absent.  ``mission`` returns ``7`` for a
 policy refusal, ``8`` for a paused objective and ``2`` for an out-of-scope
-target.
+target.  An interrupted run returns ``130`` (SIGINT, the shell convention) and a
+budget timeout returns ``124`` (the ``timeout(1)`` convention); in both cases the
+terminal output names the checkpoint and partial report that survived.
 
 Authorised use only
 -------------------
@@ -291,6 +344,7 @@ import atexit
 import hashlib
 import importlib.util
 import io
+import signal
 import ipaddress
 import json
 import os
@@ -302,12 +356,13 @@ import tempfile
 import threading
 import time
 import uuid
+from asyncio import CancelledError
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum, IntEnum
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 # --- third party: CLI surface -------------------------------------------------
 # Typer + Rich are the only hard imports.  They are imported at module level
@@ -340,7 +395,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 8
+VERSION_MINOR: int = 9
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -393,7 +448,7 @@ BUILD_PHASE_NAME: str = "Contracts"
 #: Section banners shared by the banner panel and ``version --json``.
 PHASE_ROADMAP: tuple[tuple[int, str, str], ...] = (
     (1, "Foundation", "CLI skeleton, config probing, version reporting"),
-    (2, "Contracts", "Settings, doctor, preflight, models, state, renderer, lifecycle"),
+    (2, "Contracts", "Contracts, state, rendering, lifecycle, resilience"),
     (3, "Orchestration", "LangGraph Master Agent + runtime Subagent factory"),
     (4, "Browser", "browser-use/Playwright sessions and capture"),
     (5, "Collection", "passive OSINT sources, artefact hashing/chain of custody"),
@@ -3290,7 +3345,7 @@ def evaluate_objective(objective: str) -> PolicyVerdict:
             alternative=rule.alternative,
             evidence=tuple(dict.fromkeys(fragments))[:5],
             downgraded=True,
-            notes=(f"Confirm with --confirm-intent if this is authorised defensive work.",),
+            notes=("Confirm with --confirm-intent if this is authorised defensive work.",),
             reframable=rule.reframable,
         )
 
@@ -4392,14 +4447,8 @@ def mission_command(
 # ErrorInfo) deliberately have no id: they are embedded components of an
 # entity, never referenced on their own.  They still carry a timestamp where
 # the moment matters (when the unknown was determined, when an error occurred).
-
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    Field,
-    field_validator,
-    model_validator,
-)
+# Pydantic is imported once, in the import block above; re-importing it here
+# shadowed the first binding for no benefit.
 
 #: Schema version for the model set below; bump on any breaking change.
 MODEL_SCHEMA_VERSION: int = 1
@@ -6604,7 +6653,6 @@ class RunStateStore:
 
         with self._lock:
             assignments = list(self._assignments.values())
-            results = list(self._results.values())
             statuses = [a.status for a in assignments]
             evidence = list(self._evidence.values())
 
@@ -7882,7 +7930,6 @@ def run_renderer_self_test() -> list[RendererCheck]:
     _render_demo_mission(renderer)
     plain = buffer.getvalue()
     record("no colour ⇒ no ANSI escapes", "\x1b[" not in plain, "clean" if "\x1b[" not in plain else "escapes present")
-    all_kinds = {kind for kind in RenderKind if kind not in {RenderKind.DEBUG}}
     rendered_kinds = {e.kind for e in renderer.trace.events}
     record(
         "no colour ⇒ complete log",
@@ -8704,6 +8751,16 @@ class LifecycleTracker:
                     closed.append(record)
             return closed
 
+    def stop_animation(self) -> None:
+        """Detach the transient status line without closing any record.
+
+        Cancellation uses this: the unwind path marks each record with its own
+        precise terminal state (``cancelled``), so pre-emptively marking
+        everything ``interrupted`` here would lose that detail.
+        """
+
+        self._live.stop()
+
     def shutdown(self, reason: str = "run ended") -> None:
         """Stop animation and close anything still open.  Safe to call twice."""
 
@@ -9185,22 +9242,1773 @@ def lifecycle_command(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 19. Entry point
+# 19. Resilience: structured logging, cancellation, cleanup, partial reports
+# ══════════════════════════════════════════════════════════════════════════
+#
+# A mission that is interrupted — by Ctrl+C, by a timeout, by a crash in a
+# Worker — must still leave three things behind:
+#
+#   1. readable terminal output (never a half-painted spinner or a bare
+#      traceback);
+#   2. a recoverable mission state (a checkpoint on disk);
+#   3. a partial report that says what finished, what was lost, and why.
+#
+# This section provides the machinery for all three:
+#
+#   MissionLogger        optional structured JSONL log with redaction on write
+#   CancellationToken    propagates cancellation to pending work, exactly once
+#   BrowserReaper        guarantees browser/context/page cleanup, even on crash
+#   CancellationGuard    turns SIGINT/SIGTERM into an ordered shutdown
+#   build_partial_report()  evidence-preserving report of an aborted mission
+#
+# Recursive agent errors (nested Worker → Subagent → Master) are wrapped in
+# :class:`AgentError`, which records *identifiers* — agent id, assignment id,
+# attempt — and never the prompt or working memory that produced the failure.
+
+class InterruptionKind(str, Enum):
+    """Why a mission stopped early."""
+
+    SIGINT = "sigint"                 # operator pressed Ctrl+C
+    SIGTERM = "sigterm"               # supervisor asked us to stop
+    TIMEOUT = "timeout"               # wall-clock or task budget expired
+    EXCEPTION = "exception"           # unexpected failure
+    POLICY = "policy"                 # refused mid-flight (scope change)
+    OPERATOR = "operator"             # explicit cancel request
+    UNKNOWN = "unknown"
+
+
+#: Exit code for an interrupted run (matches shell convention for SIGINT).
+EXIT_INTERRUPTED: int = 130
+
+
+class AgentError(RuntimeError):
+    """A failure attributed to a specific agent and assignment.
+
+    Deliberately carries identifiers and a *redacted* message only: prompts,
+    scratchpads and working memory can contain sensitive case data and must not
+    travel up the stack into logs or reports.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        agent_id: str | None = None,
+        assignment_id: str | None = None,
+        agent_kind: str | None = None,
+        attempt: int = 1,
+        stage: str | None = None,
+        chain: Sequence[str] = (),
+        cause: BaseException | None = None,
+        retryable: bool = False,
+    ) -> None:
+        safe = redact_text(message, secrets=known_secrets())
+        super().__init__(safe)
+        self.message = safe
+        self.agent_id = agent_id
+        self.assignment_id = assignment_id
+        self.agent_kind = agent_kind
+        self.attempt = attempt
+        self.stage = stage
+        # Ordered outermost → innermost, e.g. ("master", "sa-dns", "wrk-resolver").
+        # The failing agent always closes the chain so a rendered error names the
+        # agent that actually failed even when the caller passed no history.
+        nodes = tuple(chain) + ((agent_id,) if agent_id and (not chain or chain[-1] != agent_id) else ())
+        self.chain: tuple[str, ...] = nodes
+        self.cause = cause
+        self.retryable = retryable
+
+    def child(self, message: str, *, agent_id: str, agent_kind: str, assignment_id: str | None = None,
+              cause: BaseException | None = None, retryable: bool = False) -> "AgentError":
+        """Wrap a deeper failure, extending the chain without duplicating text."""
+
+        return AgentError(
+            message,
+            agent_id=agent_id,
+            assignment_id=assignment_id or self.assignment_id,
+            agent_kind=agent_kind,
+            attempt=self.attempt,
+            stage=self.stage,
+            chain=self.chain,
+            cause=cause or self,
+            retryable=retryable,
+        )
+
+    def to_error_info(self) -> ErrorInfo:
+        return ErrorInfo(
+            code="agent-error",
+            message=self.render(),
+            stage=self.stage,
+            component=self.agent_id,
+            retryable=self.retryable,
+            attempt=self.attempt,
+            cause_type=type(self.cause).__name__ if self.cause else "AgentError",
+            context={
+                "agent_id": self.agent_id or "",
+                "assignment_id": self.assignment_id or "",
+                "chain": " → ".join(self.chain),
+            },
+        )
+
+    def render(self) -> str:
+        """One-line, operator-readable attribution with identifiers."""
+
+        bits = []
+        if self.chain:
+            bits.append("via " + " → ".join(self.chain))
+        if self.agent_id:
+            bits.append(f"agent={self.agent_id}" + (f" ({self.agent_kind})" if self.agent_kind else ""))
+        if self.assignment_id:
+            bits.append(f"assignment={self.assignment_id}")
+        if self.attempt > 1:
+            bits.append(f"attempt={self.attempt}")
+        suffix = f" [{'; '.join(bits)}]" if bits else ""
+        return f"{self.message}{suffix}"
+
+
+# --------------------------------------------------------------------------
+# 19.1 Structured JSONL mission logging
+# --------------------------------------------------------------------------
+
+
+class LogLevel(str, Enum):
+    DEBUG = "debug"
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
+
+    @property
+    def rank(self) -> int:
+        return {"debug": 0, "info": 1, "warning": 2, "error": 3, "critical": 4}[self.value]
+
+
+class LogRecord(StrictModel):
+    """One JSONL line.  Flat enough to grep, structured enough to query."""
+
+    ts: datetime = Field(default_factory=utc_now)
+    level: LogLevel = LogLevel.INFO
+    event: str = Field(min_length=1)
+    mission_id: str | None = None
+    agent_id: str | None = None
+    agent_kind: str | None = None
+    assignment_id: str | None = None
+    attempt: int | None = None
+    message: str | None = None
+    duration_ms: float | None = None
+    error_code: str | None = None
+    data: dict[str, Any] = Field(default_factory=dict)
+    interrupted: bool = False
+    schema_version: int = 1
+
+    @field_validator("ts", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> datetime:
+        return normalise_datetime(value)
+
+    @field_validator("message")
+    @classmethod
+    def _redact_message(cls, value: str | None) -> str | None:
+        return redact_text(value, secrets=known_secrets()) if value else value
+
+    @field_validator("data")
+    @classmethod
+    def _redact_data(cls, value: dict[str, Any]) -> dict[str, Any]:
+        """Redact values *and* key names that look secret-bearing."""
+
+        safe: dict[str, Any] = {}
+        for key, item in value.items():
+            if re.search(r"(?i)(api[_-]?key|token|secret|password|passwd|credential|auth)", key):
+                safe[key] = REDACTED
+                continue
+            if isinstance(item, str):
+                safe[key] = redact_text(item, secrets=known_secrets())
+            elif isinstance(item, (int, float, bool)) or item is None:
+                safe[key] = item
+            elif isinstance(item, (list, tuple)):
+                safe[key] = [redact_text(str(x), secrets=known_secrets()) if isinstance(x, str) else x for x in item]
+            elif isinstance(item, dict):
+                safe[key] = {k: REDACTED if re.search(r"(?i)(key|token|secret|password)", k) else v
+                             for k, v in item.items()}
+            else:
+                safe[key] = redact_text(str(item), secrets=known_secrets())
+        return safe
+
+
+class MissionLogger:
+    """Optional structured JSONL logger.  Thread-safe, redacting, non-fatal.
+
+    Logging must never take a mission down, so every write failure disables the
+    file and records the reason — the run continues with console output only.
+    """
+
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        *,
+        mission_id: str | None = None,
+        min_level: LogLevel = LogLevel.INFO,
+        enabled: bool = True,
+        max_bytes: int = 32 * 1024 * 1024,
+    ) -> None:
+        self.path = Path(path).expanduser() if path else None
+        self.mission_id = mission_id
+        self.min_level = min_level
+        self.enabled = bool(enabled and self.path is not None)
+        self.max_bytes = max_bytes
+        self._lock = threading.RLock()
+        self._handle: Any = None
+        self._records = 0
+        self._failure: str | None = None
+        self._truncated = False
+        if self.enabled:
+            self._open()
+
+    def _open(self) -> None:
+        assert self.path is not None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            new_file = not self.path.exists()
+            self._handle = self.path.open("a", encoding="utf-8")
+            if new_file:
+                # Always write the first line, whatever the level filter says:
+                # a log whose header is filtered out is confusing when triaged.
+                self.log(
+                    "log.opened",
+                    level=LogLevel.DEBUG,
+                    message=f"mission log at {self.path}",
+                    force=True,
+                )
+        except OSError as exc:
+            self.enabled = False
+            self._failure = f"could not open {self.path}: {exc}"
+
+    # -- writing -----------------------------------------------------------
+
+    def log(
+        self,
+        event: str,
+        *,
+        level: LogLevel = LogLevel.INFO,
+        message: str | None = None,
+        agent_id: str | None = None,
+        agent_kind: str | None = None,
+        assignment_id: str | None = None,
+        attempt: int | None = None,
+        duration_ms: float | None = None,
+        error_code: str | None = None,
+        data: dict[str, Any] | None = None,
+        interrupted: bool = False,
+        force: bool = False,
+    ) -> LogRecord | None:
+        """Write one record.  Returns it, or ``None`` when filtered/disabled."""
+
+        if not force and level.rank < self.min_level.rank:
+            return None
+        record = LogRecord(
+            level=level,
+            event=event,
+            mission_id=self.mission_id,
+            agent_id=agent_id,
+            agent_kind=agent_kind,
+            assignment_id=assignment_id,
+            attempt=attempt,
+            message=message,
+            duration_ms=duration_ms,
+            error_code=error_code,
+            data=data or {},
+            interrupted=interrupted,
+        )
+        if not self.enabled or self._handle is None:
+            return record
+        with self._lock:
+            try:
+                if self._truncated:
+                    return record
+                if self._handle.tell() > self.max_bytes:
+                    self._truncated = True
+                    self._handle.write(json.dumps({
+                        "ts": utc_now().isoformat(), "level": "warning",
+                        "event": "log.truncated", "message": f"size cap {self.max_bytes} reached",
+                    }) + "\n")
+                    self._handle.flush()
+                    return record
+                self._handle.write(record.model_dump_json(exclude_none=False) + "\n")
+                self._handle.flush()
+                self._records += 1
+            except OSError as exc:                       # disk full, revoked handle
+                self.enabled = False
+                self._failure = f"write failed: {exc}"
+        return record
+
+    def error(self, event: str, exc: BaseException, **kwargs: Any) -> LogRecord | None:
+        return self.log(
+            event,
+            level=LogLevel.ERROR,
+            message=f"{type(exc).__name__}: {exc}",
+            error_code=type(exc).__name__.lower(),
+            **kwargs,
+        )
+
+    def agent_error(self, event: str, error: AgentError, **kwargs: Any) -> LogRecord | None:
+        """Log an attributed agent failure — ids only, never the prompt."""
+
+        return self.log(
+            event,
+            level=LogLevel.ERROR,
+            message=error.render(),
+            agent_id=error.agent_id,
+            agent_kind=error.agent_kind,
+            assignment_id=error.assignment_id,
+            attempt=error.attempt,
+            error_code="agent-error",
+            **kwargs,
+        )
+
+    def close(self) -> None:
+        with self._lock:
+            if self._handle is not None:
+                try:
+                    self._handle.flush()
+                    self._handle.close()
+                except OSError:                            # pragma: no cover
+                    pass
+                self._handle = None
+
+    # -- inspection --------------------------------------------------------
+
+    @property
+    def failure(self) -> str | None:
+        return self._failure
+
+    @property
+    def record_count(self) -> int:
+        with self._lock:
+            return self._records
+
+    def read_records(self) -> list[LogRecord]:
+        """Parse the file back — used by tests and by ``resilience --verify``."""
+
+        if not self.path or not self.path.exists():
+            return []
+        records: list[LogRecord] = []
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                records.append(LogRecord.model_validate_json(line))
+        return records
+
+    def __enter__(self) -> "MissionLogger":
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        self.close()
+        return False
+
+
+# --------------------------------------------------------------------------
+# 19.2 Cancellation
+# --------------------------------------------------------------------------
+
+
+class CancellationRequested(CancelledError):
+    """Raised inside pending work when a mission is cancelled.
+
+    Inherits :class:`asyncio.CancelledError` so existing ``except`` clauses keep
+    working, and :class:`BaseException` semantics apply (never swallowed by a
+    bare ``except Exception``).
+    """
+
+
+class CancellationToken:
+    """Cooperative cancellation shared by the Master, Subagents and Workers.
+
+    A single event plus a callback registry: cancelling is idempotent, callbacks
+    run exactly once in registration order, and any callback that raises is
+    recorded rather than allowed to abort the remaining cleanup.
+    """
+
+    def __init__(self, kind: InterruptionKind = InterruptionKind.OPERATOR, reason: str = "") -> None:
+        self._event = threading.Event()
+        self._lock = threading.RLock()
+        self._callbacks: list[tuple[str, Callable[[], None]]] = []
+        self._ran: list[str] = []
+        self._errors: list[tuple[str, str]] = []
+        self.kind: InterruptionKind | None = None
+        self.reason = reason
+        self.requested_at: datetime | None = None
+
+    # -- state -------------------------------------------------------------
+
+    @property
+    def cancelled(self) -> bool:
+        return self._event.is_set()
+
+    def raise_if_cancelled(self, *, stage: str | None = None) -> None:
+        """Cooperative check — call between units of work."""
+
+        if self._event.is_set():
+            raise CancellationRequested(self.reason or "mission cancelled")
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self._event.wait(timeout)
+
+    # -- registration ------------------------------------------------------
+
+    def on_cancel(self, name: str, callback: Callable[[], None]) -> None:
+        with self._lock:
+            if self._event.is_set():
+                self._run_one(name, callback)
+            else:
+                self._callbacks.append((name, callback))
+
+    def _run_one(self, name: str, callback: Callable[[], None]) -> None:
+        try:
+            callback()
+            self._ran.append(name)
+        except BaseException as exc:                      # cleanup must all run
+            self._errors.append((name, f"{type(exc).__name__}: {exc}"))
+
+    # -- cancel ------------------------------------------------------------
+
+    def cancel(self, reason: str = "", kind: InterruptionKind = InterruptionKind.OPERATOR) -> bool:
+        """Request cancellation.  Returns ``True`` only for the first request."""
+
+        with self._lock:
+            if self._event.is_set():
+                return False
+            self.kind = kind
+            self.reason = reason or self.reason or "mission cancelled"
+            self.requested_at = utc_now()
+            self._event.set()
+            for name, callback in self._callbacks:
+                self._run_one(name, callback)
+            self._callbacks.clear()
+            return True
+
+    # -- inspection --------------------------------------------------------
+
+    def summary(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "cancelled": self.cancelled,
+                "kind": self.kind.value if self.kind else None,
+                "reason": redact_text(self.reason, secrets=known_secrets()),
+                "requested_at": self.requested_at.isoformat() if self.requested_at else None,
+                "cleanups_run": list(self._ran),
+                "cleanup_errors": [f"{n}: {e}" for n, e in self._errors],
+                "pending_cleanups": [n for n, _ in self._callbacks],
+            }
+
+    @contextmanager
+    def guard(self, stage: str = "work") -> Iterator["CancellationToken"]:
+        """Yield self while translating cancellation into an exception."""
+
+        self.raise_if_cancelled(stage=stage)
+        yield self
+        self.raise_if_cancelled(stage=stage)
+
+
+# --------------------------------------------------------------------------
+# 19.3 Browser and resource cleanup
+# --------------------------------------------------------------------------
+
+
+class BrowserReaper:
+    """Owns every browser, context and page a mission opens.
+
+    Playwright/browser-use objects hold file descriptors, a driver subprocess and
+    temporary profile directories.  Losing them on an exception leaks both the
+    process and the disk.  The reaper therefore:
+
+      * registers each resource at creation;
+      * closes them in reverse order (page → context → browser → driver);
+      * runs from ``CancellationToken`` callbacks, ``atexit`` and the
+        cancellation guard, and is idempotent;
+      * keeps a list of close failures so a stubborn resource is reported rather
+        than silently leaked.
+    """
+
+    def __init__(self, logger: MissionLogger | None = None) -> None:
+        self._lock = threading.RLock()
+        self._resources: list[tuple[str, Any]] = []
+        self._closed: list[str] = []
+        self._errors: list[tuple[str, str]] = []
+        self._is_closed = False
+        self.logger = logger
+
+    def track(self, name: str, resource: Any) -> Any:
+        """Register a resource for cleanup and return it unchanged."""
+
+        with self._lock:
+            if self._is_closed:                       # late registration after close
+                self._close_one(name, resource)
+                return resource
+            self._resources.append((name, resource))
+        if self.logger:
+            self.logger.log("browser.tracked", message=name, level=LogLevel.DEBUG)
+        return resource
+
+    def _close_one(self, name: str, resource: Any) -> None:
+        """Best-effort close, trying the usual Playwright method names."""
+
+        for method in ("close", "stop", "dispose", "kill"):
+            fn = getattr(resource, method, None)
+            if callable(fn):
+                try:
+                    fn()
+                except BaseException as exc:
+                    self._errors.append((name, f"{method}() failed: {type(exc).__name__}: {exc}"))
+                else:
+                    self._closed.append(name)
+                return
+        # Nothing to close (e.g. a plain path object): count it as handled.
+        self._closed.append(name)
+
+    def close_all(self, reason: str = "mission ended") -> dict[str, Any]:
+        """Close everything in reverse order.  Idempotent."""
+
+        with self._lock:
+            if self._is_closed:
+                return self.summary()
+            self._is_closed = True
+            pending = list(reversed(self._resources))
+            self._resources.clear()
+        for name, resource in pending:
+            self._close_one(name, resource)
+        if self.logger:
+            self.logger.log(
+                "browser.closed",
+                message=f"{len(self._closed)} resource(s) closed ({reason})",
+                data={"closed": list(self._closed), "errors": [f"{n}: {e}" for n, e in self._errors]},
+                interrupted=bool(self._errors),
+            )
+        return self.summary()
+
+    @property
+    def is_closed(self) -> bool:
+        with self._lock:
+            return self._is_closed
+
+    @property
+    def open_count(self) -> int:
+        with self._lock:
+            return len(self._resources)
+
+    def summary(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "closed": self._is_closed,
+                "tracked": len(self._closed) + len(self._resources),
+                "closed_resources": list(self._closed),
+                "open_resources": [n for n, _ in self._resources],
+                "errors": [f"{n}: {e}" for n, e in self._errors],
+            }
+
+
+class ResourceStack:
+    """Generic LIFO cleanup stack for anything that is not a browser.
+
+    Used for HTTP clients, temp profile directories and file handles.  Accepts
+    plain callables as well as objects with a ``close`` method.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._items: list[tuple[str, Callable[[], None]]] = []
+        self._closed: list[str] = []
+        self._errors: list[tuple[str, str]] = []
+
+    def add(self, name: str, resource: Any) -> Any:
+        if callable(resource) and not hasattr(resource, "close"):
+            closer = resource
+        else:
+            method = getattr(resource, "close", None) or getattr(resource, "cleanup", None)
+            if method is None:
+                raise TypeError(f"{name}: resource has no close()/cleanup() and is not callable")
+            closer = method
+        with self._lock:
+            self._items.append((name, closer))
+        return resource
+
+    def add_directory(self, path: str | Path) -> Path:
+        """Register a temporary directory for recursive removal."""
+
+        target = Path(path)
+        self.add(f"dir:{target}", lambda: shutil.rmtree(target, ignore_errors=True))
+        return target
+
+    def close_all(self) -> dict[str, Any]:
+        with self._lock:
+            pending = list(reversed(self._items))
+            self._items.clear()
+        for name, closer in pending:
+            try:
+                closer()
+                self._closed.append(name)
+            except BaseException as exc:
+                self._errors.append((name, f"{type(exc).__name__}: {exc}"))
+        with self._lock:
+            return {
+                "closed": list(self._closed),
+                "errors": [f"{n}: {e}" for n, e in self._errors],
+                "open": [n for n, _ in self._items],
+            }
+
+
+# --------------------------------------------------------------------------
+# 19.4 Signal → cancellation
+# --------------------------------------------------------------------------
+
+
+class CancellationGuard:
+    """Translate SIGINT/SIGTERM into an orderly cancellation.
+
+    A second SIGINT is allowed to raise ``KeyboardInterrupt`` immediately: an
+    operator who insists should not be blocked by a slow cleanup.
+    """
+
+    def __init__(
+        self,
+        token: CancellationToken,
+        *,
+        logger: MissionLogger | None = None,
+        install_signals: bool = True,
+    ) -> None:
+        self.token = token
+        self.logger = logger
+        self._install_signals = install_signals
+        self._previous: dict[int, Any] = {}
+        self._interrupts = 0
+
+    def _handler(self, signum: int, frame: Any) -> None:      # pragma: no cover - signal path
+        self._interrupts += 1
+        kind = InterruptionKind.SIGINT if signum == signal.SIGINT else InterruptionKind.SIGTERM
+        if self._interrupts > 1:
+            if self.logger:
+                self.logger.log("cancel.forced", level=LogLevel.WARNING,
+                                message=f"second {'SIGINT' if signum == signal.SIGINT else 'SIGTERM'}; aborting immediately")
+            raise KeyboardInterrupt
+        first = self.token.cancel(f"received {kind.value}", kind=kind)
+        if self.logger:
+            self.logger.log(
+                "cancel.requested",
+                level=LogLevel.WARNING,
+                message=f"{kind.value} received" + ("" if first else " (already cancelling)"),
+                interrupted=True,
+            )
+
+    def __enter__(self) -> "CancellationGuard":
+        if self._install_signals:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    self._previous[sig] = signal.getsignal(sig)
+                    signal.signal(sig, self._handler)
+                except (ValueError, OSError):        # not the main thread / not permitted
+                    pass
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        for sig, previous in self._previous.items():
+            try:
+                signal.signal(sig, previous)
+            except (ValueError, OSError):            # pragma: no cover
+                pass
+        self._previous.clear()
+        return False
+
+
+# --------------------------------------------------------------------------
+# 19.5 Partial reports
+# --------------------------------------------------------------------------
+
+
+def _status_for(kind: InterruptionKind | None) -> EntityStatus:
+    """Map how a run ended onto the mission status stored with it.
+
+    A timeout is a budget failure and an unexpected exception is a failure;
+    only an operator action (Ctrl-C, SIGTERM, cancellation token) is a
+    cancellation.  Keeping this in one place stops the checkpoint and the
+    report from disagreeing about how the mission ended.
+    """
+
+    if kind is None:
+        return EntityStatus.SUCCEEDED
+    if kind is InterruptionKind.TIMEOUT:
+        return EntityStatus.BUDGET_EXCEEDED
+    if kind is InterruptionKind.EXCEPTION:
+        return EntityStatus.FAILED
+    return EntityStatus.CANCELLED
+
+
+def build_partial_report(
+    *,
+    mission: Mission,
+    evidence: Sequence[EvidenceItem],
+    interruption: InterruptionKind,
+    reason: str,
+    assignments: Sequence[TaskAssignment] = (),
+    results: Sequence[TaskResult] = (),
+    reviews: Sequence[QualityReview] = (),
+    retries: Mapping[str, int] | None = None,
+    budget: BudgetLedger | None = None,
+    events: Sequence[StateEvent] = (),
+) -> FinalReport:
+    """Assemble a report of what completed before an interruption.
+
+    Completed evidence is preserved verbatim; the report states plainly that it
+    is partial, why it stopped, and which work was still outstanding.  Nothing
+    is inferred to fill a gap.
+    """
+
+    retries = dict(retries or {})
+    by_status: dict[str, int] = {}
+    for assignment in assignments:
+        by_status[assignment.status.value] = by_status.get(assignment.status.value, 0) + 1
+
+    finished = [a for a in assignments if a.status.terminal or a.status is EntityStatus.SUCCEEDED]
+    outstanding = [a for a in assignments if a not in finished]
+
+    gaps: list[UnknownValue] = [
+        UnknownValue(
+            reason=UnknownReason.FAILED if interruption is InterruptionKind.EXCEPTION else UnknownReason.OUT_OF_SCOPE,
+            detail=f"mission stopped early ({interruption.value}): {redact_text(reason, secrets=known_secrets())}",
+            determined_by="resilience",
+        )
+    ]
+    for assignment in outstanding[:50]:
+        gaps.append(
+            UnknownValue(
+                reason=UnknownReason.NOT_YET_OBSERVED,
+                detail=f"assignment {assignment.id} did not finish ({assignment.status.value})",
+                determined_by="resilience",
+            )
+        )
+
+    findings = [e for e in evidence if e.kind is EvidenceKind.OBSERVATION]
+    inferences = [e for e in evidence if e.kind is EvidenceKind.INFERENCE]
+    allegations = [e for e in evidence if e.kind is EvidenceKind.ALLEGATION]
+
+    uncertainty_parts = [
+        f"This report is PARTIAL: the mission stopped early ({interruption.value}).",
+        f"{len(evidence)} evidence item(s) were preserved before stopping; "
+        f"{len(outstanding)} of {len(assignments) or len(outstanding)} assignment(s) did not finish.",
+    ]
+    if budget is not None and budget.seconds_limit:
+        uncertainty_parts.append(f"{budget.seconds_used:.0f}s of {budget.seconds_limit}s mission budget was used.")
+    uncertainty_parts.append("Unfinished work is listed as gaps; no conclusions were extrapolated from it.")
+
+    confidence = Confidence.UNKNOWN
+    basis: str | None = None
+    if findings:
+        supported = [e for e in findings if e.confidence is not Confidence.UNKNOWN]
+        if supported and len(supported) == len(findings):
+            lowest = min(supported, key=lambda e: e.confidence.rank).confidence
+            confidence, basis = lowest, f"lowest confidence among {len(supported)} preserved observation(s); mission incomplete"
+
+    return FinalReport(
+        mission_id=mission.id,
+        objective=mission.objective,
+        scope=mission.scope,
+        status=_status_for(interruption),
+        findings=findings,
+        inferences=inferences,
+        allegations=allegations,
+        hypotheses_open=[
+            f"unverified: {e.statement[:80]}" for e in inferences[:10]
+        ],
+        uncertainty_statement=" ".join(uncertainty_parts),
+        limitations=[
+            f"interrupted by {interruption.value}: {redact_text(reason, secrets=known_secrets())[:200]}",
+            f"task status at interruption: {by_status or 'none assigned'}",
+            f"retries consumed: {sum(retries.values())}" if retries else "no retries were consumed",
+            f"quality reviews completed: {len(reviews)}",
+        ],
+        gaps=gaps,
+        # Nothing to relate: a review is not a SubagentReport.  Finished
+        # SubagentReport ids are filled in by the caller that has them.
+        subagent_reports=(),
+        confidence=confidence,
+        confidence_basis=basis,
+        generated_by="resilience.build_partial_report",
+    )
+
+
+@dataclass
+class MissionOutcome:
+    """Everything a caller needs after a run, whatever way it ended."""
+
+    mission_id: str
+    status: EntityStatus
+    interrupted: bool
+    kind: InterruptionKind | None
+    reason: str
+    exit_code: int
+    report: FinalReport | None = None
+    checkpoint_path: Path | None = None
+    report_path: Path | None = None
+    log_path: Path | None = None
+    cleanup: dict[str, Any] = field(default_factory=dict)
+    cancellation: dict[str, Any] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def recoverable(self) -> bool:
+        """A mission is recoverable when its state reached disk."""
+
+        return self.checkpoint_path is not None and self.checkpoint_path.exists()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mission_id": self.mission_id,
+            "status": self.status.value,
+            "interrupted": self.interrupted,
+            "kind": self.kind.value if self.kind else None,
+            "reason": redact_text(self.reason, secrets=known_secrets()),
+            "exit_code": self.exit_code,
+            "report": json.loads(model_to_json(self.report)) if self.report else None,
+            "checkpoint_path": str(self.checkpoint_path) if self.checkpoint_path else None,
+            "report_path": str(self.report_path) if self.report_path else None,
+            "log_path": str(self.log_path) if self.log_path else None,
+            "cleanup": self.cleanup,
+            "cancellation": self.cancellation,
+            "recoverable": self.recoverable,
+            "errors": [redact_text(e, secrets=known_secrets()) for e in self.errors],
+        }
+
+
+# --------------------------------------------------------------------------
+# 19.6 The resilient run wrapper
+# --------------------------------------------------------------------------
+
+
+class MissionRun:
+    """Owns the resilience machinery for one run.
+
+    Use it as a context manager so the ordering is fixed and identical whether
+    the body succeeds, raises, times out or is cancelled:
+
+        checkpoint → evidence preserved → resources closed → partial report
+        → terminal summary
+    """
+
+    def __init__(
+        self,
+        mission: Mission,
+        *,
+        log_path: str | Path | None = None,
+        checkpoint_path: str | Path | None = None,
+        report_path: str | Path | None = None,
+        log_level: LogLevel = LogLevel.INFO,
+        renderer: EventRenderer | None = None,
+        tracker: LifecycleTracker | None = None,
+        install_signals: bool = False,
+        cleanup_callbacks: Sequence[tuple[str, Callable[[], None]]] = (),
+    ) -> None:
+        self.mission = mission
+        self.checkpoint_path = Path(checkpoint_path).expanduser() if checkpoint_path else None
+        self.report_path = Path(report_path).expanduser() if report_path else None
+        self.logger = MissionLogger(log_path, mission_id=mission.id, min_level=log_level)
+        self.renderer = renderer or EventRenderer.from_options()
+        self.tracker = tracker
+        self.token = CancellationToken()
+        self.browsers = BrowserReaper(self.logger)
+        self.resources = ResourceStack()
+        self.guard = CancellationGuard(self.token, logger=self.logger, install_signals=install_signals)
+        self.store = RunStateStore(mission)
+        self.outcome: MissionOutcome | None = None
+        self._extra_cleanup = list(cleanup_callbacks)
+        self._started = time.monotonic()
+        self._pid = os.getpid()
+
+    # -- helpers -----------------------------------------------------------
+
+    def _elapsed_ms(self) -> float:
+        return round((time.monotonic() - self._started) * 1000, 1)
+
+    def _finalise(self, kind: InterruptionKind | None, reason: str, exc: BaseException | None = None) -> MissionOutcome:
+        """Ordered shutdown.  Every step is attempted even if an earlier one fails."""
+
+        errors: list[str] = []
+        interrupted = kind is not None
+
+        # 1. Stop animation first so all remaining output is readable.
+        if self.tracker is not None:
+            try:
+                self.tracker.shutdown(reason or "mission ended")
+            except BaseException as err:
+                errors.append(f"tracker shutdown: {type(err).__name__}: {err}")
+
+        # 2. Mark the mission and persist state.
+        status = _status_for(kind)
+        try:
+            if not self.store.status.terminal:
+                self.store.set_status(status, actor="resilience", note=reason or None)
+        except BaseException as err:
+            errors.append(f"status update: {type(err).__name__}: {err}")
+
+        checkpoint: Path | None = None
+        if self.checkpoint_path is not None:
+            try:
+                checkpoint = self.store.save_checkpoint(self.checkpoint_path)
+            except BaseException as err:
+                errors.append(f"checkpoint: {type(err).__name__}: {err}")
+
+        # 3. Close browsers before writing the report, so cleanup failures are
+        #    reported in it.
+        cleanup: dict[str, Any] = {}
+        try:
+            cleanup["browsers"] = self.browsers.close_all(reason or "mission ended")
+            cleanup["resources"] = self.resources.close_all()
+        except BaseException as err:
+            errors.append(f"cleanup: {type(err).__name__}: {err}")
+        for name, callback in self._extra_cleanup:
+            try:
+                callback()
+                cleanup.setdefault("callbacks", []).append(name)
+            except BaseException as err:
+                errors.append(f"cleanup {name}: {type(err).__name__}: {err}")
+
+        # 4. Partial report from whatever the store actually holds.
+        snapshot = self.store.snapshot()
+        report = build_partial_report(
+            mission=self.mission,
+            evidence=snapshot["evidence"],
+            interruption=kind or InterruptionKind.OPERATOR,
+            reason=reason or "mission completed",
+            assignments=snapshot["assignments"],
+            results=snapshot["results"],
+            reviews=snapshot["reviews"],
+            retries=snapshot["retries"],
+            budget=snapshot["budget"],
+            events=snapshot["events"],
+        )
+        report_path: Path | None = None
+        if self.report_path is not None:
+            try:
+                self.report_path.parent.mkdir(parents=True, exist_ok=True)
+                self.report_path.write_text(model_to_json(report), encoding="utf-8")
+                report_path = self.report_path
+            except OSError as err:
+                errors.append(f"report write: {type(err).__name__}: {err}")
+
+        # Conventional exit status so shell wrappers and CI can branch without
+        # parsing text: 130 = interrupted, 124 = timeout(1), 7 = refused by
+        # policy, 70 = internal failure.
+        exit_code = int(ExitCode.OK)
+        if kind is InterruptionKind.TIMEOUT:
+            exit_code = 124                                     # timeout(1) convention
+        elif kind is InterruptionKind.POLICY:
+            exit_code = int(ExitCode.POLICY)
+        elif kind in (InterruptionKind.EXCEPTION, InterruptionKind.SIGTERM, InterruptionKind.UNKNOWN):
+            # SIGTERM is not a terminal Ctrl-C: a supervisor or `kill` sent it,
+            # so report a generic failure rather than the shell's 130.
+            exit_code = int(ExitCode.INTERNAL)
+        elif interrupted:
+            exit_code = EXIT_INTERRUPTED
+
+        if exc is not None:
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+        self.logger.log(
+            "mission.finished",
+            level=LogLevel.WARNING if interrupted else LogLevel.INFO,
+            message=reason or "mission completed",
+            interrupted=interrupted,
+            duration_ms=self._elapsed_ms(),
+            data={
+                "exit_code": exit_code,
+                "status": status.value,
+                "evidence": len(report.findings) + len(report.inferences) + len(report.allegations),
+                "checkpoint": str(checkpoint) if checkpoint else "",
+                "report": str(report_path) if report_path else "",
+                "errors": len(errors),
+            },
+        )
+        self.logger.close()
+
+        self.outcome = MissionOutcome(
+            mission_id=self.mission.id,
+            status=status,
+            interrupted=interrupted,
+            kind=kind,
+            reason=reason,
+            exit_code=exit_code,
+            report=report,
+            checkpoint_path=checkpoint,
+            report_path=report_path,
+            log_path=self.logger.path if self.logger.enabled else None,
+            cleanup=cleanup,
+            cancellation=self.token.summary(),
+            errors=errors,
+        )
+        return self.outcome
+
+    # -- context manager ---------------------------------------------------
+
+    def __enter__(self) -> "MissionRun":
+        self.guard.__enter__()
+        self.logger.log(
+            "mission.started",
+            message=self.mission.objective,
+            data={"mode": self.mission.mode.value, "dry_run": self.mission.dry_run,
+                  "pid": self._pid, "scope": self.mission.scope.includes},
+        )
+        self.token.on_cancel("browsers", lambda: self.browsers.close_all("cancelled"))
+        self.token.on_cancel("resources", lambda: self.resources.close_all())
+        if self.tracker is not None:
+            # Only silence the spinner here.  Records are terminalised by the
+            # unwind (``cancelled``) or, failing that, by ``_finalise``.
+            self.token.on_cancel("tracker", self.tracker.stop_animation)
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        self.guard.__exit__(exc_type, exc, tb)
+        if exc_type is None and self.token.cancelled:
+            # The caller handled the cancellation itself (a Supervisor often
+            # does).  The mission was still cut short, so the checkpoint and the
+            # partial report must say so rather than claim success.
+            self._finalise(self.token.kind or InterruptionKind.OPERATOR, self.token.reason or "cancelled")
+        elif exc_type is None:
+            self._finalise(None, "mission completed")
+        elif isinstance(exc, CancellationRequested):
+            self._finalise(self.token.kind or InterruptionKind.OPERATOR, self.token.reason or "cancelled")
+        elif isinstance(exc, KeyboardInterrupt):
+            self._finalise(InterruptionKind.SIGINT, "operator interrupted (Ctrl+C)")
+        elif isinstance(exc, TimeoutError):
+            self._finalise(InterruptionKind.TIMEOUT, f"timed out: {exc}")
+        elif isinstance(exc, AgentError):
+            self.logger.agent_error("agent.failed", exc, duration_ms=self._elapsed_ms())
+            self._finalise(InterruptionKind.EXCEPTION, exc.render(), exc)
+        else:
+            self._finalise(InterruptionKind.EXCEPTION, f"{type(exc).__name__}: {exc}", exc)
+        return False      # exceptions still propagate to the CLI boundary
+
+    # -- cooperative helpers ----------------------------------------------
+
+    def check(self) -> None:
+        """Call between units of work: raises if cancellation was requested."""
+
+        self.token.raise_if_cancelled()
+
+    def add_evidence(self, item: EvidenceItem, *, actor: str | None = None) -> EvidenceItem:
+        """Record evidence in the store *and* the log, so a crash keeps both."""
+
+        stored = self.store.add_evidence(item, actor=actor)
+        self.logger.log(
+            "evidence.recorded",
+            agent_id=item.collected_by,
+            assignment_id=item.task_id,
+            message=item.statement[:200],
+            data={"kind": item.kind.value, "confidence": item.confidence.value,
+                  "sources": len(item.sources), "evidence_id": item.id},
+        )
+        return stored
+
+    def track_browser(self, name: str, resource: Any) -> Any:
+        return self.browsers.track(name, resource)
+
+    def summary_panel(self) -> Panel:
+        """Readable end-of-run summary for the terminal (never a traceback)."""
+
+        assert self.outcome is not None
+        outcome = self.outcome
+        body = Text()
+        if outcome.interrupted:
+            body.append("interrupted", style="bold yellow")
+            body.append(f" — {outcome.kind.value if outcome.kind else 'unknown'}\n")
+            body.append(f"{redact_text(outcome.reason, secrets=known_secrets())}\n", style="white")
+        else:
+            body.append("completed\n", style="bold green")
+        evidence_total = (
+            len(outcome.report.findings) + len(outcome.report.inferences) + len(outcome.report.allegations)
+            if outcome.report else 0
+        )
+        body.append("\n")
+        body.append("evidence preserved  ", style="dim")
+        body.append(f"{evidence_total} item(s)\n")
+        body.append("state               ", style="dim")
+        body.append("recoverable\n" if outcome.recoverable else "[yellow]not checkpointed[/yellow]\n")
+        if outcome.checkpoint_path:
+            body.append("checkpoint          ", style="dim")
+            body.append(f"{outcome.checkpoint_path}\n")
+        if outcome.report_path:
+            body.append("report              ", style="dim")
+            body.append(f"{outcome.report_path}\n")
+        if outcome.log_path:
+            body.append("log                 ", style="dim")
+            body.append(f"{outcome.log_path}\n")
+        open_browsers = outcome.cleanup.get("browsers", {}).get("open_resources", [])
+        body.append("resources closed    ", style="dim")
+        body.append(f"{len(outcome.cleanup.get('browsers', {}).get('closed_resources', []))} browser(s)\n")
+        if open_browsers:
+            body.append("still open          ", style="dim")
+            body.append(f"[red]{len(open_browsers)} resource(s)[/red]\n")
+        if outcome.errors:
+            body.append("\nerrors\n", style="bold red")
+            for error in outcome.errors[:5]:
+                body.append(f"  • {redact_text(error, secrets=known_secrets())}\n", style="red")
+        return Panel(
+            body,
+            title="[bold]mission outcome[/bold]",
+            title_align="left",
+            border_style="yellow" if outcome.interrupted else "green",
+            expand=False,
+        )
+
+
+# --------------------------------------------------------------------------
+# 19.7 Self-test and CLI
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ResilienceCheck:
+    name: str
+    ok: bool
+    detail: str
+
+
+def run_resilience_self_test() -> list[ResilienceCheck]:
+    """Prove the acceptance criteria for cancellation, timeout and exceptions."""
+
+    checks: list[ResilienceCheck] = []
+
+    def record(name: str, ok: bool, detail: Any = "ok") -> None:
+        # Details are often counts or exception text; normalise once here so no
+        # call site can hand Rich a non-string.
+        checks.append(ResilienceCheck(name, ok, str(detail)))
+
+    def mission() -> Mission:
+        return Mission(
+            objective="resilience self-test mission",
+            scope=Scope(entries=[ScopeEntry(pattern="example.com")], data_classes=[DataClass.PUBLIC_WEB]),
+            limits={"mission_budget_seconds": 600},
+        )
+
+    def seed(run: MissionRun, count: int = 3) -> None:
+        """Record some completed evidence before pulling the plug."""
+
+        sub = SubagentSpec(mission_id=run.mission.id, name="sa", objective="collect")
+        run.store.add_subagent(sub)
+        worker = WorkerSpec(subagent_id=sub.id, name="wk", objective="fetch")
+        run.store.add_worker(worker)
+        for index in range(count):
+            task = TaskAssignment(subagent_id=sub.id, worker_id=worker.id, objective=f"fetch {index}")
+            run.store.assign_task(task)
+            run.store.start_task(task.id)
+            run.add_evidence(
+                EvidenceItem(
+                    kind=EvidenceKind.OBSERVATION,
+                    statement=f"observation {index}",
+                    sources=[SourceReference(kind=SourceKind.PUBLIC_WEB, url=f"https://example.com/{index}",
+                                             retrieval_method=RetrievalMethod.HTTP)],
+                    collected_by=worker.id,
+                    task_id=task.id,
+                ),
+                actor=worker.id,
+            )
+            run.store.record_result(
+                TaskResult(task_id=task.id, worker_id=worker.id, status=EntityStatus.SUCCEEDED)
+            )
+        # One still-running task, so interruption has something to cancel.
+        pending = TaskAssignment(subagent_id=sub.id, worker_id=worker.id, objective="unfinished")
+        run.store.assign_task(pending)
+        run.store.start_task(pending.id)
+
+    # --- 1. structured logging -------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        log_path = Path(tmp) / "mission.jsonl"
+        logger = MissionLogger(log_path, mission_id="mission-x")
+        logger.log("mission.started", message="hello")
+        logger.log(
+            "agent.step",
+            agent_id="sa-1",
+            assignment_id="task-1",
+            attempt=2,
+            duration_ms=12.5,
+            data={"note": "ok"},
+        )
+        logger.close()
+        records = logger.read_records()
+        record("jsonl log is one object per line", len(records) == 3, f"{len(records)} lines")
+        record("jsonl log parses back", all(isinstance(r, LogRecord) for r in records))
+        step = next(r for r in records if r.event == "agent.step")
+        record(
+            "jsonl log carries ids",
+            step.agent_id == "sa-1" and step.assignment_id == "task-1" and step.attempt == 2,
+            "ids present",
+        )
+        record("logging is optional", MissionLogger(None).enabled is False)
+        record("logger tolerates an unwritable path",
+               MissionLogger("/proc/nope/mission.jsonl").enabled is False)
+
+        # redaction in the log
+        secret = "sk-proj-LOGSECRET1234567890abcdef"
+        logger2 = MissionLogger(Path(tmp) / "redact.jsonl")
+        logger2.log("leak", message=f"failed with {secret}", data={"api_key": secret,
+                                                                     "url": f"https://x/?k={secret}"})
+        logger2.close()
+        text = (Path(tmp) / "redact.jsonl").read_text()
+        record("log redacts message secrets", secret not in text, "clean")
+        record("log redacts secret-named keys", REDACTED in text)
+
+    # --- 2. cancellation ---------------------------------------------------
+    token = CancellationToken()
+    ran: list[str] = []
+    token.on_cancel("a", lambda: ran.append("a"))
+    token.on_cancel("b", lambda: ran.append("b"))
+    record("token starts open", token.cancelled is False)
+    record("first cancel wins", token.cancel("stop") is True)
+    record("second cancel is a no-op", token.cancel("again") is False)
+    record("callbacks run in order", ran == ["a", "b"], str(ran))
+    record("token records its reason", token.summary()["reason"] == "stop")
+    token.on_cancel("late", lambda: ran.append("late"))
+    record("late registration still runs", "late" in ran, str(ran))
+    try:
+        token.raise_if_cancelled()
+        record("raise_if_cancelled raises", False)
+    except CancellationRequested:
+        record("raise_if_cancelled raises", True)
+
+    failing = CancellationToken()
+    order: list[str] = []
+    def boom() -> None:
+        order.append("boom")
+        raise RuntimeError("cleanup exploded")
+    failing.on_cancel("boom", boom)
+    failing.on_cancel("after", lambda: order.append("after"))
+    failing.cancel("x")
+    record("a failing cleanup does not stop the others", order == ["boom", "after"], str(order))
+    record("cleanup failure is recorded", failing.summary()["cleanup_errors"][0].startswith("boom"), "recorded")
+
+    # cancellation propagates into pending work
+    token2 = CancellationToken()
+    def work() -> None:
+        token2.cancel("stop now")
+        token2.raise_if_cancelled()
+    try:
+        work()
+        record("pending work observes cancellation", False)
+    except CancellationRequested:
+        record("pending work observes cancellation", True)
+    record("CancellationRequested is an asyncio cancellation",
+           issubclass(CancellationRequested, asyncio.CancelledError))
+
+    # --- 3. browser cleanup ------------------------------------------------
+    class FakeBrowser:
+        def __init__(self) -> None: self.closed = 0
+        def close(self) -> None: self.closed += 1
+    class FakePage:
+        def __init__(self) -> None: self.closed = 0
+        def close(self) -> None: self.closed += 1
+    reaper = BrowserReaper()
+    page, context, browser = FakePage(), FakeBrowser(), FakeBrowser()
+    reaper.track("page", page)
+    reaper.track("context", context)
+    reaper.track("browser", browser)
+    record("reaper tracks resources", reaper.open_count == 3)
+    result = reaper.close_all("test")
+    record("reaper closes everything", page.closed == 1 and context.closed == 1 and browser.closed == 1)
+    record("reaper is idempotent", reaper.close_all("again")["closed"] is True and page.closed == 1)
+    record("reaper reports no leaks", result["open_resources"] == [])
+    bad = BrowserReaper()
+    class ExplodingBrowser:
+        def close(self) -> None: raise RuntimeError("driver gone")
+    bad.track("bad", ExplodingBrowser())
+    summary = bad.close_all()
+    record("a failed close is reported, not raised", len(summary["errors"]) == 1, summary["errors"][0][:40])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = Path(tmp) / "profile"
+        tmpdir.mkdir()
+        (tmpdir / "cookie").write_text("x")
+        stack = ResourceStack()
+        stack.add_directory(tmpdir)
+        stack.close_all()
+        record("resource stack removes temp dirs", not tmpdir.exists())
+
+    # --- 4. Ctrl+C leaves readable output, state and a partial report -----
+    with tempfile.TemporaryDirectory() as tmp:
+        buffer = io.StringIO()
+        renderer = EventRenderer.from_options(stream=buffer, color=False, animation=False)
+        tracker = LifecycleTracker(renderer, animation=False, register_atexit=False)
+        m1 = mission()
+        run = MissionRun(
+            m1,
+            log_path=Path(tmp) / "m.jsonl",
+            checkpoint_path=Path(tmp) / "state.json",
+            report_path=Path(tmp) / "report.json",
+            renderer=renderer,
+            tracker=tracker,
+        )
+        try:
+            with run:
+                seed(run)
+                tracker.spawn("task-x", "fetch", kind=LifecycleKind.TASK, detail="fetching")
+                with tracker.active_work("task-x", detail="fetching"):
+                    raise KeyboardInterrupt
+        except KeyboardInterrupt:
+            pass
+        outcome = run.outcome
+        record("Ctrl+C: outcome recorded", outcome is not None and outcome.interrupted)
+        record("Ctrl+C: kind is sigint", outcome.kind is InterruptionKind.SIGINT, str(outcome.kind))
+        record("Ctrl+C: exit code 130", outcome.exit_code == EXIT_INTERRUPTED, outcome.exit_code)
+        record("Ctrl+C: checkpoint on disk", outcome.recoverable, str(outcome.checkpoint_path))
+        record("Ctrl+C: partial report written", outcome.report_path is not None and outcome.report_path.exists())
+        record("Ctrl+C: evidence preserved", len(outcome.report.findings) == 3,
+               f"{len(outcome.report.findings)} observations")
+        record("Ctrl+C: report is marked partial",
+               "PARTIAL" in (outcome.report.uncertainty_statement or ""), "PARTIAL present")
+        record("Ctrl+C: unfinished work listed as gaps",
+               any("did not finish" in g.detail for g in outcome.report.gaps), f"{len(outcome.report.gaps)} gaps")
+        record("Ctrl+C: tracker closed", tracker.progress()["all_terminal"])
+        record("Ctrl+C: no spinner", tracker.live_running is False)
+        record("Ctrl+C: terminal output readable", "interrupt" in buffer.getvalue().lower() or outcome.reason)
+        recovered = RunStateStore.load_checkpoint(outcome.checkpoint_path)
+        record("Ctrl+C: state reloads", recovered.progress().evidence_total == 3,
+               recovered.progress().evidence_total)
+        record("Ctrl+C: reloaded state keeps the mission status",
+               recovered.status is not EntityStatus.RUNNING, recovered.status.value)
+
+        # --- 5. timeout --------------------------------------------------
+        buffer2 = io.StringIO()
+        renderer2 = EventRenderer.from_options(stream=buffer2, color=False, animation=False)
+        tracker2 = LifecycleTracker(renderer2, animation=False, register_atexit=False)
+        run2 = MissionRun(
+            mission(),
+            log_path=Path(tmp) / "t.jsonl",
+            checkpoint_path=Path(tmp) / "t-state.json",
+            report_path=Path(tmp) / "t-report.json",
+            renderer=renderer2,
+            tracker=tracker2,
+        )
+        try:
+            with run2:
+                seed(run2, count=2)
+                raise TimeoutError("task budget exhausted after 300s")
+        except TimeoutError:
+            pass
+        out2 = run2.outcome
+        record("timeout: kind recorded", out2.kind is InterruptionKind.TIMEOUT, str(out2.kind))
+        record("timeout: exit code 124", out2.exit_code == 124, out2.exit_code)
+        record("timeout: status is budget-exceeded", out2.status is EntityStatus.BUDGET_EXCEEDED, out2.status.value)
+        record("timeout: evidence preserved", len(out2.report.findings) == 2)
+        record("timeout: checkpoint recoverable", out2.recoverable)
+        record("timeout: reason explains the timeout", "budget" in out2.reason.lower(), out2.reason)
+
+        # --- 6. unexpected exception -------------------------------------
+        buffer3 = io.StringIO()
+        renderer3 = EventRenderer.from_options(stream=buffer3, color=False, animation=False)
+        run3 = MissionRun(
+            mission(),
+            log_path=Path(tmp) / "e.jsonl",
+            checkpoint_path=Path(tmp) / "e-state.json",
+            report_path=Path(tmp) / "e-report.json",
+            renderer=renderer3,
+        )
+        try:
+            with run3:
+                seed(run3, count=1)
+                raise ValueError("unexpected parser failure")
+        except ValueError:
+            pass
+        out3 = run3.outcome
+        record("exception: kind recorded", out3.kind is InterruptionKind.EXCEPTION, str(out3.kind))
+        record("exception: exit code 70", out3.exit_code == int(ExitCode.INTERNAL), out3.exit_code)
+        record("exception: error listed for the operator", any("parser failure" in e for e in out3.errors),
+               out3.errors[:1])
+        record("exception: evidence preserved", len(out3.report.findings) == 1)
+        record("exception: state recoverable", out3.recoverable)
+        record("exception: log records the failure",
+               any(r.event == "mission.finished" for r in (MissionLogger(Path(tmp) / "e.jsonl").read_records())))
+        records3 = MissionLogger(Path(tmp) / "e.jsonl").read_records()
+        record("exception: log marks interruption", any(r.interrupted for r in records3))
+
+        # --- 7. browser cleanup on the way out ---------------------------
+        buffer4 = io.StringIO()
+        run4 = MissionRun(
+            mission(),
+            log_path=Path(tmp) / "b.jsonl",
+            checkpoint_path=Path(tmp) / "b-state.json",
+            renderer=EventRenderer.from_options(stream=buffer4, color=False, animation=False),
+        )
+        fake_page2 = FakePage()
+        try:
+            with run4:
+                run4.track_browser("page", fake_page2)
+                raise RuntimeError("browser crashed")
+        except RuntimeError:
+            pass
+        record("browser closed on exception", fake_page2.closed == 1)
+        record("cleanup summary recorded", run4.outcome.cleanup["browsers"]["closed"] is True)
+        record("no resources left open", run4.outcome.cleanup["browsers"]["open_resources"] == [])
+
+        # --- 8. cancellation token wired into the run --------------------
+        buffer5 = io.StringIO()
+        run5 = MissionRun(
+            mission(),
+            log_path=Path(tmp) / "c.jsonl",
+            checkpoint_path=Path(tmp) / "c-state.json",
+            renderer=EventRenderer.from_options(stream=buffer5, color=False, animation=False),
+        )
+        fake_page3 = FakePage()
+        try:
+            with run5:
+                run5.track_browser("page", fake_page3)
+                seed(run5, count=1)
+                run5.token.cancel("operator cancelled", InterruptionKind.OPERATOR)
+                run5.check()
+        except CancellationRequested:
+            pass
+        out5 = run5.outcome
+        record("cancellation: kind recorded", out5.kind is InterruptionKind.OPERATOR, str(out5.kind))
+        record("cancellation: browsers closed by callback", fake_page3.closed == 1)
+        record("cancellation: cancel callbacks ran",
+               "browsers" in out5.cancellation["cleanups_run"], str(out5.cancellation["cleanups_run"]))
+        record("cancellation: evidence preserved", len(out5.report.findings) == 1)
+
+        # --- 9. agent errors carry ids, never prompts -------------------
+        err = AgentError(
+            "worker exceeded its task budget",
+            agent_id="wrk-1",
+            assignment_id="task-9",
+            agent_kind="worker",
+            attempt=2,
+            chain=("master", "sa-1"),
+        )
+        outer = err.child("subagent could not merge results", agent_id="sa-1", agent_kind="subagent")
+        text = outer.render()
+        record("agent error carries the agent id", "sa-1" in text, text)
+        record("agent error carries the assignment id", "task-9" in text)
+        record("agent error shows the call chain", "master → sa-1" in text)
+        record("agent error carries the attempt", "attempt=2" in text)
+
+        secret_prompt = "SYSTEM PROMPT: you are an assistant. Use key sk-proj-PROMPTSECRET0987654321"
+        err2 = AgentError(secret_prompt, agent_id="wrk-2", assignment_id="task-1")
+        record("agent error redacts prompt secrets", "sk-proj-PROMPTSECRET" not in err2.render())
+        record("agent error keeps no prompt attribute", "prompt" not in AgentError.__init__.__code__.co_varnames)
+        info = err2.to_error_info()
+        record("ErrorInfo from agent error has no prompt", "PROMPTSECRET" not in info.message)
+        logged = MissionLogger(Path(tmp) / "agent.jsonl")
+        logged.agent_error("agent.failed", err2)
+        logged.close()
+        logtext = (Path(tmp) / "agent.jsonl").read_text()
+        record("agent log line carries ids", '"agent_id":"wrk-2"' in logtext.replace(" ", ""))
+        record("agent log line has no prompt secret", "PROMPTSECRET" not in logtext)
+
+        # --- the status each ending is recorded as -----------------------------
+        record("status map: exception is failed", _status_for(InterruptionKind.EXCEPTION) is EntityStatus.FAILED)
+        record("status map: timeout is budget-exceeded",
+               _status_for(InterruptionKind.TIMEOUT) is EntityStatus.BUDGET_EXCEEDED)
+        record("status map: Ctrl+C is cancelled", _status_for(InterruptionKind.SIGINT) is EntityStatus.CANCELLED)
+        record("status map: success is succeeded", _status_for(None) is EntityStatus.SUCCEEDED)
+
+        # --- a handled cancellation still ends the mission honestly ------------
+        tracker8 = LifecycleTracker(EventRenderer.from_options(stream=io.StringIO(), color=False,
+                                                              animation=False),
+                                    animation=False, register_atexit=False)
+        run8 = MissionRun(mission(), renderer=EventRenderer.from_options(stream=io.StringIO(),
+                                                                        color=False, animation=False),
+                          tracker=tracker8)
+        with run8:
+            try:
+                with tracker8.active_work("sa-1", detail="delegating"):
+                    with tracker8.active_work("task-7", detail="fetching"):
+                        run8.token.cancel("operator cancelled", InterruptionKind.OPERATOR)
+                        run8.check()
+            except CancellationRequested:
+                pass        # the supervisor handled it, as a real one would
+        out8 = run8.outcome
+        record("handled cancellation: mission is not reported as success", out8.kind is InterruptionKind.OPERATOR,
+               str(out8.kind))
+        record("handled cancellation: exit code 130", out8.exit_code == EXIT_INTERRUPTED, out8.exit_code)
+        record("handled cancellation: inner work marked cancelled",
+               {r.state for r in tracker8.records()} == {LifecycleState.CANCELLED},
+               str({r.id: r.state.value for r in tracker8.records()}))
+        record("handled cancellation: no record left open", tracker8.progress()["all_terminal"])
+        record("handled cancellation: spinner stopped", tracker8.live_running is False)
+
+    return checks
+
+
+#: The interruptions the demo can simulate, and the conventional exit status each
+#: produces.  ``sigterm``/``policy``/``unknown`` exist for programmatic callers
+#: but cannot be simulated convincingly in-process.
+_DEMO_KINDS: dict[str, InterruptionKind] = {
+    "sigint": InterruptionKind.SIGINT,
+    "timeout": InterruptionKind.TIMEOUT,
+    "exception": InterruptionKind.EXCEPTION,
+    "operator": InterruptionKind.OPERATOR,
+}
+
+
+def _resilience_demo(tmp: Path, kind: InterruptionKind, *, evidence: int = 3) -> dict[str, Any]:
+    """Run a short mission that is interrupted in a specific way."""
+
+    mission = Mission(
+        objective="Map the public attack surface of example.com",
+        scope=Scope(entries=[ScopeEntry(pattern="example.com")], data_classes=[DataClass.PUBLIC_WEB]),
+        limits={"mission_budget_seconds": 600},
+    )
+    buffer = io.StringIO()
+    renderer = EventRenderer.from_options(stream=buffer, color=False, animation=False)
+    tracker = LifecycleTracker(renderer, animation=False, register_atexit=False)
+
+    class DemoBrowser:
+        closed = 0
+        def close(self) -> None: DemoBrowser.closed += 1
+
+    demonstration = DemoBrowser()
+
+    run = MissionRun(
+        mission,
+        log_path=tmp / "mission.jsonl",
+        checkpoint_path=tmp / "state.json",
+        report_path=tmp / "report.json",
+        renderer=renderer,
+        tracker=tracker,
+    )
+
+    tracker.spawn("master", "master", kind=LifecycleKind.AGENT, detail="plan")
+    tracker.spawn("sa-dns", "passive-dns", kind=LifecycleKind.SUBAGENT, parent="master", detail="collect")
+    try:
+        with run:
+            run.track_browser("browser", demonstration)
+            sub = SubagentSpec(mission_id=mission.id, name="passive-dns", objective="collect")
+            run.store.add_subagent(sub)
+            for index in range(evidence):
+                task = TaskAssignment(subagent_id=sub.id, objective=f"fetch record {index}")
+                run.store.assign_task(task)
+                run.store.start_task(task.id)
+                run.add_evidence(
+                    EvidenceItem(
+                        kind=EvidenceKind.OBSERVATION,
+                        statement=f"record {index} observed",
+                        sources=[SourceReference(kind=SourceKind.PUBLIC_WEB,
+                                                 url=f"https://example.com/{index}",
+                                                 retrieval_method=RetrievalMethod.HTTP)],
+                        task_id=task.id,
+                    )
+                )
+                run.store.record_result(
+                    TaskResult(task_id=task.id, worker_id="", status=EntityStatus.SUCCEEDED)
+                )
+            pending = TaskAssignment(subagent_id=sub.id, objective="fetch remaining records")
+            run.store.assign_task(pending)
+            run.store.start_task(pending.id)
+            with tracker.active_work("task-pending", label="fetch remaining records", detail="running"):
+                if kind is InterruptionKind.SIGINT:
+                    raise KeyboardInterrupt
+                if kind is InterruptionKind.TIMEOUT:
+                    raise TimeoutError("task budget of 300s exhausted")
+                if kind is InterruptionKind.OPERATOR:
+                    run.token.cancel("operator cancelled the mission", kind)
+                    run.check()
+                raise RuntimeError("unexpected failure while parsing a record")
+    except (KeyboardInterrupt, TimeoutError, RuntimeError, CancellationRequested):
+        pass
+
+    assert run.outcome is not None
+    return {
+        "terminal": buffer.getvalue(),
+        "outcome": run.outcome.to_dict(),
+        "browser_closed": demonstration.closed,
+        "tracker": tracker.progress(),
+        "log_records": len(MissionLogger(tmp / "mission.jsonl").read_records()),
+        "log_lines": (tmp / "mission.jsonl").read_text().splitlines(),
+        "report": json.loads((tmp / "report.json").read_text()),
+        "state_exists": (tmp / "state.json").exists(),
+    }
+
+
+@app.command("resilience", help="Structured logging, cancellation, cleanup and partial reports.")
+def resilience_command(
+    demo: str | None = typer.Option(
+        None,
+        "--demo",
+        help="Simulate an interruption: sigint | timeout | exception | operator.",
+        show_default=False,
+    ),
+    evidence: int = typer.Option(3, "--evidence", min=0, max=50, help="Evidence items collected before interrupting."),
+    out_dir: str | None = typer.Option(None, "--out-dir", help="Directory for log/state/report artefacts."),
+    self_test: bool = typer.Option(False, "--self-test", help="Verify the resilience guarantees."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Pure local behaviour: no network, no model, no real browser."""
+
+    console = get_console()
+
+    if self_test:
+        results = run_resilience_self_test()
+        failures = [r for r in results if not r.ok]
+        if as_json:
+            _emit(json.dumps({"ok": not failures, "checks": [asdict(r) for r in results]}, indent=2))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        console.print()
+        table = Table(title="resilience self-test", title_justify="left", box=None, pad_edge=False)
+        table.add_column("", width=2)
+        table.add_column("check", style="bold", no_wrap=True)
+        table.add_column("detail", overflow="fold")
+        for result in results:
+            glyph, colour = ("✔", "green") if result.ok else ("✘", "red")
+            table.add_row(f"[{colour}]{glyph}[/{colour}]", escape(result.name), escape(result.detail))
+        console.print(table)
+        console.print(f"[{'green' if not failures else 'red'}]{len(results) - len(failures)} passed[/] · {len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    # Validated here rather than by Typer's enum: the enum also carries
+    # sigterm/policy/unknown for programmatic callers, but the demo only knows
+    # how to simulate four of them, and a bad value deserves guidance not a
+    # 30-line "invalid value" dump.
+    kind = InterruptionKind.SIGINT if demo is None else _DEMO_KINDS.get(demo.strip().lower())
+    if kind is None:
+        console.print(
+            f"[red]\u2718[/red] unknown demo kind {escape(repr(demo))}; "
+            f"choose one of: {', '.join(_DEMO_KINDS)}"
+        )
+        raise typer.Exit(ExitCode.USAGE)
+
+    directory = Path(out_dir).expanduser() if out_dir else Path(tempfile.mkdtemp(prefix="argus-resilience-"))
+    directory.mkdir(parents=True, exist_ok=True)
+
+    try:
+        result = _resilience_demo(directory, kind, evidence=evidence)
+    except Exception as exc:                              # pragma: no cover - defensive
+        console.print(f"[red]demo failed:[/red] {escape(f'{type(exc).__name__}: {exc}')}")
+        raise typer.Exit(ExitCode.INTERNAL) from exc
+
+    outcome = result["outcome"]
+    if as_json:
+        _emit(json.dumps(result, indent=2))
+        raise typer.Exit(int(outcome["exit_code"]))
+
+    console.print()
+    console.print(
+        Panel(
+            Text(result["terminal"].rstrip(), style="white"),
+            title=f"[bold]terminal output ({kind.value})[/bold]",
+            title_align="left",
+            border_style="dim",
+            expand=False,
+        )
+    )
+    console.print(
+        Panel(
+            Text(
+                f"cause          {outcome['kind']} — {outcome['reason']}\n"
+                f"exit code      {outcome['exit_code']}\n"
+                f"evidence kept  {len(result['report']['findings'])} observation(s)\n"
+                f"state          {'recoverable' if outcome['recoverable'] else 'MISSING'}\n"
+                f"log            {len(result['log_lines'])} JSONL line(s)\n"
+                f"browser        closed {result['browser_closed']}x, "
+                f"{len(outcome['cleanup']['browsers']['open_resources'])} left open\n"
+                f"gaps listed    {len(result['report']['gaps'])}\n"
+                f"artefacts      {directory}",
+                style="white",
+            ),
+            title="[bold]outcome[/bold]",
+            title_align="left",
+            border_style="green",
+            expand=False,
+        )
+    )
+    console.print()
+    raise typer.Exit(int(outcome["exit_code"]))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 20. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 
 def run() -> None:
-    """Invoke the CLI.  Import-safe: only called from ``__main__``."""
+    """Invoke the CLI.  Import-safe: only called from ``__main__``.
 
+    This is the last line of defence for terminal readability: whatever escapes
+    a command — Ctrl+C, a timeout, an unexpected exception — leaves a short,
+    redacted explanation instead of a traceback, and points at the artefacts a
+    resume would need.
+    """
+
+    console = get_console()
     try:
         app()
-    except KeyboardInterrupt:                      # pragma: no cover - interactive
-        get_console().print("\n[yellow]interrupted[/yellow]")
-        raise typer.Exit(130)
     except (typer.Exit, SystemExit):
         raise
-    except Exception as exc:                       # pragma: no cover - last resort
-        get_console().print(f"[red]internal error:[/red] {escape(f'{type(exc).__name__}: {exc}')}")
+    except KeyboardInterrupt:
+        # Never a traceback, never a half-painted spinner: the tracker's atexit
+        # handler and the CancellationGuard have already done their work.
+        console.print()
+        console.print(
+            Panel(
+                Text(
+                    "interrupted by operator (Ctrl+C)\n"
+                    "Any checkpoint written during the run is complete and can be resumed.",
+                    style="yellow",
+                ),
+                border_style="yellow",
+                title="stopped",
+                title_align="left",
+                expand=False,
+            )
+        )
+        raise typer.Exit(EXIT_INTERRUPTED)
+    except TimeoutError as exc:
+        console.print()
+        console.print(
+            Panel(
+                Text(
+                    f"timed out: {redact_text(str(exc)) or 'budget exhausted'}\n"
+                    "Partial results were preserved; resume from the checkpoint.",
+                    style="yellow",
+                ),
+                border_style="yellow",
+                title="timeout",
+                title_align="left",
+                expand=False,
+            )
+        )
+        raise typer.Exit(124)
+    except CancellationRequested as exc:
+        console.print()
+        console.print(
+            Panel(
+                Text(f"mission cancelled: {redact_text(str(exc))}", style="yellow"),
+                border_style="yellow",
+                title="cancelled",
+                title_align="left",
+                expand=False,
+            )
+        )
+        raise typer.Exit(EXIT_INTERRUPTED)
+    except AgentError as exc:
+        console.print()
+        console.print(
+            Panel(
+                Text(redact_text(exc.render()), style="red"),
+                border_style="red",
+                title="agent failure",
+                title_align="left",
+                expand=False,
+            )
+        )
+        raise typer.Exit(ExitCode.INTERNAL)
+    except Exception as exc:
+        # Redacted, attributed, and never a raw traceback in the terminal.
+        detail = redact_text(f"{type(exc).__name__}: {exc}")
+        console.print()
+        console.print(
+            Panel(
+                Text(
+                    f"{detail}\n\nThis is a bug. Re-run with --verbose for more detail.",
+                    style="red",
+                ),
+                border_style="red",
+                title="internal error",
+                title_align="left",
+                expand=False,
+            )
+        )
         raise typer.Exit(ExitCode.INTERNAL)
 
 
