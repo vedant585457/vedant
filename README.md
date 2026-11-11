@@ -23,6 +23,7 @@ python vedant_osint.py research --self-test   # source-aware web research
 python vedant_osint.py extract --self-test    # bounded, untrusted document extraction
 python vedant_osint.py artifacts --self-test  # read-only artifact handling, no writes
 python vedant_osint.py timeline --self-test   # source vs derived time, explained links
+python vedant_osint.py outcomes --self-test  # Worker statuses, no verdicts
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -728,13 +729,52 @@ python vedant_osint.py timeline --path ~/evidence  # a case, ordered
   canonical member is chosen by path so a re-run makes the same choice. Neither
   copy is deleted: both paths stay on the record.
 
+## Worker outcomes
+
+Every Worker returns the same record: one of **four statuses**, findings, structured
+evidence, source references, limitations and suggested follow-up. It may not reach a
+mission-level conclusion, and it may not contact another team — both are refused at
+the boundary rather than requested in a prompt.
+
+```bash
+python vedant_osint.py outcomes --self-test         # 144 contract checks, offline
+python vedant_osint.py outcomes --demo              # four statuses, refusals, failures
+python vedant_osint.py outcomes --check report.json # validate a report ('-' = stdin)
+```
+
+- **Four statuses, and the status is a claim about the contents.** `completed` needs
+  findings *and* sourced evidence and may carry no limitations; `partial` needs
+  findings, sourced evidence *and* a named limitation; `blocked` needs a reason and
+  may be empty; `failed` needs its error. A completed report that still hedges is
+  refused as a partial one wearing the wrong label.
+- **The prohibition is structural.** `WorkerReport` has no conclusion, verdict,
+  identity or recipient field, and a nested `attribution`/`peer_id` key is refused
+  with its dotted path. Phrases such as "the mission is complete" or "delegated to
+  the archive team" are refused in whichever prose field they appear — summary,
+  finding, limitation, follow-up — while an artefact path containing the same word is
+  left alone, because a locator is data, not a claim.
+- **A failed tool does not crash the mission.** `survive_tool_failure` turns a raising
+  call into a `ToolCallResult` with a status and a redacted error, and
+  `report_from_tool_results` folds several calls into one report whose status is
+  never better than the worst call. Evidence the tool had already produced is kept
+  with its source; cancellation is re-raised, because that is an operator's decision.
+- **Partial results retain usable provenance.** Findings must cite evidence the
+  report actually contains, every evidence item of a usable report must carry a
+  source reference, and `OutcomeLedger.provenance_intact` checks that across the
+  whole team. A `blocked` Worker states nothing rather than guessing.
+- **The graph is unchanged, and the contract crosses into it.** `outcome_from_report`
+  and `report_from_outcome` convert both ways (a partial Worker maps to the graph's
+  `blocked`, never to `succeeded`), each settled `WorkerOutcome` carries its report,
+  and the gaps a Worker declares reach the Subagent's aggregate instead of being
+  re-invented there.
+
 ## Status
 
 | Phase | Scope | State |
 |-------|-------|-------|
 | 1 | Foundation — CLI skeleton, config probing, version reporting | ✅ done |
 | 2 | Contracts — settings, `doctor`, preflight, models, state, renderer, lifecycle, resilience, model adapter | ✅ done |
-| 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control) |
+| 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control, Worker outcome contract) |
 | 4 | Browser — browser-use / Playwright sessions and capture | 🟡 started (policy, scope, capture, guarded closure, agent mode) |
 | 5 | Collection — passive OSINT sources, artefact hashing | 🟡 started (source-aware web research; safe document/page extraction with injection defence; read-only artifact manifests, hashing and access ledger) |
 | 6 | Synthesis — cross-source correlation and reporting | 🟡 started (deterministic timelines, explained indicator correlation, content de-duplication) |

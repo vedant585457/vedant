@@ -722,6 +722,51 @@ distinction visible:
     python vedant_osint.py timeline --record "a:domain=evil.example.org;hash=<sha256>"
     python vedant_osint.py timeline --path ~/evidence  # a case, ordered
 
+Worker outcomes: four statuses, and no verdict a Worker could not have reached
+------------------------------------------------------------------------------
+A Worker touches one slice of the mission, so what it may return is the narrowest
+record in this build: a status, findings, structured evidence, source references,
+limitations and suggested follow-up.  It may not conclude for the mission, and it
+may not contact another team; both refusals are properties of the record, checked at
+every boundary its output crosses, not requests in a prompt.
+
+*   **Four statuses, and the status is a claim about the contents.**  ``completed``
+    needs findings *and* sourced evidence and may carry no limitations; ``partial``
+    needs findings, sourced evidence *and* a named limitation; ``blocked`` needs a
+    reason and may be empty (nothing was attempted, so nothing is claimed); ``failed``
+    needs its error.  A completed report that still hedges is refused: it is a
+    partial report wearing the wrong label, and the mission's confidence is computed
+    from these statuses.
+*   **The prohibition on conclusions is structural.**  :class:`WorkerReport` has no
+    conclusion, verdict, identity or recipient field, and a nested
+    ``attribution``/``peer_id`` key is refused with its dotted path.  Conclusion and
+    hand-off phrases are refused in whichever prose field they appear — summary,
+    finding, limitation, follow-up — while an artefact *path* containing the same
+    word is left alone, because a locator is data and not a claim.
+*   **A failed tool is a result, not an exception.**  :func:`survive_tool_failure`
+    turns a raising call into a :class:`ToolCallResult` with a status and a redacted
+    error, and :func:`report_from_tool_results` folds several calls into one report
+    whose status is never better than the worst call.  Evidence the tool had already
+    produced is kept, with its source reference: a partial result is useful *and*
+    incomplete, and the record says both.  Cancellation is re-raised, because it is
+    an operator's decision rather than a tool's failure.
+*   **Partial results retain usable provenance.**  Findings must cite evidence the
+    report actually contains, every evidence item of a usable report must carry a
+    source reference, and :attr:`OutcomeLedger.provenance_intact` checks that across
+    the whole team.  A missing source is refused rather than filled in.
+*   **The flow is unchanged; the contract crosses into it.**
+    :func:`outcome_from_report` and :func:`report_from_outcome` convert both ways — a
+    partial Worker maps to the graph's ``blocked``, never to ``succeeded`` — every
+    settled :class:`WorkerOutcome` carries its report, and the gaps a Worker declares
+    reach the Subagent's aggregate instead of being re-invented there.
+
+::
+
+    python vedant_osint.py outcomes --self-test         # 144 contract checks
+    python vedant_osint.py outcomes --demo              # statuses, refusals, failures
+    python vedant_osint.py outcomes --check report.json # validate one report
+    python vedant_osint.py outcomes --check - < report.json   # the same, from a pipe
+
 Structured model adapter
 ------------------------
 One model-calling interface sits between orchestration and every provider, so
@@ -785,6 +830,7 @@ Usage
     python vedant_osint.py extract --self-test          # bounded, untrusted, defanged reading
     python vedant_osint.py artifacts --self-test        # read-only artifacts, access ledger
     python vedant_osint.py timeline --self-test         # source vs derived time, links
+    python vedant_osint.py outcomes --self-test         # Worker statuses, provenance
     python vedant_osint.py extract --demo               # a hostile page, quoted and refused
     python vedant_osint.py extract --file report.docx   # what a document says, as data
     python vedant_osint.py extract --limits             # the size, time and text ceilings
@@ -924,7 +970,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 22
+VERSION_MINOR: int = 23
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -23325,6 +23371,11 @@ class HierarchicalFlow:
             outcome = outcome.model_copy(update={
                 "task_id": outcome.task_id or content_id("task", subagent.id, worker.id, attempt),
                 "seconds": outcome.seconds or (time.monotonic() - started)})
+        # §33: whatever the runner returned, the graph's record of it carries a
+        # conforming WorkerReport — status, findings, evidence and limitations.  A
+        # runner that skipped the contract gets its outcome restated honestly (a
+        # partial report with a named limitation), never promoted to completed.
+        outcome = _with_worker_contract(outcome)
         self.last_outcome = outcome
         if self.resume is not None:
             # Written *before* the review, so a crash between the two leaves a
@@ -23416,6 +23467,9 @@ class HierarchicalFlow:
         retries = 0
         for worker in subagent.workers:
             outcome = latest.get(worker.id)
+            # Reset per Worker: a report from the previous iteration must never be
+            # read as this unit's (§33).
+            report: WorkerReport | None = None
             approved = any(review.worker_id == worker.id and review.approved
                            for review in reviews)
             if outcome is not None:
@@ -23429,8 +23483,21 @@ class HierarchicalFlow:
                 else:
                     for payload in outcome.payload.get("evidence", []):
                         evidence.append(EvidenceItem.model_validate(payload))
+                report = _report_of(outcome)
+                if report is not None:
+                    # The gaps the Worker itself declared travel with its evidence: a
+                    # partial result is useful *and* incomplete, and the aggregate has
+                    # to carry both facts.  They are not cast as review failures — the
+                    # Worker already said what is missing, and the graph already has
+                    # its own gap for a unit that never passed review.
+                    gaps.extend(report.gaps)
             if not approved:
                 gate = self._gates.get(worker.id) or FlowGate.REVIEW_REJECTED
+                if report is not None and report.gaps:
+                    # The Worker declared why it could not finish.  That gap is in
+                    # ``gaps`` already, and a second one for the same unit would
+                    # double-count the mission's unknowns.
+                    continue
                 gaps.append(UnknownValue(
                     reason=UnknownReason.FAILED, determined_by=subagent.id,
                     detail=f"{worker.name}: {gate.value}"
@@ -34475,7 +34542,7 @@ def run_extraction_self_test() -> list[ExtractionCheck]:
         not any(capability.value in page.text for capability in Capability),
         [capability.value for capability in Capability
          if capability.value in page.text])
-    entry = _source_section("# 30. Safe document and page extraction", "# 33. Entry point")
+    entry = _source_section("# 30. Safe document and page extraction", "# 34. Entry point")
     add("the extraction section grants no capability",
         bool(entry) and "CapabilityGrant(" not in entry, len(entry))
     add("the extraction section never constructs a router",
@@ -38864,7 +38931,2432 @@ def timeline_command(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 33. Entry point
+# 33. Worker outcomes: one contract, four statuses, no mission conclusions
+# ══════════════════════════════════════════════════════════════════════════
+#
+# A Worker is the smallest unit that touches a source.  What it may hand back is
+# therefore the narrowest thing in this build: a status, findings, evidence with
+# provenance, the limitations it hit, and what it thinks should happen next.  It
+# may *not* conclude for the mission, and it may not talk to another team — both
+# are checked properties of the record, not instructions in a prompt.
+#
+# The section is deliberately independent of the graph in §25: the contract is a
+# property of a record, so it can be enforced at every seam a Worker's output
+# crosses (the runner, the review node, the Subagent's aggregate, a case file),
+# and tested without running a graph at all.
+
+
+class WorkerStatus(str, Enum):
+    """The only four things a Worker may say about its own work.
+
+    Four, not ten: ``pending``/``running`` describe a Worker that has not
+    reported, and a report is what this contract is about.  Anything else a
+    Worker wants to convey belongs in findings, limitations or follow-up.
+    """
+
+    COMPLETED = "completed"   # the unit was done, and its completion criteria were met
+    PARTIAL = "partial"       # some of the unit was done; what is missing is named
+    BLOCKED = "blocked"       # could not proceed: permission, scope, dependency, policy
+    FAILED = "failed"         # the attempt ran and did not produce usable work
+
+    @property
+    def usable(self) -> bool:
+        """Whether the work may be built on at all — partial work still counts."""
+
+        return self in {WorkerStatus.COMPLETED, WorkerStatus.PARTIAL}
+
+    @property
+    def ok(self) -> bool:
+        return self is WorkerStatus.COMPLETED
+
+    @property
+    def needs_attention(self) -> bool:
+        return self is not WorkerStatus.COMPLETED
+
+
+#: The four statuses as a set, so a validator can name them in one message.
+WORKER_STATUSES: tuple[WorkerStatus, ...] = tuple(WorkerStatus)
+
+#: Statuses that must say *why* they are not completed.
+_NOT_COMPLETED: frozenset[WorkerStatus] = frozenset(
+    {WorkerStatus.PARTIAL, WorkerStatus.BLOCKED, WorkerStatus.FAILED})
+
+
+class ConclusionLeak(ValueError):
+    """A Worker tried to state a mission-level conclusion.
+
+    Raised rather than silently truncated: a Worker that reached a verdict on the
+    whole mission was working outside its slice, and the reader needs to know that
+    the record was refused rather than cleaned up.
+
+    Note on where it surfaces: :func:`accept_worker_report` and :func:`check_report_text`
+    raise this type directly, but a check that runs *inside* a Pydantic validator is
+    wrapped by Pydantic into ``ValidationError``.  The message is preserved verbatim
+    either way, which is why :func:`refusal_kind` reads the message rather than the
+    type — a caller cannot control which seam a payload entered by.
+    """
+
+    def __init__(self, field: str, phrase: str, *, text: str = "") -> None:
+        self.field = field
+        self.phrase = phrase
+        self.text = text
+        super().__init__(
+            f"{field} states a mission-level conclusion ({phrase!r}); a Worker reports "
+            "observations and its own unit's findings — the Master draws the conclusion")
+
+
+class PeerContactError(ValueError):
+    """A Worker tried to address, hand work to, or share with another team.
+
+    A Worker's only counterparties are its own Subagent (which reviewed it) and the
+    mission record.  Lateral contact would bypass both the review and the ledger, so
+    it is refused at the boundary and named in the record.
+    """
+
+    def __init__(self, field: str, phrase: str, *, text: str = "") -> None:
+        self.field = field
+        self.phrase = phrase
+        self.text = text
+        super().__init__(
+            f"{field} addresses another team ({phrase!r}); a Worker reports only to its "
+            "own Subagent and never contacts, delegates to, or shares with a peer")
+
+
+# --------------------------------------------------------------------------
+# 33.1 What a Worker may not say — the two prohibitions, in one place
+# --------------------------------------------------------------------------
+
+#: Phrases that assert a verdict on the whole mission rather than a finding in a
+#: slice.  Deliberately blunt: a Worker has no business with these words, and a
+#: false positive costs one rephrase while a false negative costs a fabricated
+#: conclusion attributed to a unit that could not have reached it.
+_MISSION_CONCLUSION_PHRASES: tuple[str, ...] = (
+    "the mission is complete", "mission complete", "mission accomplished",
+    "the mission succeeded", "the mission failed", "case closed", "case is closed",
+    "case solved", "we have proven", "we have established that",
+    "we have confirmed that", "we conclude", "in conclusion", "we can conclude",
+    "it is confirmed that", "we have attributed", "attributed to the actor",
+    "the actor is", "the threat actor is", "the perpetrator is", "the subject is",
+    "this proves that", "definitively", "conclusively",
+    # the linguistic tell of a verdict dressed as a summary
+    "overall assessment is", "final assessment", "final verdict", "bottom line",
+)
+
+#: A mission-level verdict about the *whole* target, which no single slice can see.
+_MISSION_LEVEL_SCOPE_WORDS: tuple[str, ...] = (
+    "the whole mission", "the entire mission", "all subagents", "every subagent",
+    "the whole investigation", "the entire investigation", "across the mission",
+    "the mission as a whole", "all workers", "the whole team",
+)
+
+#: Ways of reaching sideways to another team.  A Worker's report is a record, so
+#: these are mostly about *intent* recorded in free text: a hand-off, a request, a
+#: broadcast, or a channel outside the mission.
+_PEER_CONTACT_PHRASES: tuple[str, ...] = (
+    "contacted the", "contact the other", "asked the other team", "asked another team",
+    "notified the other", "shared with the other", "shared with another team",
+    "handed off to", "hand off to", "handover to", "delegated to", "delegate to",
+    "coordinated with", "coordinating with", "synced with", "syncing with",
+    "messaged the", "messaged another", "emailed the team", "emailed another team",
+    "told the other team", "briefed the other team", "escalated to the team",
+    "via slack", "via email to", "on the shared channel", "in the team channel",
+    "sent a message to", "sent the results to another", "forwarded to another team",
+    "peer subagent", "peer worker", "another subagent", "another worker",
+    "other subagents", "other workers", "sibling subagent",
+)
+
+#: A mission-level conclusion is only refused when it is asserted, so the check
+#: first looks for the shape of a claim about the whole, then for a verdict word.
+_CONCLUSION_WINDOW = 160
+
+
+def refusal_kind(message: str) -> str:
+    """Classify a refusal by its message: ``conclusion``, ``peer-contact`` or ``other``.
+
+    Needed because Pydantic wraps a validator's ``ValueError`` subclass into
+    ``ValidationError``: the *type* is lost at that seam, but the message this build
+    writes is not, so the message is what a caller should read.
+    """
+
+    lowered = str(message).lower()
+    if "mission-level conclusion" in lowered:
+        return "conclusion"
+    if "addresses another team" in lowered:
+        return "peer-contact"
+    return "other"
+
+
+def _phrase_hits(text: str, phrases: Sequence[str]) -> list[str]:
+    """Which phrases occur in the text, in the order they were declared."""
+
+    lowered = (text or "").lower()
+    return [phrase for phrase in phrases if phrase in lowered]
+
+
+def mission_conclusion_phrases(text: str) -> list[str]:
+    """The mission-level conclusion phrases in one string.
+
+    A phrase alone is enough: the vocabulary above is specific enough that a
+    Worker has no reason to use it, and the error message tells the Worker how to
+    rephrase.  What is *not* refused is ordinary analytic language — "the proxy
+    log shows a connection" is a finding in the Worker's slice.
+    """
+
+    return _phrase_hits(text, _MISSION_CONCLUSION_PHRASES)
+
+
+def peer_contact_phrases(text: str) -> list[str]:
+    """The phrases in one string that describe contacting another team."""
+
+    return _phrase_hits(text, _PEER_CONTACT_PHRASES)
+
+
+def _mission_scope_claim(text: str) -> list[str]:
+    """Phrases that claim a scope wider than one Worker's slice."""
+
+    return _phrase_hits(text, _MISSION_LEVEL_SCOPE_WORDS)
+
+
+# --- the *structural* half of the prohibition ------------------------------
+#
+# Text scanning catches what a Worker says; these catch what a Worker's record
+# *is*.  Both are needed: a field named ``recipients`` is a peer-contact channel
+# whatever the prose says, and prose is where a conclusion actually gets written.
+
+#: Substrings that may not appear in any field name of a Worker's report.
+_FORBIDDEN_FIELDS: tuple[str, ...] = (
+    "recipient", "recipients", "recipient_ids", "cc", "bcc", "to_team", "to_peer",
+    "peer_id", "peer_ids", "contact", "contacted", "contact_log", "mediated_by",
+    "handoff", "hand_off", "delegat", "broadcast", "channel", "slack", "webhook",
+    "notify", "notification", "escalate_to", "conclusion", "conclusions",
+    "verdict", "final_answer", "mission_conclusion", "attribution", "attributed_to",
+    "actor", "culprit", "guilt", "accuse", "accusation", "identity",
+)
+
+#: Field names that look forbidden but are how a Worker records what it did *not*
+#: establish.  The scan skips them and reads their text instead: the word is the
+#: point of the field, and refusing the record for saying so would teach a Worker to
+#: stop declaring it.
+_FORBIDDEN_ALLOWED: frozenset[str] = frozenset({
+    "identity_claimed", "identity_not_claimed", "no_identity_claim", "not_an_identity",
+    "conclusion_refused", "conclusions_refused",
+    # The two fields that *record* the prohibition: they hold the answer, not the
+    # claim, and a record that cannot say "no conclusion, no contact" cannot be
+    # checked for having made one.
+    "declares_conclusion", "peer_contacts",
+})
+
+
+#: Field names the contract itself owns, so scanning a report's own ``to_dict``
+#: output does not report ``peer_contacts`` as the thing it forbids.
+_CONTRACT_FIELDS: frozenset[str] = frozenset({
+    "worker_id", "subagent_id", "task_id", "attempt", "status", "summary", "findings",
+    "evidence", "sources", "limitations", "follow_up", "gaps", "error",
+    "declares_conclusion", "peer_contacts", "started_at", "seconds", "usable",
+    "citations",
+})
+
+
+def forbidden_fields(payload: Mapping[str, Any], *, path: str = "",
+                     allow: frozenset[str] = frozenset()) -> list[str]:
+    """Every field name in a payload that the Worker contract forbids.
+
+    Recursive, because a conclusion hides just as well one level down: a
+    ``metadata`` dictionary with an ``attribution`` key is the same claim as a
+    top-level one.  Returns dotted paths so the error names the exact field.
+    """
+
+    found: list[str] = []
+    for key, value in payload.items():
+        here = f"{path}.{key}" if path else str(key)
+        lowered = str(key).lower()
+        if lowered in allow or lowered in _FORBIDDEN_ALLOWED:
+            continue
+        if any(fragment in lowered for fragment in _FORBIDDEN_FIELDS):
+            found.append(here)
+        if isinstance(value, Mapping):
+            found.extend(forbidden_fields(value, path=here))
+        elif isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                if isinstance(item, Mapping):
+                    found.extend(forbidden_fields(item, path=f"{here}[{index}]"))
+    return found
+
+
+def _check_text(field: str, text: str) -> str:
+    """Refuse conclusion language in one free-text field.
+
+    Returns the text unchanged when it is clean, so callers can use it inline as a
+    validator.  Whitespace-only text is left alone: "missing" is a different
+    complaint, made by the field's own requirement.
+    """
+
+    if not text or not text.strip():
+        return text
+    conclusions = mission_conclusion_phrases(text)
+    if conclusions:
+        raise ConclusionLeak(field, conclusions[0], text=text[:_CONCLUSION_WINDOW])
+    peers = peer_contact_phrases(text)
+    if peers:
+        raise PeerContactError(field, peers[0], text=text[:_CONCLUSION_WINDOW])
+    return text
+
+
+#: Keys whose values the contract reads as prose.  Only these are scanned: an
+#: artefact's path or a URL may contain any word at all, and refusing evidence
+#: because a filename said "conclusion" would be a bug wearing a safeguard's coat.
+_PROSE_KEYS: frozenset[str] = frozenset({
+    "summary", "limitations", "statement", "scope_note", "reasoning",
+    "confidence_basis", "suggestion", "reason", "detail", "message", "error",
+})
+
+
+def check_report_text(payload: Mapping[str, Any], *, path: str = "") -> None:
+    """Refuse a conclusion or a peer contact written anywhere in a payload's prose.
+
+    Recursive, because a finding's ``statement`` is prose and a verdict written
+    there is the same claim as one in the summary.  Raises the typed error rather
+    than a generic one, so a caller can tell a conclusion from a hand-off without
+    reading the message.
+    """
+
+    for key, value in payload.items():
+        here = f"{path}.{key}" if path else str(key)
+        prose = str(key).lower() in _PROSE_KEYS
+        if isinstance(value, str):
+            if prose:
+                _check_text(here, value)
+        elif isinstance(value, Mapping):
+            check_report_text(value, path=here)
+        elif isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                if isinstance(item, Mapping):
+                    check_report_text(item, path=f"{here}[{index}]")
+                elif isinstance(item, str) and prose:
+                    _check_text(f"{here}[{index}]", item)
+
+
+def accept_worker_report(payload: Mapping[str, Any], *, worker_id: str = "",
+                         subagent_id: str = "", attempt: int = 1) -> "WorkerReport":
+    """The single gate a Worker's payload passes through: fields, prose, contract.
+
+    In that order, and each step's complaint is more specific than the last: a
+    forbidden *field* is named before any prose is read, prose is refused with the
+    phrase and the field, and only then is the status's own requirements checked.
+    """
+
+    bad_fields = forbidden_fields(payload, allow=_CONTRACT_FIELDS)
+    if bad_fields:
+        raise ConclusionLeak(bad_fields[0], "forbidden field")
+    check_report_text(payload)
+    data = dict(payload)
+    data.setdefault("worker_id", worker_id or "worker")
+    data.setdefault("subagent_id", subagent_id or "subagent")
+    data.setdefault("attempt", attempt)
+    # ``from_dict`` drops the derived display keys, so a report this build wrote can
+    # be checked by the same gate that checks one it did not.
+    return WorkerReport.from_dict(data)
+
+
+# --------------------------------------------------------------------------
+# 33.2 The report: status, findings, evidence, sources, limitations, follow-up
+# --------------------------------------------------------------------------
+
+class WorkerFinding(StrictModel):
+    """One thing the Worker observed, in its own slice, with what it rests on.
+
+    A finding is not a conclusion: it names a subject, what was seen, and the
+    evidence ids that show it.  ``confidence`` without ``confidence_basis`` is
+    refused, for the same reason :class:`EvidenceItem` refuses it — a number with
+    no account of itself is not a calibration.
+    """
+
+    statement: str = Field(min_length=1,
+                           description="What was observed, in neutral language.")
+    evidence_ids: list[str] = Field(min_length=1)
+    kind: EvidenceKind = EvidenceKind.OBSERVATION
+    scope_note: str = ""
+    confidence: Confidence = Confidence.UNKNOWN
+    confidence_basis: str | None = None
+    reasoning: str | None = None
+
+    @field_validator("statement", "scope_note")
+    @classmethod
+    def _clean(cls, value: str) -> str:
+        return _check_text("finding statement", value)
+
+    @field_validator("confidence_basis", "reasoning")
+    @classmethod
+    def _clean_optional(cls, value: str | None) -> str | None:
+        return None if value is None else _check_text("finding reasoning", value)
+
+    @model_validator(mode="after")
+    def _epistemic_rules(self) -> "WorkerFinding":
+        if not self.statement.strip():
+            raise ValueError("a finding needs a statement")
+        if self.kind is EvidenceKind.INFERENCE:
+            if not self.reasoning or len(self.reasoning.strip()) < 8:
+                raise ValueError("an inference must state the reasoning behind it")
+        if self.confidence is not Confidence.UNKNOWN and not self.confidence_basis:
+            raise ValueError("state confidence_basis, or leave the confidence unknown")
+        if self.confidence is Confidence.HIGH and self.kind is not EvidenceKind.OBSERVATION:
+            raise ValueError("only an observation may carry high confidence")
+        return self
+
+    @property
+    def citations(self) -> list[str]:
+        return list(self.evidence_ids)
+
+    def describe(self) -> str:
+        return f"{self.kind.value}: {self.statement} [{len(self.evidence_ids)} evidence]"
+
+
+class FollowUpPriority(str, Enum):
+    """How strongly a Worker thinks the follow-up matters.  Advisory only."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+    @property
+    def rank(self) -> int:
+        return {FollowUpPriority.LOW: 0, FollowUpPriority.MEDIUM: 1,
+                FollowUpPriority.HIGH: 2}[self]
+
+
+class WorkerFollowUp(StrictModel):
+    """Suggested next work.  A suggestion — the Subagent or Master decides.
+
+    ``reason`` is required because "collect more" without a reason is not a
+    suggestion, it is a shrug, and the next agent has no way to judge it.
+    """
+
+    suggestion: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    priority: FollowUpPriority = FollowUpPriority.MEDIUM
+    blocked_by: str | None = None
+
+    @field_validator("suggestion", "reason", "blocked_by")
+    @classmethod
+    def _clean(cls, value: str | None) -> str | None:
+        return None if value is None else _check_text("follow-up", value)
+
+    @model_validator(mode="after")
+    def _coherent(self) -> "WorkerFollowUp":
+        if not self.suggestion.strip() or not self.reason.strip():
+            raise ValueError("a follow-up needs a suggestion and a reason for it")
+        return self
+
+    def describe(self) -> str:
+        return f"{self.priority.value}: {self.suggestion} ({self.reason})"
+
+
+#: Keys :meth:`WorkerReport.to_dict` adds for readers that are not model fields.
+_DERIVED_REPORT_KEYS: frozenset[str] = frozenset({"usable", "citations", "gap_notes"})
+
+
+class WorkerReport(StrictModel):
+    """The only shape a Worker may return.  Everything else is refused.
+
+    The requirements follow from the status, because the status is a claim about
+    what the report contains:
+
+    *   ``completed`` — at least one finding, at least one sourced evidence item,
+        and no limitations that would undercut the completion (if a limitation
+        stands, the honest status is ``partial``).
+    *   ``partial`` — at least one finding *and* at least one limitation naming
+        what is missing; usable work with usable provenance, or it is a failure
+        wearing a reassuring label.
+    *   ``blocked`` — at least one limitation saying what stopped it, and no
+        requirement for findings: a blocked Worker has nothing to show.
+    *   ``failed`` — an error, and the error is what the reader gets.
+
+    ``evidence`` is the full :class:`EvidenceItem`, not an id: a Worker that
+    returned ids alone would leave its findings unciteable once the payload
+    crossed a process boundary, which is exactly when provenance matters.
+    """
+
+    worker_id: str = Field(min_length=1)
+    subagent_id: str = Field(min_length=1)
+    task_id: str = ""
+    attempt: int = Field(default=1, ge=1)
+    status: WorkerStatus
+
+    #: What the Worker did, in one or two sentences.  Never a verdict.
+    summary: str = ""
+    #: What it saw, each statement tied to the evidence that shows it.
+    findings: list[WorkerFinding] = Field(default_factory=list)
+    #: Structured evidence, with the provenance the Worker actually had.
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    #: Where the Worker's material came from, one reference per artefact or page.
+    sources: list[SourceReference] = Field(default_factory=list)
+    #: What the Worker could not do, could not see, or could not establish.
+    limitations: list[str] = Field(default_factory=list)
+    #: What it suggests be done next — for the Subagent to judge, not to obey.
+    follow_up: list[WorkerFollowUp] = Field(default_factory=list)
+    #: The gaps the Worker is declaring, typed, so they can travel into the mission.
+    gaps: list[UnknownValue] = Field(default_factory=list)
+    error: ErrorInfo | None = None
+
+    #: True by construction.  It is a field so that a report which crossed into
+    #: another system can be checked for having claimed one.
+    declares_conclusion: bool = False
+    #: Names of any lateral contact attempted.  Always empty for a valid report;
+    #: recorded rather than raised when a caller wants the evidence of the attempt.
+    peer_contacts: list[str] = Field(default_factory=list)
+
+    started_at: datetime | None = None
+    seconds: float = Field(default=0.0, ge=0)
+
+    @field_validator("summary")
+    @classmethod
+    def _clean_summary(cls, value: str) -> str:
+        return _check_text("summary", value)
+
+    @field_validator("limitations")
+    @classmethod
+    def _clean_limitations(cls, value: list[str]) -> list[str]:
+        return [_check_text("limitation", item) for item in value]
+
+    @field_validator("started_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> Any:
+        return normalise_datetime(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def _contract(self) -> "WorkerReport":
+        # 1. A Worker does not conclude, and does not reach sideways.
+        if self.declares_conclusion:
+            raise ConclusionLeak("declares_conclusion", "declares_conclusion")
+        if self.peer_contacts:
+            raise PeerContactError("peer_contacts", self.peer_contacts[0])
+        _check_text("summary", self.summary)
+        for limitation in self.limitations:
+            _check_text("limitation", limitation)
+
+        # 2. A status that is not "completed" must say why.
+        if self.status in _NOT_COMPLETED and not self.limitations and self.error is None:
+            raise ValueError(
+                f"a {self.status.value} report must record at least one limitation "
+                "(or an error) saying what is missing or what stopped it")
+
+        # 3. Usable work needs usable provenance.
+        if self.status.usable:
+            if not self.findings:
+                raise ValueError(
+                    f"a {self.status.value} report needs at least one finding; "
+                    "a Worker with nothing to show reports blocked or failed")
+            if not self.evidence:
+                raise ValueError(
+                    f"a {self.status.value} report needs at least one evidence item; "
+                    "a finding without evidence is an opinion")
+            missing = [index for index, item in enumerate(self.evidence) if not item.sources]
+            if missing:
+                raise ValueError(
+                    f"evidence item(s) {missing} have no source reference; partial work "
+                    "must keep usable provenance, not just a conclusion it reached")
+        if self.status is WorkerStatus.COMPLETED and self.limitations:
+            # Complete work with standing limitations is partial work.  Saying so
+            # is not pedantry: the mission's confidence is computed from statuses.
+            raise ValueError(
+                "a completed report may not carry limitations; record the status as "
+                "partial and name what the limitations left out")
+
+        # 4. Every finding must cite evidence the report actually contains.
+        known = {item.id for item in self.evidence}
+        dangling = sorted({evidence_id for finding in self.findings
+                           for evidence_id in finding.evidence_ids
+                           if evidence_id not in known})
+        if dangling:
+            raise ValueError(
+                f"finding(s) cite evidence this report does not contain: {dangling[:4]}")
+
+        # 5. The status must agree with the error.
+        if self.status is WorkerStatus.FAILED and self.error is None:
+            raise ValueError("a failed report must carry the error that failed it")
+        if self.error is not None and self.status is WorkerStatus.COMPLETED:
+            raise ValueError("a completed report may not carry an error")
+        return self
+
+    # -- derived views, all of them checked on construction ---------------
+
+    @property
+    def usable(self) -> bool:
+        return self.status.usable
+
+    @property
+    def evidence_ids(self) -> list[str]:
+        return [item.id for item in self.evidence]
+
+    @property
+    def citations(self) -> list[str]:
+        """Every locator this report can be checked against."""
+
+        return sorted({source.locator for source in self.sources}
+                      | {source.locator for item in self.evidence for source in item.sources})
+
+    @property
+    def sourced(self) -> bool:
+        """Whether every finding can be traced to a source reference."""
+
+        located = {source.locator for source in self.sources}
+        return all(any(source.locator in located or source in self.sources
+                       for source in item.sources) if item.sources else False
+                   for item in self.evidence)
+
+    @property
+    def has_follow_up(self) -> bool:
+        return bool(self.follow_up)
+
+    @property
+    def state(self) -> bool:
+        """Whether this report reached a mission-level conclusion.  Always ``False``.
+
+        A report that did cannot be constructed, so the property has one value by
+        construction.  It exists because a serialised record crosses boundaries,
+        and a reader must be able to *ask* the question of a record it did not
+        build.
+        """
+
+        return self.declares_conclusion is False and not self.peer_contacts
+
+    def describe(self) -> str:
+        return (f"{self.status.value}: {len(self.findings)} finding(s), "
+                f"{len(self.evidence)} evidence item(s), {len(self.sources)} source(s), "
+                f"{len(self.limitations)} limitation(s), {len(self.follow_up)} follow-up(s)")
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "WorkerReport":
+        """Rebuild a report from :meth:`to_dict`, dropping the derived keys.
+
+        ``to_dict`` adds ``usable`` and ``citations`` for a reader; they are
+        recomputed properties, not state, so a reload must not treat them as
+        fields.  Everything else is validated again on the way in — a record that
+        crossed a boundary is exactly the one to re-check.
+        """
+
+        return cls.model_validate({key: value for key, value in payload.items()
+                                   if key not in _DERIVED_REPORT_KEYS})
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise, keeping every field a reader needs to re-check the work."""
+
+        return {
+            "worker_id": self.worker_id,
+            "subagent_id": self.subagent_id,
+            "task_id": self.task_id,
+            "attempt": self.attempt,
+            "status": self.status.value,
+            "usable": self.usable,
+            "summary": self.summary,
+            "findings": [json.loads(model_to_json(finding)) for finding in self.findings],
+            "evidence": [json.loads(model_to_json(item)) for item in self.evidence],
+            "sources": [json.loads(model_to_json(source)) for source in self.sources],
+            "citations": self.citations,
+            "limitations": list(self.limitations),
+            "follow_up": [json.loads(model_to_json(item)) for item in self.follow_up],
+            # Structured, so the record reloads; the readable form is beside it.
+            "gaps": [json.loads(model_to_json(gap)) for gap in self.gaps],
+            "gap_notes": [gap.describe() for gap in self.gaps],
+            "error": (json.loads(model_to_json(self.error)) if self.error else None),
+            "declares_conclusion": self.declares_conclusion,
+            "peer_contacts": list(self.peer_contacts),
+            "seconds": round(self.seconds, 3),
+        }
+
+
+# --------------------------------------------------------------------------
+# 33.3 Building a report from what a runner actually has
+# --------------------------------------------------------------------------
+
+def _sources_from_evidence(evidence: Sequence[EvidenceItem]) -> list[SourceReference]:
+    """De-duplicate the source references the evidence already carries.
+
+    Deduplicated by locator *and* retrieval time, not by locator alone: two
+    retrievals of the same URL at different times are two facts, and collapsing
+    them would hide that the second one happened.
+    """
+
+    seen: set[tuple[str, str, str]] = set()
+    sources: list[SourceReference] = []
+    for item in evidence:
+        for source in item.sources:
+            key = (source.id or source.locator, source.locator,
+                   source.retrieved_at.isoformat())
+            if key in seen:
+                continue
+            seen.add(key)
+            sources.append(source)
+    return sources
+
+
+def report_from_evidence(
+    worker_id: str,
+    subagent_id: str,
+    *,
+    status: WorkerStatus,
+    evidence: Sequence[EvidenceItem] = (),
+    summary: str = "",
+    findings: Sequence[WorkerFinding] = (),
+    limitations: Sequence[str] = (),
+    follow_up: Sequence[WorkerFollowUp] = (),
+    gaps: Sequence[UnknownValue] = (),
+    task_id: str = "",
+    attempt: int = 1,
+    error: ErrorInfo | None = None,
+    started_at: datetime | None = None,
+    seconds: float = 0.0,
+) -> WorkerReport:
+    """Build a report from a runner's evidence, inferring only what is mechanical.
+
+    The one inference made here is a finding per evidence item when the caller
+    supplies none — the statement being the evidence's own, so nothing new is
+    asserted.  Everything else is passed through: a helper that invented
+    limitations or follow-up would be writing the Worker's report for it.
+    """
+
+    items = list(evidence)
+    derived_findings = list(findings) or [
+        WorkerFinding(statement=item.statement, evidence_ids=[item.id], kind=item.kind,
+                      confidence=item.confidence, confidence_basis=item.confidence_basis,
+                      reasoning=item.reasoning)
+        for item in items
+    ]
+    return WorkerReport(
+        worker_id=worker_id, subagent_id=subagent_id, task_id=task_id, attempt=attempt,
+        status=status, summary=summary, findings=derived_findings, evidence=items,
+        sources=_sources_from_evidence(items), limitations=list(limitations),
+        follow_up=list(follow_up), gaps=list(gaps), error=error,
+        started_at=started_at, seconds=seconds,
+    )
+
+
+def blocked_report(worker_id: str, subagent_id: str, reason: str, *,
+                   follow_up: Sequence[WorkerFollowUp] = (),
+                   gap_reason: UnknownReason = UnknownReason.UNAVAILABLE,
+                   task_id: str = "", attempt: int = 1,
+                   seconds: float = 0.0) -> WorkerReport:
+    """A Worker that never got to work: blocked, with the reason as a gap.
+
+    Blocked, not failed: nothing was attempted, so nothing can be said to have
+    failed, and the difference matters to the Subagent deciding whether to retry.
+    """
+
+    return WorkerReport(
+        worker_id=worker_id, subagent_id=subagent_id, task_id=task_id, attempt=attempt,
+        status=WorkerStatus.BLOCKED,
+        summary=f"{worker_id}: not run — {reason}"[:160].rstrip(" ,;:"),
+        limitations=[reason], follow_up=list(follow_up),
+        # ``determined_by`` is the component that *established* the gap: the Worker
+        # hit the wall, not the Subagent that assigned it.
+        gaps=[UnknownValue(reason=gap_reason, detail=reason, determined_by=worker_id)],
+        seconds=seconds,
+    )
+
+
+def failed_report(worker_id: str, subagent_id: str, exc: BaseException | str, *,
+                  stage: str = "worker", attempt: int = 1, task_id: str = "",
+                  follow_up: Sequence[WorkerFollowUp] = (),
+                  seconds: float = 0.0) -> WorkerReport:
+    """A Worker whose attempt raised: failed, with a redacted, typed error.
+
+    Errors are the commonest secret-leak path, so the message is scrubbed here as
+    well as at the field's own validator — the caller may pass an already-redacted
+    string, and doing it twice is harmless.
+    """
+
+    info = (exc if isinstance(exc, ErrorInfo)
+            else ErrorInfo.from_exception(exc, stage=stage, component=worker_id,
+                                          attempt=attempt) if isinstance(exc, BaseException)
+            else ErrorInfo(code="tool-failure", message=redact_text(str(exc)),
+                           stage=stage, component=worker_id, attempt=attempt))
+    return WorkerReport(
+        worker_id=worker_id, subagent_id=subagent_id, task_id=task_id, attempt=attempt,
+        status=WorkerStatus.FAILED,
+        summary=f"{worker_id}: failed — {info.message[:120]}",
+        limitations=[f"the attempt failed at {stage}: {info.message[:160]}"],
+        follow_up=list(follow_up), error=info, seconds=seconds,
+    )
+
+
+def normalize_worker_report(payload: Any, *, worker_id: str = "",
+                            subagent_id: str = "", attempt: int = 1) -> WorkerReport:
+    """Turn whatever a Worker returned into the one valid shape, or refuse it.
+
+    Accepted, in order of preference:
+
+    *   a :class:`WorkerReport` — validated again, because it may have been
+        built elsewhere and crossed a boundary since;
+    *   a mapping with the contract's fields;
+    *   a mapping with none of them (a bare payload) — treated as **partial**
+        evidence for :func:`report_from_evidence`, not as a completed report,
+        because a Worker that returned nothing but data has not said it finished;
+    *   a list of evidence items.
+
+    A mapping that tries to *say* something the contract forbids is not coerced:
+    the conclusion or the peer contact is raised, so a caller cannot accidentally
+    launder it into a clean record.
+    """
+
+    if isinstance(payload, WorkerReport):
+        return WorkerReport.model_validate(payload.model_dump(mode="json"))
+
+    if isinstance(payload, (list, tuple)):
+        evidence = [item if isinstance(item, EvidenceItem) else EvidenceItem.model_validate(item)
+                    for item in payload]
+        return report_from_evidence(
+            worker_id or "worker", subagent_id or "subagent",
+            status=WorkerStatus.PARTIAL if evidence else WorkerStatus.FAILED,
+            evidence=evidence, attempt=attempt,
+            limitations=[] if evidence else ["the Worker returned no evidence"])
+
+    if isinstance(payload, Mapping):
+        data = dict(payload)
+        if {"status", "findings", "evidence", "sources", "limitations"} & set(data):
+            # The gate: forbidden fields, then prose, then the status's contract.
+            return accept_worker_report(data, worker_id=worker_id,
+                                        subagent_id=subagent_id, attempt=attempt)
+        evidence = [EvidenceItem.model_validate(item)
+                    for item in data.get("evidence") or []]
+        return report_from_evidence(
+            worker_id or "worker", subagent_id or "subagent",
+            status=WorkerStatus.PARTIAL if evidence else WorkerStatus.FAILED,
+            evidence=evidence, attempt=attempt,
+            summary=str(data.get("summary") or "")[:200],
+            limitations=[] if evidence else ["the Worker returned no usable evidence"])
+
+    raise TypeError(f"a Worker may not return {type(payload).__name__}; "
+                    "return a WorkerReport, a mapping, or a list of evidence items")
+
+
+# --------------------------------------------------------------------------
+# 33.4 Standing in for a failed tool: one unit's failure is not the mission's
+# --------------------------------------------------------------------------
+
+class ToolCallResult(StrictModel):
+    """What one tool call actually did — enough to decide how to report it.
+
+    ``ok`` is derived from ``status``/``error`` rather than supplied, so a caller
+    cannot mark a failed call successful by forgetting to set it.
+    """
+
+    tool: str = Field(min_length=1)
+    status: WorkerStatus = WorkerStatus.COMPLETED
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    error: ErrorInfo | None = None
+    limitations: list[str] = Field(default_factory=list)
+    seconds: float = Field(default=0.0, ge=0)
+
+    @model_validator(mode="after")
+    def _coherent(self) -> "ToolCallResult":
+        if self.status is WorkerStatus.FAILED and self.error is None:
+            raise ValueError("a failed tool call must carry the error that failed it")
+        if self.status is WorkerStatus.COMPLETED and not self.evidence:
+            raise ValueError("a completed tool call must return at least one evidence item")
+        if not self.status.usable and not self.limitations and self.error is None:
+            raise ValueError(f"a {self.status.value} tool call must say why")
+        return self
+
+    @property
+    def ok(self) -> bool:
+        return self.status is WorkerStatus.COMPLETED
+
+
+def survive_tool_failure(
+    tool: str,
+    call: Callable[[], Any],
+    *,
+    worker_id: str,
+    subagent_id: str,
+    attempt: int = 1,
+    gather: Callable[[Any], Sequence[EvidenceItem]] | None = None,
+    follow_up: Sequence[WorkerFollowUp] = (),
+) -> ToolCallResult:
+    """Run one tool call and turn any failure into a result instead of an exception.
+
+    The mission-level guarantee of this task lives here: a tool that raises, a
+    tool that hangs up mid-write, a tool that returns rubbish — each becomes a
+    ``ToolCallResult`` with a status and an error, never a traceback that unwinds
+    the graph.  ``CancellationRequested`` is re-raised, because cancellation is an
+    operator's decision and swallowing it would make Ctrl-C unreliable.
+
+    Evidence that a failing tool already produced is *kept*: those items were
+    collected, they carry their provenance, and dropping them would discard the
+    usable part of a partial result.
+    """
+
+    started = time.monotonic()
+    try:
+        value = call()
+    except CancellationRequested:
+        raise
+    except Exception as exc:                  # a tool failure is a result, not a crash
+        partial: list[EvidenceItem] = []
+        if gather is not None:
+            try:
+                partial = [item if isinstance(item, EvidenceItem)
+                           else EvidenceItem.model_validate(item)
+                           for item in gather(exc)]
+            except Exception:                 # pragma: no cover - a broken salvage
+                partial = []
+        return ToolCallResult(
+            # FAILED, not PARTIAL: the *tool* failed.  What survives the failure is
+            # recorded beside it, and the Worker's own report (which folds several
+            # results) is what becomes partial.  Calling the tool "partial" would
+            # leave a reader unable to tell which call broke.
+            tool=tool, status=WorkerStatus.FAILED,
+            evidence=partial,
+            error=ErrorInfo.from_exception(exc, stage="tool", component=tool,
+                                           attempt=attempt),
+            limitations=[f"{tool} failed: {redact_text(str(exc))[:160]}"]
+                        + ([f"{len(partial)} item(s) survived the failure"] if partial else []),
+            seconds=time.monotonic() - started,
+        )
+    collected: list[EvidenceItem] = []
+    if gather is not None:
+        collected = [item if isinstance(item, EvidenceItem)
+                     else EvidenceItem.model_validate(item)
+                     for item in gather(value)]
+    elif isinstance(value, WorkerReport):     # pragma: no cover - a report is not a tool result
+        collected = list(value.evidence)
+    return ToolCallResult(tool=tool, status=WorkerStatus.COMPLETED if collected
+                          else WorkerStatus.PARTIAL,
+                          evidence=collected,
+                          limitations=[] if collected else [f"{tool} returned no evidence"],
+                          seconds=time.monotonic() - started)
+
+
+def report_from_tool_results(
+    worker_id: str, subagent_id: str, results: Sequence[ToolCallResult], *,
+    attempt: int = 1, task_id: str = "",
+    summary: str = "", follow_up: Sequence[WorkerFollowUp] = (),
+) -> WorkerReport:
+    """Fold several tool results into one Worker report.
+
+    The status is the *worst* outcome that still leaves something usable, and
+    never better than the worst tool: three good calls and one failure are a
+    partial report, not a completed one.  All surviving evidence is kept, with
+    its original source references.
+    """
+
+    if not results:
+        return blocked_report(worker_id, subagent_id,
+                              "no tool call was made for this unit", task_id=task_id,
+                              attempt=attempt)
+    evidence = [item for result in results for item in result.evidence]
+    limitations = [line for result in results
+                   for line in result.limitations if result.status is not WorkerStatus.COMPLETED]
+    errors = [result.error for result in results if result.error is not None]
+    if not evidence:
+        return failed_report(worker_id, subagent_id, errors[0] if errors else
+                             f"every tool call for this unit failed ({len(results)})",
+                             attempt=attempt, task_id=task_id, follow_up=follow_up)
+    status = (WorkerStatus.COMPLETED
+              if all(result.ok for result in results) and evidence
+              else WorkerStatus.PARTIAL)
+    return report_from_evidence(
+        worker_id, subagent_id, status=status, evidence=evidence,
+        summary=summary or f"{len(evidence)} item(s) from {len(results)} tool call(s), "
+                           f"{sum(1 for result in results if not result.ok)} of which failed",
+        limitations=limitations, follow_up=follow_up,
+        gaps=[UnknownValue(reason=UnknownReason.FAILED, detail=line[:160],
+                           determined_by=worker_id) for line in limitations],
+        attempt=attempt, task_id=task_id,
+        error=(errors[0] if status is WorkerStatus.PARTIAL and errors else None))
+
+
+# --------------------------------------------------------------------------
+# 33.5 The seam into the flow: a WorkerReport next to a WorkerOutcome
+# --------------------------------------------------------------------------
+
+def outcome_from_report(report: WorkerReport, *, gate: FlowGate = FlowGate.NONE,
+                        seconds: float = 0.0) -> "WorkerOutcome":
+    """Convert a validated report into the graph's own outcome record.
+
+    The mapping is total and lossless in the direction that matters: the status,
+    the findings' evidence and the limitations all survive, and the *report* is
+    carried in the payload so a reviewer can see what the Worker actually said
+    rather than only how the graph summarised it.  ``WorkerOutcome`` remains the
+    graph's record; this is the contract's record, and they name the same attempt.
+    """
+
+    status = {WorkerStatus.COMPLETED: EntityStatus.SUCCEEDED,
+              WorkerStatus.PARTIAL: EntityStatus.BLOCKED,
+              WorkerStatus.BLOCKED: EntityStatus.BLOCKED,
+              WorkerStatus.FAILED: EntityStatus.FAILED}[report.status]
+    resolved_gate = gate
+    if report.status is WorkerStatus.PARTIAL and gate is FlowGate.NONE:
+        resolved_gate = FlowGate.NONE
+    elif report.status is WorkerStatus.BLOCKED and gate is FlowGate.NONE:
+        resolved_gate = FlowGate.DEPENDENCY_FAILED
+    elif report.status is WorkerStatus.FAILED and gate is FlowGate.NONE:
+        resolved_gate = FlowGate.ERROR
+    return WorkerOutcome(
+        worker_id=report.worker_id, subagent_id=report.subagent_id,
+        task_id=report.task_id, status=status, attempt=report.attempt,
+        gate=resolved_gate, summary=report.summary[:200],
+        evidence_ids=report.evidence_ids,
+        payload={"evidence": [json.loads(model_to_json(item))
+                              for item in report.evidence],
+                 "report": report.to_dict()},
+        error=(report.error.message[:200] if report.error
+               else ("; ".join(report.limitations)[:200]
+                     if report.status is not WorkerStatus.COMPLETED else None)),
+        seconds=seconds or report.seconds,
+    )
+
+
+def report_from_outcome(outcome: "WorkerOutcome") -> WorkerReport:
+    """Recover the contract's report from a graph outcome.
+
+    A runner that still returns :class:`WorkerOutcome` is not exempt from the
+    contract: its payload carries the report when one was produced, and when it
+    does not, the outcome is *reported as partial with an explicit limitation* —
+    the graph's older shape is tolerated, but its silence about provenance is not
+    mistaken for a completed report.
+    """
+
+    carried = (outcome.payload or {}).get("report")
+    if isinstance(carried, Mapping):
+        return WorkerReport.from_dict(dict(carried))
+    evidence = [EvidenceItem.model_validate(item)
+                for item in (outcome.payload or {}).get("evidence") or []]
+    if outcome.status is EntityStatus.SUCCEEDED:
+        return report_from_evidence(
+            outcome.worker_id, outcome.subagent_id,
+            status=WorkerStatus.PARTIAL if evidence else WorkerStatus.BLOCKED,
+            evidence=evidence, summary=outcome.summary, attempt=outcome.attempt,
+            task_id=outcome.task_id,
+            limitations=["the outcome carried no WorkerReport: its findings, sources and "
+                         "follow-up are unknown, so this is not recorded as completed"],
+            seconds=outcome.seconds)
+    if outcome.status is EntityStatus.FAILED:
+        return failed_report(
+            outcome.worker_id, outcome.subagent_id,
+            ErrorInfo(code="runner", message=outcome.error or "the Worker failed",
+                      stage="worker", component=outcome.worker_id,
+                      attempt=outcome.attempt) if outcome.error else outcome.error or
+            "the Worker failed without an error",
+            attempt=outcome.attempt, task_id=outcome.task_id, seconds=outcome.seconds)
+    return blocked_report(outcome.worker_id, outcome.subagent_id,
+                          outcome.error or f"the Worker reported {outcome.status.value}",
+                          attempt=outcome.attempt, task_id=outcome.task_id,
+                          seconds=outcome.seconds)
+
+
+def _report_of(outcome: "WorkerOutcome") -> WorkerReport | None:
+    """The Worker's report, when the outcome carries one.  Never raises.
+
+    The graph calls this for every settled unit, so a malformed report — one written
+    by an older build, or edited in a case file — must not take a mission down.  It
+    is reported as absent instead, and the ledger's gap says why.
+    """
+
+    carried = (outcome.payload or {}).get("report")
+    if not isinstance(carried, Mapping):
+        return None
+    try:
+        return WorkerReport.from_dict(dict(carried))
+    except ValueError:
+        return None
+
+
+def _with_worker_contract(outcome: "WorkerOutcome") -> "WorkerOutcome":
+    """Attach a conforming :class:`WorkerReport` to a graph outcome, or explain itself.
+
+    Three cases, all of them non-fatal:
+
+    *   the payload already carries a report — revalidated, and normalised to the
+        derived-key-free form so a later read cannot mistake ``to_dict``'s extras
+        for fields;
+    *   the unit did not succeed and carries no report — one is built from the
+        outcome, so a failed unit still says what failed and what is missing;
+    *   the unit succeeded without a report — its report is *attached as partial
+        with a named limitation*.  The outcome's own status is left exactly as the
+        reviewer judged it (demoting it would rewrite the graph's record), but the
+        contract's record cannot say "completed" about work whose findings, sources
+        and follow-up are unknown.  :func:`report_from_outcome` makes the same call.
+    """
+
+    if isinstance((outcome.payload or {}).get("report"), Mapping):
+        report = _report_of(outcome)
+        if report is None:
+            report = report_from_outcome(outcome.model_copy(update={
+                "payload": {key: value for key, value in (outcome.payload or {}).items()
+                            if key != "report"}}))
+        return outcome.model_copy(update={
+            "payload": {**(outcome.payload or {}), "report": report.to_dict()}})
+    report = report_from_outcome(outcome)
+    return outcome.model_copy(update={
+        "payload": {**(outcome.payload or {}), "report": report.to_dict()}})
+
+
+def merge_reports(worker_id: str, subagent_id: str,
+                  reports: Sequence[WorkerReport]) -> WorkerReport:
+    """Combine a Worker's retry attempts into one report — never better than the last.
+
+    Retries are attempts at the same unit, and the later attempt supersedes the
+    earlier one's *findings* while inheriting the earlier one's *limitations*: a
+    retry that succeeded on the second try still had a first try that failed, and a
+    report that forgot it would overstate how straightforward the work was.
+    Evidence from every attempt is kept, because it was collected.
+    """
+
+    if not reports:
+        return blocked_report(worker_id, subagent_id, "no attempt was recorded")
+    final = reports[-1]
+    earlier = [f"attempt {report.attempt} ended {report.status.value}"
+               + (f": {report.error.message[:100]}" if report.error else "")
+               for report in reports[:-1]]
+    evidence: list[EvidenceItem] = []
+    seen: set[str] = set()
+    for report in reports:
+        for item in report.evidence:
+            if item.id not in seen:
+                seen.add(item.id)
+                evidence.append(item)
+    limitations = ([*final.limitations, *earlier]
+                   if final.status is not WorkerStatus.COMPLETED else [])
+    status = final.status
+    if status is WorkerStatus.COMPLETED and earlier:
+        # A completed retry after a failed attempt is still completed work; the
+        # earlier failures are history, not limitations of the final attempt.
+        limitations = []
+    findings = list(final.findings) or [
+        WorkerFinding(statement=item.statement, evidence_ids=[item.id], kind=item.kind,
+                      confidence=item.confidence, confidence_basis=item.confidence_basis)
+        for item in evidence]
+    return WorkerReport(
+        worker_id=worker_id, subagent_id=subagent_id, task_id=final.task_id,
+        attempt=final.attempt, status=status, summary=final.summary,
+        findings=findings, evidence=evidence,
+        sources=_sources_from_evidence(evidence), limitations=limitations,
+        follow_up=list(final.follow_up), gaps=list(final.gaps), error=final.error,
+        started_at=final.started_at, seconds=final.seconds)
+
+
+# --------------------------------------------------------------------------
+# 33.6 A team-level view: statuses, provenance and gaps across many reports
+# --------------------------------------------------------------------------
+
+class OutcomeLedger(StrictModel):
+    """Every Worker report for one mission, with the counts the readers need.
+
+    The ledger's job is to make a *partial* mission legible: which units
+    completed, which were partial and why, whether the partial work still has
+    provenance, and what the Subagent still owes the mission.
+    """
+
+    reports: list[WorkerReport] = Field(default_factory=list)
+
+    @property
+    def by_status(self) -> dict[str, list[str]]:
+        grouped: dict[str, list[str]] = {status.value: [] for status in WorkerStatus}
+        for report in self.reports:
+            grouped[report.status.value].append(report.worker_id)
+        return grouped
+
+    @property
+    def usable(self) -> list[WorkerReport]:
+        return [report for report in self.reports if report.usable]
+
+    @property
+    def partial(self) -> list[WorkerReport]:
+        return [report for report in self.reports if report.status is WorkerStatus.PARTIAL]
+
+    @property
+    def blocked(self) -> list[WorkerReport]:
+        return [report for report in self.reports if report.status is WorkerStatus.BLOCKED]
+
+    @property
+    def failed(self) -> list[WorkerReport]:
+        return [report for report in self.reports if report.status is WorkerStatus.FAILED]
+
+    @property
+    def evidence(self) -> list[EvidenceItem]:
+        return [item for report in self.reports for item in report.evidence]
+
+    @property
+    def follow_up(self) -> list[WorkerFollowUp]:
+        return [item for report in self.reports for item in report.follow_up]
+
+    @property
+    def complete(self) -> bool:
+        """Whether every unit completed.  One partial unit means a partial mission."""
+
+        return bool(self.reports) and all(report.status is WorkerStatus.COMPLETED
+                                          for report in self.reports)
+
+    @property
+    def provenance_intact(self) -> bool:
+        """Whether *every* usable item still has a source reference.
+
+        The acceptance clause about partial results retaining usable provenance,
+        as a property of the ledger rather than of one report: partial work that
+        lost its sources is not usable work.
+        """
+
+        return all(item.sources for report in self.usable for item in report.evidence)
+
+    def gaps(self) -> list[UnknownValue]:
+        gaps = [gap for report in self.reports for gap in report.gaps]
+        for report in self.reports:
+            # A unit that declared its own gaps has already said why; adding a
+            # second for the same unit would double-count the mission's unknowns.
+            if report.status.usable or report.gaps:
+                continue
+            detail = (report.error.message if report.error
+                      else "; ".join(report.limitations)[:160] or "no reason recorded")
+            gaps.append(UnknownValue(reason=UnknownReason.FAILED,
+                                     determined_by=report.worker_id,
+                                     detail=f"{report.worker_id}: {detail}"[:200]))
+        return gaps
+
+    def summary(self) -> str:
+        counts = ", ".join(f"{len(ids)} {status}" for status, ids in self.by_status.items()
+                           if ids) or "none"
+        return (f"{len(self.reports)} worker report(s): {counts}; "
+                f"{len(self.evidence)} evidence item(s); "
+                f"provenance {'intact' if self.provenance_intact else 'incomplete'}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "reports": [report.to_dict() for report in self.reports],
+            "by_status": self.by_status,
+            "complete": self.complete,
+            "provenance_intact": self.provenance_intact,
+            "evidence": len(self.evidence),
+            "follow_up": [item.describe() for item in self.follow_up],
+            "gaps": [gap.describe() for gap in self.gaps()],
+            "summary": self.summary(),
+        }
+
+
+def outcome_ledger(reports: Sequence[WorkerReport]) -> OutcomeLedger:
+    return OutcomeLedger(reports=list(reports))
+
+
+# --------------------------------------------------------------------------
+# 33.7 The scripted team: four Workers, one of every status
+# --------------------------------------------------------------------------
+
+#: The evidence a scripted Worker produces.  Real models with real source
+#: references, so nothing downstream has to pretend provenance exists.
+def _worker_demo_source(name: str, *, url: str | None = None,
+                        path: str | None = None) -> SourceReference:
+    return SourceReference(
+        kind=SourceKind.PUBLIC_WEB if url else SourceKind.LOG_FILE,
+        url=url, artifact_path=None if url else path,
+        title=name, retrieved_at=datetime(2026, 5, 4, 10, 0, tzinfo=timezone.utc),
+        retrieval_method=RetrievalMethod.HTTP if url else RetrievalMethod.LOCAL_READ,
+        http_status=200 if url else None, excerpt=f"excerpt from {name}",
+    )
+
+
+def _worker_demo_evidence(label: str, statement: str, *, name: str,
+                          url: str | None = None, path: str | None = None,
+                          worker: str = "w-proxy") -> EvidenceItem:
+    return EvidenceItem(
+        kind=EvidenceKind.OBSERVATION, statement=statement,
+        sources=[_worker_demo_source(name, url=url, path=path)],
+        confidence=Confidence.LOW,
+        confidence_basis="one automated retrieval of one source; not corroborated",
+        collected_by=worker, observed_at=datetime(2026, 5, 4, 10, 0, tzinfo=timezone.utc),
+        tags=[label],
+    )
+
+
+def worker_demo_reports() -> dict[str, WorkerReport]:
+    """One report per status, each with the provenance its status promises.
+
+    *   ``completed`` — the proxy log was read in full; three observations, all
+        cited.  No limitations, because a completed report that hedges is a
+        partial one wearing the wrong label.
+    *   ``partial`` — the DNS log was readable for one day of the window, so the
+        one observation it produced is real and cited, and the limitation names
+        the days that are missing.
+    *   ``blocked`` — the archive needs credentials nobody has; nothing was read,
+        so nothing is claimed, and the gap is typed rather than described.
+    *   ``failed`` — the hash tool died on a corrupt file after reading one
+        record; that record survives, with its source, beside the error.
+
+    A fifth report is *refused* rather than produced: see
+    :func:`worker_demo_refusals`.
+    """
+
+    proxy_evidence = [
+        _worker_demo_evidence("proxy", "the proxy log records a CONNECT to evil.example.org",
+                              name="proxy.log", path="/evidence/proxy.log"),
+        _worker_demo_evidence("proxy", "the same log records 412 bytes returned to "
+                                       "10.0.0.5 on that CONNECT",
+                              name="proxy.log", path="/evidence/proxy.log"),
+        _worker_demo_evidence("proxy", "the user agent on that request is the default "
+                                       "curl/8.4.0 string",
+                              name="proxy.log", path="/evidence/proxy.log"),
+    ]
+    completed = report_from_evidence(
+        "w-proxy", "sa-network", status=WorkerStatus.COMPLETED, evidence=proxy_evidence,
+        summary="read the whole proxy log and extracted three cited observations",
+        follow_up=[WorkerFollowUp(
+            suggestion="re-read the proxy log for the two hours before the CONNECT",
+            reason="the log starts mid-session, so the request that led to it is not in "
+                   "the captured window",
+            priority=FollowUpPriority.HIGH)],
+        task_id=content_id("task", "sa-network", "w-proxy", 1),
+        started_at=datetime(2026, 5, 4, 10, 0, tzinfo=timezone.utc), seconds=1.5,
+    )
+
+    dns_evidence = [_worker_demo_evidence(
+        "dns", "the resolver log shows one A query for evil.example.org at 10:00:00Z",
+        name="dns.log", path="/evidence/dns.log", worker="w-dns")]
+    partial = report_from_evidence(
+        "w-dns", "sa-network", status=WorkerStatus.PARTIAL, evidence=dns_evidence,
+        summary="read one day of the resolver log; the rest of the window is missing",
+        limitations=["the resolver rotates logs weekly and only 2026-05-04 survives, so "
+                     "queries on the other six days cannot be checked",
+                     "queries answered from cache are not logged at all"],
+        follow_up=[WorkerFollowUp(
+            suggestion="collect the rotated resolver logs from the backup volume",
+            reason="the missing six days are the only way to test whether the query "
+                   "pattern is routine or exceptional",
+            priority=FollowUpPriority.HIGH, blocked_by="backup volume not mounted")],
+        task_id=content_id("task", "sa-network", "w-dns", 1), seconds=0.9,
+    )
+
+    blocked = blocked_report(
+        "w-archive", "sa-history", "the archive requires an API key this mission does not "
+                                   "hold, and the policy forbids out-of-scope collection",
+        gap_reason=UnknownReason.OUT_OF_SCOPE,
+        follow_up=[WorkerFollowUp(
+            suggestion="request an archive key for this objective from the operator",
+            reason="the archive is the only source for the March snapshot",
+            priority=FollowUpPriority.MEDIUM)],
+        task_id=content_id("task", "sa-history", "w-archive", 1), seconds=0.2,
+    )
+
+    surviving = [_worker_demo_evidence(
+        "hash", "the corrupt capture's first record hashes to the same digest as the "
+                "advisory's sample",
+        name="capture.pcap", path="/evidence/capture.pcap", worker="w-hash")]
+    failed = report_from_evidence(
+        "w-hash", "sa-integrity", status=WorkerStatus.FAILED, evidence=surviving,
+        summary="hashed one record of the capture before the reader aborted",
+        limitations=["the pcap reader aborted partway through the file, so only the first "
+                     "record was hashed",
+                     "the digest covers one record, not the whole capture"],
+        follow_up=[WorkerFollowUp(
+            suggestion="re-hash the capture with the record-boundary check disabled",
+            reason="the abort was at a malformed record boundary, not in the data")],
+        error=ErrorInfo(code="pcap-truncated", stage="tool", component="w-hash",
+                        message="unexpected end of pcap record at offset 4096",
+                        cause_type="TruncatedCapture"),
+        task_id=content_id("task", "sa-integrity", "w-hash", 1), seconds=2.2,
+    )
+    # A failed report may still keep what was collected, but the contract requires
+    # the error and the limitation to agree — see the self-test.
+    return {"completed": completed, "partial": partial, "blocked": blocked,
+            "failed": failed}
+
+
+def worker_demo_refusals() -> dict[str, str]:
+    """The two reports a Worker may not return, and the error each one raises.
+
+    Written as failing constructions rather than as prose, so the prohibition is
+    demonstrated by the same code path that enforces it.
+    """
+
+    evidence = [_worker_demo_evidence(
+        "refusal", "the page's certificate expired six days before the capture",
+        name="tls.json", url="https://example.com/tls.json")]
+    refusals: dict[str, str] = {}
+
+    def attempt(key: str, *,
+                call: Callable[[], Any] | None = None,
+                payload_extra: Mapping[str, Any] | None = None,
+                **kwargs: Any) -> None:
+        try:
+            if call is not None:
+                # The refusal may happen when the *field* is built (a finding's
+                # statement is validated on construction), so the whole
+                # construction is inside the try, not just the report.
+                call()
+            elif payload_extra is not None:
+                # A field the contract forbids, in a mapping that otherwise looks
+                # like a report: refused structurally, before any prose is read.
+                payload = {"worker_id": "w-refuse", "subagent_id": "sa-network",
+                           "status": "completed", "findings": [
+                               {"statement": "the certificate expired",
+                                "evidence_ids": [item.id for item in kwargs["evidence"]]}],
+                           "evidence": [json.loads(model_to_json(item))
+                                        for item in kwargs["evidence"]],
+                           **payload_extra}
+                normalize_worker_report(payload)
+            else:
+                report_from_evidence("w-refuse", "sa-network",
+                                     status=WorkerStatus.COMPLETED, **kwargs)
+        except (ConclusionLeak, PeerContactError, ValueError) as exc:
+            refusals[key] = f"{type(exc).__name__}: {exc}"
+        else:                                  # a prohibition that let it through
+            refusals[key] = "accepted"
+
+    attempt("conclusion_in_summary", evidence=evidence,
+            summary="the mission is complete: the actor is the operator of evil.example.org")
+    # The phrase is in a *finding*, not the summary: the scan is of the payload's
+    # prose, and a verdict written one level down is the same claim.
+    attempt("conclusion_in_a_finding", call=lambda: report_from_evidence(
+        "w-refuse", "sa-network", status=WorkerStatus.COMPLETED, evidence=evidence,
+        summary="read the certificate record",
+        findings=[WorkerFinding(
+            statement="we can conclude that the certificate was replaced deliberately",
+            evidence_ids=[item.id for item in evidence])]))
+    attempt("peer_contact", evidence=evidence,
+            summary="read the certificate record, then delegated to the archive team")
+    attempt("completed_with_limitations", evidence=evidence,
+            summary="read the certificate record",
+            limitations=["the page's body was not readable"])
+    attempt("partial_without_provenance", evidence=[
+        EvidenceItem(kind=EvidenceKind.ALLEGATION,
+                     statement="a vendor says the domain was registered in March",
+                     allegation_made_by="the vendor advisory")],
+        summary="recorded the registration claim",
+        limitations=["only a claim, no document"])
+    attempt("identity_claim_field", evidence=evidence, summary="read the certificate record",
+            payload_extra={"attribution": "the actor"})
+    return refusals
+
+
+# --------------------------------------------------------------------------
+# 33.8 The runner seam: a wrapper that cannot let a failure escape
+# --------------------------------------------------------------------------
+
+class ReportingRunner:
+    """Wrap a runner so every attempt yields a validated report — or a failure record.
+
+    The graph already turns a runner exception into an outcome (§25).  This wrapper
+    makes the *contract* the thing that holds: the failure is a
+    :class:`WorkerReport` with a status, an error and its limitations, the report is
+    kept, and the caller gets a ``WorkerOutcome`` so the graph is unchanged.  Any
+    other attribute is delegated, so a wrapped runner still reviews and
+    synthesises as itself.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+        self.reports: list[WorkerReport] = []
+
+    # -- the one method the contract is about ------------------------------
+    def run_worker(self, subagent: Any, worker: Any, *, attempt: int,
+                   guidance: str = "") -> "WorkerOutcome":
+        started = time.monotonic()
+        try:
+            outcome = self.inner.run_worker(subagent, worker, attempt=attempt,
+                                            guidance=guidance)
+        except CancellationRequested:
+            raise
+        except Exception as exc:            # a runner failure is a report, not a crash
+            report = failed_report(
+                getattr(worker, "id", "worker"), getattr(subagent, "id", "subagent"),
+                exc, stage="runner", attempt=attempt,
+                seconds=time.monotonic() - started)
+        else:
+            report = report_from_outcome(outcome)
+        self.reports.append(report)
+        converted = outcome_from_report(report)
+        return converted.model_copy(update={
+            "seconds": converted.seconds or (time.monotonic() - started)})
+
+    def __getattr__(self, name: str) -> Any:      # review, synthesize, everything else
+        return getattr(self.inner, name)
+
+    # -- what the wrapper saw ----------------------------------------------
+    def ledger(self) -> OutcomeLedger:
+        return outcome_ledger(self.reports)
+
+
+# --------------------------------------------------------------------------
+# 33.9 The scripted failures: a tool that raises, and the work it kept
+# --------------------------------------------------------------------------
+
+class _CorruptCapture:
+    """A stand-in tool that produces one record, then fails reading the next.
+
+    The failure is the ordinary kind: a truncated file, discovered mid-read, after
+    the first record was already parsed.  The parsed record is a real
+    :class:`EvidenceItem` with a real source, so the partial result is usable — and
+    that is the point of the acceptance clause.
+    """
+
+    def __init__(self) -> None:
+        self.records: list[EvidenceItem] = []
+
+    def read_record(self) -> EvidenceItem:
+        item = _worker_demo_evidence(
+            "capture", "the capture's first record is a TLS handshake to "
+                       "evil.example.org",
+            name="capture.pcap", path="/evidence/capture.pcap", worker="w-hash")
+        self.records.append(item)
+        return item
+
+    def __call__(self) -> EvidenceItem:
+        self.read_record()
+        raise TruncatedCaptureRead(
+            "unexpected end of pcap record at offset 4096 (token=api_key=abcd1234efgh)")
+
+    def salvage(self, _exc: BaseException) -> list[EvidenceItem]:
+        return list(self.records)
+
+
+class TruncatedCaptureRead(Exception):
+    """The demo's tool failure.  A local exception type, so the message is ours."""
+
+
+def _outcome_tool_demo() -> dict[str, Any]:
+    """One Worker whose third tool call fails after producing a usable record.
+
+    Both halves of the acceptance clause are visible here at once: the failure did
+    not raise, and the record the tool had already produced kept its source.
+    """
+
+    capture = _CorruptCapture()
+    good = survive_tool_failure(
+        "http.fetch", lambda: _worker_demo_evidence(
+            "dns", "the resolver log shows one A query for evil.example.org",
+            name="dns.log", path="/evidence/dns.log", worker="w-mixed"),
+        worker_id="w-mixed", subagent_id="sa-network",
+        gather=lambda value: [value])
+    broken = survive_tool_failure(
+        "pcap.read", capture, worker_id="w-mixed", subagent_id="sa-network",
+        gather=capture.salvage)
+    report = report_from_tool_results(
+        "w-mixed", "sa-network", [good, broken],
+        follow_up=[WorkerFollowUp(
+            suggestion="re-read the capture with a record-boundary-tolerant reader",
+            reason="the abort was at a malformed boundary; the data before it parsed")])
+    return {
+        "tools": [{"tool": result.tool, "status": result.status.value,
+                   "ok": result.ok, "evidence": len(result.evidence),
+                   "error": (result.error.message if result.error else None),
+                   "limitations": result.limitations}
+                  for result in (good, broken)],
+        "report": report.to_dict(),
+        "raised": False,
+    }
+
+
+def _outcome_runner_demo() -> dict[str, Any]:
+    """A runner that raises, wrapped so the mission cannot see the exception."""
+
+    class ExplodingRunner:
+        def run_worker(self, subagent: Any, worker: Any, *, attempt: int,
+                       guidance: str = "") -> Any:
+            raise RuntimeError("the collector segfaulted while parsing the archive")
+
+        def review_worker(self, *_args: Any, **_kwargs: Any) -> Any:
+            return None
+
+        def synthesize(self, *_args: Any, **_kwargs: Any) -> Any:
+            return None
+
+    class _Unit:
+        def __init__(self, ident: str) -> None:
+            self.id = ident
+
+    wrapped = ReportingRunner(ExplodingRunner())
+    outcome = wrapped.run_worker(_Unit("sa-network"), _Unit("w-explode"), attempt=1)
+    return {
+        "raised": False,
+        "outcome_status": outcome.status.value,
+        "outcome_gate": outcome.gate.value,
+        "outcome_error": outcome.error,
+        "report": wrapped.reports[0].to_dict(),
+        "ledger": wrapped.ledger().to_dict(),
+    }
+
+
+def worker_outcome_demo() -> dict[str, Any]:
+    """The whole contract on one screen: four statuses, six refusals, two failures."""
+
+    reports = worker_demo_reports()
+    ledger = outcome_ledger(list(reports.values()))
+    return {
+        "statuses": [status.value for status in WorkerStatus],
+        "reports": {name: report.to_dict() for name, report in reports.items()},
+        "ledger": ledger.to_dict(),
+        "refusals": worker_demo_refusals(),
+        "tool_failure": _outcome_tool_demo(),
+        "runner_failure": _outcome_runner_demo(),
+        "mission": {
+            # A mission with a blocked and a failed Worker still has an aggregate:
+            # this is the acceptance clause stated as data.
+            "continued": True,
+            "usable_workers": len(ledger.usable),
+            "complete": ledger.complete,
+            "provenance_intact": ledger.provenance_intact,
+            "statement": ("no exception escaped a Worker: the partial reports keep their "
+                          "sources, and the gaps are reported instead of raised"),
+        },
+    }
+
+
+# --------------------------------------------------------------------------
+# 33.10 Self-test — the acceptance criteria as executable checks
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class OutcomeCheck:
+    name: str
+    ok: bool
+    detail: str = ""
+
+
+def _oc(name: str, ok: Any, detail: Any = "") -> OutcomeCheck:
+    return OutcomeCheck(name=name, ok=bool(ok), detail=str(detail)[:150])
+
+
+def _w_evidence(statement: str, *, url: str = "https://example.com/report",
+                kind: EvidenceKind = EvidenceKind.OBSERVATION,
+                sources: bool = True) -> EvidenceItem:
+    """One evidence item for the checks: real, cited, and boring on purpose."""
+
+    source = SourceReference(kind=SourceKind.PUBLIC_WEB, url=url,
+                             retrieved_at=datetime(2026, 5, 4, 10, tzinfo=timezone.utc))
+    return EvidenceItem(
+        kind=kind, statement=statement,
+        sources=[source] if sources else [],
+        allegation_made_by="the vendor advisory" if kind is EvidenceKind.ALLEGATION else None,
+        confidence=Confidence.LOW if sources else Confidence.UNKNOWN,
+        confidence_basis="one automated retrieval" if sources else None,
+        collected_by="w-test")
+
+
+def _refused(call: Callable[[], Any]) -> tuple[str, str]:
+    """Run a construction that must be refused; return (type, message).
+
+    ``CancellationRequested`` is included so a check can assert that cancellation
+    is *not* swallowed — the one exception this contract lets through.
+    """
+
+    try:
+        call()
+    except (ConclusionLeak, PeerContactError, ValueError, TypeError,
+            CancellationRequested) as exc:
+        return type(exc).__name__, str(exc)
+    return "", "accepted"
+
+
+def run_outcome_self_test() -> list[OutcomeCheck]:
+    """Prove the contract: four statuses, no conclusions, no peer contact, no crashes.
+
+    The acceptance clauses are the last two groups: a failed *tool* is a report
+    rather than an exception (33.9), and a partial report keeps provenance a
+    reader can follow (33.2/33.6).
+    """
+
+    checks: list[OutcomeCheck] = []
+    add = checks.append
+
+    # ---- 1. the vocabulary ------------------------------------------------
+    add(_oc("exactly four worker statuses are defined", len(WorkerStatus) == 4,
+            [status.value for status in WorkerStatus]))
+    add(_oc("the four statuses are the documented ones",
+            [status.value for status in WorkerStatus]
+            == ["completed", "partial", "blocked", "failed"],
+            [status.value for status in WorkerStatus]))
+    add(_oc("completed and partial are the usable statuses",
+            [status for status in WorkerStatus if status.usable]
+            == [WorkerStatus.COMPLETED, WorkerStatus.PARTIAL]))
+    add(_oc("a blocked report is not usable work",
+            not WorkerStatus.BLOCKED.usable and not WorkerStatus.FAILED.usable))
+    add(_oc("only completed is an unqualified success",
+            [status for status in WorkerStatus if status.ok] == [WorkerStatus.COMPLETED]))
+    add(_oc("a follow-up has three ordered priorities",
+            [item.value for item in FollowUpPriority] == ["low", "medium", "high"]
+            and FollowUpPriority.LOW.rank < FollowUpPriority.HIGH.rank))
+    add(_oc("a refused conclusion is a ValueError, so callers can catch it",
+            issubclass(ConclusionLeak, ValueError)))
+    add(_oc("a refused peer contact is a ValueError too",
+            issubclass(PeerContactError, ValueError)))
+
+    # ---- 2. the prohibition on conclusions is structural -------------------
+    add(_oc("the report has no field for a conclusion, verdict or identity",
+            not (set(WorkerReport.model_fields)
+                 & {"conclusion", "conclusions", "verdict", "identity", "actor",
+                    "attribution", "final_answer"}),
+            sorted(WorkerReport.model_fields)))
+    add(_oc("no report field name is on the forbidden list",
+            not forbidden_fields({"x": WorkerReport.model_fields.keys()},
+                                 allow=_CONTRACT_FIELDS)
+            and not [name for name in WorkerReport.model_fields
+                     if any(fragment in name.lower() for fragment in _FORBIDDEN_FIELDS)
+                     and name not in _FORBIDDEN_ALLOWED]))
+    add(_oc("a recipients field is refused",
+            forbidden_fields({"recipients": ["other-team"]}) == ["recipients"]))
+    add(_oc("a nested attribution field is refused",
+            forbidden_fields({"metadata": {"attribution": "the actor"}})
+            == ["metadata.attribution"]))
+    add(_oc("a forbidden field inside a list of rows is refused",
+            forbidden_fields({"rows": [{"peer_id": "sa-2"}]}) == ["rows[0].peer_id"]))
+    add(_oc("a channel field is refused", bool(forbidden_fields({"channel": "slack"}))))
+    add(_oc("the contract's own fields are not reported as forbidden",
+            forbidden_fields(worker_demo_reports()["completed"].to_dict(),
+                             allow=_CONTRACT_FIELDS) == []))
+    add(_oc("a report may say it claims no identity",
+            forbidden_fields({"identity_claimed": False}) == [],
+            "identity_claimed is the field that records the absence of a claim"))
+    add(_oc("the serialised report contains no forbidden field",
+            forbidden_fields(worker_demo_reports()["partial"].to_dict(),
+                             allow=_CONTRACT_FIELDS | _DERIVED_REPORT_KEYS) == []))
+    add(_oc("a conclusion cannot be attached as an extra field",
+            _coerce_refuses(lambda: WorkerReport(
+                worker_id="w", subagent_id="s", status="blocked",
+                limitations=["x"], conclusion="the case is closed"))[0]
+            == "ValidationError"))
+    declared = _coerce_refuses(lambda: WorkerReport(
+        worker_id="w", subagent_id="s", status="blocked",
+        limitations=["nothing was read"], declares_conclusion=True))
+    add(_oc("there is no way to build a report that declares a conclusion",
+            declared[0] == "ValidationError"
+            and refusal_kind(declared[1]) == "conclusion", declared[1][:90]))
+    contact = _coerce_refuses(lambda: WorkerReport(
+        worker_id="w", subagent_id="s", status="blocked",
+        limitations=["nothing was read"], peer_contacts=["sa-archive"]))
+    add(_oc("there is no way to build a report with a peer contact",
+            contact[0] == "ValidationError"
+            and refusal_kind(contact[1]) == "peer-contact", contact[1][:90]))
+    add(_oc("a refusal is classified by its message, not by its type",
+            refusal_kind(ConclusionLeak("f", "p").args[0]) == "conclusion"
+            and refusal_kind(PeerContactError("f", "p").args[0]) == "peer-contact"
+            and refusal_kind("something else") == "other",
+            "pydantic wraps the type; the message survives"))
+    add(_oc("a valid report says it reached no conclusion", 
+            worker_demo_reports()["completed"].state is True))
+
+    # ---- 3. the prohibition holds for prose, wherever it is written --------
+    summary_leak = _refused(lambda: report_from_evidence(
+        "w", "s", status=WorkerStatus.COMPLETED,
+        evidence=[_w_evidence("the certificate expired before the capture")],
+        summary="the mission is complete: the actor is the operator of the domain"))
+    add(_oc("a mission-level conclusion in the summary is refused",
+            summary_leak[0] == "ValidationError", summary_leak[1][:80]))
+    add(_oc("the refusal names the phrase it found",
+            "mission is complete" in summary_leak[1]))
+    finding_leak = _refused(lambda: WorkerFinding(
+        statement="we can conclude that the certificate was replaced deliberately",
+        evidence_ids=["ev-1"]))
+    add(_oc("a conclusion written in a finding is refused",
+            finding_leak[0] == "ValidationError", finding_leak[1][:80]))
+    add(_oc("a verdict phrase is refused wherever it appears",
+            all(mission_conclusion_phrases(text)
+                for text in ("case closed", "we have proven the link",
+                             "the threat actor is known", "conclusively",
+                             "final assessment: hostile"))))
+    add(_oc("ordinary analytic language is not refused",
+            not mission_conclusion_phrases(
+                "the proxy log shows a CONNECT to evil.example.org") and
+            not mission_conclusion_phrases(
+                "the certificate expired six days before the capture")))
+    add(_oc("saying a value is not an identity is not refused",
+            not mission_conclusion_phrases(
+                "the shared address is not an identity and names no person")))
+    add(_oc("an artefact path that contains a forbidden word is not scanned",
+            _refused(lambda: report_from_evidence(
+                "w", "s", status=WorkerStatus.COMPLETED,
+                evidence=[_w_evidence("the file was present",
+                                      url="https://example.com/conclusion.txt")],
+                summary="read one page"))[0] == "",
+            "evidence locators are data, not prose"))
+    add(_oc("a hand-off in the summary is refused",
+            _refused(lambda: report_from_evidence(
+                "w", "s", status=WorkerStatus.COMPLETED,
+                evidence=[_w_evidence("the file was present")],
+                summary="finished, then delegated to the archive team"))[0]
+            == "ValidationError"))
+    peer = _refused(lambda: report_from_evidence(
+        "w", "s", status=WorkerStatus.COMPLETED,
+        evidence=[_w_evidence("the file was present")],
+        summary="asked another team to confirm the record"))
+    add(_oc("the peer refusal is typed and names the phrase",
+            peer[0] == "ValidationError" and "asked another team" in peer[1], peer[1][:80]))
+    add(_oc("every peer-contact phrase is really a contact",
+            all(peer_contact_phrases(text)
+                for text in ("delegated to sa-archive", "shared with another team",
+                             "handed off to the timeline team", "via slack",
+                             "peer subagent", "coordinated with the history team"))))
+    add(_oc("a forbidden field is refused before the prose is read",
+            _refused(lambda: normalize_worker_report({
+                "worker_id": "w", "subagent_id": "s", "status": "completed",
+                "summary": "the mission is complete", "recipients": ["sa-2"],
+                "findings": [], "evidence": []}))[0] == "ConclusionLeak"))
+    add(_oc("a conclusion nested in a payload's finding is refused",
+            _refused(lambda: normalize_worker_report({
+                "worker_id": "w", "subagent_id": "s", "status": "partial",
+                "findings": [{"statement": "the case is closed",
+                              "evidence_ids": ["ev-1"]}],
+                "evidence": [], "limitations": ["nothing else was read"]}))[0]
+            == "ConclusionLeak"))
+
+    # ---- 4. the status contract -------------------------------------------
+    evidence = _w_evidence("the proxy log records a CONNECT to evil.example.org")
+    add(_oc("a completed report needs a finding",
+            _refused(lambda: WorkerReport(
+                worker_id="w", subagent_id="s", status="completed",
+                evidence=[evidence]))[0] == "ValidationError"))
+    add(_oc("a completed report needs evidence",
+            _refused(lambda: WorkerReport(
+                worker_id="w", subagent_id="s", status="completed",
+                findings=[WorkerFinding(statement="something was seen",
+                                        evidence_ids=["ev-1"])]))[0]
+            == "ValidationError"))
+    add(_oc("a completed report may not carry limitations",
+            _refused(lambda: WorkerReport(
+                worker_id="w", subagent_id="s", status="completed",
+                evidence=[evidence],
+                findings=[WorkerFinding(statement="the log records a CONNECT",
+                                        evidence_ids=[evidence.id])],
+                limitations=["the log starts mid-session"]))[0] == "ValidationError"))
+    add(_oc("a partial report must name what is missing",
+            _refused(lambda: WorkerReport(
+                worker_id="w", subagent_id="s", status="partial",
+                evidence=[evidence],
+                findings=[WorkerFinding(statement="the log records a CONNECT",
+                                        evidence_ids=[evidence.id])]))[0]
+            == "ValidationError"))
+    add(_oc("a partial report with a limitation is valid",
+            worker_demo_reports()["partial"].status is WorkerStatus.PARTIAL))
+    add(_oc("a blocked report needs a reason",
+            _refused(lambda: WorkerReport(worker_id="w", subagent_id="s",
+                                          status="blocked"))[0] == "ValidationError"))
+    add(_oc("a blocked report may carry no findings and no evidence",
+            (lambda report: report.status is WorkerStatus.BLOCKED
+             and not report.evidence and not report.findings)(
+                worker_demo_reports()["blocked"])))
+    add(_oc("a failed report must carry its error",
+            _refused(lambda: WorkerReport(worker_id="w", subagent_id="s",
+                                          status="failed",
+                                          limitations=["the tool died"]))[0]
+            == "ValidationError"))
+    add(_oc("a failed report keeps the evidence that survived",
+            len(worker_demo_reports()["failed"].evidence) == 1))
+    add(_oc("a usable report may not contain unsourced evidence",
+            _refused(lambda: report_from_evidence(
+                "w", "s", status=WorkerStatus.PARTIAL,
+                evidence=[_w_evidence("a vendor claims the domain is new",
+                                      kind=EvidenceKind.ALLEGATION, sources=False)],
+                limitations=["only a claim"])[0] == "ValidationError")))
+    add(_oc("a finding may not cite evidence the report does not contain",
+            _refused(lambda: WorkerReport(
+                worker_id="w", subagent_id="s", status="partial",
+                evidence=[evidence],
+                findings=[WorkerFinding(statement="a row was read",
+                                        evidence_ids=["ev-not-here"])],
+                limitations=["one row only"]))[0] == "ValidationError"))
+    add(_oc("an unknown status is refused, not coerced",
+            _refused(lambda: WorkerReport(worker_id="w", subagent_id="s",
+                                          status="succeeded"))[0]
+            == "ValidationError", "succeeded is a graph state, not a Worker status"))
+    add(_oc("the status may be given as a string and is normalised",
+            WorkerReport(worker_id="w", subagent_id="s", status="blocked",
+                         limitations=["no key"]).status is WorkerStatus.BLOCKED))
+    add(_oc("an attempt number below one is refused",
+            _refused(lambda: blocked_report("w", "s", "no key", attempt=0))[0]
+            == "ValidationError"))
+    add(_oc("a completed report may not carry an error",
+            _refused(lambda: WorkerReport(
+                worker_id="w", subagent_id="s", status="completed",
+                evidence=[evidence],
+                findings=[WorkerFinding(statement="the log records a CONNECT",
+                                        evidence_ids=[evidence.id])],
+                error=ErrorInfo(code="x", message="something failed")))[0]
+            == "ValidationError"))
+    add(_oc("a finding that is an inference must state its reasoning",
+            _refused(lambda: WorkerFinding(
+                statement="the connection was scripted", evidence_ids=["ev-1"],
+                kind=EvidenceKind.INFERENCE))[0] == "ValidationError"))
+    add(_oc("high confidence on an inference is refused",
+            _refused(lambda: WorkerFinding(
+                statement="the connection was scripted", evidence_ids=["ev-1"],
+                kind=EvidenceKind.INFERENCE, reasoning="the user agent is a default string",
+                confidence=Confidence.HIGH, confidence_basis="one log line"))[0]
+            == "ValidationError"))
+    add(_oc("a follow-up needs a reason as well as a suggestion",
+            _refused(lambda: WorkerFollowUp(suggestion="collect more",
+                                            reason="  "))[0] == "ValidationError"))
+
+    # ---- 5. the builders --------------------------------------------------
+    derived = report_from_evidence("w", "s", status=WorkerStatus.COMPLETED,
+                                   evidence=[evidence], summary="read one page")
+    add(_oc("a report derives one finding per evidence item",
+            len(derived.findings) == 1
+            and derived.findings[0].evidence_ids == [evidence.id]))
+    add(_oc("a derived finding repeats the evidence's own statement",
+            derived.findings[0].statement == evidence.statement))
+    add(_oc("the report collects the sources its evidence already carries",
+            [source.locator for source in derived.sources]
+            == ["https://example.com/report"]))
+    later = evidence.sources[0].model_copy(
+        update={"retrieved_at": datetime(2026, 5, 5, 9, tzinfo=timezone.utc)})
+    reread = evidence.model_copy(update={
+        "id": "ev-reread", "sources": [evidence.sources[0], later]})
+    add(_oc("the same source retrieved twice is kept twice",
+            len(_sources_from_evidence([reread])) == 2,
+            "one retrieval each: collapsing them would hide the second"))
+    add(_oc("the same retrieval cited by two items is recorded once",
+            len(_sources_from_evidence([evidence, evidence.model_copy(
+                update={"id": "ev-other"})])) == 1))
+    blocked = blocked_report("w", "s", "the archive needs a key this mission does not hold")
+    add(_oc("a blocked report is blocked, not failed",
+            blocked.status is WorkerStatus.BLOCKED and blocked.error is None))
+    add(_oc("a blocked report records a typed gap",
+            len(blocked.gaps) == 1 and isinstance(blocked.gaps[0], UnknownValue)))
+    scrubbed = failed_report("w", "s", "the collector rejected api_key=abcd1234efgh")
+    add(_oc("a failure message is redacted before it reaches the record",
+            "abcd1234efgh" not in scrubbed.error.message, scrubbed.error.message))
+    add(_oc("a failure names the component and the stage",
+            scrubbed.error.component == "w" and scrubbed.error.stage == "worker"))
+    add(_oc("a failure carries a limitation saying what stopped it",
+            bool(scrubbed.limitations)))
+
+    # ---- 6. a failed tool does not crash the mission (acceptance one) -----
+    tool = _outcome_tool_demo()
+    add(_oc("a raising tool returns a result instead of raising", tool["raised"] is False))
+    add(_oc("the failing tool is recorded as failed",
+            tool["tools"][1]["status"] == "failed" and tool["tools"][1]["ok"] is False))
+    add(_oc("the working tool in the same Worker is still completed",
+            tool["tools"][0]["status"] == "completed"))
+    add(_oc("the failure carries the error the tool raised",
+            "unexpected end of pcap record" in (tool["tools"][1]["error"] or "")))
+    add(_oc("the error message is redacted in the tool result",
+            "abcd1234efgh" not in (tool["tools"][1]["error"] or ""),
+            tool["tools"][1]["error"]))
+    add(_oc("the policy-free Worker report folds to partial", 
+            tool["report"]["status"] == "partial", tool["report"]["status"]))
+    add(_oc("the failed tool still returns the record it had already read",
+            tool["tools"][1]["evidence"] == 1, tool["tools"][1]["evidence"]))
+    add(_oc("the partial report keeps the record the tool produced first",
+            len(tool["report"]["evidence"]) == 2, len(tool["report"]["evidence"])))
+    add(_oc("the salvaged record keeps its source reference",
+            all(item["sources"] for item in tool["report"]["evidence"])))
+    add(_oc("the partial report's citations include the salvaged artefact",
+            "file:///evidence/capture.pcap" in tool["report"]["citations"]
+            or "/evidence/capture.pcap" in " ".join(tool["report"]["citations"]),
+            tool["report"]["citations"]))
+    add(_oc("the partial report names the tool that failed",
+            any("pcap.read" in line for line in tool["report"]["limitations"])))
+    add(_oc("the partial report still has a usable status",
+            tool["report"]["usable"] is True))
+
+    class _Raises:
+        def __call__(self) -> Any:
+            raise RuntimeError("the collector segfaulted while parsing the archive")
+
+        def salvage(self, _exc: BaseException) -> list[Any]:
+            return []
+
+    no_evidence = survive_tool_failure("collect", _Raises(), worker_id="w",
+                                       subagent_id="s", gather=_Raises().salvage)
+    add(_oc("a tool that fails with nothing to salvage is failed, not partial",
+            no_evidence.status is WorkerStatus.FAILED))
+    add(_oc("a tool whose evidence is empty is not reported as completed",
+            survive_tool_failure("collect", lambda: None, worker_id="w",
+                                 subagent_id="s").status is WorkerStatus.PARTIAL))
+    def _cancelled_tool() -> Any:
+        """A tool that finds the mission cancelled: raises where it is called."""
+
+        raise CancellationRequested("operator pressed Ctrl-C")
+
+    cancelled = _refused(lambda: survive_tool_failure(
+        "collect", _cancelled_tool, worker_id="w", subagent_id="s"))
+    add(_oc("cancellation is re-raised, because it is an operator's decision",
+            cancelled[0] == "CancellationRequested", cancelled[1][:60]))
+    add(_oc("a tool failure never leaves a Worker without a status",
+            all(result["status"] in {status.value for status in WorkerStatus}
+                for result in tool["tools"])))
+    folded = report_from_tool_results("w", "s", [])
+    add(_oc("no tool call at all is blocked rather than failed",
+            folded.status is WorkerStatus.BLOCKED))
+
+    # ---- 7. the runner seam ----------------------------------------------
+    seam = _outcome_runner_demo()
+    add(_oc("a runner that raises does not escape the wrapper", seam["raised"] is False))
+    add(_oc("the wrapper's outcome is failed", seam["outcome_status"] == "failed"))
+    add(_oc("the wrapper's report names the failure",
+            "segfaulted" in (seam["report"]["error"] or {}).get("message", "")))
+    add(_oc("the wrapper keeps the report it produced",
+            len(seam["ledger"]["reports"]) == 1))
+    add(_oc("the wrapper's ledger records the failed unit",
+            seam["ledger"]["by_status"]["failed"] == ["w-explode"]))
+
+    # ---- 8. the flow seam: statuses map both ways ------------------------
+    reports = worker_demo_reports()
+    mapped = {name: outcome_from_report(report)
+              for name, report in reports.items()}
+    add(_oc("completed maps to the graph's succeeded",
+            mapped["completed"].status is EntityStatus.SUCCEEDED))
+    add(_oc("partial maps to blocked, not to succeeded",
+            mapped["partial"].status is EntityStatus.BLOCKED,
+            "a partial unit has not succeeded, and the graph must not say it did"))
+    add(_oc("blocked stays blocked and names a dependency gate",
+            mapped["blocked"].status is EntityStatus.BLOCKED
+            and mapped["blocked"].gate is FlowGate.DEPENDENCY_FAILED))
+    add(_oc("failed maps to failed with the error gate",
+            mapped["failed"].status is EntityStatus.FAILED
+            and mapped["failed"].gate is FlowGate.ERROR))
+    add(_oc("the outcome carries the same evidence ids as the report",
+            mapped["completed"].evidence_ids == reports["completed"].evidence_ids))
+    add(_oc("the outcome carries the report itself in its payload",
+            "report" in mapped["completed"].payload))
+    add(_oc("the graph's own record round-trips back to the contract",
+            report_from_outcome(mapped["partial"]).status is WorkerStatus.PARTIAL))
+    add(_oc("a round trip keeps the citations a reader needs",
+            report_from_outcome(mapped["completed"]).citations
+            == reports["completed"].citations))
+    legacy = WorkerOutcome(
+        worker_id="w", subagent_id="s", status=EntityStatus.SUCCEEDED,
+        summary="collected two rows", payload={"evidence": [
+            json.loads(model_to_json(evidence))]})
+    recovered = report_from_outcome(legacy)
+    add(_oc("an outcome without a report is not recorded as completed",
+            recovered.status is WorkerStatus.PARTIAL, recovered.status.value))
+    add(_oc("the recovered report says why it is partial",
+            any("no WorkerReport" in line for line in recovered.limitations)))
+    add(_oc("the recovered report keeps the evidence it was given",
+            len(recovered.evidence) == 1))
+    merged = merge_reports("w", "s", [
+        failed_report("w", "s", "the source timed out", attempt=1),
+        report_from_evidence("w", "s", status=WorkerStatus.COMPLETED,
+                             evidence=[evidence], summary="read the page on the retry",
+                             attempt=2)])
+    add(_oc("a retried unit reports its final status",
+            merged.status is WorkerStatus.COMPLETED and merged.attempt == 2))
+    add(_oc("a retried unit keeps the evidence from both attempts",
+            len(merged.evidence) >= 1))
+    add(_oc("a retry after a failure keeps the findings of the last attempt",
+            len(merged.findings) == 1))
+    add(_oc("merging no attempts is blocked, not completed",
+            merge_reports("w", "s", []).status is WorkerStatus.BLOCKED))
+
+    # ---- 8b. the flow seam: a partial Worker reaches the aggregate ---------
+    # A Subagent with one failing Worker out of two: the mission must continue,
+    # the aggregate must carry the surviving evidence, and the gap must be the
+    # *unit's own* — once.
+    context = _selftest_context("exposure")
+    units = flow_units_for(context, "exposure")
+    target = next(unit for unit in units if len(unit.workers) >= 2)
+    partial_flow = HierarchicalFlow(
+        context=context, subagents=units,
+        runner=_CountingRunner(scope=context.scope_entries,
+                               failing=[target.workers[0].id]))
+    partial_result = partial_flow.run()
+    partial_report = next(report for report in partial_result.reports
+                          if report.subagent_id == target.id)
+    add(_oc("a failed Worker does not abort the mission",
+            partial_result.synthesis is not None and not partial_result.stopped))
+    add(_oc("the surviving Worker's evidence reaches the aggregate",
+            len(partial_report.evidence) >= 1, len(partial_report.evidence)))
+    add(_oc("the failed Worker is one gap, not two",
+            len(partial_report.gaps) == 1,
+            [gap.describe()[:60] for gap in partial_report.gaps]))
+    add(_oc("the gap names the unit that failed",
+            target.workers[0].name in str(partial_report.gaps[0].detail),
+            partial_report.gaps[0].describe()[:80]))
+    carried = [outcome.payload.get("report") for outcome in partial_report.outcomes]
+    add(_oc("every outcome the aggregate saw carried a WorkerReport",
+            all(isinstance(payload, Mapping) for payload in carried)))
+    add(_oc("the carried reports re-validate",
+            all(WorkerReport.from_dict(payload).status in set(WorkerStatus)
+                for payload in carried)))
+    add(_oc("a partial Worker's report does not claim completion",
+            all(WorkerReport.from_dict(payload).status is not WorkerStatus.COMPLETED
+                for payload in carried)))
+    silent = _with_worker_contract(WorkerOutcome(
+        worker_id="w", subagent_id="s", status=EntityStatus.SUCCEEDED,
+        summary="collected two rows",
+        payload={"evidence": [json.loads(model_to_json(evidence))]}))
+    add(_oc("a succeeding outcome without a report keeps its own status",
+            silent.status is EntityStatus.SUCCEEDED,
+            "the graph's record is what the reviewer judged"))
+    add(_oc("a succeeding outcome without a report is restated as partial",
+            _report_of(silent).status is WorkerStatus.PARTIAL,
+            "the contract's record cannot claim completion it cannot describe"))
+    add(_oc("a succeeding outcome with no evidence at all is blocked",
+            _report_of(_with_worker_contract(WorkerOutcome(
+                worker_id="w", subagent_id="s", status=EntityStatus.SUCCEEDED,
+                summary="nothing came back"))).status is WorkerStatus.BLOCKED,
+            "there is nothing to make a finding from, so nothing is claimed"))
+    add(_oc("a wrapped outcome gains a report when the unit did not succeed",
+            isinstance(_with_worker_contract(WorkerOutcome(
+                worker_id="w", subagent_id="s", status=EntityStatus.FAILED,
+                error="the source timed out")).payload.get("report"), Mapping)))
+    add(_oc("a malformed carried report is dropped, not raised",
+            _report_of(WorkerOutcome(worker_id="w", subagent_id="s",
+                                     payload={"report": {"nonsense": 1}})) is None))
+
+    # ---- 9. the ledger: a partial mission is legible ---------------------
+    ledger = outcome_ledger(list(reports.values()))
+    add(_oc("the ledger counts one report per status",
+            {status: len(ids) for status, ids in ledger.by_status.items() if ids}
+            == {"completed": 1, "partial": 1, "blocked": 1, "failed": 1},
+            ledger.by_status))
+    add(_oc("two of the four workers are usable", len(ledger.usable) == 2))
+    add(_oc("a mission with a blocked worker is not complete",
+            ledger.complete is False))
+    add(_oc("every usable item still has provenance", ledger.provenance_intact is True))
+    add(_oc("the ledger reports the gaps the units declared",
+            len(ledger.gaps()) == 2, [gap.describe()[:60] for gap in ledger.gaps()]))
+    add(_oc("a blocked unit's gap is its own, and is not counted twice",
+            [gap.determined_by for gap in ledger.gaps()].count("w-archive") == 1
+            and any("w-archive" in gap.describe() or gap.determined_by == "w-archive"
+                    for gap in ledger.gaps()),
+            [gap.describe()[:70] for gap in ledger.gaps()]))
+    add(_oc("the failed unit's gap is reported beside it",
+            any("offset 4096" in gap.describe() for gap in ledger.gaps())))
+    add(_oc("the ledger aggregates follow-up across units",
+            len(ledger.follow_up) == len([item for report in reports.values()
+                                          for item in report.follow_up])
+            and len(ledger.follow_up) == 4))
+    add(_oc("the ledger's summary names the statuses it found",
+            all(word in ledger.summary() for word in ("completed", "partial",
+                                                      "blocked", "failed")),
+            ledger.summary()))
+    add(_oc("a ledger is complete only when every unit completed",
+            outcome_ledger([reports["completed"]]).complete is True))
+    unsourced = WorkerReport.model_construct(
+        worker_id="w-x", subagent_id="s", status=WorkerStatus.PARTIAL,
+        findings=[], evidence=[EvidenceItem.model_construct(
+            id="ev-x", kind=EvidenceKind.OBSERVATION, statement="a row",
+            sources=[])], limitations=["one row"], follow_up=[], gaps=[])
+    add(_oc("a record that lost its sources is refused by the ledger",
+            _refused(lambda: outcome_ledger([unsourced]))[0] == "ValidationError",
+            "the ledger re-validates the records it is given, including records it "
+            "did not build"))
+    add(_oc("a ledger forced to hold an unsourced record reports provenance as broken",
+            OutcomeLedger.model_construct(reports=[unsourced]).provenance_intact is False,
+            "the property judges the records it is handed, even unvalidated ones"))
+    add(_oc("the ledger serialises its statuses", 
+            set(ledger.to_dict()["by_status"]) == {status.value for status in WorkerStatus}))
+
+    # ---- 10. the demo ----------------------------------------------------
+    demo = worker_outcome_demo()
+    add(_oc("the demo covers all four statuses",
+            sorted(demo["reports"]) == ["blocked", "completed", "failed", "partial"]))
+    add(_oc("every demo report re-validates from its own serialisation",
+            all(WorkerReport.from_dict(payload).status.value == name
+                for name, payload in demo["reports"].items())))
+    add(_oc("no demo refusal was accepted",
+            all(value != "accepted" for value in demo["refusals"].values()),
+            demo["refusals"]))
+    add(_oc("the demo demonstrates six refusals", len(demo["refusals"]) == 6))
+    add(_oc("the refusals cover a conclusion, a hand-off and a provenance failure",
+            any("conclusion" in value.lower() for value in demo["refusals"].values())
+            and any("another team" in value for value in demo["refusals"].values())
+            and any("no source reference" in value for value in demo["refusals"].values())))
+    add(_oc("the demo's mission continued despite a failed unit",
+            demo["mission"]["continued"] is True
+            and demo["mission"]["complete"] is False))
+    add(_oc("the demo's mission kept usable provenance",
+            demo["mission"]["provenance_intact"] is True))
+    add(_oc("every demo follow-up has a reason",
+            all(item["reason"] for payload in demo["reports"].values()
+                for item in payload["follow_up"])))
+
+    # ---- 11. determinism and immutability of the record -------------------
+    # One evidence item, rebuilt once: two separate constructions would differ in
+    # their observed_at and therefore in their ids, which is the ids working, not
+    # a non-determinism.  Determinism here is of the *serialisation*, given the same
+    # record.
+    built = report_from_evidence("w", "s", status=WorkerStatus.COMPLETED,
+                                 evidence=[_w_evidence("the log records a CONNECT")],
+                                 summary="read one page")
+    twice = [json.dumps(built.to_dict(), default=str) for _ in range(2)]
+    add(_oc("two identical builds serialise identically", twice[0] == twice[1]))
+    add(_oc("the report serialises to plain JSON",
+            isinstance(json.dumps(reports["partial"].to_dict()), str)))
+    add(_oc("a report reloaded from its dict keeps its citations",
+            WorkerReport.from_dict(reports["completed"].to_dict()).citations
+            == reports["completed"].citations))
+    add(_oc("derived display keys are not accepted as fields",
+            _refused(lambda: WorkerReport.model_validate(
+                reports["completed"].to_dict()))[0] == "ValidationError"))
+    add(_oc("a report may not carry an unknown field",
+            _refused(lambda: WorkerReport(
+                worker_id="w", subagent_id="s", status="blocked",
+                limitations=["no key"], extra_notes="x"))[0] == "ValidationError"))
+    add(_oc("the status of every serialised report is one of the four",
+            all(payload["status"] in {status.value for status in WorkerStatus}
+                for payload in demo["reports"].values())))
+
+    # ---- 12. the section's own discipline ---------------------------------
+    section = _source_section("# 33. Worker outcomes", "# 34. Entry point")
+    add(_oc("the Worker-outcome section is present and bounded", bool(section),
+            len(section)))
+    add(_oc("the section grants no capability",
+            bool(section) and "CapabilityGrant(" not in section))
+    add(_oc("the section calls no model provider",
+            bool(section) and "call_model(" not in section and ".complete(" not in section))
+    add(_oc("the section dispatches no tool of its own",
+            bool(section) and "CapabilityRouter(" not in section and ".route(" not in section))
+    add(_oc("the section never imports network code of its own",
+            bool(section) and "requests." not in section and "httpx." not in section))
+    add(_oc("the contract names every status in one place",
+            all(status.value in section for status in WorkerStatus)))
+    return checks
+
+
+def _coerce_refuses(call: Callable[[], Any]) -> tuple[str, str]:
+    """As :func:`_refused`, for a Pydantic construction that may raise either type."""
+
+    try:
+        call()
+    except Exception as exc:                  # noqa: BLE001 - the type is the assertion
+        return type(exc).__name__, str(exc)
+    return "", "accepted"
+
+
+# --------------------------------------------------------------------------
+# 33.11 Rendering
+# --------------------------------------------------------------------------
+
+_STATUS_STYLE: dict[str, str] = {"completed": "green", "partial": "yellow",
+                                 "blocked": "cyan", "failed": "red"}
+
+
+def render_outcome_self_test(checks: Sequence[OutcomeCheck]) -> Table:
+    table = Table(title="worker-outcome self-test", title_justify="left", box=None,
+                  pad_edge=False)
+    table.add_column("", width=2)
+    table.add_column("check", no_wrap=True)
+    table.add_column("detail", overflow="fold")
+    for check in checks:
+        glyph, colour = ("✔", "green") if check.ok else ("✘", "red")
+        table.add_row(f"[{colour}]{glyph}[/{colour}]", escape(check.name),
+                      escape(check.detail))
+    return table
+
+
+def render_worker_reports(payload: Mapping[str, Any]) -> Table:
+    """One row per Worker: what it returned, and whether it is usable."""
+
+    table = Table(title="worker outcomes — one contract, four statuses",
+                  title_justify="left", box=None, pad_edge=False)
+    table.add_column("worker", no_wrap=True)
+    table.add_column("status", no_wrap=True)
+    table.add_column("findings", justify="right")
+    table.add_column("evidence", justify="right")
+    table.add_column("sources", justify="right")
+    table.add_column("limits", justify="right")
+    table.add_column("next", justify="right")
+    table.add_column("what it said", overflow="fold", max_width=44)
+    for name, report in payload["reports"].items():
+        status = str(report["status"])
+        colour = _STATUS_STYLE.get(status, "white")
+        table.add_row(
+            escape(str(report["worker_id"])),
+            f"[{colour}]{escape(status)}[/{colour}]",
+            str(len(report["findings"])), str(len(report["evidence"])),
+            str(len(report["sources"])), str(len(report["limitations"])),
+            str(len(report["follow_up"])),
+            escape(str(report["summary"])[:90] or "—"),
+        )
+    return table
+
+
+def render_outcome_demo(payload: Mapping[str, Any]) -> Group:
+    """The demo on screen: the reports, the refusals, the two failures, the ledger."""
+
+    ledger = payload["ledger"]
+    refusals = Table(title="refused — what a Worker may not return",
+                     title_justify="left", box=None, pad_edge=False)
+    refusals.add_column("attempt", no_wrap=True)
+    refusals.add_column("refused because", overflow="fold", max_width=96)
+    for name, detail in payload["refusals"].items():
+        refusals.add_row(escape(name), escape(_first_sentence(detail)[:180]))
+
+    tool_rows = Table(title="a failed tool is a result, not a crash",
+                      title_justify="left", box=None, pad_edge=False)
+    tool_rows.add_column("tool", no_wrap=True)
+    tool_rows.add_column("status", no_wrap=True)
+    tool_rows.add_column("evidence kept", justify="right")
+    tool_rows.add_column("error", overflow="fold", max_width=60)
+    for item in payload["tool_failure"]["tools"]:
+        colour = _STATUS_STYLE.get(str(item["status"]), "white")
+        tool_rows.add_row(escape(str(item["tool"])),
+                          f"[{colour}]{escape(str(item['status']))}[/{colour}]",
+                          str(item["evidence"]), escape(str(item["error"] or "—")))
+
+    failures = Text(
+        "runner that raised → outcome "
+        f"{payload['runner_failure']['outcome_status']}"
+        f" · report {payload['runner_failure']['report']['status']}"
+        f" · no exception escaped\n"
+        f"mixed tool calls → report {payload['tool_failure']['report']['status']}"
+        f" with {len(payload['tool_failure']['report']['evidence'])} evidence item(s), "
+        f"{len(payload['tool_failure']['report']['citations'])} citation(s)", style="dim")
+
+    tail = Text(
+        f"\n{ledger['summary']}\n"
+        "mission continued: " + ("yes" if payload["mission"]["continued"] else "no")
+        + f" · complete: {'yes' if ledger['complete'] else 'no'}"
+        f" · provenance: {'intact' if ledger['provenance_intact'] else 'incomplete'}\n"
+        + "\n".join(f"  · gap {line[:140]}" for line in ledger["gaps"][:6])
+        + "\n" + "\n".join(f"  · next {line[:140]}" for line in ledger["follow_up"][:4])
+        + "\nno Worker concluded for the mission, and none contacted another team",
+        style="dim")
+    return Group(render_worker_reports(payload), refusals, tool_rows, failures, tail)
+
+
+def _refusal_reasons(text: str) -> list[str]:
+    """The validator messages inside an error, one per line, without scaffolding.
+
+    A refusal is a list of rules that were broken, and a reader checking a report
+    from another process is the reason this output exists: the framework's
+    "for further information visit" lines are noise to that reader.
+    """
+
+    reasons: list[str] = []
+    for line in str(text).splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.lower().startswith(_PYDANTIC_NOISE):
+            continue
+        if "validation error for" in stripped.lower() or stripped.startswith("[type="):
+            continue
+        stripped = stripped.split("[type=")[0].split("(type=")[0].strip()
+        if not stripped or stripped.startswith(("Type ", "input_value")):
+            continue
+        reasons.append(stripped.split("Value error,", 1)[-1].strip())
+    return reasons or [str(text).strip()[:200]]
+
+
+#: Lines Pydantic adds around a validator's message.  Dropped from a table cell,
+#: because they say where the error was raised, not what was wrong.
+_PYDANTIC_NOISE: tuple[str, ...] = ("for further information visit",
+                                    "input_value=", "input_type=")
+
+
+def _first_sentence(text: str) -> str:
+    """The reason inside an error, without the framework's scaffolding."""
+
+    body: list[str] = []
+    for line in str(text).splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.lower().startswith(_PYDANTIC_NOISE):
+            continue
+        if "validation error for" in stripped.lower():
+            continue
+        # Pydantic appends the error's type and the offending value on the same
+        # line: cut both before deciding whether the line carries the message.
+        stripped = stripped.split("[type=")[0].split("(type=")[0].strip()
+        if not stripped or stripped.startswith(("Type ", "input_value")):
+            continue
+        if stripped.startswith("Value error,"):
+            # Pydantic prefixes the validator's own message; keep the message.
+            stripped = stripped.split("Value error,", 1)[1].strip()
+        body.append(stripped)
+        if len(" ".join(body)) > 160:
+            break
+    joined = " ".join(body) or str(text)
+    return joined.split("[type=")[0].strip().rstrip(",;")
+
+
+@app.command("outcomes", help="Worker outcomes: four statuses, findings, provenance, no verdicts.")
+def outcomes_command(
+    self_test: bool = typer.Option(False, "--self-test",
+                                   help="Prove the Worker contract offline."),
+    demo: bool = typer.Option(False, "--demo",
+                              help="Four statuses, six refusals, two failures."),
+    check: str | None = typer.Option(
+        None, "--check", help="Validate a report file (or '-' for stdin).",
+        show_default=False),
+    worker: str = typer.Option("worker", "--worker", help="Worker id for --check."),
+    subagent: str = typer.Option("subagent", "--subagent",
+                                 help="Subagent id for --check."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Enforce the Worker contract, or show it being enforced.
+
+    ``--check`` is the seam for a runner in another process: it reads a JSON report,
+    validates it as a Worker would be validated, and exits non-zero with the reason
+    when the record is not acceptable.
+    """
+
+    console = get_console()
+
+    if self_test:
+        checks = run_outcome_self_test()
+        failures = [check for check in checks if not check.ok]
+        if as_json:
+            _emit(json.dumps({"ok": not failures,
+                              "checks": [asdict(check) for check in checks]}, indent=2))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        console.print()
+        console.print(render_outcome_self_test(checks))
+        colour = "green" if not failures else "red"
+        console.print(f"\n[{colour}]{len(checks) - len(failures)} passed[/] · "
+                      f"{len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    if demo:
+        payload = worker_outcome_demo()
+        if as_json:
+            _emit(json.dumps(payload, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(render_outcome_demo(payload))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    if check:
+        if check != "-" and not Path(check).expanduser().exists():
+            console.print(f"[red]✘[/red] no such file: {escape(check[:160])}")
+            raise typer.Exit(ExitCode.USAGE)
+        try:
+            raw = (sys.stdin.read() if check == "-"
+                   else Path(check).expanduser().read_text(encoding="utf-8"))
+        except OSError as exc:
+            console.print(f"[red]✘[/red] could not read {escape(check[:120])}: "
+                          f"{escape(str(exc)[:120])}")
+            raise typer.Exit(ExitCode.USAGE) from exc
+        try:
+            loaded = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            console.print(f"[red]✘[/red] not JSON: {escape(str(exc))}")
+            raise typer.Exit(ExitCode.USAGE) from exc
+        if not isinstance(loaded, Mapping):
+            console.print("[red]✘[/red] a Worker report must be a JSON object")
+            raise typer.Exit(ExitCode.USAGE)
+        try:
+            report = accept_worker_report(loaded, worker_id=worker,
+                                          subagent_id=subagent)
+        except (ConclusionLeak, PeerContactError, ValueError) as exc:
+            # The refusal is the result: say which rule, and refuse the record.
+            kind = refusal_kind(str(exc))
+            if as_json:
+                _emit(json.dumps({"ok": False, "refusal": kind,
+                                  "reason": _first_sentence(str(exc))[:600]}, indent=2))
+            else:
+                console.print(f"\n[red]✘ refused[/red] ({escape(kind)})")
+                for line in _refusal_reasons(str(exc)):
+                    console.print(f"  [dim]·[/dim] {escape(line[:200])}")
+                console.print()
+            raise typer.Exit(ExitCode.POLICY) from exc
+        if as_json:
+            _emit(json.dumps({"ok": True, "report": report.to_dict()}, indent=2,
+                             default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(render_worker_reports({"reports": {"checked": report.to_dict()}}))
+        console.print(Text(f"\n{report.describe()}\n"
+                           + "\n".join(f"  · source {line}" for line in report.citations)
+                           + "\naccepted: no conclusion, no peer contact, provenance intact",
+                           style="dim"))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    console.print("[red]✘[/red] choose --demo, --self-test or --check FILE")
+    raise typer.Exit(ExitCode.USAGE)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 34. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 
