@@ -53528,8 +53528,12 @@ def _executive_summary(report: MasterReport) -> str:
          f"{strongest.statement[:200]}" if strongest else
          "None of them is corroborated by a second independent origin, so every finding "
          "below carries the band it earned."),
-        (f"{len(report.open_hypotheses)} explanation(s) remain possible"
-         + (f"; {len(report.conflicts)} contradiction(s) are stated rather than settled"
+        # A count of what is still open, never a count of what has been excluded: "no
+        # explanation remains" is the one sentence this document may not write, because
+        # excluding an alternative requires evidence, not the absence of a hypothesis.
+        (f"{len(report.open_hypotheses)} explanation(s) remain open; this document does not "
+         f"claim that it has excluded the others"
+         + (f", and {len(report.conflicts)} contradiction(s) are stated rather than settled"
             if report.conflicts else "")
          + f". Confidence: {report.confidence.value}."),
     ]
@@ -54513,6 +54517,11 @@ def synthesis_demo() -> dict[str, Any]:
             for finding in report.findings),
         "ten sections, all filled": len(corroborated.sections) == len(REQUIRED_SECTIONS)
             and all(section.filled for section in corroborated.sections),
+        # The summary may count what is still open; it may never claim to have excluded
+        # the alternatives, because exclusion needs evidence and this line has none.
+        "the summary counts what is open, not what it has excluded":
+            "remain open" in corroborated.section_of("executive-summary").body
+            and "remain possible" not in corroborated.section_of("executive-summary").body,
     }
     return {
         "objective": context.objective,
