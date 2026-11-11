@@ -2,13 +2,13 @@
   "schema_version": 1,
   "mission_id": "flow-a995e56deaae",
   "objective": "map the publicly documented exposure of example.com and rank the advisory-backed risks",
-  "generated_at": "2026-11-11T11:20:21.490570Z",
+  "generated_at": "2026-11-11T11:48:21.328650Z",
   "format_version": "argus-dossier/1",
   "report": {
     "mission_id": "flow-a995e56deaae",
     "objective": "map the publicly documented exposure of example.com and rank the advisory-backed risks",
     "question": "the published advisories name the affected component",
-    "generated_at": "2026-11-11T11:20:19.584744Z",
+    "generated_at": "2026-11-11T11:48:19.383348Z",
     "sections": [
       {
         "kind": "executive-summary",
@@ -324,7 +324,7 @@
         "gate": "none",
         "attempts": 1,
         "evidence": 3,
-        "seconds": 0.115,
+        "seconds": 0.116,
         "origin": "planned",
         "note": "ready"
       },
@@ -337,7 +337,7 @@
         "gate": "none",
         "attempts": 1,
         "evidence": 1,
-        "seconds": 0.05,
+        "seconds": 0.051,
         "origin": "planned",
         "note": ""
       },
@@ -350,7 +350,7 @@
         "gate": "none",
         "attempts": 1,
         "evidence": 1,
-        "seconds": 0.05,
+        "seconds": 0.052,
         "origin": "planned",
         "note": ""
       },
@@ -374,16 +374,16 @@
     "adopted": [],
     "withheld": [],
     "time": {
-      "total_seconds": 0.31,
-      "critical_path_seconds": 0.307,
-      "ledger_origin_seconds": 0.344,
+      "total_seconds": 0.312,
+      "critical_path_seconds": 0.309,
+      "ledger_origin_seconds": 0.34,
       "per_unit_seconds": {
         "wrk-03581617fd6c": 0.05,
         "wrk-60aa16261035": 0.05,
         "wrk-7fa8d41b476a": 0.05,
         "wrk-ac9fe515391b": 0.05,
-        "wrk-d9962bee6734": 0.05,
-        "wrk-e9cfb6efebac": 0.05
+        "wrk-d9962bee6734": 0.052,
+        "wrk-e9cfb6efebac": 0.051
       },
       "stages": [
         [
@@ -392,7 +392,7 @@
         ],
         [
           "subagent planning",
-          0.003
+          0.004
         ],
         [
           "worker execution",
@@ -400,15 +400,15 @@
         ],
         [
           "worker review",
-          0.003
+          0.002
         ],
         [
           "reconciliation",
-          0.18
+          0.181
         ],
         [
           "master review",
-          0.003
+          0.002
         ],
         [
           "follow-up planning",
@@ -423,7 +423,7 @@
       "workers": 0,
       "attempts": 6,
       "max_concurrency": 0,
-      "parallelism_note": "stage windows are differences between the first appearance of each stage in the ledger, not instrumented unit durations, so overlapping stages share their window rather than summing to the total. The ledger's zero is when the flow was built, 0.344s before its first event; the run's own clock starts when it is invoked, which is why the two totals differ."
+      "parallelism_note": "stage windows are differences between the first appearance of each stage in the ledger, not instrumented unit durations, so overlapping stages share their window rather than summing to the total. The ledger's zero is when the flow was built, 0.340s before its first event; the run's own clock starts when it is invoked, which is why the two totals differ."
     },
     "stopping": {
       "stopped": false,
@@ -440,12 +440,12 @@
   },
   "sources": [
     {
-      "id": "src-60fcfec4bda8",
+      "id": "src-1a9c8afe9779",
       "kind": "local-artifact",
       "locator": "example.com",
       "title": "advisory-reader \u2014 published-advisories",
       "publisher": "",
-      "retrieved_at": "2026-11-11T11:20:19.335292Z",
+      "retrieved_at": "2026-11-11T11:48:19.132719Z",
       "method": "local-read",
       "http_status": null,
       "digest": "",
@@ -473,7 +473,7 @@
       "contradicts": [],
       "collected_by": "wrk-60aa16261035",
       "task_id": "",
-      "observed_at": "2026-11-11T11:20:19.395036Z",
+      "observed_at": "2026-11-11T11:48:19.192718Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -493,7 +493,7 @@
       "contradicts": [],
       "collected_by": "wrk-ac9fe515391b",
       "task_id": "",
-      "observed_at": "2026-11-11T11:20:19.514311Z",
+      "observed_at": "2026-11-11T11:48:19.312726Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -513,7 +513,7 @@
       "contradicts": [],
       "collected_by": "wrk-d9962bee6734",
       "task_id": "",
-      "observed_at": "2026-11-11T11:20:19.456754Z",
+      "observed_at": "2026-11-11T11:48:19.256661Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -533,7 +533,7 @@
       "contradicts": [],
       "collected_by": "wrk-03581617fd6c",
       "task_id": "",
-      "observed_at": "2026-11-11T11:20:19.574956Z",
+      "observed_at": "2026-11-11T11:48:19.373785Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -553,7 +553,7 @@
       "contradicts": [],
       "collected_by": "wrk-e9cfb6efebac",
       "task_id": "",
-      "observed_at": "2026-11-11T11:20:19.455365Z",
+      "observed_at": "2026-11-11T11:48:19.254052Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -573,7 +573,7 @@
       "contradicts": [],
       "collected_by": "wrk-7fa8d41b476a",
       "task_id": "",
-      "observed_at": "2026-11-11T11:20:19.335292Z",
+      "observed_at": "2026-11-11T11:48:19.132719Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -591,7 +591,7 @@
       "digest": "",
       "digest_complete": false,
       "collected_by": "wrk-7fa8d41b476a",
-      "collected_at": "2026-11-11T11:20:19.335440Z",
+      "collected_at": "2026-11-11T11:48:19.132876Z",
       "method": "local-read",
       "original_location": "example.com",
       "storage_location": "",
@@ -611,18 +611,19 @@
     "environment": {
       "app": "argus",
       "app_title": "ARGUS",
-      "version": "0.32.0",
-      "version_label": "0.32.0-alpha",
+      "version": "0.33.0",
+      "version_label": "0.33.0-alpha",
       "build_phase": 3,
       "format_version": "argus-audit/1",
       "python": "3.11.2",
       "implementation": "CPython",
       "platform": "Linux-6.1.158+-x86_64-with-glibc2.36",
       "machine": "x86_64",
-      "user_agent": "ARGUS/0.32.0 (+authorised-security-research)",
-      "command": "report --mission /tmp/argus-t32-cli-3ukrnn50/flow-exposure.json",
+      "user_agent": "ARGUS/0.33.0 (+authorised-security-research)",
+      "command": "report --mission /tmp/argus-t32-cli-tiq12yqc/flow-exposure.json",
       "operator": "",
       "dry_run": true,
+      "mode": "live",
       "invoked_from": "vedant_osint.py",
       "ci": false
     },
@@ -761,7 +762,7 @@
       },
       {
         "key": "network.user_agent",
-        "value": "ARGUS/0.32.0 (+authorised-security-research)",
+        "value": "ARGUS/0.33.0 (+authorised-security-research)",
         "source": "default",
         "redacted": false
       },
@@ -840,10 +841,10 @@
       "supplied_from": "flow"
     },
     "stamps": {
-      "started_at": "2026-11-11T11:20:19+00:00",
-      "ended_at": "2026-11-11T11:20:19+00:00",
-      "recorded_at": "2026-11-11T11:20:21+00:00",
-      "duration_seconds": 0.31,
+      "started_at": "2026-11-11T11:48:19+00:00",
+      "ended_at": "2026-11-11T11:48:19+00:00",
+      "recorded_at": "2026-11-11T11:48:21+00:00",
+      "duration_seconds": 0.312,
       "stages": [
         [
           "planning",
@@ -851,7 +852,7 @@
         ],
         [
           "subagent planning",
-          0.003
+          0.004
         ],
         [
           "worker execution",
@@ -859,15 +860,15 @@
         ],
         [
           "worker review",
-          0.003
+          0.002
         ],
         [
           "reconciliation",
-          0.18
+          0.181
         ],
         [
           "master review",
-          0.003
+          0.002
         ],
         [
           "follow-up planning",
@@ -959,7 +960,7 @@
           "gate": "none",
           "attempts": 1,
           "evidence": 3,
-          "seconds": 0.115,
+          "seconds": 0.116,
           "origin": "planned",
           "spawned_by": "",
           "depends_on": [],
@@ -976,7 +977,7 @@
           "gate": "none",
           "attempts": 1,
           "evidence": 1,
-          "seconds": 0.05,
+          "seconds": 0.051,
           "origin": "planned",
           "spawned_by": "",
           "depends_on": [],
@@ -993,7 +994,7 @@
           "gate": "none",
           "attempts": 1,
           "evidence": 1,
-          "seconds": 0.05,
+          "seconds": 0.052,
           "origin": "planned",
           "spawned_by": "",
           "depends_on": [],
@@ -1062,7 +1063,7 @@
     "secrets": {
       "scanned": true,
       "clean": true,
-      "bytes_scanned": 57926,
+      "bytes_scanned": 58157,
       "findings": [],
       "rules": [
         {
@@ -1102,7 +1103,7 @@
           "removed": false
         }
       ],
-      "scanned_at": "2026-11-11T11:20:21+00:00",
+      "scanned_at": "2026-11-11T11:48:21+00:00",
       "patterns": [
         "connection-string-password",
         "json-credential-field",
@@ -1117,7 +1118,7 @@
         "known-credential-value",
         "credential-store-shape"
       ],
-      "scanned_text": "clean: 57,926 byte(s) scanned for 12 credential pattern(s)"
+      "scanned_text": "clean: 58,157 byte(s) scanned for 12 credential pattern(s)"
     },
     "reproduction": [
       {

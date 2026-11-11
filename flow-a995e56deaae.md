@@ -1,9 +1,10 @@
 # Mission report — map the publicly documented exposure of example.com and rank the advisory-backed risks
 
 - mission: `flow-a995e56deaae`
-- generated: 2026-11-11T11:20:21+00:00
+- generated: 2026-11-11T11:48:21+00:00
 - format: `argus-dossier/1` (schema version 1)
-- produced by: argus 0.32.0 on Python 3.11.2 (CPython, x86\_64); schema argus-audit/1
+- produced by: argus 0.33.0 on Python 3.11.2 (CPython, x86\_64); schema argus-audit/1
+- run mode: **live**
 - confidence: **low** — the weakest of 5 finding(s) sets the level: single-source (1 origin(s)), because the answer cannot be stronger than the claim it depends on
 - evidence: 5 citation(s) from 5 independent origin(s); 6 item(s) in the table
 - status: finished — the mission finished: the run completed and recorded no stopping bound, so this dossier reports the absence rather than inventing one. No stopping decision was part of this file, so the reason above is the whole of what the record says.
@@ -26,6 +27,8 @@ Mission confidence: low.
 Basis: the weakest of 5 finding(s) sets the level: single-source (1 origin(s)), because the answer cannot be stronger than the claim it depends on
 Bands: single-source 5, corroborated 0, well-corroborated 0
 Band rules: one independent origin is single-source; two are corroborated; three or more are well-corroborated. An allegation is capped at corroborated — a third party repeating a claim does not establish it — and an inference is capped at corroborated, because reasoning over good evidence is still reasoning.
+
+**Stated basis:** the weakest of 5 finding(s) sets the level: single-source (1 origin(s)), because the answer cannot be stronger than the claim it depends on
 
 ## Key findings
 
@@ -86,16 +89,16 @@ Total wall-clock: 0.31s. First ledger event to last: 0.31s (the ledger opened 0.
 
 | stage | window |
 | --- | --- |
-| reconciliation | 0.180s |
+| reconciliation | 0.181s |
 | follow-up planning | 0.065s |
 | worker execution | 0.052s |
-| subagent planning | 0.003s |
-| worker review | 0.003s |
-| master review | 0.003s |
+| subagent planning | 0.004s |
 | planning | 0.002s |
+| worker review | 0.002s |
+| master review | 0.002s |
 | synthesis | 0.000s |
 
-stage windows are differences between the first appearance of each stage in the ledger, not instrumented unit durations, so overlapping stages share their window rather than summing to the total. The ledger's zero is when the flow was built, 0.344s before its first event; the run's own clock starts when it is invoked, which is why the two totals differ.
+stage windows are differences between the first appearance of each stage in the ledger, not instrumented unit durations, so overlapping stages share their window rather than summing to the total. The ledger's zero is when the flow was built, 0.340s before its first event; the run's own clock starts when it is invoked, which is why the two totals differ.
 
 ## Errors
 
@@ -119,7 +122,7 @@ the mission finished: the run completed and recorded no stopping bound, so this 
 
 | id | title | locator | kind | method | retrieved | digest | items | cited |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `src-60fcfec4bda8` | advisory-reader — published-advisories | example.com | local-artifact | local-read | 2026-11-11T11:20:19+00:00 | not hashed | 5 | 5 |
+| `src-1a9c8afe9779` | advisory-reader — published-advisories | example.com | local-artifact | local-read | 2026-11-11T11:48:19+00:00 | not hashed | 5 | 5 |
 
 ## Evidence table
 
@@ -140,28 +143,29 @@ the mission finished: the run completed and recorded no stopping bound, so this 
 
 | evidence | artefact | digest | coverage | handled by | when | method | preserved | status |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `ev-c759a5e97a06` | example.com | **not hashed** | — | wrk-7fa8d41b476a | 2026-11-11T11:20:19+00:00 | local-read | **no** | not-assessed |
+| `ev-c759a5e97a06` | example.com | **not hashed** | — | wrk-7fa8d41b476a | 2026-11-11T11:48:19+00:00 | local-read | **no** | not-assessed |
 
 - `ev-c759a5e97a06`: no digest recorded — no custody record was made for this artefact: the digest alone does not establish who handled it or whether it was preserved
 
 ## Audit and reproducibility
 
-This mission ran on argus 0.32.0 on Python 3.11.2 (CPython, x86\_64); schema argus-audit/1. It was invoked as `report --mission /tmp/argus-t32-cli-3ukrnn50/flow-exposure.json`. 
+This mission ran on argus 0.33.0 on Python 3.11.2 (CPython, x86\_64); schema argus-audit/1. It was invoked as `report --mission /tmp/argus-t32-cli-tiq12yqc/flow-exposure.json`. 
 
 ## Environment
 
 | field | value |
 | --- | --- |
 | application | argus |
-| version | 0.32.0 |
-| version label | 0.32.0-alpha |
+| version | 0.33.0 |
+| version label | 0.33.0-alpha |
 | build phase | 3 |
 | record format | argus-audit/1 |
 | python | 3.11.2 (CPython) |
 | platform | Linux-6.1.158+-x86_64-with-glibc2.36 |
 | machine | x86_64 |
-| user agent | ARGUS/0.32.0 (+authorised-security-research) |
+| user agent | ARGUS/0.33.0 (+authorised-security-research) |
 | dry run | yes |
+| run mode | live |
 
 ## Configuration
 
@@ -188,7 +192,7 @@ This mission ran on argus 0.32.0 on Python 3.11.2 (CPython, x86\_64); schema arg
 | network.respect_robots | yes | default |
 | network.http_concurrency | 8 | default |
 | network.http_timeout | 30.0 | default |
-| network.user_agent | ARGUS/0.32.0 (+authorised-security-research) | default |
+| network.user_agent | ARGUS/0.33.0 (+authorised-security-research) | default |
 | paths.output_dir | argus_home/output | settings |
 | paths.case_dir | not set | settings |
 Redacted by name, with the *state* of each kept: `model.api_key` (<redacted: unset, value not recorded>).
@@ -213,9 +217,9 @@ The credential itself is never recorded: a reader who needs one supplies their o
 
 ## Timestamps
 
-- recorded: 2026-11-11T11:20:21+00:00
-- mission started: 2026-11-11T11:20:19+00:00
-- mission ended: 2026-11-11T11:20:19+00:00
+- recorded: 2026-11-11T11:48:21+00:00
+- mission started: 2026-11-11T11:48:19+00:00
+- mission ended: 2026-11-11T11:48:19+00:00
 - duration: 0.31s
 - per stage: planning 0.00s, subagent planning 0.00s, worker execution 0.05s, worker review 0.00s, reconciliation 0.18s, master review 0.00s, follow-up planning 0.07s, synthesis 0.00s.
 
@@ -260,7 +264,7 @@ Following these steps reproduces the *procedure*, not the answer. A re-run colle
 
 ## What is deliberately not recorded
 
-- scan: clean: 57,926 byte(s) scanned for 12 credential pattern(s)
+- scan: clean: 58,157 byte(s) scanned for 12 credential pattern(s)
 - not recorded — api keys and provider tokens: a credential is authority, not procedure: a record that carried one would let a reader act as the operator instead of reproducing their setup.
 - not recorded — cookies and browser session state: a cookie is the operator's authenticated identity on somebody else's service.
 - not recorded — browser profile contents and credentials: the profile directory is named so the setup can be repeated; none of its contents are copied.

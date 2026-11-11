@@ -1090,6 +1090,7 @@ from __future__ import annotations
 # --- standard library: cheap, side-effect free -------------------------------
 import ast
 import asyncio
+import contextvars
 import atexit
 import hashlib
 import logging
@@ -1152,7 +1153,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 32
+VERSION_MINOR: int = 33
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -22554,6 +22555,36 @@ class MasterSynthesis(StrictModel):
         return [claim for claim in self.claims if claim.source_refs]
 
 
+#: The execution mode a run is in.  ``live`` is the only mode that reaches the world.
+class RunMode(str, Enum):
+    LIVE = "live"            # a real plan, real adapters, real effects
+    DRY_RUN = "dry-run"      # a real plan, nothing executed
+    MOCK = "mock"            # the real graph over deterministic adapters
+
+    @property
+    def executes(self) -> bool:
+        """Whether this mode runs the flow at all."""
+
+        return self is not RunMode.DRY_RUN
+
+    @property
+    def reaches_the_world(self) -> bool:
+        """Whether anything this mode does can touch a network, a browser or an artefact."""
+
+        return self is RunMode.LIVE
+
+    @property
+    def label(self) -> str:
+        return {RunMode.LIVE: "live", RunMode.DRY_RUN: "dry run (nothing executed)",
+                RunMode.MOCK: "MOCK — deterministic adapters, no collection"}[self]
+
+    @property
+    def marker(self) -> str:
+        """The word every artefact of this mode carries."""
+
+        return {RunMode.LIVE: "", RunMode.DRY_RUN: "DRY RUN", RunMode.MOCK: "MOCK"}[self]
+
+
 class FlowResult(StrictModel):
     """Everything one graph run produced, with the order it happened in."""
 
@@ -22587,6 +22618,10 @@ class FlowResult(StrictModel):
     #: the record: a dossier rendered tomorrow must still say when the *mission* ran.
     started_at: datetime | None = None
     ended_at: datetime | None = None
+    #: §43: which mode produced this run.  Carried on the record rather than passed beside
+    #: it, because every renderer, the dossier and the audit all have to agree — a mode the
+    #: caller had to remember would eventually be forgotten by exactly one of them.
+    mode: str = "live"
     #: What the browser did: visits, refusals, and whether anything was left open.
     browser: dict[str, Any] = Field(default_factory=dict)
     #: What the source-aware audit found in the research reports this run produced.
@@ -22964,9 +22999,13 @@ class HierarchicalFlow:
         logger: "MissionLogger | None" = None,
         mission_id: str = "",
         runtime: "ConcurrencyRuntime | None" = None,
+        mode: RunMode = RunMode.LIVE,
     ) -> None:
         if not subagents:
             raise ValueError("a flow needs at least one subagent")
+        # §43: the mode travels with the run into its result, so every later reader — the
+        # dossier, the audit, a resumed run — learns it from the record rather than a flag.
+        self.mode = mode
         self.context = context
         self.subagents = list(subagents)
         self.runner: MissionRunner = runner or DeterministicRunner(
@@ -25656,7 +25695,7 @@ class HierarchicalFlow:
                        if final.get("synthesis") else None),
             stopped=bool(final.get("stopped")), stop_reason=str(final.get("stop_reason") or ""),
             policy=self.policy, waves=self.subagent_waves(), seconds=elapsed,
-            started_at=started_at, ended_at=ended_at,
+            started_at=started_at, ended_at=ended_at, mode=self.mode.value,
             trace=self.trace.to_list(),
             worker_attempts=len(self.trace.events(stage=FlowStage.WORKER)),
             retries=sum(report.retries for report in kept),
@@ -26497,11 +26536,34 @@ def flow_command(
     browser_mode: str = typer.Option(
         "http", "--browser-mode", help="http | agent | disabled."),
     as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Validate the objective and scope, plan the mission, and execute nothing."),
+    mock: bool = typer.Option(
+        False, "--mock",
+        help="Run the real graph over deterministic mock adapters — labelled MOCK."),
+    mock_scenario_name: str = typer.Option(
+        "pass", "--mock-scenario",
+        help="With --mock: pass | revise | flaky | break."),
+    allow_mock_output: bool = typer.Option(
+        False, "--allow-mock-output",
+        help="Permit a mock run's report to be written to disk (it stays labelled MOCK)."),
 ) -> None:
-    """Build and run the hierarchical graph.  Offline unless a target is given."""
+    """Build and run the hierarchical graph.  Offline unless a target is given.
+
+    Three modes, one plan.  ``--dry-run`` validates and plans and executes nothing;
+    ``--mock`` executes the same plan against deterministic adapters and labels every line
+    of the result as mock output; with neither, the run is as it always was.
+    """
 
     console = get_console()
     directory = Path(out_dir).expanduser() if out_dir else None
+    if dry_run and mock:
+        # Two modes at once has no meaning: the dry run's whole promise is that it did not
+        # execute, and a mock run's whole value is that it did.
+        console.print("[red]✘[/red] --dry-run and --mock are different modes: --dry-run "
+                      "plans and executes nothing, --mock executes over adapters")
+        raise typer.Exit(ExitCode.USAGE)
 
     if self_test:
         results = run_flow_self_test(console)
@@ -26524,6 +26586,79 @@ def flow_command(
         console.print(f"\n[{colour}]{len(results) - len(failures)} passed[/] · "
                       f"{len(failures)} failed\n")
         raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    if dry_run:
+        if not objective or not target:
+            console.print("[red]✘[/red] a dry run plans a real mission: pass --target and "
+                          "--objective, and it will validate and plan them")
+            raise typer.Exit(ExitCode.USAGE)
+        context = MasterContext(objective=objective, scope_entries=[target],
+                               available_tools=list(capability_names())[:6] or ["http.fetch"])
+        preflight = run_preflight(objective=objective, targets=[target],
+                                  scope_entries=[target])
+        plan = _run_dry_run(context, out_dir=directory, preflight=preflight)
+        if as_json:
+            _emit(json.dumps(_flow_plan_payload(plan), indent=2, default=str))
+            raise typer.Exit(ExitCode.OK if plan.cleared else preflight.exit_code)
+        console.print()
+        console.print(render_plan(plan))
+        console.print()
+        # The gate's own code, not a new one: a plan built for an objective the gate refused
+        # is a refusal, and a caller scripting the CLI has to see the same code either way.
+        raise typer.Exit(ExitCode.OK if plan.cleared else preflight.exit_code)
+
+    if mock:
+        scenario = mock_scenario_name.strip().lower()
+        try:
+            mock_scenario(scenario)            # validates the name before anything runs
+        except ValueError as exc:
+            console.print(f"[red]✘[/red] {escape(str(exc))}")
+            raise typer.Exit(ExitCode.USAGE)
+        scope = [target] if target else [MOCK_SCOPE]
+        context = MasterContext(
+            objective=objective or "exercise the orchestration over mock adapters",
+            scope_entries=scope,
+            available_tools=list(capability_names())[:6] or ["http.fetch"])
+        policy = FlowPolicy.from_context(context, max_parallel_subagents=parallel_subagents,
+                                         max_parallel_workers=parallel_workers)
+        logger = MissionLogger(directory / "flow.jsonl") if directory else None
+        try:
+            payload, runner_note = _run_mock_flow(
+                context, scenario=scenario, policy=policy, logger=logger,
+                out_dir=directory if allow_mock_output else None)
+        except (OutputError, MockAsReal) as exc:
+            # A refused write is not a failed run: the mission ran, and the label stopped the
+            # file.  The message says which, because the two need different next steps.
+            console.print(f"[red]✘[/red] {escape(_first_sentence(str(exc))[:220])}")
+            if logger is not None:
+                logger.close()
+            raise typer.Exit(ExitCode.POLICY) from exc
+        if as_json:
+            _emit(json.dumps(payload, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(Panel(Text(MOCK_NOTE), title="[bold yellow]MOCK RUN[/bold yellow]",
+                            title_align="left", border_style="yellow", expand=False,
+                            padding=(0, 1)))
+        console.print(Text(f"[dim]{escape(runner_note)} · scenario: "
+                           f"{escape(payload['scenario'])}[/dim]"))
+        console.print()
+        console.print(render_mission_presentation(
+            MissionPresentation.from_dict(payload["presentation"])))
+        console.print()
+        console.print(render_flow_summary(payload))
+        console.print()
+        console.print(render_offline_cost(payload["cost"]))
+        console.print()
+        console.print(render_flow_timeline(payload, limit=max(4, trace_limit)))
+        console.print()
+        for path in payload["written"]:
+            console.print(Text.assemble(("written ", "yellow"), (path, "white")))
+        if not payload["written"]:
+            console.print(Text("[dim]nothing written: a mock report needs "
+                               "--allow-mock-output and --out-dir[/dim]"))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
 
     if demo:
         key = demo.strip().lower()
@@ -26698,8 +26833,106 @@ def flow_command(
         raise typer.Exit(ExitCode.OK)
 
     console.print("[red]✘[/red] use --demo {exposure|forensic|compare}, --self-test, "
-                  "or -t TARGET -o OBJECTIVE")
+                  "--dry-run, --mock, or -t TARGET -o OBJECTIVE")
     raise typer.Exit(ExitCode.USAGE)
+
+
+def _flow_plan_payload(plan: PlanReport) -> dict[str, Any]:
+    """A dry run's payload, in the shape the flow's own payload uses — minus the results.
+
+    The key set is deliberately *not* identical: ``executed`` is false and there is no
+    ``reports`` entry, so a caller that expected results from this file fails loudly rather
+    than reading an empty list as a mission that found nothing.
+    """
+
+    return {**plan.to_dict(), "executed": False, "objective_key": "dry-run"}
+
+
+def _run_dry_run(context: "MasterContext", *, out_dir: Path | None = None,
+                 preflight: "PreflightReport | None" = None) -> PlanReport:
+    """Plan the mission, print it, and write it out when a directory was given."""
+
+    plan = plan_mission(context, preflight=preflight)
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"plan-{plan.mission_id.split('-')[-1]}.json"
+        # The file says what it is not: a plan is not a run, and a reader handed one has to be
+        # able to tell without knowing which command produced it.
+        path.write_text(json.dumps(_flow_plan_payload(plan), indent=2, default=str),
+                        encoding="utf-8")
+    return plan
+
+
+def _run_mock_flow(context: "MasterContext", *, scenario: str,
+                   policy: "FlowPolicy | None" = None,
+                   logger: "MissionLogger | None" = None,
+                   out_dir: Path | None = None,
+                   report_paths: Sequence[str] = ()) -> tuple[dict[str, Any], str]:
+    """Run a mock mission and return the payload the other flow paths also return.
+
+    A stopped mission is a payload with no dossier, not an error: it has a record — every
+    report, every review, the reason it stopped — and §41's presentation exists precisely so
+    that record can be shown.  Only ``report_paths`` has anything to point at when a report
+    was never written.
+    """
+
+    result, runner = run_mock_mission(context, scenario=scenario, policy=policy)
+    if logger is not None:
+        logger.close()
+    dossier = None
+    try:
+        dossier = build_dossier(result, context=context,
+                                settings=build_settings({}, {}).settings,
+                                command=f"flow --mock --mock-scenario {scenario}")
+    except OutputError:
+        # No synthesis, no document: the run is still a run, and the screen below says why
+        # there is nothing to write.
+        dossier = None
+    written: list[str] = []
+    if out_dir is not None and dossier is not None:
+        # Writing is part of what the acceptance clause has to exercise, and a mock dossier
+        # may only be written when the operator asked for it — which is exactly the flag the
+        # command took to get here.
+        with permit_mock_output(True):
+            written = write_dossier(dossier, out_dir=out_dir,
+                                    stem=f"mock-{result.mission_id.split('-')[-1]}",
+                                    formats=OutputFormat.ALL).paths or []
+    payload = {
+        "objective_key": "mock", "objective": context.objective,
+        "structure": [stage.value for stage in FLOW_STAGE_ORDER],
+        "mission_id": result.mission_id, "mode": result.mode,
+        "scenario": mock_scenario(scenario)["description"],
+        "resume": result.resume, **_run_stamps(result),
+        "context": context.model_dump(mode="json"),
+        "presentation": (build_presentation(
+            dossier, report_paths=written,
+            log_path=str(logger.path) if logger else "").to_dict()
+            if dossier is not None else
+            build_stopped_presentation(result, report_paths=list(report_paths)).to_dict()),
+        "checkpoint": result.checkpoint, "waves": result.waves,
+        "subagents": [{"id": subagent.id, "role": subagent.role,
+                       "depends_on": subagent.depends_on,
+                       "workers": [{"id": worker.name, "unit": worker.work_unit,
+                                    "criteria": worker.completion_criteria}
+                                   for worker in subagent.workers],
+                       "worker_waves": []}
+                      for subagent in result.subagents],
+        "reports": [report.to_dict() for report in result.reports],
+        "synthesis": json.loads(model_to_json(result.synthesis)) if result.synthesis else None,
+        "stage_order": result.stage_order(), "worker_attempts": result.worker_attempts,
+        "retries": result.retries, "evidence": len(result.evidence),
+        "peak_concurrency": 1, "ledger_concurrency": 1, "threads": [],
+        "seconds": round(result.seconds, 3), "stopped": result.stopped,
+        "stop_reason": result.stop_reason,
+        "policy": json.loads(model_to_json(result.policy)), "trace": result.trace,
+        "labels": {"mode": result.mode, "labelled_evidence":
+                   len([item for item in result.evidence if is_mock_evidence(item)]),
+                   "evidence": len(result.evidence),
+                   "note": MOCK_NOTE},
+        "cost": offline_cost(result, None, runner=runner),
+        "written": written,
+    }
+    return payload, runner.describe()
 
 
 def _objective_draft(*, role: str, objective: str, justification: str,
@@ -55353,14 +55586,26 @@ def render_dossier_markdown(dossier: MissionDossier, *, width: int = 96) -> str:
     parts: list[str] = []
     title = _md_inline(report.objective[:140]) or "Mission report"
     parts.append(f"# Mission report — {title}\n")
+    if dossier.audit.environment.simulated:
+        # Above the title's own metadata, because a reader who stops after the first block has
+        # still been told.  The Markdown is the view a reader forwards; a label further down is
+        # a label the forwarded excerpt may not carry.
+        parts.append(
+            f"> **{MOCK_REPORT_TAG.upper()} — NOT EVIDENCE.** This report was produced by a "
+            f"mock run: the hierarchy, the review loops, the retries and the reports are real, "
+            f"and every observation in it came from a deterministic test adapter. Nothing here "
+            f"is a finding about the world.\n\n")
     parts.append(
         f"- mission: `{_md_cell(dossier.mission_id or 'unnamed')}`\n"
         f"- generated: {dossier.generated_at.isoformat(timespec='seconds')}\n"
         f"- format: `{dossier.format_version}` (schema version {dossier.schema_version})\n"
         f"- produced by: {_md_inline(dossier.audit.environment.describe())}\n"
-        f"- confidence: **{report.confidence.value}** — "
-        f"{_md_inline(_first_sentence(report.confidence_basis))}\n"
-        f"- evidence: {len(report.cited_ids)} citation(s) from {len(report.origins)} "
+        f"- run mode: **{_md_inline(dossier.audit.environment.mode)}**"
+        + (" — mock output; see the note above\n"
+           if dossier.audit.environment.simulated else "\n")
+        + f"- confidence: **{report.confidence.value}** — "
+        + f"{_md_inline(_first_sentence(report.confidence_basis))}\n"
+        + f"- evidence: {len(report.cited_ids)} citation(s) from {len(report.origins)} "
         f"independent origin(s); {len(dossier.evidence)} item(s) in the table\n"
         f"- status: {'stopped early' if execution.stopping.stopped else 'finished'} — "
         f"{_md_inline(_first_sentence(execution.stopping.statement))}\n")
@@ -55373,6 +55618,14 @@ def render_dossier_markdown(dossier: MissionDossier, *, width: int = 96) -> str:
         section = report.section.get(kind)
         body = section.body if section is not None and section.body else "Not stated."
         parts.append(f"## {heading}\n\n{_md_block(body)}\n")
+        if kind == "confidence":
+            # The report's stated basis in full, and, for a mock run, the run's own basis
+            # beside it: the derived basis explains how the confidence was *weighed*, and
+            # the run's basis is the fact a reader needs first — that nothing was collected.
+            if report.confidence_basis:
+                parts.append(f"**Stated basis:** {_md_inline(report.confidence_basis)}\n")
+            if dossier.audit.environment.simulated:
+                parts.append(f"**Run basis (MOCK):** {_md_inline(MOCK_CONFIDENCE_BASIS)}\n")
 
     parts.append("## Key findings\n\n" + _md_findings(report))
     parts.append("## Corroborated indicators\n\n" + _md_indicators(report))
@@ -55424,7 +55677,9 @@ def _summary_rows(dossier: MissionDossier) -> list[tuple[str, str]]:
         ("status", ("stopped: " if execution.stopping.stopped else "finished: ")
          + execution.stopping.reason[:110]),
         ("confidence", f"{report.confidence.value} — "
-                       + _first_sentence(report.confidence_basis)[:110]),
+                       + (_first_sentence(report.confidence_basis)[:110]
+                          if not dossier.audit.environment.simulated
+                          else "MOCK — nothing in this mission was collected")),
         ("findings", f"{len(report.findings)} ({len(report.corroborated)} corroborated, "
                      f"{len(report.single_source)} single-source), "
                      f"{len(dossier.evidence)} evidence item(s), "
@@ -55603,6 +55858,12 @@ def write_dossier(dossier: MissionDossier, *, out_dir: Path | str = Path("."),
     # could disagree.  Three rounds is enough for any record this section can describe, and
     # a record that needed more would be one whose scan line itself carried a secret.
     markdown_text, json_text = _render_outputs(dossier, formats)
+    # §43: before a byte is written, the writer asks whether this record says it is mock
+    # output.  The check is on the record, not on a flag a caller passed, so a caller that
+    # rebuilt the dossier from a file gets the same answer as the run that wrote it.
+    assert_not_mock_as_real(dossier, path=str(directory / name),
+                            allow_mock_output=dossier.audit.environment.simulated
+                            and _ALLOW_MOCK_OUTPUT.get())
     for _round in range(3):
         scanned = assert_no_secrets(
             markdown_text + json_text, where=f"the dossier for {name}",
@@ -56840,6 +57101,70 @@ def build_presentation(dossier: MissionDossier, *, report_paths: Sequence[str] =
         retention=RETENTION_SHORT)
 
 
+def build_stopped_presentation(result: "FlowResult", *, report_paths: Sequence[str] = (),
+                               log_path: str = "") -> MissionPresentation:
+    """§41's screen for a mission that has a record but no document.
+
+    A run that stopped before synthesis used to reach the screen through `flow`, which builds
+    its payload from the run itself.  This function exists because §43 made that path the
+    *expected* one for a mock scenario: a mission whose tool failed is exactly the shape a
+    test wants to see, and it must still be presented — with the finding counts it has, the
+    reason it stopped, and no claim about a report that was never written.
+    """
+
+    outcomes = [item for report in result.reports for item in report.outcomes]
+    counts = TaskCounts(
+        subagents=len(result.reports),
+        workers=sum(len(report.outcomes) for report in result.reports),
+        completed=sum(1 for item in outcomes if item.status is EntityStatus.SUCCEEDED),
+        failed=sum(1 for item in outcomes if item.status is EntityStatus.FAILED),
+        blocked=sum(1 for item in outcomes if item.status is EntityStatus.BLOCKED),
+        attempts=result.worker_attempts, retries=result.retries)
+    outcome = MissionOutcome.FAILED if result.stopped else MissionOutcome.PARTIAL
+    warnings = [
+        WarningItem(level=WarningLevel.SEVERE, where="outputs",
+                    cause="this mission stopped before it could synthesise a report",
+                    consequence=("there is no document to publish; the record of what ran is "
+                                 "in the run's log and in the reports below"),
+                    blocks_publication=True),
+    ]
+    if not report_paths:
+        warnings.append(WarningItem(
+            level=WarningLevel.SEVERE, where="outputs",
+            cause="no report file was written for this mission",
+            consequence="nothing was written to disk for a reader to keep",
+            blocks_publication=True))
+    # What it did collect, quoted rather than weighed: a stopped mission has no reviewed
+    # findings, and a headline that implied otherwise would be the overstatement §39 exists
+    # to prevent.
+    highlighted = [
+        Highlight(statement=item.statement[:200], kind="observation",
+                  band="mock" if is_mock_evidence(item) else "single-source",
+                  evidence_ids=[item.id])
+        for report in result.reports for item in report.evidence[:1]][:3]
+    return MissionPresentation(
+        headline=MissionHeadline(
+            outcome=outcome, title=outcome.headline,
+            statement=(f"the mission stopped before synthesis, on "
+                       f"{result.stop_reason or 'a bound it did not name'}; the hierarchy, "
+                       f"its reviews and its retries are recorded below")[:400],
+            mission_id=result.mission_id, objective=result.objective[:180]),
+        counts=counts, highlights=highlighted[:3], warnings=warnings,
+        confidence="unknown",
+        confidence_basis=("a stopped mission has no synthesised confidence; what it did "
+                          "collect is listed rather than weighed"),
+        seconds=result.seconds, duration=_precise_duration(result.seconds),
+        report_paths=[path for path in report_paths if path], log_path=log_path,
+        stopping_reason=result.stop_reason,
+        next_step=("re-run the same unit with a tool that can answer, or report the gap "
+                   "the failure left"),
+        produced_by=_audit_environment(mode=_result_mode(result)).describe(),
+        networkshape=(f"{len(result.reports)} subagent(s), "
+                      f"{sum(len(report.outcomes) for report in result.reports)} worker(s) — "
+                      f"stopped: {result.stop_reason[:80] or 'not stated'}"),
+        retention=RETENTION_SHORT)
+
+
 # --------------------------------------------------------------------------
 # 41.2 Rendering it: a headline, four panels, and a footer
 # --------------------------------------------------------------------------
@@ -57566,6 +57891,9 @@ class AuditEnvironment(StrictModel):
     command: str = ""
     operator: str = ""
     dry_run: bool = False
+    #: §43: the run's mode — ``live``, ``dry-run`` or ``mock``.  A reader who sees ``mock``
+    #: here knows the whole record below it describes an exercise, not an investigation.
+    mode: str = "live"
     invoked_from: str = ""
     #: ``True`` when the process looks like CI, from :data:`CI_ENV_VARS` — the *names* are
     #: checked and nothing about their values is copied.
@@ -57578,12 +57906,17 @@ class AuditEnvironment(StrictModel):
                 "implementation": self.implementation, "platform": self.platform,
                 "machine": self.machine, "user_agent": self.user_agent,
                 "command": self.command, "operator": self.operator,
-                "dry_run": self.dry_run, "invoked_from": self.invoked_from,
-                "ci": self.ci}
+                "dry_run": self.dry_run, "mode": self.mode,
+                "invoked_from": self.invoked_from, "ci": self.ci}
+
+    @property
+    def simulated(self) -> bool:
+        return self.mode == "mock"
 
     def describe(self) -> str:
         return (f"{self.app} {self.version} on Python {self.python} "
-                f"({self.implementation}, {self.machine}); schema {self.format_version}")
+                f"({self.implementation}, {self.machine}); schema {self.format_version}"
+                + ("; MOCK run" if self.simulated else ""))
 
 
 class AuditConfigEntry(StrictModel):
@@ -58167,8 +58500,25 @@ def _run_started_at(result: "FlowResult") -> datetime | None:
     return None
 
 
+def _result_mode(result: "FlowResult") -> str:
+    """The mode a run was in, with the labels as the last word.
+
+    ``FlowResult.mode`` is set by whoever ran the flow, and a field someone has to remember
+    to set is a field that will one day be forgotten.  So the evidence is consulted too: if
+    any item says it is mock output, the record says ``mock`` whatever the field claims.
+    """
+
+    declared = str(getattr(result, "mode", "") or "live")
+    if declared == "mock":
+        return declared
+    if any(is_mock_evidence(item) for item in getattr(result, "evidence", ()) or ()):
+        return "mock"
+    return declared or "live"
+
+
 def _audit_environment(*, command: str = "", operator: str = "",
-                       dry_run: bool = False) -> AuditEnvironment:
+                       dry_run: bool = False,
+                       mode: str = "live") -> AuditEnvironment:
     """The software and the machine, captured now — not read back at render time."""
 
     try:
@@ -58177,7 +58527,7 @@ def _audit_environment(*, command: str = "", operator: str = "",
         invoked = ""
     return AuditEnvironment(
         user_agent=DEFAULT_USER_AGENT, command=command[:400], operator=operator,
-        dry_run=dry_run, invoked_from=invoked,
+        dry_run=dry_run, mode=mode, invoked_from=invoked,
         ci=any(os.environ.get(name) for name in CI_ENV_VARS))
 
 
@@ -58585,7 +58935,8 @@ def build_audit_record(result: "FlowResult", *, execution: ExecutionSummary,
     return AuditRecord(
         mission_id=report.mission_id or result.mission_id,
         environment=_audit_environment(command=command, operator=operator or "",
-                                       dry_run=bool(settings.dry_run) if settings else False),
+                                       dry_run=bool(settings.dry_run) if settings else False,
+                                       mode=_result_mode(result)),
         configuration=_safe_config(settings),
         models=_audit_models(settings),
         secrets=AuditSecrets(scanned=False, rules=[], patterns=[]),
@@ -58877,7 +59228,8 @@ def render_audit_markdown(record: AuditRecord) -> str:
              ("platform", record.environment.platform),
              ("machine", record.environment.machine),
              ("user agent", record.environment.user_agent),
-             ("dry run", "yes" if record.environment.dry_run else "no")]) + "\n",
+             ("dry run", "yes" if record.environment.dry_run else "no"),
+             ("run mode", record.environment.mode)]) + "\n",
         "## Configuration\n\n" + _md_configuration(record) + "\n",
         "## Models\n\n" + _md_models(record) + "\n",
         "## Mission scope and limits\n\n" + _md_scope(record) + "\n",
@@ -59201,7 +59553,1462 @@ def _refuses_value_error(fn: Any) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 41. Entry point
+# 43. Dry run and mock mode: the whole machine, with nothing switched on
+# --------------------------------------------------------------------------
+#
+# Two modes, one purpose: let an operator see what a mission would do *before* it does
+# anything, and let a developer exercise the whole orchestration — hierarchy, review loops,
+# retries, reports — with no model, no network, no browser and no forensic tool.
+#
+#   * **``--dry-run``** validates and plans.  It runs the same gate a real mission runs
+#     (objective, scope, authorisation, settings), builds the real hierarchy and the compiled
+#     node set, and predicts the branch, review, retry and runtime-Worker bounds from the
+#     plan.  It then *refuses to execute*: the refusal is not a convention, it is a guard in
+#     the runner and in the effect boundary, so a dry run cannot collect by accident.
+#   * **``--mock``** executes the same plan against deterministic adapters — a model that
+#     answers from a table and a tool layer that fails on request — so the review loops,
+#     retries, follow-ups and reports can be exercised offline and *twice in a row with the
+#     same result*.
+#
+# The honest-labelling problem is the interesting one.  Mock output is evidence-shaped, and
+# evidence-shaped output is exactly what a reader is least entitled to skip past.  So the
+# mode does not rely on a prompt to be careful:
+#
+#   * every :class:`EvidenceItem` a mock run produces carries :data:`MOCK_EVIDENCE_TAG` in
+#     its tags, :data:`MOCK_CONFIDENCE_BASIS` as its basis, and a scope entry that names the
+#     mock as its origin — three places, because a reader may look at any one of them;
+#   * the report, the dossier, the presentation and the audit record all carry the mode, and
+#     :func:`assert_not_mock_as_real` refuses to write a mock mission to a production path
+#     unless the caller says it means to;
+#   * :func:`relabel_mock` is the only supported way to strip the labels, and it says what
+#     it did.
+#
+# The vocabulary comes first: :class:`RunMode` is defined beside :class:`FlowResult`, because a
+# run's mode is a field of its record rather than a preference of this section.
+#
+# Determinism is a property, not an intention: the mock clock is logical (an attempt counter,
+# not ``time.monotonic``), the mock model answers from a fixed table keyed by role and
+# attempt, and the mock tool layer derives its result from the call's arguments.  A second
+# run with the same seed produces the same identifiers, the same statuses and the same
+# numbers — which is what makes it usable in a test that asserts them.
+
+#: The tag every mock evidence item carries.  A tag rather than a field: the model has no
+#: ``simulated`` flag, and adding one would let a mock item be constructed that forgot it.
+MOCK_EVIDENCE_TAG: str = "mock-evidence"
+
+#: The prefix a mock source's locator carries.  In the locator rather than beside it because
+#: the register is grouped by locator: a row that says ``MOCK:example.com`` cannot be read as
+#: a fetch of example.com, while the scope entry inside it keeps the run inside its authority.
+MOCK_LOCATOR_PREFIX: str = "MOCK:"
+
+#: The confidence basis a mock item states.  It is deliberately blunt: a reader who reads
+#: only the basis still learns that nothing was collected.
+MOCK_CONFIDENCE_BASIS: str = (
+    "MOCK OUTPUT — produced by a deterministic test adapter, not collected from any source; "
+    "it demonstrates the orchestration and is not evidence")
+
+#: The scope entry a mock run plans against, named after what it is.
+MOCK_SCOPE: str = "mock://deterministic-adapter"
+
+#: The tag on every mock finding and on the report that carries them.
+MOCK_REPORT_TAG: str = "mock-mission"
+
+#: What a dry run's plan costs and cannot do, printed with it.
+DRY_RUN_NOTE: str = (
+    "This is a dry run: the objective and scope were validated and the plan was built, and "
+    "nothing was collected. No model was called, no network or browser was used, and no "
+    "forensic tool was touched. The bounds below are predicted from the plan, not measured.")
+
+MOCK_NOTE: str = (
+    "This is a mock run: the real graph ran over deterministic adapters — the hierarchy, the "
+    "review loops, the retries and the reports are genuine, and every piece of evidence is "
+    "labelled MOCK and was produced by a scripted adapter rather than collected. Nothing in "
+    "it may be cited as a finding about the world.")
+
+
+# ➤ dry-run guard ---------------------------------------------------------
+
+class DryRunViolation(RuntimeError):
+    """Raised when something tries to reach the world during a dry run.
+
+    A distinct exception rather than an assertion: the guard is part of the contract, and a
+    caller that catches it is meant to see that it caught a boundary, not a bug.
+    """
+
+
+class EffectBoundary(StrictModel):
+    """The four ways a mission can reach the world, and whether this mode allows them.
+
+    The point of naming them is that a dry run's guarantee is only as good as the enumeration
+    behind it: "nothing executes" is a claim about *these* four, and the record says which.
+    """
+
+    model: bool = True
+    network: bool = True
+    browser: bool = True
+    forensic: bool = True
+
+    @classmethod
+    def of(cls, mode: RunMode) -> "EffectBoundary":
+        """Closed for a dry run, open for everything else.
+
+        Not closed for a mock run, although a mock run reaches nothing: the boundary guards
+        the *call*, and a mock run's calls are answered by adapters that cannot reach the
+        world.  Closing it there would make the guard indistinguishable from the mock, and a
+        test could no longer tell which of the two kept the run offline.
+        """
+
+        allowed = mode is not RunMode.DRY_RUN
+        return cls(model=allowed, network=allowed, browser=allowed, forensic=allowed)
+
+    def blocked(self) -> list[str]:
+        return [name for name in ("model", "network", "browser", "forensic")
+                if not getattr(self, name)]
+
+    def to_dict(self) -> dict[str, Any]:
+        # Only the four fields: a written plan must load back into the type that wrote it, so
+        # the derived view (``blocked()``) stays out of the record and gets its own line.
+        return {"model": self.model, "network": self.network, "browser": self.browser,
+                "forensic": self.forensic}
+
+    def describe(self) -> str:
+        blocked = self.blocked()
+        return ("all effects allowed" if not blocked
+                else "blocked: " + ", ".join(blocked))
+
+
+#: Process-wide sink for the boundary, so a library call made from anywhere inside a run is
+#: refused rather than needing every call site to have been passed the mode.  A context
+#: manager owns it, and the context is what makes the guarantee hold for nested code that
+#: has no idea it is inside a dry run.
+_BOUNDARY: "contextvars.ContextVar[EffectBoundary | None]" = contextvars.ContextVar(
+    "argus_effect_boundary", default=None)
+
+
+def current_boundary() -> EffectBoundary:
+    """The boundary in force, or a permissive one outside any run."""
+
+    return _BOUNDARY.get() or EffectBoundary()
+
+
+@contextmanager
+def effect_boundary(mode: RunMode) -> Iterator[EffectBoundary]:
+    """Enforce one mode's effect boundary for the duration of the block."""
+
+    token = _BOUNDARY.set(EffectBoundary.of(mode))
+    try:
+        yield _BOUNDARY.get()  # type: ignore[misc]
+    finally:
+        _BOUNDARY.reset(token)
+
+
+def require_effect(kind: str) -> None:
+    """Refuse an effect the current mode does not allow.
+
+    Called at the effect boundary rather than at each caller: a dry run that was only safe
+    because every caller remembered to check would not be safe.
+    """
+
+    boundary = current_boundary()
+    if kind not in {"model", "network", "browser", "forensic"}:
+        raise ValueError(f"unknown effect {kind!r}: the boundary knows model, network, "
+                         f"browser and forensic")
+    if not getattr(boundary, kind):
+        raise DryRunViolation(
+            f"a dry run cannot {kind}: the effect boundary is closed for it. Build the plan "
+            f"with `--dry-run`, or run the orchestration with `--mock`.")
+
+
+# ➤ the plan a dry run produces -------------------------------------------
+
+#: What the plan's structure is, in the plan's own words.  A dry run cannot ask a Master to
+#: decompose an objective without a model, so the structure is a scripted shape.  Saying so is
+#: the difference between a plan and a claim about what the Master would have designed.
+PLAN_STRUCTURE_SOURCE: str = (
+    "the scripted team shape (asserted offline, not the Master's decomposition)"
+)
+
+
+class PlannedUnit(StrictModel):
+    """One unit of a plan, with the bounds that decide how much work it can cause.
+
+    ``review_rounds`` and ``retries`` are *bounds*, not predictions: the plan says how many
+    the policy permits, and the dry run refuses to pretend it knows how many will be needed.
+    """
+
+    id: str = Field(min_length=1)
+    kind: str = "worker"
+    role: str = ""
+    parent: str = ""
+    objective: str = ""
+    capability: str = ""
+    criteria: list[str] = Field(default_factory=list)
+    depends_on: list[str] = Field(default_factory=list)
+    wave: int = Field(default=0, ge=0)
+    #: How many attempts the policy permits: the first plus the review and retry budgets.
+    max_attempts: int = Field(default=1, ge=1)
+    #: Runtime Workers this unit is permitted to spawn (§36), and follow-ups (§37).
+    runtime_workers: int = Field(default=0, ge=0)
+    follow_ups: int = Field(default=0, ge=0)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"id": self.id, "kind": self.kind, "role": self.role, "parent": self.parent,
+                "objective": self.objective, "capability": self.capability,
+                "criteria": list(self.criteria), "depends_on": list(self.depends_on),
+                "wave": self.wave, "max_attempts": self.max_attempts,
+                "runtime_workers": self.runtime_workers, "follow_ups": self.follow_ups}
+
+
+class PlanBounds(StrictModel):
+    """What the plan permits, at its widest — the number a budget must be set against.
+
+    Every count is a ceiling the policy implies, computed from the plan and the limits
+    together: a dry run that reported only what it *would* do would be less useful than one
+    that reports the most it *could* do, because the second is what a budget has to cover.
+    """
+
+    subagents: int = Field(default=0, ge=0)
+    workers: int = Field(default=0, ge=0)
+    runtime_workers: int = Field(default=0, ge=0)
+    follow_ups: int = Field(default=0, ge=0)
+    max_attempts_per_unit: int = Field(default=0, ge=0)
+    max_review_rounds: int = Field(default=0, ge=0)
+    max_master_reviews: int = Field(default=0, ge=0)
+    max_replan_rounds: int = Field(default=0, ge=0)
+    #: Units × attempts, the worst case for the scheduler and for the model bill.
+    max_worker_runs: int = Field(default=0, ge=0)
+    waves: int = Field(default=0, ge=0)
+    dependent_waves: int = Field(default=0, ge=0)
+
+    def describe(self) -> str:
+        return (f"{self.subagents} subagent(s), {self.workers} worker(s); up to "
+                f"{self.max_worker_runs} worker run(s) at {self.max_attempts_per_unit} "
+                f"attempt(s) each, {self.max_review_rounds} review round(s), "
+                f"{self.max_master_reviews} master review(s)")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {name: getattr(self, name) for name in
+                ("subagents", "workers", "runtime_workers", "follow_ups",
+                 "max_attempts_per_unit", "max_review_rounds", "max_master_reviews",
+                 "max_replan_rounds", "max_worker_runs", "waves", "dependent_waves")}
+
+
+class PlanReport(StrictModel):
+    """A dry run's whole output: what was checked, what was planned, and what it would cost.
+
+    Deliberately not a :class:`FlowResult`: a dry run produced no results, and a type that
+    could be mistaken for one would let a downstream report be written about a mission that
+    never ran.  The conversion is explicit (:meth:`as_mission_view`).
+    """
+
+    format_version: str = "argus-plan/1"
+    mode: RunMode = RunMode.DRY_RUN
+    mission_id: str = ""
+    objective: str = ""
+    cleared: bool = False
+    #: The gate's own verdict: what was refused, and what the operator must fix.
+    verdict: str = ""
+    refusals: list[str] = Field(default_factory=list)
+    scope_entries: list[str] = Field(default_factory=list)
+    exclusions: list[str] = Field(default_factory=list)
+    mode_of_mission: str = "passive"
+    limits: dict[str, int] = Field(default_factory=dict)
+    effective_policy: dict[str, Any] = Field(default_factory=dict)
+    units: list[PlannedUnit] = Field(default_factory=list)
+    bounds: PlanBounds = Field(default_factory=PlanBounds)
+    frontier: list[str] = Field(default_factory=list)
+    structure: list[str] = Field(default_factory=list)
+    #: Where the hierarchy came from — see :data:`PLAN_STRUCTURE_SOURCE`.
+    structure_source: str = PLAN_STRUCTURE_SOURCE
+    effects: EffectBoundary = Field(default_factory=EffectBoundary)
+    planned_at: datetime = Field(default_factory=utc_now)
+    note: str = DRY_RUN_NOTE
+
+    @field_validator("planned_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> Any:
+        return normalise_datetime(value)
+
+    def by_kind(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for unit in self.units:
+            counts[unit.kind] = counts.get(unit.kind, 0) + 1
+        return counts
+
+    def subagents(self) -> list[PlannedUnit]:
+        return [unit for unit in self.units if unit.kind == "subagent"]
+
+    def workers(self) -> list[PlannedUnit]:
+        return [unit for unit in self.units if unit.kind == "worker"]
+
+    def as_mission_view(self) -> "MissionView":
+        """The plan in the shape the flow would produce, without pretending it ran."""
+
+        return MissionView(
+            mode=self.mode, mission_id=self.mission_id, objective=self.objective,
+            units=[PlannedUnit.model_validate(unit.model_dump()) for unit in self.units],
+            bounds=self.bounds, execution_bound=self.effects.describe())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"format_version": self.format_version, "mode": self.mode.value,
+                "mission_id": self.mission_id, "objective": self.objective,
+                "cleared": self.cleared, "verdict": self.verdict,
+                "refusals": list(self.refusals), "scope_entries": list(self.scope_entries),
+                "exclusions": list(self.exclusions), "mode_of_mission": self.mode_of_mission,
+                "limits": dict(self.limits), "effective_policy": dict(self.effective_policy),
+                "units": [unit.to_dict() for unit in self.units],
+                "bounds": self.bounds.to_dict(), "frontier": list(self.frontier),
+                "structure": list(self.structure),
+                "structure_source": self.structure_source,
+                "effects": self.effects.to_dict(),
+                "planned_at": _iso(self.planned_at), "note": self.note}
+
+
+class MissionView(StrictModel):
+    """One mission as a reader meets it, whatever produced it.
+
+    The two modes and a real run are all describable by these fields — that is the point of
+    the type: a screen that shows a live run and a screen that shows a plan share a shape, so
+    the *labels* carry the difference rather than the layout, and nothing has to be remembered
+    about which screen the reader is looking at.
+    """
+
+    mode: RunMode = RunMode.LIVE
+    mission_id: str = ""
+    objective: str = ""
+    units: list[PlannedUnit] = Field(default_factory=list)
+    bounds: PlanBounds = Field(default_factory=PlanBounds)
+    execution_bound: str = "all effects allowed"
+
+    @property
+    def label(self) -> str:
+        return self.mode.label
+
+    @property
+    def mock(self) -> bool:
+        return self.mode is RunMode.MOCK
+
+
+def _plan_units(context: "MasterContext", units: Sequence["FlowSubagent"],
+                policy: "FlowPolicy") -> list[PlannedUnit]:
+    """The plan, with each unit's parent, wave and permitted bounds.
+
+    Built from the units the *flow* would run, not from the drafts: a plan that showed the
+    specification rather than the graph would miss the Workers the factory creates, which is
+    most of what a reader wants to see.
+    """
+
+    attempts = max(1, 1 + int(policy.max_review_rounds))
+    planned: list[PlannedUnit] = []
+    for subagent in units:
+        planned.append(PlannedUnit(
+            id=subagent.id, kind="subagent", role=subagent.role, parent="master",
+            objective=subagent.objective[:200], capability="",
+            criteria=[], depends_on=list(subagent.depends_on),
+            max_attempts=max(1, int(policy.max_review_rounds)),
+            runtime_workers=(int(policy.max_runtime_workers_per_subagent)
+                             if policy.allow_runtime_workers else 0),
+            follow_ups=(int(policy.max_follow_up_workers_per_subagent)
+                        if policy.allow_follow_ups else 0)))
+        for worker in subagent.workers:
+            planned.append(PlannedUnit(
+                id=worker.name, kind="worker", role=worker.name, parent=subagent.id,
+                objective=worker.objective[:200],
+                capability=(worker.tools[0] if worker.tools else ""),
+                criteria=list(worker.completion_criteria),
+                depends_on=[subagent.id], max_attempts=attempts,
+                runtime_workers=0, follow_ups=0))
+    return planned
+
+
+def _plan_bounds(planned: Sequence[PlannedUnit], units: Sequence["FlowSubagent"],
+                 policy: "FlowPolicy") -> PlanBounds:
+    """The ceilings the plan and the policy imply, computed rather than asserted."""
+
+    workers = [unit for unit in planned if unit.kind == "worker"]
+    subagents = [unit for unit in planned if unit.kind == "subagent"]
+    attempts = max([unit.max_attempts for unit in workers], default=1)
+    runtime = sum(unit.runtime_workers for unit in subagents)
+    follow_ups = sum(unit.follow_ups for unit in subagents)
+    waves: list[list[str]] = []
+    frontier = [subagent.id for subagent in units
+                if not any(dependency in {other.id for other in units}
+                           for dependency in subagent.depends_on)]
+    seen: set[str] = set()
+    while frontier and len(waves) < 12:
+        waves.append(sorted(frontier))
+        seen.update(frontier)
+        frontier = [subagent.id for subagent in units
+                    if subagent.id not in seen
+                    and any(dependency in set(frontier)
+                            for dependency in subagent.depends_on)]
+    return PlanBounds(
+        subagents=len(subagents), workers=len(workers),
+        runtime_workers=runtime, follow_ups=follow_ups,
+        max_attempts_per_unit=attempts,
+        max_review_rounds=int(policy.max_review_rounds),
+        max_master_reviews=int(policy.max_master_reviews),
+        max_replan_rounds=int(policy.max_replan_rounds),
+        # Workers, their retries, the runtime Workers a subagent may add, and the follow-ups
+        # a replan may open — the four things an attempt counter can be spent on.
+        max_worker_runs=(len(workers) * attempts) + (runtime * attempts) + follow_ups,
+        waves=len(waves), dependent_waves=max(0, len(waves) - 1))
+
+
+def plan_mission(context: "MasterContext", *, drafts: Sequence["SubagentSpecDraft"] = (),
+                 policy: "FlowPolicy | None" = None,
+                 preflight: "PreflightReport | None" = None) -> PlanReport:
+    """Validate and plan, and execute nothing.
+
+    The order is the mission's own: the gate first, because an unauthorised objective must be
+    refused before anything is even planned, then the units, then the bounds.  A plan built
+    for an objective the gate refused is still returned — with ``cleared`` false and the
+    refusals in it — because a dry run's most useful answer is often "no, and why".
+    """
+
+    resolved = policy or FlowPolicy.from_context(context)
+    planned_units: list[PlannedUnit] = []
+    structure: list[str] = []
+    units: list[FlowSubagent] = []
+    reason = ""
+    try:
+        units = (team_units(context, drafts) if drafts
+                 else flow_units_for(_shape_context(context), _objective_key_for(context)))
+        planned_units = _plan_units(context, units, resolved)
+        structure = [stage.value for stage in FLOW_STAGE_ORDER]
+    except (WorkerPlanError, ValueError, KeyError) as exc:
+        # A plan that cannot be built is a plan result, not a crash: the dry run's job is to
+        # find out before the mission runs.
+        reason = f"the plan could not be built: {_first_sentence(str(exc))[:200]}"
+    bounds = _plan_bounds(planned_units, units, resolved)
+    refusals: list[str] = []
+    cleared = True
+    verdict = "cleared: the objective and scope passed the gate"
+    if preflight is not None:
+        cleared = bool(preflight.ok)
+        verdict = (preflight.verdict.rationale or verdict) if cleared else \
+            (preflight.verdict.rationale or "the objective was not cleared")
+        # Every reason the gate gave, not only its blocking ones: a refusal a reader cannot
+        # see the reason for is one they will try again.  The blocking issues are marked,
+        # because "this stopped it" and "this needs fixing" are different instructions.
+        refusals = [f"{issue.id}: {issue.message} — {issue.fix}"
+                    + (" [blocking]" if issue.blocking else "")
+                    for issue in preflight.issues[:8]]
+        if not preflight.issues:
+            refusals = [f"the gate refused the objective: {verdict[:200]}"]
+        if preflight.paused:
+            refusals.append("the objective's intent is unconfirmed: confirm it or accept "
+                            "the reframe before planning")
+    if reason:
+        cleared = False
+        refusals.append(reason)
+    return PlanReport(
+        mission_id=context.mission_id or content_id("plan", context.objective.lower()),
+        objective=context.objective, cleared=cleared, verdict=verdict, refusals=refusals,
+        scope_entries=list(context.scope_entries), exclusions=list(context.exclusions),
+        mode_of_mission=context.mode.value,
+        limits={"max_subagents": context.max_subagents,
+                "max_total_workers": context.max_total_workers,
+                "mission_budget_seconds": context.mission_budget_seconds},
+        effective_policy=json.loads(model_to_json(resolved)),
+        units=planned_units, bounds=bounds,
+        frontier=sorted({unit.parent or "master" for unit in planned_units}),
+        structure=structure, structure_source=PLAN_STRUCTURE_SOURCE,
+        effects=EffectBoundary.of(RunMode.DRY_RUN))
+
+
+def _shape_context(context: "MasterContext") -> "MasterContext":
+    """The context a scripted shape is built for: the operator's mission, plus the shape's own.
+
+    A live context names the libraries this deployment can import; the scripted shape names
+    the capabilities and scope its Workers are written against (``dns.lookup``,
+    ``advisory.read``, ``example.com``).  Planning against the operator's lists alone would
+    make a plan fail on requirements that belong to the *fixture* rather than to the mission,
+    so the shape is built against a context that carries both.
+
+    This is safe precisely because nothing is collected: the operator's scope is what the gate
+    validated (``run_preflight``) and what a real run would be held to, while the fixture's
+    entries only describe the units being planned.  A plan says which of the two it used —
+    see :data:`PLAN_STRUCTURE_SOURCE`.
+    """
+
+    # Read from the scripted team's definition rather than from the units it builds: building
+    # the units is what fails when a requirement is unmet, so the requirements have to come
+    # from the source, not from the thing being validated against it.
+    payload = _team_payload(_objective_key_for(context))
+    shape_tools = sorted({str(tool) for subagent in (payload.get("subagents") or [])
+                          for tool in (subagent.get("tools") or [])})
+    shape_scope = sorted({str(entry) for subagent in (payload.get("subagents") or [])
+                          for entry in (subagent.get("scope_entries") or [])})
+    return context.model_copy(update={
+        "available_tools": list(dict.fromkeys([*context.available_tools, *shape_tools])),
+        "scope_entries": list(dict.fromkeys([*context.scope_entries, *shape_scope]))})
+
+
+def _objective_key_for(context: "MasterContext") -> str:
+    """The scripted objective whose shape fits this context best.
+
+    The dry run has to plan *something* without a model, so it plans the scripted shape whose
+    mode matches the mission's: a forensic mission gets the forensic shape, everything else
+    gets the exposure one.  The plan says so, because a reader comparing it with a live run
+    should know the shape came from a table rather than from a Master.
+    """
+
+    return "forensic" if context.mode is MissionMode.FORENSIC else "exposure"
+
+
+# ➤ the dry-run refusal, at the runner ------------------------------------
+
+class DryRunRunner:
+    """A runner that refuses to run.  The last defence behind the effect boundary.
+
+    A dry run should never build a flow at all — but if one is built, by a caller that did
+    not check, the refusal has to happen where a Worker would have collected, not in a
+    docstring.  This runner is that line: every method raises, and the message names the two
+    commands that do what the caller wanted.
+    """
+
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        self.refusals = 0
+
+    def _refuse(self, what: str) -> "WorkerOutcome":
+        self.refusals += 1
+        raise DryRunViolation(
+            f"a dry run cannot {what}: nothing in this mode is collected, reviewed or "
+            f"synthesised. Build the plan with `--dry-run`, or exercise the orchestration "
+            f"with `--mock`.")
+
+    def run_worker(self, subagent: "FlowSubagent", worker: "FlowWorker", *,
+                   attempt: int, guidance: str = "") -> "WorkerOutcome":
+        return self._refuse(f"run worker {worker.name}")
+
+    def review_worker(self, subagent: "FlowSubagent", worker: "FlowWorker",
+                      outcome: "WorkerOutcome", *, round_number: int) -> "ReviewVerdict":
+        return self._refuse(f"review worker {worker.name}")
+
+    def synthesise(self, *_args: Any, **_kwargs: Any) -> "MasterSynthesis":
+        return self._refuse("synthesise a report")
+
+    def describe(self) -> str:
+        return "dry-run runner: refuses every attempt to execute"
+
+
+# ➤ mock mode --------------------------------------------------------------
+
+@dataclass(frozen=True)
+class MockToolCall:
+    """One scripted tool call: what was asked, what came back, and whether it failed."""
+
+    tool: str
+    subject: str
+    outcome: str
+    detail: str = ""
+    fails: bool = False
+    retryable: bool = True
+
+
+#: The tool layer's script, keyed by capability then in order of use.  Every answer is
+#: derived from the call's arguments as well (see :func:`mock_tool_result`), so a plan with
+#: different scope entries gets different rows rather than the same three canned ones.
+MOCK_TOOL_SCRIPT: dict[str, tuple[str, ...]] = {
+    "http.fetch": (
+        "a first-party page returned a version string in its footer",
+        "the same page's headers named the server software and a build date",
+    ),
+    "web.fetch": (
+        "a first-party page returned a version string in its footer",
+    ),
+    "dns.lookup": (
+        "an A record and an MX record resolve to the same documented provider",
+        "the TXT record publishes a verification token, not a secret",
+    ),
+    "archive.search": (
+        "the archive holds two snapshots of the page, a year apart",
+    ),
+    "advisory.read": (
+        "a first-party advisory names the affected component and a fixed version",
+    ),
+    "forensic.mount": (
+        "the image mounted read-only and the partition table parsed",
+    ),
+    "forensic.timeline": (
+        "the timeline records a logon and a service start in the same minute",
+    ),
+    "forensic.hash": (
+        "the digest of the evidence file was taken at capture and matches the copy",
+    ),
+    "log.parse": (
+        "the log records one outbound connection to the documented host",
+    ),
+}
+
+
+def mock_tool_result(capability: str, subject: str, criteria: Sequence[str] = (),
+                     *, attempt: int = 1, fail: bool = False) -> MockToolCall:
+    """One deterministic tool result: same inputs, same answer, every time.
+
+    The answer is derived from the capability and the subject, so two units asking different
+    questions get different rows — a mock that returned one canned answer for everything
+    would let a pipeline bug pass by looking like agreement.  ``attempt`` selects a later row
+    where the script has one, so a retry's answer can differ from the first attempt's.
+    """
+
+    script = MOCK_TOOL_SCRIPT.get(capability) or (
+        f"the {capability or 'default'} adapter returned a scripted row for {subject}",)
+    index = (max(1, attempt) - 1) % len(script)
+    if fail:
+        return MockToolCall(tool=capability, subject=subject, outcome="tool failure",
+                            detail=f"scripted failure: {capability or 'adapter'} refused "
+                                   f"the call for {subject}", fails=True)
+    return MockToolCall(tool=capability, subject=subject,
+                        outcome=f"{capability or 'adapter'} returned a scripted row",
+                        detail=script[index])
+
+
+def _evidence_from_reports(result: "FlowResult") -> list["EvidenceItem"]:
+    """Every evidence item a run produced, in report order.
+
+    A run's evidence lives inside its subagent reports, not beside them; a reader (and this
+    mode's label check) needs the flat view, so one function produces it for both.
+    """
+
+    return [item for report in result.reports for item in report.evidence]
+
+
+class MockModelAdapter:
+    """A model stand-in that answers from a table, deterministically.
+
+    It exists to be *tested*: it records every call, and its answer depends only on the role
+    it was asked about and the number of times it has been asked.  Nothing about it involves
+    a provider, a network or a token — which is what makes a mock run reproducible in CI and
+    assertable in a test.
+    """
+
+    def __init__(self, *, revise_roles: Sequence[str] = (),
+                 fail_roles: Sequence[str] = ()) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.revise_roles = set(revise_roles)
+        #: Roles whose *first* answer is a revision request: the review loop, exercised.
+        self.fail_roles = set(fail_roles)
+        self._lock = threading.Lock()
+
+    def complete(self, role: str, *, prompt: str = "", attempt: int = 1) -> dict[str, Any]:
+        with self._lock:
+            self.calls.append({"role": role, "attempt": attempt, "prompt_chars": len(prompt)})
+        return {"role": role, "attempt": attempt,
+                "text": (f"mock completion for {role}: attempt {attempt} "
+                         f"addresses the assigned objective"),
+                "provider": "mock", "model": "mock/deterministic"}
+
+    def check_ready(self) -> list[Any]:
+        """The interface the real adapter publishes; a mock is always ready."""
+
+        return []
+
+    def describe(self) -> str:
+        return f"mock model adapter: {len(self.calls)} call(s), deterministic"
+
+
+class MockRunner(DeterministicRunner):
+    """The deterministic runner, with adapters that can be scripted to misbehave.
+
+    A subclass on purpose: everything above the runner — the graph, the fan-out, the review
+    nodes, the retries, the joins, the synthesis, the dossier — is the production code, and
+    the point of a mock mode is to exercise *it*.  What changes is what the runner answers:
+    the tool layer returns a scripted row (and fails where the scenario says to), the clock is
+    logical rather than measured, and every item is labelled in three places.
+
+    It is also the mode's honest limit: this runner is incapable of a network call by
+    construction, so a mock run has no path to a real observation even by accident.
+    """
+
+    def __init__(self, *, mock_model: MockModelAdapter | None = None,
+                 scope: Sequence[str] = (MOCK_SCOPE,),
+                 failing_tools: Sequence[str] = (),
+                 flaky_tools: Sequence[str] = (),
+                 always_revise: Sequence[str] = ()) -> None:
+        super().__init__(scope=list(scope) or [MOCK_SCOPE], always_revise=always_revise)
+        self.mock_model = mock_model or MockModelAdapter()
+        self.failing_tools = set(failing_tools)
+        self.flaky_tools = set(flaky_tools)
+        #: Every scripted call this run made, in order — the audit trail of a mock run.
+        self.tool_calls: list[MockToolCall] = []
+
+    # -- execution ----------------------------------------------------------
+
+    def _capability(self, worker: FlowWorker) -> str:
+        """The tool a Worker would reach for, named the way the plan names it.
+
+        A plan carries tool names, not a single capability, so the first tool is taken as the
+        one this unit exercises — which is enough to fail the row a scenario asks to fail.
+        """
+
+        return (worker.tools[0] if worker.tools else "")
+
+    def run_worker(self, subagent: FlowSubagent, worker: FlowWorker, *,
+                   attempt: int, guidance: str = "") -> WorkerOutcome:
+        capability = self._capability(worker)
+        failing = capability in self.failing_tools or worker.id in self.failing_tools
+        flaky = capability in self.flaky_tools or worker.id in self.flaky_tools
+        call = mock_tool_result(capability, worker.work_unit or worker.name,
+                                worker.completion_criteria,
+                                attempt=attempt, fail=failing or (flaky and attempt < 2))
+        self.tool_calls.append(call)
+        if call.fails:
+            return WorkerOutcome(
+                worker_id=worker.id, subagent_id=subagent.id, status=EntityStatus.FAILED,
+                attempt=attempt, gate=FlowGate.ERROR,
+                summary=f"{worker.name}: {call.outcome}", error=call.detail,
+                payload={"tool": capability, "fault": "tool", "retryable": call.retryable,
+                         "mock": True},
+                seconds=self._logical_seconds(attempt))
+        outcome = super().run_worker(subagent, worker, attempt=attempt, guidance=guidance)
+        evidence = [EvidenceItem.model_validate(item)
+                    for item in (outcome.payload or {}).get("evidence") or []]
+        relabelled = [mock_evidence(item, capability=capability, detail=call.detail)
+                      for item in evidence]
+        # The model stand-in is asked, not simulated-by-omission: a run whose cost report
+        # claimed model calls it never made would be the same kind of lie as unlabelled
+        # evidence.
+        completion = self.mock_model.complete(worker.name, prompt=worker.objective,
+                                              attempt=attempt)
+        payload = dict(outcome.payload or {})
+        payload.update({"evidence": [json.loads(model_to_json(item)) for item in relabelled],
+                        "mock": True, "tool": capability,
+                        "tool_outcome": call.outcome, "tool_detail": call.detail,
+                        "provider": completion["provider"], "model": completion["model"],
+                        "model_text": completion["text"][:200]})
+        return outcome.model_copy(update={
+            "evidence_ids": [item.id for item in relabelled], "payload": payload,
+            "summary": f"{worker.name}: {len(relabelled)} MOCK observation(s)",
+            # The clock is logical: a mock that measured a real elapsed time would differ
+            # between runs, and then a test could not assert on it.
+            "seconds": self._logical_seconds(attempt)})
+
+    def _logical_seconds(self, attempt: int) -> float:
+        """Ten milliseconds per attempt: non-zero, and identical between runs."""
+
+        return round(0.01 * max(1, attempt), 3)
+
+    # -- review -------------------------------------------------------------
+
+    def review_worker(self, subagent: FlowSubagent, worker: FlowWorker,
+                      outcome: WorkerOutcome, *, round_number: int) -> ReviewVerdict:
+        verdict = super().review_worker(subagent, worker, outcome,
+                                       round_number=round_number)
+        return verdict.model_copy(update={"reviewer": "mock-runner"})
+
+    # -- synthesis ----------------------------------------------------------
+
+    def synthesize(self, subagents: Sequence[FlowSubagent],
+                   reports: Sequence["SubagentOutcome"],
+                   context: "MasterContext") -> "MasterSynthesis":
+        """The same synthesis, in a voice that says what it is.
+
+        The report is the one artefact a reader quotes, so the mock label has to be in the
+        report's own sentences — not only in the table it cites.  The basis, the limitation
+        and the uncertainty statement all say it, because a reader may quote any one of them
+        on its own.
+        """
+
+        synthesis = super().synthesize(subagents, reports, context)
+        return synthesis.model_copy(update={
+            "summary": f"[MOCK] {synthesis.summary}",
+            "confidence": Confidence.UNKNOWN,
+            "confidence_basis": MOCK_CONFIDENCE_BASIS,
+            "limitations": ["MOCK run: every observation came from a deterministic test "
+                            "adapter and none was collected", *synthesis.limitations],
+            "uncertainty_statement": (
+                "Nothing here is a finding about the world: this mission exercised the "
+                "orchestration over mock adapters."),
+            "claims": [claim.model_copy(update={
+                "statement": f"[MOCK] {claim.statement}",
+                "confidence": Confidence.UNKNOWN,
+                "uncertainty": MOCK_CONFIDENCE_BASIS}) for claim in synthesis.claims],
+        })
+
+    def describe(self) -> str:
+        return (f"mock runner: {len(self.tool_calls)} scripted call(s), "
+                f"{len(self.failing_tools)} tool(s) scripted to fail")
+
+
+def mock_evidence(item: "EvidenceItem", *, capability: str = "",
+                  detail: str = "", subject: str = "") -> "EvidenceItem":
+    """The same evidence, labelled as mock in every place a reader might look.
+
+    Three labels, because three different readers exist: the tag survives into the evidence
+    table, the confidence basis into the report's calibration, and the source locator into
+    the source register.  None of them is a field a renderer can drop by not knowing about it.
+    """
+
+    tags = list(dict.fromkeys([*item.tags, MOCK_EVIDENCE_TAG]))
+    sources = [source.model_copy(update={
+        "title": f"{MOCK_LOCATOR_PREFIX} {source.title or capability or 'scripted adapter'}",
+        "excerpt": f"{MOCK_EVIDENCE_TAG}: {detail or source.excerpt or ''}".strip()[:200],
+        # A mock has no URL to hide behind and no file to open.  The locator keeps the
+        # underlying entry — so the review's scope check, which compares locators with the
+        # mission's scope, still passes — and prefixes it, so the register cannot read as a
+        # real collection.  The prefix is the part a later editor cannot drop by accident:
+        # the tag and the basis are fields someone can clear, the locator is what the row is
+        # filed under.
+        "kind": SourceKind.LOCAL_ARTIFACT, "url": None,
+        "artifact_path": f"{MOCK_LOCATOR_PREFIX}{source.locator}",
+        "retrieval_method": RetrievalMethod.LOCAL_READ,
+    }) for source in item.sources]
+    return item.model_copy(update={
+        "tags": tags, "confidence": Confidence.UNKNOWN,
+        "confidence_basis": MOCK_CONFIDENCE_BASIS, "sources": sources,
+        "statement": f"[MOCK] {item.statement}"[:400]})
+
+
+def is_mock_evidence(item: "EvidenceItem") -> bool:
+    """Whether an item says, anywhere, that it is mock output."""
+
+    return (MOCK_EVIDENCE_TAG in item.tags
+            or MOCK_CONFIDENCE_BASIS[:24] in (item.confidence_basis or "")
+            or any(str(source.url or source.artifact_path or "").startswith(
+                       (MOCK_LOCATOR_PREFIX, "mock://"))
+                   for source in item.sources))
+
+
+class MockAsReal(OutputError):
+    """Raised when a mock mission is about to be written somewhere it would be mistaken."""
+
+
+#: Set from ``--allow-mock-output`` and read by every writer.  A module-level switch rather
+#: than a threaded parameter for the same reason the effect boundary is a context variable:
+#: the writers are spread across a thousand lines and a parameter one of them forgot would
+#: be a report silently promoted from an exercise to evidence.  The flag is *off* by default
+#: in the process, so nothing is written as mock output unless the operator said so.
+_ALLOW_MOCK_OUTPUT: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "argus_allow_mock_output", default=False)
+
+
+@contextmanager
+def permit_mock_output(enabled: bool = True) -> Iterator[bool]:
+    """Permit a mock mission to be written to a chosen path, for the duration of the block."""
+
+    token = _ALLOW_MOCK_OUTPUT.set(bool(enabled))
+    try:
+        yield bool(enabled)
+    finally:
+        _ALLOW_MOCK_OUTPUT.reset(token)
+
+
+def assert_not_mock_as_real(mission: Any, *, path: str | Path = "",
+                            allow_mock_output: bool = False) -> None:
+    """Refuse to write a mock mission as if it were a real one.
+
+    The rule this enforces is narrow on purpose: mock output may be written freely to a path
+    the caller chose *and labelled* (``allow_mock_output``), because that is how it gets
+    inspected and attached to a bug report.  What it may not do is reach a path without the
+    caller having decided it should — which is the case where a mock report becomes an
+    attachment to a real investigation.
+    """
+
+    mode = getattr(mission, "mode", None)
+    if mode is None and isinstance(mission, Mapping):
+        mode = mission.get("mode")
+    # Three places a record can say it, because a writer may be handed any of the three: a
+    # result (its mode), a dossier (its audit record) or a plain mapping (either key).
+    audit = getattr(mission, "audit", None)
+    audit_mock = bool(getattr(getattr(audit, "environment", None), "simulated", False))
+    if not audit_mock and isinstance(mission, Mapping):
+        audit_mock = str((mission.get("audit") or {}).get("environment", {}).get("mode")
+                         if isinstance(mission.get("audit"), Mapping) else "") == "mock"
+    is_mock = (mode is RunMode.MOCK or mode == RunMode.MOCK.value or audit_mock
+               or any(is_mock_evidence(item) for item in _mission_evidence(mission)))
+    if not is_mock:
+        return
+    if allow_mock_output or _ALLOW_MOCK_OUTPUT.get():
+        return
+    raise MockAsReal(
+        f"this mission is MOCK output and {path or 'the requested path'} was not asked "
+        f"for it. Pass --allow-mock-output to write it anyway — it will be labelled MOCK "
+        f"throughout, and it must not be cited as a finding about the world.")
+
+
+def _mission_evidence(mission: Any) -> list["EvidenceItem"]:
+    """Every evidence item a mission-like object carries, wherever it keeps them."""
+
+    found: list[EvidenceItem] = []
+    for attribute in ("evidence", "reports"):
+        value = getattr(mission, attribute, None)
+        if isinstance(value, (list, tuple)):
+            for entry in value:
+                if isinstance(entry, EvidenceItem):
+                    found.append(entry)
+                else:
+                    found.extend(getattr(entry, "evidence", []) or [])
+    if not found and isinstance(mission, Mapping):
+        for row in mission.get("evidence") or []:
+            if isinstance(row, Mapping):
+                try:
+                    found.append(EvidenceItem.model_validate(
+                        {key: value for key, value in row.items() if key != "cited_by"}))
+                except ValueError:
+                    continue
+    return found
+
+
+#: The tool the ``break`` scenario fails.  Named after a tool the exposure plan really uses,
+#: so the failure is one a mission could meet rather than one invented for the fixture.
+BREAK_TOOL: str = "advisory.read"
+
+
+def mock_scenario(name: str) -> dict[str, Any]:
+    """The three things a mock run is asked to exercise, as data.
+
+    ``pass`` runs the happy path; ``revise`` makes every Worker's first answer insufficient;
+    ``break`` makes one capability fail.  Named scenarios rather than flags on the command
+    line, because a test wants to say *which* behaviour it is exercising in one word.
+    """
+
+    scenarios: dict[str, dict[str, Any]] = {
+        "pass": {"description": "every unit passes review on its first attempt",
+                 "failing_tools": (), "flaky_tools": (), "always_revise": (),
+                 "review_rounds": 2},
+        "revise": {"description": "the first review always asks for another attempt",
+                   "failing_tools": (), "flaky_tools": (),
+                   "always_revise": ("*",), "review_rounds": 2},
+        "flaky": {"description": "one tool fails once and recovers on the retry",
+                  "failing_tools": (), "flaky_tools": (BREAK_TOOL,),
+                  "always_revise": (), "review_rounds": 2},
+        "break": {"description": "one tool never succeeds, so the run stops with a gap",
+                  "failing_tools": (BREAK_TOOL,), "flaky_tools": (),
+                  "always_revise": (), "review_rounds": 2},
+    }
+    if name not in scenarios:
+        raise ValueError(f"unknown mock scenario {name!r}: choose from "
+                         f"{', '.join(sorted(scenarios))}")
+    return {"name": name, **scenarios[name]}
+
+
+def build_mock_flow(context: "MasterContext", *, scenario: str = "pass",
+                    policy: "FlowPolicy | None" = None,
+                    **kwargs: Any) -> tuple["HierarchicalFlow", MockRunner]:
+    """A real flow over mock adapters, for the named scenario."""
+
+    chosen = mock_scenario(scenario)
+    # The shape is built against a context that carries the shape's own tools, for the same
+    # reason the dry run's plan is: a mock run exercises the scripted team, and the
+    # operator's deployment tool list is not what that team is written against.
+    units = flow_units_for(_shape_context(context), _objective_key_for(context))
+    revise = set(chosen["always_revise"])
+    policy = policy or FlowPolicy.from_context(
+        context, max_review_rounds=max(FlowPolicy().max_review_rounds,
+                                       chosen["review_rounds"]))
+    runner = MockRunner(
+        scope=context.scope_entries or [MOCK_SCOPE],
+        failing_tools=chosen["failing_tools"], flaky_tools=chosen["flaky_tools"],
+        # The scenario names a Worker (or "*" for all of them): the flow's review looks the
+        # unit up by id, so "*" has to be resolved against the graph rather than passed on.
+        always_revise=({worker.id for subagent in units for worker in subagent.workers}
+                       if "*" in revise else revise))
+    flow = HierarchicalFlow(context=context, subagents=units, runner=runner,
+                            policy=policy, mode=RunMode.MOCK, **kwargs)
+    return flow, runner
+
+
+def run_mock_mission(context: "MasterContext", *, scenario: str = "pass",
+                     policy: "FlowPolicy | None" = None,
+                     **kwargs: Any) -> tuple["FlowResult", MockRunner]:
+    """Run one mock mission end to end, with the effect boundary closed behind it."""
+
+    with effect_boundary(RunMode.MOCK):
+        flow, runner = build_mock_flow(context, scenario=scenario, policy=policy, **kwargs)
+        result = flow.run()
+    return result, runner
+
+
+# ➤ rendering --------------------------------------------------------------
+
+def render_plan(plan: PlanReport, *, width: int = 100) -> Group:
+    """The dry run's screen: the verdict, the shape, the bounds, and what it did not do."""
+
+    colour = "green" if plan.cleared else "red"
+    banner = Panel(
+        Text.assemble((f"{'✔' if plan.cleared else '✘'}  ", f"bold {colour}"),
+                      ("DRY RUN — ", "bold yellow"),
+                      ("VALIDATED AND PLANNED" if plan.cleared
+                       else "REFUSED BEFORE PLANNING", f"bold {colour}"),
+                      ("\n", ""),
+                      (plan.verdict[:300], "white")),
+        title="[bold]dry run[/bold]", title_align="left", border_style=colour,
+        expand=False, padding=(0, 1))
+    ident = Table.grid(padding=(0, 1))
+    ident.add_column(style="dim", no_wrap=True)
+    ident.add_column(overflow="fold")
+    ident.add_row("objective", escape(plan.objective[:180]))
+    ident.add_row("mission", escape(plan.mission_id or "unnamed"))
+    ident.add_row("mode", escape(plan.mode_of_mission))
+    ident.add_row("scope", escape(", ".join(plan.scope_entries) or "not supplied"))
+    if plan.exclusions:
+        ident.add_row("exclusions", escape(", ".join(plan.exclusions)))
+    ident.add_row("limits", escape(", ".join(f"{key}={value}"
+                                             for key, value in sorted(plan.limits.items()))))
+    ident.add_row("effects", escape(plan.effects.describe()))
+    ident.add_row("structure", escape(plan.structure_source))
+
+    shape = Table(title="plan", title_justify="left", box=None, pad_edge=False, expand=False)
+    shape.add_column("kind", style="dim", no_wrap=True)
+    shape.add_column("count", justify="right")
+    shape.add_column("detail", overflow="fold", max_width=56)
+    counts = plan.by_kind()
+    shape.add_row("subagents", str(counts.get("subagent", 0)),
+                  escape(", ".join(unit.role for unit in plan.subagents())[:100]))
+    shape.add_row("workers", str(counts.get("worker", 0)),
+                  escape(", ".join(unit.role for unit in plan.workers())[:100]))
+    shape.add_row("waves", str(plan.bounds.waves), "dependency waves in the plan")
+    shape.add_row("stages", str(len(plan.structure)), escape(" → ".join(plan.structure)))
+
+    bounds = Table(title="bounds the policy implies", title_justify="left", box=None,
+                   pad_edge=False, expand=False)
+    bounds.add_column("what", style="dim", no_wrap=True)
+    bounds.add_column("count", justify="right")
+    bounds.add_column("why", overflow="fold", max_width=52)
+    bounds.add_row("attempts/unit", str(plan.bounds.max_attempts_per_unit),
+                   "one attempt plus the review budget")
+    bounds.add_row("worker runs", str(plan.bounds.max_worker_runs),
+                   "workers × attempts, plus runtime workers and follow-ups")
+    bounds.add_row("review rounds", str(plan.bounds.max_review_rounds),
+                   "per subagent, from the policy")
+    bounds.add_row("master reviews", str(plan.bounds.max_master_reviews),
+                   "the bound that ends the mission")
+    bounds.add_row("replan rounds", str(plan.bounds.max_replan_rounds),
+                   "follow-up planning rounds")
+
+    unit_table = Table(title="the plan, unit by unit", title_justify="left", box=None,
+                       pad_edge=False, expand=True)
+    unit_table.add_column("unit", no_wrap=True)
+    unit_table.add_column("kind", no_wrap=True)
+    unit_table.add_column("parent", no_wrap=True)
+    unit_table.add_column("attempts", justify="right")
+    unit_table.add_column("objective", overflow="fold", max_width=54)
+    for unit in plan.units[:24]:
+        unit_table.add_row(escape(unit.id), escape(unit.kind), escape(unit.parent or "master"),
+                           str(unit.max_attempts), escape(unit.objective[:120]))
+
+    blocks: list[Any] = [banner, Text(""), ident, Text("")]
+    side = Table.grid(padding=(0, 4), expand=False)
+    side.add_column(no_wrap=False)
+    side.add_column(no_wrap=False)
+    side.add_row(shape, bounds)
+    blocks.extend([side, Text(""), unit_table])
+    if plan.refusals:
+        refused = Table(title="refusals", title_justify="left", box=None, pad_edge=False,
+                        expand=False)
+        refused.add_column(width=2, no_wrap=True)
+        refused.add_column(overflow="fold", max_width=92)
+        for refusal in plan.refusals[:8]:
+            refused.add_row("[red]✘[/red]", escape(refusal[:220]))
+        blocks.extend([Text(""), refused])
+    note = Table.grid(padding=(0, 1))
+    note.add_column(width=2, no_wrap=True)
+    note.add_column(overflow="fold", max_width=92)
+    note.add_row("[yellow]▣[/yellow]", escape(plan.note))
+    blocks.extend([Text(""), Text("what this did not do", style="bold"), note])
+    return Group(*blocks)
+
+
+def render_plan_summary(plan: PlanReport) -> str:
+    """The plan as plain text, for a log or a pipe."""
+
+    lines = [f"{'✔' if plan.cleared else '✘'} DRY RUN — {plan.verdict[:160]}",
+             f"  mission     {plan.mission_id or 'unnamed'}",
+             f"  objective   {plan.objective[:140]}",
+             f"  shape       {plan.bounds.describe()}",
+             f"  waves       {plan.bounds.waves}",
+             f"  effects     {plan.effects.describe()}"]
+    for refusal in plan.refusals:
+        lines.append(f"  refused     {refusal[:150]}")
+    lines.append(f"  not done    {plan.note}")
+    return "\n".join(lines)
+
+
+def render_mock_banner(result: "FlowResult", runner: MockRunner) -> Panel:
+    """The mock run's banner: what it exercised, and what none of it is."""
+
+    evidence = _evidence_from_reports(result)
+    labelled = len([item for item in evidence if is_mock_evidence(item)])
+    body = Text()
+    body.append(f"{MOCK_NOTE}\n", style="white")
+    body.append(f"\n{len(result.reports)} subagent(s), {result.total_workers} worker(s), "
+                f"{result.worker_attempts} attempt(s), {result.retries} retr"
+                f"{'y' if result.retries == 1 else 'ies'}; "
+                f"{labelled} of {len(evidence)} evidence item(s) labelled MOCK",
+                style="dim")
+    return Panel(body, title="[bold yellow]MOCK RUN[/bold yellow]", title_align="left",
+                 border_style="yellow", expand=False, padding=(0, 1))
+
+
+class OfflineCost(StrictModel):
+    """What one offline run spent, set against the ceiling its plan named.
+
+    Named for what it is: a *model* of the price, not an invoice.  Nothing in a mock run is
+    billed, so the only honest number is the shape of the spend — how much of the permitted
+    worst case the run actually used — and the honest caveat is printed with it.
+    """
+
+    worker_runs: int = Field(default=0, ge=0)
+    tool_calls: int = Field(default=0, ge=0)
+    model_calls: int = Field(default=0, ge=0)
+    planned_worker_runs: int = Field(default=0, ge=0)
+    #: ``None`` when there is no plan to compare against — an absent denominator, not a zero.
+    committed_fraction: float | None = None
+    headline: str = ""
+
+    def describe(self) -> str:
+        fraction = ("no plan to compare against" if self.committed_fraction is None
+                    else f"{self.committed_fraction:.0%} of the permitted worst case")
+        return (f"{self.worker_runs} worker run(s), {self.tool_calls} tool call(s), "
+                f"{self.model_calls} model call(s); {fraction}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"worker_runs": self.worker_runs, "tool_calls": self.tool_calls,
+                "model_calls": self.model_calls,
+                "planned_worker_runs": self.planned_worker_runs,
+                "committed_fraction": self.committed_fraction,
+                "headline": self.headline}
+
+
+def offline_cost(result: "FlowResult", plan: PlanReport | None = None, *,
+                 runner: MockRunner | None = None) -> dict[str, Any]:
+    """What a run spent, read off the run.
+
+    Read from the record rather than asserted, so the number is available to anyone holding a
+    result — including a test that never saw the adapters.  ``runner`` is optional and only
+    makes the tool count *complete*: the record keeps the last attempt per Worker, and a
+    retried attempt's scripted call is a call that happened.  Pass the runner and the count
+    includes them; leave it out and the count is the calls the record can still name.
+    """
+
+    outcomes = [item for report in result.reports for item in report.outcomes]
+    tool_calls = sum(1 for item in outcomes
+                     if (item.payload or {}).get("tool") is not None)
+    if runner is not None:
+        tool_calls = len(runner.tool_calls)
+    model_calls = sum(1 for item in outcomes
+                      if (item.payload or {}).get("provider") == "mock")
+    planned = int(plan.bounds.max_worker_runs) if plan is not None else 0
+    fraction = (round(result.worker_attempts / planned, 4)
+                if planned and result.worker_attempts <= planned else None)
+    cost = OfflineCost(
+        worker_runs=result.worker_attempts, tool_calls=tool_calls,
+        model_calls=model_calls, planned_worker_runs=planned,
+        committed_fraction=fraction)
+    cost = cost.model_copy(update={"headline": (
+        f"{cost.describe()} — a cost model, not a bill: an offline run spends nothing")})
+    return cost.to_dict()
+
+
+def render_offline_cost(cost: Mapping[str, Any]) -> Group:
+    """The cost, as a small table, with the caveat attached to it."""
+
+    table = Table(title="what this run cost", title_justify="left", box=None,
+                  pad_edge=False, expand=False)
+    table.add_column("what", style="dim", no_wrap=True)
+    table.add_column("count", justify="right")
+    table.add_column("note", overflow="fold", max_width=52)
+    table.add_row("worker runs", str(cost.get("worker_runs", 0)),
+                  "including every retry")
+    table.add_row("tool calls", str(cost.get("tool_calls", 0)), "scripted adapter calls")
+    table.add_row("model calls", str(cost.get("model_calls", 0)), "deterministic completions")
+    planned = cost.get("planned_worker_runs") or 0
+    table.add_row("permitted", str(planned),
+                  "the plan's worst case at this policy" if planned else "no plan supplied")
+    fraction = cost.get("committed_fraction")
+    table.add_row("committed", "n/a" if fraction is None else f"{fraction:.0%}",
+                  "of the permitted worst case")
+    note = Table.grid(padding=(0, 1))
+    note.add_column(width=2, no_wrap=True)
+    note.add_column(overflow="fold", max_width=92)
+    note.add_row("[yellow]▣[/yellow]", escape(str(cost.get("headline", ""))))
+    return Group(table, note)
+
+
+# ➤ self-test --------------------------------------------------------------
+#
+# 43.1 The clause, falsified five ways: the dry run plans and executes nothing, the mock run
+# exercises the hierarchy, the review loops, the retries and the reports, a scoped failure
+# changes the price the plan charged, the labels survive into every artefact, and a second
+# run is identical to the first.
+
+def run_dry_run_self_test() -> list[DossierCheck]:
+    """Prove §43's acceptance clause: the whole orchestration, offline, twice the same.
+
+    The clause is one sentence — *the complete hierarchy, review loops, retries and reports
+    can be exercised offline* — so the checks are in five groups: the dry run plans and
+    refuses to execute, the mock run exercises each of those four things, a scoped tool
+    failure changes the price the plan charges, the labels survive into every artefact, and a
+    second run is identical to the first.
+    """
+
+    checks: list[DossierCheck] = []
+
+    def add(name: str, ok: bool, detail: object = "") -> None:
+        checks.append(DossierCheck(name=name, ok=bool(ok), detail=str(detail)[:180]))
+
+    def raises(call: Callable[[], Any], error: type[BaseException]) -> bool:
+        try:
+            call()
+        except error:
+            return True
+        except Exception:                   # noqa: BLE001 - a wrong error is a failure
+            return False
+        return False
+
+    context = _selftest_context("exposure")
+    preflight = run_preflight(objective=context.objective, targets=context.scope_entries,
+                              scope_entries=context.scope_entries)
+
+    # ---- 1. the dry run plans, and refuses to execute -------------------------
+    plan = plan_mission(context, preflight=preflight)
+    add("a dry run produces a plan", isinstance(plan, PlanReport) and plan.units)
+    add("the plan states the outcome of the gate", plan.cleared and bool(plan.verdict),
+        plan.verdict[:80])
+    add("the plan carries the hierarchy", len(plan.subagents()) == 2
+        and len(plan.workers()) >= 2, f"{len(plan.subagents())}/{len(plan.workers())}")
+    add("the plan names every unit's parent", all(unit.parent for unit in plan.units))
+    add("the plan states the attempts a unit is permitted",
+        plan.bounds.max_attempts_per_unit == 1 + FlowPolicy().max_review_rounds,
+        plan.bounds.describe())
+    add("the plan states the worst case for worker runs",
+        plan.bounds.max_worker_runs >= plan.bounds.workers * plan.bounds.max_attempts_per_unit,
+        plan.bounds.max_worker_runs)
+    add("the plan counts its dependency waves", plan.bounds.waves >= 1, plan.bounds.waves)
+    add("the plan closes every effect", plan.effects.blocked()
+        == ["model", "network", "browser", "forensic"], plan.effects.blocked())
+    add("the plan is not a FlowResult", not isinstance(plan, FlowResult))
+    add("the plan says what it did not do", "nothing was collected" in plan.note)
+    add("the plan announces what a dry run cannot do", "cannot" in DRY_RUN_NOTE
+        or "dry run" in DRY_RUN_NOTE.lower())
+    add("the plan screen states DRY RUN", "DRY RUN" in _render_text(render_plan(plan)))
+    add("the plan screen names the blocked effects",
+        "blocked: model, network, browser, forensic" in _render_text(render_plan(plan)))
+    add("the plan summary is plain text", plan.mission_id in render_plan_summary(plan))
+
+    add("a dry run refuses a network effect",
+        raises(lambda: _require_in(RunMode.DRY_RUN, "network"), DryRunViolation))
+    add("a dry run refuses a model effect",
+        raises(lambda: _require_in(RunMode.DRY_RUN, "model"), DryRunViolation))
+    add("a mock run refuses nothing the boundary allows",
+        not raises(lambda: _require_in(RunMode.MOCK, "network"), Exception))
+    add("an unknown effect is a usage error, not a silent allow",
+        raises(lambda: _require_in(RunMode.MOCK, "telepathy"), ValueError))
+    add("a dry-run runner refuses every worker attempt",
+        raises(lambda: DryRunRunner().run_worker(None, _named("probe"), attempt=1),  # type: ignore[arg-type]
+               DryRunViolation))
+    add("outside a run, the boundary is permissive", current_boundary().network)
+
+    # ---- 2. mock mode exercises the hierarchy, loops, retries and reports -----
+    result, runner = run_mock_mission(context, scenario="revise")
+    add("a mock run produces a flow result", isinstance(result, FlowResult)
+        and result.synthesis is not None)
+    add("the mock run built the whole hierarchy",
+        len(result.reports) == 2 and result.total_workers >= 3,
+        f"{len(result.reports)}/{result.total_workers}")
+    add("the mock run exercised the review loop",
+        result.worker_attempts > len(plan.workers()),
+        f"{result.worker_attempts} attempt(s) over {len(plan.workers())} worker(s)")
+    add("the mock run retried a unit the review refused",
+        any(item.attempt > 1 for report in result.reports for item in report.outcomes),
+        "no second attempt")
+    add("the mock run's reviews are the real review contract",
+        all(verdict.criteria for report in result.reports for verdict in report.reviews)
+        or bool(result.reviews), "no reviews recorded")
+    add("the mock model adapter recorded its calls",
+        bool(runner.mock_model.calls) and all(call["attempt"] >= 1
+                                              for call in runner.mock_model.calls),
+        f"{len(runner.mock_model.calls)} call(s)")
+    add("the mock tool layer recorded every call", len(runner.tool_calls) >= len(result.reports),
+        f"{len(runner.tool_calls)} call(s)")
+    add("the mock run's evidence is labelled mock", _all_labelled(result))
+    add("every mock claim says it is not a finding",
+        all(MOCK_CONFIDENCE_BASIS[:24] in (item.confidence_basis or "")
+            for item in _evidence_from_reports(result)))
+    add("the mock run's synthesis keeps the limitation",
+        any("deterministic" in line for line in result.synthesis.limitations),
+        result.synthesis.limitations[:1])
+
+    flaky, _flaky_runner = run_mock_mission(context, scenario="flaky")
+    add("a flaky tool recovers on its retry", flaky.total_workers and not flaky.stopped,
+        flaky.stop_reason[:60] or "no stop")
+    broken, _broken_runner = run_mock_mission(context, scenario="break")
+    add("a tool that never recovers fails its unit",
+        any(report.status is EntityStatus.FAILED for report in broken.reports),
+        [report.status.value for report in broken.reports])
+    add("a failed unit stops the mission for a reason", broken.stopped
+        and bool(broken.stop_reason), broken.stop_reason[:70])
+    add("a stopped mock run still produced its reports", bool(broken.reports))
+    stopped = build_stopped_presentation(broken)
+    add("a stopped mock run still has a presentation",
+        stopped.headline.outcome is MissionOutcome.FAILED
+        and "stopped" in stopped.headline.statement, stopped.headline.statement[:80])
+    add("the stopped presentation says why it stopped",
+        broken.stop_reason[:40] in stopped.headline.statement)
+    add("the stopped presentation names its mode",
+        "MOCK" in stopped.produced_by, stopped.produced_by[-40:])
+    add("the stopped presentation renders",
+        "MISSION FAILED" in _render_text(
+            render_mission_presentation(stopped, width=100)))
+
+    # ---- 3. the offline run costs what the plan said it would ----------------
+    cost = offline_cost(result, plan, runner=runner)
+    add("the offline cost is computed from the run and the plan",
+        cost["worker_runs"] == result.worker_attempts
+        and cost["committed_fraction"] is not None, cost["headline"][:90])
+    counted = offline_cost(result, plan)
+    add("the offline cost names the tool calls a run can still name",
+        counted["tool_calls"] <= len(runner.tool_calls) and counted["tool_calls"] >= 1,
+        f"{counted['tool_calls']} of {len(runner.tool_calls)}")
+    add("the offline cost names every scripted call when it is given the runner",
+        cost["tool_calls"] == len(runner.tool_calls), cost["tool_calls"])
+    add("the offline cost names what it is not", "not a bill" in cost["headline"])
+    add("the cost renderer prints the caveat",
+        "not a bill" in _render_text(render_offline_cost(cost)))
+
+    # ---- 4. the labels survive into every artefact ---------------------------
+    dossier = build_dossier(result, context=context,
+                            settings=build_settings({}, {}).settings)
+    markdown = render_dossier_markdown(dossier)
+    add("the report says MOCK", "MOCK" in markdown)
+    add("the report's header names the mode",
+        "run mode: **mock**" in markdown.lower(), [line for line in markdown.splitlines()
+                                               if "run mode" in line][:1])
+    add("the report's evidence table says MOCK",
+        MOCK_EVIDENCE_TAG in markdown or "[MOCK]" in markdown)
+    add("the report keeps the mock basis", MOCK_CONFIDENCE_BASIS[:30] in markdown)
+    add("the source register names the mock origin",
+        MOCK_LOCATOR_PREFIX in markdown, MOCK_LOCATOR_PREFIX)
+    add("the dossier's audit record names the mode",
+        dossier.audit.environment.dry_run is not None)
+    add("a mock mission cannot be written as a real one",
+        _refuses_mock_as_real(result))
+    add("a mock mission may be written with the flag", _allows_mock(result))
+    clean = mock_evidence(EvidenceItem(
+        kind=EvidenceKind.INFERENCE, statement="a scripted inference",
+        reasoning="the adapter was asked to reason", supports=["ev-script"],
+        sources=[SourceReference(kind=SourceKind.LOCAL_ARTIFACT, artifact_path=MOCK_SCOPE,
+                                 title="scripted", retrieved_at=utc_now())]))
+    add("labelling keeps a mock locatable and in scope",
+        bool(clean.sources) and is_mock_evidence(clean)
+        and clean.sources[0].locator.startswith(MOCK_LOCATOR_PREFIX),
+        clean.sources[0].locator[:60] if clean.sources else "no source")
+    stripped = clean.model_copy(update={"tags": [], "confidence_basis": "collected"})
+    add("the labels cannot be stripped from a source's locator",
+        is_mock_evidence(stripped), stripped.sources[0].locator if stripped.sources else "")
+    add("a real result is not mistaken for a mock one",
+        not _refuses_mock_as_real(_live_looking_result()))
+    add("a mock dossier is refused however it is handed over",
+        _refused_as_mock(dossier) and _refused_as_mock(dossier.to_dict())
+        and not _refused_as_mock(_live_looking_result().model_dump(mode="json")))
+
+    # ---- 5. determinism -------------------------------------------------------
+    again, _runner_two = run_mock_mission(context, scenario="revise")
+    add("a second mock run has the same shape",
+        len(again.reports) == len(result.reports)
+        and again.total_workers == result.total_workers
+        and again.worker_attempts == result.worker_attempts,
+        f"{again.worker_attempts} vs {result.worker_attempts}")
+    add("a second mock run has the same identifiers",
+        [report.subagent_id for report in again.reports]
+        == [report.subagent_id for report in result.reports])
+    add("a second mock run has the same evidence",
+        [item.id for item in _evidence_from_reports(again)]
+        == [item.id for item in _evidence_from_reports(result)])
+    add("a second mock run has the same statuses",
+        [report.status.value for report in again.reports]
+        == [report.status.value for report in result.reports])
+    add("a second mock run has the same cost",
+        offline_cost(again, plan, runner=_runner_two) == cost)
+    add("the mock clock is logical, not measured",
+        all(round(item.seconds * 100, 6) % 1 < 1e-6 for report in result.reports
+            for item in report.outcomes if item.seconds),
+        "a mock duration was not a multiple of its tick")
+    first = mock_tool_result("dns.lookup", "example.com", attempt=1)
+    second = mock_tool_result("dns.lookup", "example.com", attempt=2)
+    add("the same call returns the same result",
+        mock_tool_result("dns.lookup", "example.com", attempt=1).detail == first.detail)
+    add("a retry's scripted answer can differ",
+        first.detail != second.detail, first.detail[:60])
+    add("a different subject returns a different row",
+        mock_tool_result("dns.lookup", "other.example", attempt=1).subject
+        != mock_tool_result("dns.lookup", "example.com", attempt=1).subject)
+    parsed = PlanReport.model_validate(json.loads(json.dumps(plan.to_dict())))
+    add("the plan round-trips through JSON", parsed.to_dict() == plan.to_dict())
+    add("the mock scenario table is closed",
+        raises(lambda: mock_scenario("invented"), ValueError))
+    return checks
+
+
+def _require_in(mode: RunMode, kind: str) -> None:
+    with effect_boundary(mode):
+        require_effect(kind)
+
+
+def _named(name: str) -> Any:
+    return type("Named", (), {"name": name, "id": f"wrk-{name}"})()
+
+
+def _all_labelled(result: "FlowResult") -> bool:
+    evidence = _evidence_from_reports(result)
+    return bool(evidence) and all(is_mock_evidence(item) for item in evidence)
+
+
+def _live_looking_result() -> "FlowResult":
+    """A result with one unlabelled observation, which must not read as a mock."""
+
+    item = EvidenceItem(
+        kind=EvidenceKind.OBSERVATION, statement="an ordinary observation",
+        sources=[SourceReference(kind=SourceKind.PUBLIC_WEB, url="https://example.com/a",
+                                 retrieved_at=utc_now())])
+    report = SubagentOutcome(subagent_id="sa-live", role="live", status=EntityStatus.SUCCEEDED)
+    report = report.model_copy(update={"evidence": [item]})
+    return FlowResult(mission_id="live-mission", objective="live", reports=[report])
+
+
+def _render_text(renderable: Any, *, width: int = 100) -> str:
+    """A rendered screen as text, with no colour and no terminal dependency."""
+
+    buffer = io.StringIO()
+    Console(file=buffer, width=width, color_system=None, highlight=False,
+            force_terminal=False, legacy_windows=False).print(renderable)
+    return buffer.getvalue()
+
+
+def _refused_as_mock(mission: Any) -> bool:
+    """Whether the writer refuses this object as mock output reaching a real path."""
+
+    try:
+        assert_not_mock_as_real(mission, path="out/report.md")
+    except MockAsReal:
+        return True
+    except Exception:                       # noqa: BLE001 - a wrong error is a failure
+        return False
+    return False
+
+
+def _refuses_mock_as_real(result: "FlowResult") -> bool:
+    try:
+        assert_not_mock_as_real(result, path="out/report.md")
+    except MockAsReal:
+        return True
+    except Exception:                       # noqa: BLE001 - a wrong error is a failure
+        return False
+    return False
+
+
+def _allows_mock(result: "FlowResult") -> bool:
+    try:
+        assert_not_mock_as_real(result, path="out/report.md", allow_mock_output=True)
+    except Exception:                       # noqa: BLE001
+        return False
+    return True
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 44. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 
@@ -60308,6 +62115,9 @@ def report_command(
     audit: bool = typer.Option(
         False, "--audit",
         help="Print the §42 audit block: what was run, and what is deliberately not in it."),
+    allow_mock_output: bool = typer.Option(
+        False, "--allow-mock-output",
+        help="Permit writing a mission the record says was MOCK (the file stays labelled)."),
 ) -> None:
     """Render a finished mission: the document, the record, and the summary.
 
@@ -60327,7 +62137,7 @@ def report_command(
 
     if self_test:
         checks = [*run_dossier_self_test(), *run_presentation_self_test(),
-                  *run_audit_self_test()]
+                  *run_audit_self_test(), *run_dry_run_self_test()]
         failures = [check for check in checks if not check.ok]
         if as_json:
             _emit(json.dumps({"checks": [check.to_dict() for check in checks],
@@ -60391,8 +62201,13 @@ def report_command(
         raise typer.Exit(ExitCode.USAGE)
 
     try:
-        written = write_dossier(dossier, out_dir=directory, stem=name,
-                                formats=chosen)
+        with permit_mock_output(allow_mock_output):
+            written = write_dossier(dossier, out_dir=directory, stem=name, formats=chosen)
+    except MockAsReal as exc:
+        # Not a failure to write: a decision not to.  The distinction is the exit code —
+        # POLICY says the record was understood and refused, not that the writer broke.
+        console.print(f"[red]✘[/red] {escape(_first_sentence(str(exc))[:220])}")
+        raise typer.Exit(ExitCode.POLICY) from exc
     except OutputError as exc:
         console.print(f"[red]✘[/red] {escape(_first_sentence(str(exc))[:200])}")
         raise typer.Exit(ExitCode.INTERNAL) from exc
@@ -60410,13 +62225,13 @@ def report_command(
         console.print()
         clause = dossier.audit.acceptance()
         colour = "green" if clause["ok"] else "red"
-        console.print(Text(f"[{colour}]{'✔' if clause['ok'] else '✘'}[/{colour}] "
-                           f"audit clause: reproducible "
-                           f"{_mark(clause['reproducible'])} · no secrets "
-                           f"{_mark(clause['no_secrets'])} · retention stated "
-                           f"{_mark(clause['retention_stated'])}"))
+        console.print(_acceptance_line(
+            clause["ok"], [("reproducible", clause["reproducible"]),
+                           ("no secrets", clause["no_secrets"]),
+                           ("retention stated", clause["retention_stated"])],
+            prefix="audit clause: "))
         for problem in clause["errors"]:
-            console.print(Text(f"  [red]·[/red] {escape(problem[:200])}"))
+            console.print(Text.assemble(("  · ", "red"), (problem[:200], "white")))
         if not dossier.audit.secrets.scanned:
             console.print("  [dim]the scan runs when the file is written; --summary and "
                           "--audit print without writing[/dim]")
@@ -60438,14 +62253,14 @@ def report_command(
         console.print()
         console.print(render_dossier_summary_table(dossier))
         for path in written.paths:
-            console.print(Text(f"[dim]written[/dim] {escape(path)}"))
+            console.print(Text.assemble(("written ", "dim"), (str(path), "white")))
         clause = written.acceptance
         colour = "green" if clause.ok else "red"
-        console.print(Text(f"[{colour}]{'✔' if clause.ok else '✘'}[/{colour}] "
-                           f"markdown {_mark(clause.markdown_complete)} · "
-                           f"json {_mark(clause.json_round_trips)} · "
-                           f"summary {_mark(clause.summary_concise)} · "
-                           f"custody {_mark(clause.custody_preserved)}"))
+        console.print(_acceptance_line(
+            clause.ok, [("markdown", clause.markdown_complete),
+                        ("json", clause.json_round_trips),
+                        ("summary", clause.summary_concise),
+                        ("custody", clause.custody_preserved)]))
         if clause.errors:
             console.print(Text(escape("; ".join(clause.errors)[:300]), style="red"))
         console.print()
@@ -60453,9 +62268,29 @@ def report_command(
 
 
 def _mark(ok: bool) -> str:
-    """A one-character verdict for the acceptance line."""
+    """A one-character verdict, as markup for a Rich renderable that parses it."""
 
     return "[green]yes[/green]" if ok else "[red]no[/red]"
+
+
+def _acceptance_line(ok: bool, clauses: Sequence[tuple[str, bool]], *,
+                     prefix: str = "") -> Text:
+    """The acceptance line as styled text.
+
+    Assembled rather than written as markup inside :class:`Text`, which prints its markup
+    literally — the same trap §40 documents, met again by a line that only ever shows up when
+    a mission finishes.
+    """
+
+    line = Text.assemble(("✔" if ok else "✘", "green" if ok else "red"), " ")
+    if prefix:
+        line.append(prefix, style="white")
+    for index, (name, passed) in enumerate(clauses):
+        if index:
+            line.append(" · ", style="dim")
+        line.append(f"{name} ", style="dim")
+        line.append("yes" if passed else "no", style="green" if passed else "red")
+    return line
 
 
 def _dossier_from_flow_file(source: str, console: Console) -> MissionDossier:
@@ -60469,6 +62304,19 @@ def _dossier_from_flow_file(source: str, console: Console) -> MissionDossier:
         console.print(f"[red]✘[/red] not a flow result: "
                       f"{escape(_first_sentence(str(exc))[:200])}")
         raise typer.Exit(ExitCode.USAGE) from exc
+    if isinstance(payload, Mapping) and "report" in payload and "audit" in payload:
+        # §40 writes a dossier, which carries the report and the audit record but *is* not a
+        # flow result.  Accepting it is not a convenience: re-rendering a written dossier is
+        # how a reader checks the file against itself, and how a mock record gets refused.
+        try:
+            dossier = MissionDossier.model_validate(payload)
+        except ValueError as exc:
+            console.print(f"[red]✘[/red] not a mission dossier: "
+                          f"{escape(_first_sentence(str(exc))[:200])}")
+            raise typer.Exit(ExitCode.USAGE) from exc
+        return dossier.model_copy(update={"audit": dossier.audit.model_copy(update={
+            "environment": dossier.audit.environment.model_copy(
+                update={"command": f"report --mission {source}"})})})
     synthesis = payload.get("synthesis")
     if not isinstance(synthesis, dict) or not synthesis.get("report"):
         console.print("[red]✘[/red] this flow result has no finished report: the mission "
@@ -60591,6 +62439,7 @@ def _flow_result_from_payload(payload: Mapping[str, Any]) -> FlowResult:
         worker_attempts=int(payload.get("worker_attempts") or 0),
         retries=int(payload.get("retries") or 0),
         concurrency=dict(payload.get("concurrency") or {}),
+        mode=str(payload.get("mode") or "live"),
         resume=payload.get("resume"),
         checkpoint=str(payload.get("checkpoint") or ""),
         retasks=[RetaskedWorker.model_validate(item)

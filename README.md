@@ -15,6 +15,7 @@ python vedant_osint.py master --self-test     # Master Agent boundaries
 python vedant_osint.py subagents --self-test  # runtime Subagent specifications
 python vedant_osint.py workers --self-test    # runtime Worker specifications
 python vedant_osint.py flow --self-test       # LangGraph execution flow
+python vedant_osint.py flow --mock             # the whole graph over mock adapters
 python vedant_osint.py sched --self-test      # bounded queues, deadlines, licences
 python vedant_osint.py resume --self-test     # checkpointing and resumable missions
 python vedant_osint.py router --self-test     # the controlled capability router
@@ -30,7 +31,7 @@ python vedant_osint.py aggregate --self-test # reviewed work only, and never ear
 python vedant_osint.py review-master --self-test # five lenses, five ways to stop
 python vedant_osint.py loops --self-test      # repeated work, blocked lines, saturation
 python vedant_osint.py synthesis --self-test  # a report that cannot outrun its evidence
-python vedant_osint.py report --self-test     # formats, presentation, audit (217)
+python vedant_osint.py report --self-test     # formats, presentation, audit, dry run (283)
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -364,9 +365,11 @@ Worker → `subagent-aggregate`), and a **Worker** child graph (`worker-task` �
 `worker-review`, looping while the review asks for a retry).
 
 ```bash
-python vedant_osint.py flow --self-test        # 60 guarantee checks, offline
+python vedant_osint.py flow --self-test        # 77 guarantee checks, offline
 python vedant_osint.py flow --demo exposure    # summary + ledger + joins
 python vedant_osint.py flow --demo compare     # one structure, two widths
+python vedant_osint.py flow --dry-run -t example.com -o "…"   # plan only, nothing executed
+python vedant_osint.py flow --mock             # the same graph over mock adapters
 python vedant_osint.py flow -t example.com -o "assess the exposure of example.com"
 ```
 
@@ -1024,7 +1027,7 @@ one `MissionDossier` assembled from the reviewed record, so a fact that is not i
 is not in the Markdown either — the JSON is the authority and the other two are renderings.
 
 ```
-python vedant_osint.py report --self-test                    # 217 checks: formats, presentation, audit
+python vedant_osint.py report --self-test                    # 283 checks: formats, presentation, audit, dry run/mock
 python vedant_osint.py report --demo                         # one mission, three formats
 python vedant_osint.py flow --demo exposure --json > m.json
 python vedant_osint.py report --mission m.json --out-dir out/ # writes m.md and m.json
@@ -1151,6 +1154,75 @@ written anyway has documented the leak instead of preventing it. The scan's resu
 clause it produced, are recorded in the file that passed it. Findings name a location, never
 a value: a scan report that quoted the secret it found would be the leak it was checking for.
 
+## Dry run and mock mode
+
+Two modes, one purpose: see what a mission would do before it does anything, and exercise the
+whole orchestration — hierarchy, review loops, retries, reports — with nothing switched on.
+
+```bash
+python vedant_osint.py flow --dry-run -t example.com -o "…"   # validate, plan, execute nothing
+python vedant_osint.py flow --dry-run -t example.com -o "…" --json > plan.json
+python vedant_osint.py flow --mock                            # the real graph, mock adapters
+python vedant_osint.py flow --mock --mock-scenario revise      # pass | revise | flaky | break
+python vedant_osint.py flow --mock --out-dir out/ --allow-mock-output   # and write the report
+```
+
+- **A dry run validates and plans, and cannot execute.** It runs the same gate a real mission
+  runs — objective, scope, authorisation, limits — builds the real hierarchy and the compiled
+  node set, and predicts the bounds the policy implies: attempts per unit, the worst-case
+  number of Worker runs, review rounds, Master reviews, replan rounds and dependency waves.
+  The plan is a `PlanReport`, deliberately *not* a `FlowResult`: a type that could be mistaken
+  for a run would let a report be written about a mission that never happened.
+- **The refusal is a guard, not a convention.** `effect_boundary` closes the four ways a
+  mission reaches the world — model, network, browser, forensic — for the duration of a dry
+  run, and `require_effect` raises `DryRunViolation` at the boundary rather than at each call
+  site. `DryRunRunner` is the last line: every method refuses, so a caller that built a flow
+  anyway cannot collect by accident.
+- **A dry run says where its plan came from.** Without a Master there is no decomposition to
+  show, so the structure is a scripted team shape — and the plan says so, in the screen, in
+  the JSON (`structure_source`), and in the plan file, which also records `executed: false`
+  and no reports at all. The gate's verdict travels with it: a refused objective produces a
+  plan with `cleared: false`, the gate's reasons under `refusals`, and the gate's exit code.
+- **A mock run executes the real graph over deterministic adapters.** `--mock` keeps
+  everything above the runner — fan-out, Worker review, retasking, aggregation, Master review
+  and replanning, synthesis, the dossier — and replaces only the two things that would reach
+  the world: a model that answers from a table, and a tool layer that returns a scripted row
+  per capability and can be told to fail. `--mock-scenario revise` makes every first review
+  ask for another attempt, `flaky` fails one tool once and recovers, `break` never recovers
+  and stops the mission with a gap it reports.
+- **Determinism is a property, not an intention.** The clock is logical (ten milliseconds per
+  attempt, not a measured elapsed time), the tool answer is derived from the capability and
+  the subject, and the model answer from role and attempt. Two runs of the same scenario
+  produce the same mission id, the same evidence ids, the same statuses, the same retries and
+  the same cost — which is what makes the mode usable in a test that asserts them.
+- **Mock output is labelled where a reader will look.** Every evidence item carries the
+  `mock-evidence` tag, the `MOCK OUTPUT — … not collected from any source` confidence basis,
+  and a `MOCK:example.com` locator in the source register — three places, because a reader
+  may look at any one of them, and the locator is the one a later edit cannot quietly drop.
+  The report's own voice says it too: a `[MOCK]` summary and claims, unknown confidence, the
+  limitation first in the list, a `MOCK-MISSION — NOT EVIDENCE` note above the title's
+  metadata, and `run mode: mock` in the header. The audit record's `environment.mode` says
+  `mock`, and the terminal banner repeats it.
+- **A mock report cannot be written as if it were real.** `write_dossier` asks whether the
+  record says it is mock output; if it does, the write is refused with `MockAsReal` unless
+  the operator passed `--allow-mock-output` (exit `POLICY`, exit code 7, nothing written).
+  The same check runs when a written record is re-rendered through `report --mission`, so a
+  record that was rebuilt from a file gets the same answer as the run that wrote it.
+- **What a run cost is modelled, not billed.** `offline_cost` reads the spend off the record
+  — Worker runs, scripted tool calls, model calls — and sets it against the plan's worst case,
+  with the caveat printed beside it. An offline run spends nothing, and a cost report that
+  implied otherwise would be the same kind of lie as unlabelled evidence.
+- **A stopped mission still has a screen.** A mock scenario that fails has no synthesis and
+  therefore no dossier; `build_stopped_presentation` presents its record — outcome, counts,
+  the reason it stopped, the evidence it did collect — so the failure is visible rather than
+  turning into an error message.
+
+`report --self-test` covers the acceptance clause in 66 checks of its own (283 in total):
+the dry run plans and refuses to execute, the mock run exercises the hierarchy, the review
+loops, the retries and the reports, a scoped tool failure changes what the plan predicted,
+the labels survive into the Markdown, the JSON, the audit record and the presentation, and a
+second run is identical to the first.
+
 ## Status
 
 | Phase | Scope | State |
@@ -1161,7 +1233,7 @@ a value: a scan report that quoted the secret it found would be the leak it was 
 | 4 | Browser — browser-use / Playwright sessions and capture | 🟡 started (policy, scope, capture, guarded closure, agent mode) |
 | 5 | Collection — passive OSINT sources, artefact hashing | 🟡 started (source-aware web research; safe document/page extraction with injection defence; read-only artifact manifests, hashing and access ledger) |
 | 6 | Synthesis — cross-source correlation and reporting | 🟡 started (deterministic timelines, explained indicator correlation, content de-duplication, the evidence-based Master report with citations and calibrated confidence, Markdown/JSON/terminal output formats with a source register, execution summary and chain of custody, the Rich mission presentation with four derived outcomes) |
-| 7 | Operations — resume, budgets, audit trail, hardening | 🟡 started (checkpoints, resumable missions, capability router, budgets, reproducibility and audit metadata with a secret-refusing write) |
+| 7 | Operations — resume, budgets, audit trail, hardening | 🟡 started (checkpoints, resumable missions, capability router, budgets, reproducibility and audit metadata with a secret-refusing write, deterministic dry-run planning and a labelled mock mode) |
 
 ## Install
 
