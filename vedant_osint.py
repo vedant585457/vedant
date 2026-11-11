@@ -678,6 +678,50 @@ opened with the paths the operator names, and nothing else:
     python vedant_osint.py artifacts --path report.docx --copy --json
     python vedant_osint.py artifacts --limits
 
+Forensic time: normalise, order, correlate, de-duplicate
+-------------------------------------------------------
+A timeline is a list sorted by a rule, not evidence of order, and a correlation is a
+statement about observables, not about a person.  Both are built to keep that
+distinction visible:
+
+*   **The source's timestamp, and this build's reading of it, are different fields.**
+    :class:`NormalisedTimestamp` keeps ``original`` verbatim, ``wall_clock`` as written,
+    ``offset_minutes`` as stated, and ``utc`` as this build's normalisation — with a
+    ``certainty`` that says how much was stated.  ``EXACT`` is the only level a report
+    may quote as the time of an event; ``APPROXIMATE``, ``REDUCED`` (a date with no
+    time), ``AMBIGUOUS`` (no offset, or a day/month order that could differ) and
+    ``UNVERIFIED`` all carry the reason.  An ambiguous day/month order keeps the
+    alternative reading beside the one that was used.
+*   **The order states its own provenance.**  Every :class:`TimelineEvent` carries an
+    ``ordering_basis``: ``source-timestamp`` when its position rests on an instant the
+    source stated, ``tie-break`` when two events share an instant (so *every* member of
+    the tie is marked, because none can be shown to have happened first), ``derived``
+    when the instant is one this tool wrote (an access, a copy), and ``undated`` for
+    events with no usable time — which are listed after the dated ones and never
+    interleaved.  ``ForensicTimeline.order_is_derived`` is true when nothing at all was
+    placed by a source.
+*   **Correlation explains every link in a sentence** naming the shared indicators, the
+    strength and the reason — "identical content" is strong, two independent
+    observables are moderate, one is weak.  :class:`CorrelationLink` has no field for a
+    person, an actor or an identity: shared indicators show overlapping observables and
+    nothing more, and every link says so.
+*   **A coincidence is not a match.**  A free mail provider, a default file name, a
+    private or documentation address, a stock user agent or a four-letter username
+    never links two records on its own; the pair is reported as a near-miss *with the
+    reason*, so the reader sees what was excluded rather than what survived.
+*   **Duplicates are content, never names.**  Two artefacts are the same evidence only
+    when sha256 *and* size match; a shared name or a shared size is reported as a
+    look-alike that was kept distinct, and the canonical member is chosen by path so a
+    re-run makes the same choice.
+
+::
+
+    python vedant_osint.py timeline --self-test        # 145 forensic-time checks
+    python vedant_osint.py timeline --demo             # order, links, duplicates
+    python vedant_osint.py timeline --timestamp "04/05/2026 12:00" "2026-05-04T12:00:00+02:00"
+    python vedant_osint.py timeline --record "a:domain=evil.example.org;hash=<sha256>"
+    python vedant_osint.py timeline --path ~/evidence  # a case, ordered
+
 Structured model adapter
 ------------------------
 One model-calling interface sits between orchestration and every provider, so
@@ -740,6 +784,7 @@ Usage
     python vedant_osint.py research --self-test         # source-aware web research
     python vedant_osint.py extract --self-test          # bounded, untrusted, defanged reading
     python vedant_osint.py artifacts --self-test        # read-only artifacts, access ledger
+    python vedant_osint.py timeline --self-test         # source vs derived time, links
     python vedant_osint.py extract --demo               # a hostile page, quoted and refused
     python vedant_osint.py extract --file report.docx   # what a document says, as data
     python vedant_osint.py extract --limits             # the size, time and text ceilings
@@ -840,7 +885,7 @@ import operator
 from asyncio import CancelledError
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum, IntEnum
 from pathlib import Path
 from typing import (Annotated, Any, Callable, ClassVar, Iterable, Iterator, Mapping,
@@ -879,7 +924,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 21
+VERSION_MINOR: int = 22
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -34430,7 +34475,7 @@ def run_extraction_self_test() -> list[ExtractionCheck]:
         not any(capability.value in page.text for capability in Capability),
         [capability.value for capability in Capability
          if capability.value in page.text])
-    entry = _source_section("# 30. Safe document and page extraction", "# 32. Entry point")
+    entry = _source_section("# 30. Safe document and page extraction", "# 33. Entry point")
     add("the extraction section grants no capability",
         bool(entry) and "CapabilityGrant(" not in entry, len(entry))
     add("the extraction section never constructs a router",
@@ -36982,7 +37027,1844 @@ def artifacts_command(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 32. Entry point
+# 32. Forensics: normalise time, order a timeline, correlate, de-duplicate
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class TimestampOrigin(str, Enum):
+    """Where a timestamp came from.  A source fact and a tool's own record differ."""
+
+    STATED = "stated"            # the source text says it: a log line, a page, a field
+    EMBEDDED = "embedded"        # a document's own metadata (title page, core props)
+    FILESYSTEM = "filesystem"    # a stat result: mtime, ctime, atime
+    FILENAME = "filename"        # encoded in the artefact's name (2026-05-04_1200.log)
+    DERIVED = "derived"          # produced by this tool, e.g. when it made an access
+    UNKNOWN = "unknown"
+
+
+class TimeCertainty(str, Enum):
+    """How much of a timestamp is actually stated, as opposed to filled in."""
+
+    EXACT = "exact"              # a full instant with an explicit offset
+    APPROXIMATE = "approximate"  # "~", "about", "circa": a range, not an instant
+    REDUCED = "reduced"          # a date without a time; midnight is a placeholder
+    AMBIGUOUS = "ambiguous"      # no offset, or a day/month order that could differ
+    DERIVED = "derived"          # inferred by this tool, not stated by the source
+    UNVERIFIED = "unverified"    # nothing was recognised; nothing was assumed
+
+    @property
+    def quotable(self) -> bool:
+        """Whether a report may state this as *the* time of an event."""
+
+        return self is TimeCertainty.EXACT
+
+    @property
+    def rank(self) -> int:
+        return {TimeCertainty.EXACT: 0, TimeCertainty.APPROXIMATE: 1,
+                TimeCertainty.REDUCED: 2, TimeCertainty.AMBIGUOUS: 3,
+                TimeCertainty.DERIVED: 4, TimeCertainty.UNVERIFIED: 5}[self]
+
+
+class NormalisedTimestamp(StrictModel):
+    """One timestamp: the source's own string, and this build's reading of it.
+
+    Three things are kept apart on purpose, because a forensic report that mixes them
+    up is worse than no report:
+
+    *   ``original`` — the bytes as they appeared.  Never rewritten.
+    *   ``wall_clock`` and ``offset_minutes`` — the local time and the zone offset
+        *as the source stated them*, so the original can be reconstructed.
+    *   ``utc`` — this build's normalised instant, with the ``certainty`` that says
+        how much of it was stated and how much was filled in.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    #: The source string, verbatim.  Empty only when the input was already a datetime.
+    original: str = ""
+    #: The instant in UTC, or None when nothing could be normalised.
+    utc: datetime | None = None
+    #: The local time exactly as written, with no zone attached.
+    wall_clock: datetime | None = None
+    #: The offset the source stated, in minutes east of UTC.  None when it stated none.
+    offset_minutes: int | None = None
+    #: How the zone was arrived at, in words the reader can check.
+    tz_label: str = ""
+    certainty: TimeCertainty = TimeCertainty.UNVERIFIED
+    origin: TimestampOrigin = TimestampOrigin.UNKNOWN
+    #: Every reason a reader should not quote this value, stated rather than implied.
+    caveats: list[str] = Field(default_factory=list)
+    #: Other readings that are equally consistent with the source (day/month order).
+    alternatives: list[datetime] = Field(default_factory=list)
+
+    @field_validator("utc")
+    @classmethod
+    def _utc_tz(cls, value: Any) -> Any:
+        # ``None`` is a value here: an undated event has no instant, and that is the
+        # point of the type — the validator must not turn it into a parse error.
+        return None if value is None else normalise_datetime(value)
+
+    @field_validator("wall_clock")
+    @classmethod
+    def _wall_tz(cls, value: Any) -> Any:
+        """The wall clock keeps the source's local time and gains no zone of its own."""
+
+        if value is None:
+            return None
+        moment = value if isinstance(value, datetime) else datetime.fromisoformat(
+            str(value))
+        return moment.replace(tzinfo=None)
+
+    @property
+    def known(self) -> bool:
+        return self.utc is not None
+
+    @property
+    def epoch(self) -> float | None:
+        return None if self.utc is None else self.utc.timestamp()
+
+    @property
+    def local(self) -> datetime | None:
+        """The wall clock with the source's own offset reattached, when it stated one."""
+
+        if self.wall_clock is None:
+            return None
+        if self.offset_minutes is None:
+            return self.wall_clock
+        return self.wall_clock.replace(
+            tzinfo=timezone(timedelta(minutes=self.offset_minutes)))
+
+    def sort_key(self) -> tuple[int, float, str]:
+        """Deterministic ordering: known instants first, then undated, stably."""
+
+        return (0, self.epoch, self.original) if self.known else (1, 0.0, self.original)
+
+    def describe(self) -> str:
+        if self.utc is None:
+            return f"unverified ({self.original[:40] or 'no value'})"
+        stamp = self.utc.strftime("%Y-%m-%d %H:%M:%SZ")
+        zone = f" {self.tz_label}" if self.tz_label else ""
+        return (f"{stamp}{zone} · {self.certainty.value}"
+                + (f" · {self.origin.value}" if self.origin is not TimestampOrigin.UNKNOWN
+                   else ""))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self.model_dump(mode="json"), "describe": self.describe(),
+                "known": self.known, "quotable": self.certainty.quotable}
+
+
+#: Day-first is the reading this build uses when a source is ambiguous — and it says so,
+#: because the alternative is a silent guess that looks like evidence.
+_DATE_AMBIGUITY_CAVEAT = (
+    "day/month order is ambiguous: read as DD/MM/YYYY; MM/DD/YYYY would give the "
+    "listed alternative")
+
+_NO_OFFSET_CAVEAT = (
+    "the source states no UTC offset: the wall clock is preserved and UTC is this "
+    "build's reading, not the source's claim")
+
+_DATE_ONLY_CAVEAT = (
+    "a date with no time: 00:00 is a placeholder for the day, not an instant")
+
+_APPROXIMATE_MARKERS: tuple[str, ...] = ("~", "≈", "about ", "circa ", "c. ", "ca. ",
+                                         "approx. ", "approximately ", "around ")
+
+
+def parse_timestamp(value: Any, *, origin: TimestampOrigin = TimestampOrigin.STATED,
+                    now: datetime | None = None) -> NormalisedTimestamp:
+    """Read one timestamp, keeping what the source said apart from what was assumed.
+
+    Deterministic: the same input always yields the same result, and nothing consults
+    the clock unless ``now`` is supplied — which is used only to judge whether an epoch
+    value is plausible, never to fill in a missing date.
+    """
+
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            # A naive datetime states a wall clock and nothing else: reading it as UTC
+            # would invent an offset, and this build never invents one.
+            return NormalisedTimestamp(
+                original=value.isoformat(), utc=value.replace(tzinfo=timezone.utc),
+                wall_clock=value, offset_minutes=None, tz_label="no offset stated",
+                certainty=TimeCertainty.AMBIGUOUS, origin=origin,
+                caveats=[_NO_OFFSET_CAVEAT])
+        stamp = normalise_datetime(value)
+        return NormalisedTimestamp(
+            original=value.isoformat(), utc=stamp,
+            wall_clock=stamp.replace(tzinfo=None), offset_minutes=None,
+            tz_label=f"supplied as an aware datetime ({value.utcoffset()})",
+            certainty=TimeCertainty.EXACT, origin=origin, caveats=[])
+    raw = "" if value is None else str(value).strip()
+    if not raw:
+        return NormalisedTimestamp(original="", origin=origin,
+                                   certainty=TimeCertainty.UNVERIFIED,
+                                   caveats=["no value was supplied"])
+
+    approximate = False
+    text = raw
+    lowered = text.lower()
+    for marker in _APPROXIMATE_MARKERS:
+        if lowered.startswith(marker):
+            approximate = True
+            text = text[len(marker):].strip()
+            break
+    if text.endswith("?"):
+        approximate = True
+        text = text[:-1].strip()
+
+    # -- epochs ------------------------------------------------------------
+    if re.fullmatch(r"\d{9,10}", text):
+        return _epoch_timestamp(raw, int(text), 1, origin, approximate, now)
+    if re.fullmatch(r"\d{13}", text):
+        return _epoch_timestamp(raw, int(text), 1000, origin, approximate, now)
+
+    # -- ISO 8601 ----------------------------------------------------------
+    iso = re.fullmatch(
+        r"(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(\.\d+)?)?)?"
+        r"\s*(Z|[+-]\d{2}:?\d{2})?", text)
+    if iso is not None:
+        year, month, day, hour, minute, second, _fraction, zone = iso.groups()
+        try:
+            wall = datetime(int(year), int(month), int(day), int(hour or 0),
+                            int(minute or 0), int(second or 0))
+        except ValueError:
+            return _unverified(raw, origin, "the fields do not form a real date")
+        offset = _offset_minutes(zone)
+        caveats: list[str] = []
+        certainty = TimeCertainty.EXACT
+        if hour is None:
+            certainty = TimeCertainty.REDUCED
+            caveats.append(_DATE_ONLY_CAVEAT)
+        if offset is None:
+            certainty = TimeCertainty.AMBIGUOUS if hour is not None else certainty
+            caveats.append(_NO_OFFSET_CAVEAT)
+        if approximate:
+            certainty = TimeCertainty.APPROXIMATE
+            caveats.append("the source marks this value as approximate")
+        utc = (wall - timedelta(minutes=offset) if offset is not None
+               else wall).replace(tzinfo=timezone.utc)
+        return NormalisedTimestamp(
+            original=raw, utc=utc, wall_clock=wall, offset_minutes=offset,
+            tz_label=_zone_label(offset, stated=zone is not None, date_only=hour is None),
+            certainty=certainty, origin=origin, caveats=caveats)
+
+    # -- numeric day/month/year -------------------------------------------
+    slash = re.fullmatch(r"(\d{1,2})[/.](\d{1,2})[/.](\d{4})(?:[ T](\d{2}):(\d{2}))?",
+                         text)
+    if slash is not None:
+        first, second_field, year, hour, minute = slash.groups()
+        readings: list[datetime] = []
+        for day, month in ((int(first), int(second_field)),
+                           (int(second_field), int(first))):
+            try:
+                readings.append(datetime(int(year), month, day, int(hour or 0),
+                                         int(minute or 0)))
+            except ValueError:
+                continue
+        if not readings:
+            return _unverified(raw, origin, "the fields do not form a real date")
+        unknown_order = len(readings) == 2 and readings[0] != readings[1]
+        certainty = TimeCertainty.AMBIGUOUS if unknown_order else TimeCertainty.EXACT
+        caveats = [_DATE_AMBIGUITY_CAVEAT] if unknown_order else []
+        if hour is None:
+            certainty = TimeCertainty.REDUCED
+            caveats.append(_DATE_ONLY_CAVEAT)
+        caveats.append(_NO_OFFSET_CAVEAT)
+        return NormalisedTimestamp(
+            original=raw, utc=readings[0].replace(tzinfo=timezone.utc),
+            wall_clock=readings[0], offset_minutes=None,
+            tz_label="no offset stated", certainty=certainty, origin=origin,
+            caveats=caveats, alternatives=readings[1:])
+
+    # -- named months and RFC-2822-ish shapes ------------------------------
+    for pattern, has_time, has_zone in (
+            ("%a, %d %b %Y %H:%M:%S %z", True, True),
+            ("%d %b %Y %H:%M:%S %z", True, True),
+            ("%d %b %Y %H:%M %z", True, True),
+            ("%d %B %Y %H:%M %z", True, True),
+            ("%a, %d %b %Y %H:%M %z", True, True),
+            ("%a, %d %b %Y %H:%M:%S", True, False),
+            ("%d %b %Y %H:%M:%S", True, False),
+            ("%d %b %Y %H:%M", True, False),
+            ("%d %B %Y %H:%M", True, False),
+            ("%B %d, %Y %H:%M", True, False),
+            ("%d %b %Y", False, False),
+            ("%d %B %Y", False, False),
+            ("%B %d, %Y", False, False),
+            ("%b %d, %Y", False, False)):
+        try:
+            parsed = datetime.strptime(text, pattern)
+        except ValueError:
+            continue
+        offset = (int(parsed.utcoffset().total_seconds() // 60)
+                  if has_zone and parsed.tzinfo is not None else None)
+        wall = parsed.replace(tzinfo=None)
+        utc = ((wall - timedelta(minutes=offset)) if offset is not None else wall)
+        certainty = TimeCertainty.EXACT
+        caveats: list[str] = []
+        if not has_time:
+            certainty = TimeCertainty.REDUCED
+            caveats.append(_DATE_ONLY_CAVEAT)
+        elif not has_zone:
+            certainty = TimeCertainty.AMBIGUOUS
+            caveats.append(_NO_OFFSET_CAVEAT)
+        if approximate:
+            certainty = TimeCertainty.APPROXIMATE
+            caveats.append("the source marks this value as approximate")
+        return NormalisedTimestamp(
+            original=raw, utc=utc.replace(tzinfo=timezone.utc), wall_clock=wall,
+            offset_minutes=offset,
+            tz_label=_zone_label(offset, stated=has_zone, date_only=not has_time),
+            certainty=certainty, origin=origin, caveats=caveats)
+
+    # -- an explicit "no date" ---------------------------------------------
+    if lowered in {"unknown", "n/a", "na", "-", "—", "none", "null", "never"}:
+        return NormalisedTimestamp(original=raw, origin=origin,
+                                   certainty=TimeCertainty.UNVERIFIED,
+                                   caveats=[f"the source records no timestamp ({raw!r})"])
+    return _unverified(raw, origin, "no recognised timestamp format; nothing was assumed")
+
+
+def _unverified(raw: str, origin: TimestampOrigin, why: str) -> NormalisedTimestamp:
+    return NormalisedTimestamp(original=raw, origin=origin,
+                               certainty=TimeCertainty.UNVERIFIED,
+                               caveats=[why])
+
+
+def _epoch_timestamp(raw: str, value: int, divisor: int, origin: TimestampOrigin,
+                     approximate: bool, now: datetime | None) -> NormalisedTimestamp:
+    """A numeric epoch: seconds or milliseconds, judged plausible against a reference."""
+
+    seconds = value / divisor
+    reference = (now or utc_now()).timestamp()
+    try:
+        stamp = datetime.fromtimestamp(seconds, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return _unverified(raw, origin, "the epoch is outside the representable range")
+    caveats = [f"a bare number was read as epoch {'milliseconds' if divisor > 1 else 'seconds'}"]
+    certainty = TimeCertainty.EXACT
+    if approximate:
+        certainty = TimeCertainty.APPROXIMATE
+        caveats.append("the source marks this value as approximate")
+    # A value far outside a plausible window is a different unit, not a fault: say so
+    # rather than presenting 1970-01-19 as a date the evidence supports.
+    # Ten years either side of the case clock: outside that, the unit is far more
+    # likely to be wrong than the date is to be real.
+    if abs(reference - seconds) > 60 * 60 * 24 * 365 * 10:
+        certainty = TimeCertainty.AMBIGUOUS
+        caveats.append(
+            f"this epoch is {abs(reference - seconds) / 31_556_952:.0f} year(s) from the "
+            "case's own clock: the unit may be different (seconds vs milliseconds)")
+    return NormalisedTimestamp(
+        original=raw, utc=stamp, wall_clock=stamp.replace(tzinfo=None),
+        offset_minutes=0, tz_label="epoch, always UTC", certainty=certainty,
+        origin=origin, caveats=caveats)
+
+
+def _offset_minutes(zone: str | None) -> int | None:
+    if not zone:
+        return None
+    if zone.upper() == "Z":
+        return 0
+    sign = -1 if zone[0] == "-" else 1
+    digits = zone[1:].replace(":", "")
+    return sign * (int(digits[:2]) * 60 + int(digits[2:]))
+
+
+def _zone_label(offset: int | None, *, stated: bool, date_only: bool) -> str:
+    if date_only:
+        return "date only, no zone" if not stated else "date only"
+    if offset is None:
+        return "no offset stated"
+    sign = "+" if offset >= 0 else "-"
+    hours, minutes = divmod(abs(offset), 60)
+    return f"UTC{sign}{hours:02d}:{minutes:02d}" + ("" if stated else " (assumed)")
+
+
+# -- the timeline: source order vs derived order ---------------------------
+
+
+class TimelineEvent(StrictModel):
+    """One event on a timeline: what is claimed, by what, and how it was placed."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str = ""
+    label: str = Field(min_length=1)
+    at: NormalisedTimestamp = Field(default_factory=NormalisedTimestamp)
+    #: Where the claim comes from: a path, a URL, a log file, "this tool".
+    source: str = ""
+    kind: str = "event"
+    #: 1-based position in the ordered list.  A *derived* fact, not a source fact.
+    sequence: int = Field(default=0, ge=0)
+    #: Why this event sits where it does: ``source-timestamp``, ``tie-break``,
+    #: ``derived`` or ``undated``.  The acceptance criterion lives in this field.
+    ordering_basis: str = "undated"
+    detail: str = ""
+    #: The record this event was built from, so a reader can go back to it.
+    record_id: str = ""
+
+    @model_validator(mode="after")
+    def _identify(self) -> "TimelineEvent":
+        if not self.id:
+            object.__setattr__(self, "id", content_id(
+                "evt", self.label, self.at.original or str(self.at.utc), self.source))
+        return self
+
+    @property
+    def from_source(self) -> bool:
+        """Whether the *position* rests on a timestamp the source stated."""
+
+        return self.ordering_basis == "source-timestamp"
+
+    def describe(self) -> str:
+        stamp = self.at.describe()
+        return f"{self.sequence:>3}. {stamp} · {self.label[:60]} [{self.source[:40]}]"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self.model_dump(mode="json"), "describe": self.describe(),
+                "from_source": self.from_source}
+
+
+class ForensicTimeline(StrictModel):
+    """A chronological list, with the provenance of the *order* stated separately.
+
+    A timeline is not evidence of order; it is a list sorted by a rule.  So the record
+    carries the rule, the count of events whose position rests on a source timestamp,
+    and the events whose position this tool derived — because those are the ones a
+    reader must not treat as sequence of events.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str = ""
+    title: str = "timeline"
+    events: list[TimelineEvent] = Field(default_factory=list)
+    #: Events with no usable timestamp.  Kept apart: interleaving them would invent an
+    #: order the evidence does not support.
+    undated: list[TimelineEvent] = Field(default_factory=list)
+    ordering_rule: str = ""
+    #: True when *no* event's position rests on a source timestamp.
+    order_is_derived: bool = False
+    caveats: list[str] = Field(default_factory=list)
+    zones: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _identify(self) -> "ForensicTimeline":
+        if not self.id:
+            object.__setattr__(self, "id", content_id(
+                "tl", self.title, [event.id for event in self.events],
+                [event.id for event in self.undated]))
+        return self
+
+    @property
+    def source_ordered(self) -> list[TimelineEvent]:
+        return [event for event in self.events if event.from_source]
+
+    @property
+    def tied(self) -> list[TimelineEvent]:
+        return [event for event in self.events if event.ordering_basis == "tie-break"]
+
+    @property
+    def uncertain(self) -> list[TimelineEvent]:
+        return [event for event in self.events
+                if event.at.certainty is not TimeCertainty.EXACT]
+
+    def describe(self) -> str:
+        return (f"{len(self.events)} dated · {len(self.undated)} undated · "
+                f"{len(self.source_ordered)} placed by a source timestamp · "
+                f"{len(self.tied)} tie-broken · {len(self.uncertain)} uncertain"
+                + (" · the whole order is derived" if self.order_is_derived else ""))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **self.model_dump(mode="json"), "describe": self.describe(),
+            "source_ordered": len(self.source_ordered),
+            "tie_broken": len(self.tied),
+            "uncertain": len(self.uncertain),
+            "order_is_derived": self.order_is_derived,
+        }
+
+
+def build_timeline(events: Sequence[TimelineEvent], *,
+                   title: str = "timeline") -> ForensicTimeline:
+    """Order events by their normalised instant, and never by anything else.
+
+    The rules, in order, and nothing beyond them:
+
+    1.  An event with a normalised instant comes before an event without one.
+    2.  Between two instants, the earlier comes first — in UTC, so two events written
+        in different zones are ordered by what happened, not by what they say.
+    3.  At the same instant, the order is by source then label: deterministic, and
+        *every* member of the tie is marked ``tie-break``, because none of them can be
+        shown to have happened first.
+    4.  An event with no instant is undated: listed separately, ordered by label, and
+        never interleaved with dated events.
+    """
+
+    dated = [event for event in events if event.at.known]
+    undated = [event for event in events if not event.at.known]
+    dated.sort(key=lambda event: (event.at.epoch, event.source, event.label, event.id))
+    ordered: list[TimelineEvent] = []
+    counts: dict[float, int] = {}
+    for event in dated:
+        counts[event.at.epoch] = counts.get(event.at.epoch, 0) + 1
+    for index, event in enumerate(dated, start=1):
+        basis = "source-timestamp"
+        if counts.get(event.at.epoch, 0) > 1:
+            # A shared instant cannot order its members: all of them are tie-broken.
+            basis = "tie-break"
+        if event.at.origin is TimestampOrigin.DERIVED:
+            # The instant was produced by this tool, not stated by the source.
+            basis = "derived"
+        ordered.append(event.model_copy(update={"sequence": index,
+                                                "ordering_basis": basis}))
+    undated_sorted = sorted(undated, key=lambda event: (event.source, event.label, event.id))
+    for offset, event in enumerate(undated_sorted, start=len(ordered) + 1):
+        ordered.append(event.model_copy(update={"sequence": offset,
+                                                "ordering_basis": "undated"}))
+    zones = sorted({event.at.tz_label for event in ordered if event.at.tz_label})
+    caveats = [
+        "the sequence numbers are this tool's ordering, not a fact the sources state",
+        "an event placed by a source timestamp is marked source-timestamp; a tie is "
+        "marked tie-break and asserts nothing about which came first",
+        "undated events are listed after the dated ones and are not interleaved",
+    ]
+    derived_events = [event for event in ordered if event.ordering_basis == "derived"]
+    if derived_events:
+        caveats.append(f"{len(derived_events)} event(s) carry a timestamp this tool "
+                       "recorded (an access, a copy), not one the evidence states")
+    return ForensicTimeline(
+        title=title, events=ordered, undated=[event for event in ordered
+                                              if not event.at.known],
+        ordering_rule=("ascending normalised UTC instant; ties by source then label; "
+                       "undated last"),
+        order_is_derived=not any(event.from_source for event in ordered),
+        caveats=caveats, zones=zones)
+
+
+def timeline_from_manifest(manifest: "ArtifactManifest") -> ForensicTimeline:
+    """A timeline from an artifact case: file times, plus what this tool did to them.
+
+    Two kinds of entry, kept visibly apart: ``file-modified`` comes from the artefact's
+    own stat result, while ``case-access`` is a timestamp *this tool* wrote.  Both are
+    on the timeline because both are useful; only the first is evidence of the past.
+    """
+
+    events: list[TimelineEvent] = []
+    for entry in manifest.entries:
+        if entry.error is not None or entry.file_type != "regular":
+            continue
+        name = entry.relative_path or entry.path
+        events.append(TimelineEvent(
+            label=f"{name} last modified",
+            at=parse_timestamp(entry.times.modified, origin=TimestampOrigin.FILESYSTEM)
+            if entry.times.modified is not None
+            else NormalisedTimestamp(origin=TimestampOrigin.FILESYSTEM,
+                                     caveats=["the filesystem recorded no mtime"]),
+            source=entry.path, kind="file-modified", record_id=entry.id,
+            detail=f"{entry.size_bytes:,} bytes; {entry.identity.kind.value}"))
+        if entry.metadata.created_at is not None:
+            events.append(TimelineEvent(
+                label=f"{name} created (document metadata)",
+                at=parse_timestamp(entry.metadata.created_at,
+                                   origin=TimestampOrigin.EMBEDDED),
+                source=entry.path, kind="document-created", record_id=entry.id,
+                detail="stated by the document itself, not by the filesystem"))
+    for record in manifest.ledger.records:
+        events.append(TimelineEvent(
+            label=f"{record.action.value} {Path(record.path).name}",
+            at=parse_timestamp(record.at, origin=TimestampOrigin.DERIVED),
+            source=record.path, kind="case-access", record_id="",
+            detail=f"{record.bytes_touched:,} bytes; {record.handling}"))
+    return build_timeline(events, title=f"artifacts — {Path(manifest.root).name}")
+
+
+# -- correlation: shared indicators, explained -----------------------------
+
+
+class IndicatorKind(str, Enum):
+    """The kinds of thing two records can have in common."""
+
+    HASH = "hash"                # a content digest: the strongest, and still not identity
+    DOMAIN = "domain"
+    IP = "ip"
+    URL = "url"
+    EMAIL = "email"
+    FILENAME = "filename"
+    PATH = "path"
+    USERNAME = "username"
+    USER_AGENT = "user-agent"
+    MUTEX = "mutex"
+
+
+#: Indicator kinds whose value is a name, not a location or a digest.
+_NAME_LIKE: frozenset["IndicatorKind"] = frozenset({
+    IndicatorKind.USERNAME, IndicatorKind.MUTEX})
+
+
+class Indicator(StrictModel):
+    """One observable in one record, normalised but with its original kept."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: IndicatorKind
+    raw: str = Field(min_length=1)
+    value: str = Field(min_length=1)
+    record_id: str = ""
+
+    def key(self) -> tuple[str, str]:
+        return (self.kind.value, self.value)
+
+    def describe(self) -> str:
+        return f"{self.kind.value} {self.value}"
+
+
+#: Values that commonly coincide: shared hosting, a generic file name, a free mail
+#: provider, a default user agent.  Two records sharing only one of these are *not*
+#: linked, because the coincidence is the better explanation.
+_COINCIDENTAL_VALUES: frozenset[str] = frozenset({
+    "index.html", "index.php", "config.json", "robots.txt", "favicon.ico", "readme.md",
+    "gmail.com", "outlook.com", "hotmail.com", "yahoo.com", "protonmail.com",
+    "example.com", "localhost", "127.0.0.1", "::1", "0.0.0.0",
+    "mozilla/5.0", "curl/7.68.0", "python-requests/2.31.0", "wget/1.20.3",
+    "admin", "user", "root", "test", "guest", "info",
+})
+
+#: Suffixes that make an email address belong to a provider rather than a person.
+_PUBLIC_MAIL_DOMAINS: frozenset[str] = frozenset({
+    "gmail.com", "outlook.com", "hotmail.com", "yahoo.com", "protonmail.com",
+    "icloud.com", "aol.com", "gmx.de", "mail.ru", "yandex.ru", "zoho.com",
+})
+
+
+def _is_coincidental(indicator: Indicator) -> tuple[bool, str]:
+    """Whether a shared indicator is a coincidence, and why — stated, not implied."""
+
+    if indicator.value in _COINCIDENTAL_VALUES:
+        return True, "a value that commonly coincides"
+    if indicator.kind is IndicatorKind.EMAIL:
+        domain = indicator.value.split("@", 1)[-1]
+        if domain in _PUBLIC_MAIL_DOMAINS:
+            return True, f"a free mail provider ({domain}) is not an identity"
+    if indicator.kind is IndicatorKind.IP:
+        try:
+            address = ipaddress.ip_address(indicator.value)
+        except ValueError:
+            return True, "not a usable address"
+        if not address.is_global:
+            return True, ("a private, loopback, link-local or documentation address is "
+                          "shared by everything behind it, or owned by nobody")
+    if indicator.kind is IndicatorKind.FILENAME and indicator.value in {
+            "index.html", "favicon.ico"}:
+        return True, "a default file name"
+    if indicator.kind is IndicatorKind.USER_AGENT:
+        return True, "a user agent describes software, not a person"
+    if indicator.kind is IndicatorKind.USERNAME and len(indicator.value) <= 4:
+        return True, "a very short name is shared by chance"
+    return False, ""
+
+
+def normalise_indicator(kind: IndicatorKind, value: str) -> str | None:
+    """Canonical form of an observable, or ``None`` when it is not one.
+
+    Strict on purpose: a "hash" that is not a hex digest of a real length is not a
+    hash, and treating it as one would create a match that does not exist.
+    """
+
+    text = (value or "").strip()
+    if not text:
+        return None
+    if kind is IndicatorKind.HASH:
+        lowered = text.lower()
+        if len(lowered) in _DIGEST_LENGTHS.values() and all(
+                character in "0123456789abcdef" for character in lowered):
+            return lowered
+        return None
+    if kind is IndicatorKind.IP:
+        try:
+            return str(ipaddress.ip_address(text.strip("[]")))
+        except ValueError:
+            return None
+    if kind is IndicatorKind.DOMAIN:
+        lowered = text.lower().rstrip(".")
+        if "://" in lowered or "/" in lowered or " " in lowered or "." not in lowered:
+            return None
+        return lowered[4:] if lowered.startswith("www.") else lowered
+    if kind is IndicatorKind.URL:
+        normalised = normalise_url(text)
+        return normalised.canonical if normalised is not None else None
+    if kind is IndicatorKind.EMAIL:
+        lowered = text.lower()
+        if re.fullmatch(r"[^@\s]+@[^@\s]+\.[a-z]{2,}", lowered):
+            return lowered
+        return None
+    if kind is IndicatorKind.USERNAME:
+        return text.lower() if re.fullmatch(r"[\w.@-]{1,64}", text) else None
+    if kind in {IndicatorKind.FILENAME, IndicatorKind.PATH}:
+        cleaned = text.replace("\\", "/").strip()
+        return (cleaned.rsplit("/", 1)[-1] if kind is IndicatorKind.FILENAME
+                else cleaned).lower() or None
+    if kind is IndicatorKind.USER_AGENT:
+        return " ".join(text.lower().split())
+    if kind is IndicatorKind.MUTEX:
+        return text.lower()
+    return None
+
+
+class CorrelationRecord(StrictModel):
+    """One record to correlate: an id, a label, and the observables it carries."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str = Field(min_length=1)
+    label: str = ""
+    source: str = ""
+    indicators: list[Indicator] = Field(default_factory=list)
+    #: Free-form provenance, e.g. "page fetched 2026-05-04", quoted if a link needs it.
+    note: str = ""
+
+    @classmethod
+    def from_pairs(cls, record_id: str, pairs: Sequence[tuple[IndicatorKind, str]], *,
+                   label: str = "", source: str = "", note: str = ""
+                   ) -> "CorrelationRecord":
+        """Build from ``(kind, value)`` pairs, dropping anything that is not an indicator."""
+
+        indicators: list[Indicator] = []
+        for kind, value in pairs:
+            normalised = normalise_indicator(kind, value)
+            if normalised:
+                indicators.append(Indicator(kind=kind, raw=str(value), value=normalised,
+                                            record_id=record_id))
+        return cls(id=record_id, label=label, source=source, indicators=indicators,
+                   note=note)
+
+    def describe(self) -> str:
+        return f"{self.id}: {self.label or self.source}".strip()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self.model_dump(mode="json"), "describe": self.describe()}
+
+
+class CorrelationLink(StrictModel):
+    """Two records, the indicators they share, and the sentence that justifies a link.
+
+    There is no field for an identity, an actor or a person: a correlation is a
+    statement about *observables*, and the schema cannot make it anything else.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    left: str = Field(min_length=1)
+    right: str = Field(min_length=1)
+    shared: list[Indicator] = Field(default_factory=list)
+    strength: str = "weak"
+    #: Why these records were linked.  A full sentence, with the values in it.
+    explanation: str = ""
+    #: The strongest indicator behind the link.
+    basis: str = ""
+    #: Always false.  Present so a report can print it rather than imply otherwise.
+    identity_claimed: bool = False
+    #: The sentence a reader needs before quoting a link.
+    not_identity_note: str = (
+        "shared indicators show that two records describe overlapping observables; "
+        "they do not establish that the same person or system was responsible")
+
+    def pair(self) -> tuple[str, str]:
+        return tuple(sorted((self.left, self.right)))
+
+    def describe(self) -> str:
+        return (f"{self.left} ↔ {self.right}: {self.strength} — {self.explanation[:110]}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self.model_dump(mode="json"), "describe": self.describe()}
+
+
+class CorrelationReport(StrictModel):
+    """Every link between a set of records, every near-miss, and why each was decided."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str = ""
+    records: list[CorrelationRecord] = Field(default_factory=list)
+    links: list[CorrelationLink] = Field(default_factory=list)
+    #: Records that overlap only on indicators that commonly coincide.  Not linked.
+    near_misses: list[str] = Field(default_factory=list)
+    rules: list[str] = Field(default_factory=list)
+    caveats: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _identify(self) -> "CorrelationReport":
+        if not self.id:
+            object.__setattr__(self, "id", content_id(
+                "corr", [record.id for record in self.records],
+                [link.pair() for link in self.links]))
+        return self
+
+    @property
+    def coincidental(self) -> list[Indicator]:
+        return [indicator for record in self.records for indicator in record.indicators
+                if _is_coincidental(indicator)[0]]
+
+    def by_strength(self, strength: str) -> list[CorrelationLink]:
+        return [link for link in self.links if link.strength == strength]
+
+    def describe(self) -> str:
+        counts = ", ".join(f"{name} {len(self.by_strength(name))}"
+                           for name in ("strong", "moderate", "weak"))
+        return (f"{len(self.records)} record(s) · {len(self.links)} link(s) ({counts}) · "
+                f"{len(self.near_misses)} near-miss(es) · no identity is inferred")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self.model_dump(mode="json"), "describe": self.describe()}
+
+
+#: The rules this build correlates by, in the words a report prints.
+CORRELATION_RULES: tuple[str, ...] = (
+    "a shared content hash links two records as the same bytes, and nothing more",
+    "two or more independent indicators link two records at moderate strength",
+    "one indicator links two records weakly, unless it commonly coincides",
+    "an indicator that commonly coincides never links anything on its own",
+    "a link is a statement about observables: it never asserts identity",
+)
+
+
+def correlate_records(records: Sequence[CorrelationRecord]) -> CorrelationReport:
+    """Link records that share indicators, and explain every link in a sentence.
+
+    Deterministic: the same records in any order produce the same links, in the same
+    order, with the same wording — because every ordering rule is total.
+    """
+
+    index: dict[tuple[str, str], list[Indicator]] = {}
+    for record in records:
+        for indicator in record.indicators:
+            index.setdefault(indicator.key(), []).append(indicator)
+
+    pairs: dict[tuple[str, str], list[Indicator]] = {}
+    for (kind, value), holders in index.items():
+        ids = sorted({indicator.record_id for indicator in holders})
+        for left_index, left in enumerate(ids):
+            for right in ids[left_index + 1:]:
+                # The *same* indicator joins this pair, so the list holds every
+                # observable the two records have in common — not just the first.
+                pairs.setdefault((left, right), []).append(
+                    Indicator(kind=holders[0].kind, raw=holders[0].raw, value=value,
+                              record_id=""))
+
+    links: list[CorrelationLink] = []
+    near_misses: list[str] = []
+    for (left, right) in sorted(pairs):
+        shared = sorted(pairs[(left, right)], key=lambda item: item.key())
+        decisive = [(indicator, _is_coincidental(indicator))
+                    for indicator in shared]
+        real = [indicator for indicator, (coincidental, _why) in decisive
+                if not coincidental]
+        if not real:
+            reasons = "; ".join(sorted({why for _indicator, (coincidental, why)
+                                        in decisive if coincidental}))
+            near_misses.append(
+                f"{left} and {right} share only {', '.join(i.describe() for i in shared)} "
+                f"({reasons or 'indicators that commonly coincide'}): no link is asserted")
+            continue
+        strength, basis = _link_strength(real)
+        explanation = (
+            f"{left} and {right} share {len(real)} decisive indicator(s): "
+            + "; ".join(indicator.describe() for indicator in real)
+            + ". " + _strength_reason(strength, basis)
+            + (" Coincidental overlaps were excluded: "
+               + "; ".join(indicator.describe()
+                           for indicator, (coincidental, _w) in decisive if coincidental)
+               if any(coincidental for _i, (coincidental, _w) in decisive) else ""))
+        links.append(CorrelationLink(
+            left=left, right=right, shared=shared, strength=strength, basis=basis,
+            explanation=explanation))
+    links.sort(key=lambda link: (-_STRENGTH_ORDER[link.strength], link.pair()))
+    return CorrelationReport(
+        records=sorted(records, key=lambda record: record.id), links=links,
+        near_misses=near_misses, rules=list(CORRELATION_RULES),
+        caveats=[
+            "a link explains why two records were compared, not who was responsible",
+            "absence of a link is not evidence of independence: records may overlap "
+            "on something this build does not extract",
+        ])
+
+
+_STRENGTH_ORDER: dict[str, int] = {"strong": 3, "moderate": 2, "weak": 1}
+
+
+def _link_strength(indicators: Sequence[Indicator]) -> tuple[str, str]:
+    """The strength of a link, and the single indicator that justifies it.
+
+    Strong means the strongest kind of match this build knows: identical content.
+    Moderate means two independent observables agree.  Weak means one observable does.
+    """
+
+    hashes = [indicator for indicator in indicators
+              if indicator.kind is IndicatorKind.HASH]
+    if hashes:
+        return "strong", f"identical content ({hashes[0].kind.value} " \
+                         f"{hashes[0].value[:16]}…)"
+    if len(indicators) >= 2:
+        return "moderate", (f"{len(indicators)} independent indicators "
+                            f"({', '.join(sorted({i.kind.value for i in indicators}))})")
+    return "weak", f"one {indicators[0].kind.value} in common"
+
+
+def _strength_reason(strength: str, basis: str) -> str:
+    if strength == "strong":
+        return (f"Strength: strong — {basis}, so the records describe the same bytes. "
+                "That is a fact about content, not about who produced it.")
+    if strength == "moderate":
+        return (f"Strength: moderate — {basis}, which is unlikely to coincide but does "
+                "not identify an actor.")
+    return (f"Strength: weak — {basis}. One shared observable is the ordinary way two "
+            "unrelated records meet.")
+
+
+def correlate_artifacts(manifest: "ArtifactManifest") -> CorrelationReport:
+    """Correlate an artifact manifest: content hashes, names, and nothing speculative."""
+
+    records: list[CorrelationRecord] = []
+    for entry in manifest.entries:
+        if entry.error is not None:
+            continue
+        pairs: list[tuple[IndicatorKind, str]] = []
+        if entry.sha256:
+            pairs.append((IndicatorKind.HASH, entry.sha256))
+        if entry.relative_path:
+            pairs.append((IndicatorKind.FILENAME,
+                          Path(entry.relative_path).name))
+        if entry.metadata.author:
+            pairs.append((IndicatorKind.USERNAME, entry.metadata.author))
+        records.append(CorrelationRecord.from_pairs(
+            entry.id, pairs, label=entry.relative_path or entry.path,
+            source=entry.path,
+            note=entry.identity.describe()))
+    return correlate_records(records)
+
+
+# -- duplicate evidence ----------------------------------------------------
+
+
+class DuplicateGroup(StrictModel):
+    """Records that are the same evidence, and how that was decided."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: str = "identical-bytes"     # ``identical-bytes`` is the only duplicate kind
+    digest: str = ""
+    size_bytes: int = Field(default=0, ge=0)
+    members: list[str] = Field(default_factory=list)
+    #: The member kept as canonical: the first by path, so the choice is deterministic.
+    canonical: str = ""
+    #: Members that add nothing beyond the canonical copy.
+    redundant: list[str] = Field(default_factory=list)
+    #: Why they were grouped — or, for a rejection, why they were not.
+    explanation: str = ""
+
+    def describe(self) -> str:
+        return (f"{len(self.members)} × {self.size_bytes:,} bytes "
+                f"({self.digest[:16]}…): {self.explanation[:90]}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self.model_dump(mode="json"), "describe": self.describe()}
+
+
+class DeduplicationReport(StrictModel):
+    """Duplicate groups, look-alikes that are not duplicates, and the rule used."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str = ""
+    groups: list[DuplicateGroup] = Field(default_factory=list)
+    #: Pairs that look alike and are not duplicates, with the reason.
+    distinct: list[str] = Field(default_factory=list)
+    rule: str = (
+        "two artefacts are the same evidence only when their sha256 and their size "
+        "both match; a shared name, a shared size or a shared prefix is not a match")
+    caveats: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _identify(self) -> "DeduplicationReport":
+        if not self.id:
+            object.__setattr__(self, "id", content_id(
+                "dedup", [group.digest for group in self.groups],
+                [member for group in self.groups for member in group.members]))
+        return self
+
+    @property
+    def redundant(self) -> list[str]:
+        return [member for group in self.groups for member in group.redundant]
+
+    def describe(self) -> str:
+        return (f"{len(self.groups)} duplicate group(s) · "
+                f"{len(self.redundant)} redundant cop(y/ies) · "
+                f"{len(self.distinct)} look-alike(s) kept distinct")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self.model_dump(mode="json"), "describe": self.describe(),
+                "redundant": self.redundant}
+
+
+def find_duplicate_evidence(items: Sequence[Any]) -> DeduplicationReport:
+    """Group artefacts whose bytes are identical, and say why the others are not.
+
+    Accepts :class:`ArtifactEntry` records or any object with ``path``, ``sha256``,
+    ``size_bytes`` and ``id``.  A shared *name* or a shared *size* is reported as a
+    look-alike, never as a duplicate: those are the coincidences that make a case file
+    look bigger than the evidence it holds.
+    """
+
+    by_digest: dict[str, list[Any]] = {}
+    by_name: dict[str, list[Any]] = {}
+    by_size: dict[int, list[Any]] = {}
+    for item in items:
+        digest = str(getattr(item, "sha256", "") or "")
+        name = Path(str(getattr(item, "path", ""))).name.lower()
+        size = int(getattr(item, "size_bytes", 0) or 0)
+        if getattr(item, "error", None) is not None:
+            continue
+        if digest:
+            by_digest.setdefault(digest, []).append(item)
+        if name:
+            by_name.setdefault(name, []).append(item)
+        by_size.setdefault(size, []).append(item)
+
+    def label(item: Any) -> str:
+        return (str(getattr(item, "relative_path", ""))
+                or str(getattr(item, "path", "")) or str(getattr(item, "id", "")))
+
+    groups: list[DuplicateGroup] = []
+    for digest, members in sorted(by_digest.items()):
+        if len(members) < 2:
+            continue
+        sizes = {int(getattr(item, "size_bytes", 0) or 0) for item in members}
+        if len(sizes) != 1:
+            continue                      # a digest match with two sizes is not possible
+        ordered = sorted(members, key=label)
+        renamed = len({Path(label(item)).name for item in ordered}) > 1
+        groups.append(DuplicateGroup(
+            digest=digest, size_bytes=sizes.pop(),
+            members=[label(item) for item in ordered], canonical=label(ordered[0]),
+            redundant=[label(item) for item in ordered[1:]],
+            explanation=("identical sha256 and identical size: the same bytes"
+                         + ("; renamed copies of one artefact" if renamed
+                            else "; the same artefact listed twice")
+                         + f"; {label(ordered[0])} is kept as canonical")))
+
+    distinct: list[str] = []
+    for name, members in sorted(by_name.items()):
+        if len(members) < 2:
+            continue
+        digests = {str(getattr(item, "sha256", "") or "") for item in members}
+        if len(digests) > 1:
+            distinct.append(
+                f"{name}: {len(members)} artefacts share the name but have "
+                f"{len(digests)} different digests — same name, different evidence")
+    for size, members in sorted(by_size.items()):
+        if len(members) < 2:
+            continue
+        digests = {str(getattr(item, "sha256", "") or "") for item in members}
+        if len(digests) > 1:
+            distinct.append(
+                f"{size:,} bytes: {len(members)} artefacts share the size but have "
+                f"{len(digests)} different digests — size is not content")
+    return DeduplicationReport(
+        groups=groups, distinct=sorted(set(distinct)),
+        caveats=[
+            "a duplicate is removed from the count of evidence, never from the case: "
+            "both paths stay on the record",
+            "this compares recorded digests; it does not read the bytes again",
+        ])
+
+
+def deduplicate_manifest(manifest: "ArtifactManifest") -> DeduplicationReport:
+    """Duplicate detection across one artifact manifest."""
+
+    return find_duplicate_evidence(manifest.entries)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 32b. Proving forensic time: source vs derived order, explained correlation
+# ══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True)
+class TimelineCheck:
+    """One claim about timelines and correlation, and the evidence for it."""
+
+    name: str
+    ok: bool
+    detail: str = ""
+
+
+def _correlation_demo_records() -> list[CorrelationRecord]:
+    """Six records: three that genuinely overlap, two that only look alike, one alone."""
+
+    kinds = IndicatorKind
+    return [
+        CorrelationRecord.from_pairs(
+            "rec-advisory", [(kinds.DOMAIN, "evil.example.org"),
+                             (kinds.HASH, "a" * 64),
+                             (kinds.EMAIL, "analyst@gmail.com"),
+                             (kinds.IP, "10.0.0.5")],
+            label="vendor advisory", source="https://example.com/advisory"),
+        CorrelationRecord.from_pairs(
+            "rec-mirror", [(kinds.DOMAIN, "EVIL.example.org."),
+                           (kinds.HASH, "a" * 64)],
+            label="mirror of the advisory", source="https://mirror.example.net/a"),
+        CorrelationRecord.from_pairs(
+            "rec-mail", [(kinds.EMAIL, "analyst@gmail.com")],
+            label="mail header", source="share://mail.eml"),
+        CorrelationRecord.from_pairs(
+            "rec-scan", [(kinds.DOMAIN, "evil.example.org"), (kinds.IP, "10.0.0.5"),
+                         (kinds.USERNAME, "admin")],
+            label="proxy log", source="share://proxy.log"),
+        CorrelationRecord.from_pairs(
+            "rec-index-a", [(kinds.FILENAME, "index.html")],
+            label="fetched page", source="https://a.example/index.html"),
+        CorrelationRecord.from_pairs(
+            "rec-index-b", [(kinds.FILENAME, "index.html")],
+            label="another page", source="https://b.example/index.html"),
+    ]
+
+
+def _timeline_demo_events() -> list[TimelineEvent]:
+    """Five events: two of them at the same instant, in different zones."""
+
+    return [
+        TimelineEvent(label="proxy log: CONNECT to evil.example.org",
+                      at=parse_timestamp("2026-05-04T12:00:00+02:00"),
+                      source="share://proxy.log", kind="log-line"),
+        TimelineEvent(label="DNS query for evil.example.org",
+                      at=parse_timestamp("2026-05-04T10:00:00Z"),
+                      source="share://dns.log", kind="log-line"),
+        TimelineEvent(label="advisory published",
+                      at=parse_timestamp("04 May 2026 09:30 +0000"),
+                      source="https://example.com/advisory", kind="publication"),
+        TimelineEvent(label="document created",
+                      at=parse_timestamp("2026-05-03T23:00:00-05:00"),
+                      source="share://report.docx", kind="document-created"),
+        TimelineEvent(label="timeline built",
+                      at=parse_timestamp("2026-05-04T10:00:00Z",
+                                         origin=TimestampOrigin.DERIVED),
+                      source="this tool", kind="case-access"),
+        TimelineEvent(label="undated note",
+                      at=parse_timestamp("undated"), source="share://note.txt"),
+    ]
+
+
+def timeline_demo() -> dict[str, Any]:
+    """A timeline, a correlation and a de-duplication, run for the record."""
+
+    timeline = build_timeline(_timeline_demo_events(), title="case timeline")
+    correlation = correlate_records(_correlation_demo_records())
+    fixture = _artifact_fixture()
+    try:
+        # A renamed copy of one artefact, so the demo shows a duplicate group rather
+        # than only the look-alikes that de-duplication refuses to merge.
+        original = fixture.evidence / "notes.txt"
+        (fixture.evidence / "notes-copy.txt").write_bytes(original.read_bytes())
+        case = ArtifactCase(roots=[str(fixture.evidence)], case_dir=fixture.case_dir)
+        manifest = case.walk(str(fixture.evidence))
+        duplicates = deduplicate_manifest(manifest)
+        artifact_timeline = timeline_from_manifest(manifest)
+    finally:
+        fixture.cleanup()
+    return {
+        "timeline": timeline.to_dict(),
+        "correlation": correlation.to_dict(),
+        "deduplication": duplicates.to_dict(),
+        "artifact_timeline": artifact_timeline.to_dict(),
+        "events": [event.to_dict() for event in timeline.events],
+    }
+
+
+def render_correlation_report(report: CorrelationReport) -> Group:
+    """The links of one correlation, and the near-misses they left out.
+
+    Separate from the demo renderer so ``timeline --record`` can show a correlation
+    without an empty timeline table above it.
+    """
+
+    links = Table(title="correlation — every link carries its reason",
+                  title_justify="left", box=None, pad_edge=False)
+    links.add_column("pair", no_wrap=True)
+    links.add_column("strength", no_wrap=True)
+    links.add_column("explanation", overflow="fold", max_width=64)
+    for link in report.links:
+        colour = {"strong": "green", "moderate": "yellow"}.get(link.strength, "dim")
+        links.add_row(escape(f"{link.left} ↔ {link.right}"),
+                      f"[{colour}]{escape(link.strength)}[/{colour}]",
+                      escape(link.explanation[:200]))
+    if not report.links:
+        links.add_row("—", "[dim]none[/dim]",
+                      "[dim]no two records share a decisive indicator[/dim]")
+    near = Text("not linked — the coincidence is the better explanation:\n"
+                + "\n".join(f"  · {line[:160]}" for line in report.near_misses)
+                if report.near_misses else "", style="dim")
+    return Group(links, near, Text(f"\n{report.describe()}\n" + "\n".join(
+        f"  · {rule}" for rule in report.rules)
+        + "\na shared indicator explains a comparison; it never names a person",
+        style="dim"))
+
+
+def render_timeline_demo(payload: Mapping[str, Any]) -> Group:
+    """The demo on screen: the order, the reason for it, and the links with sentences."""
+
+    timeline = payload["timeline"]
+    table = Table(title=f"timeline — {timeline.get('title', '')}", title_justify="left",
+                  box=None, pad_edge=False)
+    table.add_column("#", no_wrap=True)
+    table.add_column("instant (UTC)", no_wrap=True)
+    table.add_column("certainty", no_wrap=True)
+    table.add_column("placed by", no_wrap=True)
+    table.add_column("event", overflow="fold", max_width=34)
+    for item in payload.get("events") or []:
+        basis = item["ordering_basis"]
+        colour = {"source-timestamp": "green", "tie-break": "yellow",
+                  "derived": "cyan", "undated": "red"}.get(basis, "white")
+        table.add_row(
+            str(item["sequence"]),
+            escape((item["at"]["utc"] or "—")[:19].replace("T", " ")),
+            escape(item["at"]["certainty"]),
+            f"[{colour}]{escape(basis)}[/{colour}]",
+            escape(f"{item['label'][:60]} [{item['source'][:28]}]"))
+
+    correlation = payload["correlation"]
+    links = Table(title="correlation — every link carries its reason",
+                  title_justify="left", box=None, pad_edge=False)
+    links.add_column("pair", no_wrap=True)
+    links.add_column("strength", no_wrap=True)
+    links.add_column("explanation", overflow="fold", max_width=64)
+    for item in correlation.get("links") or []:
+        colour = {"strong": "green", "moderate": "yellow"}.get(item["strength"], "dim")
+        links.add_row(escape(f"{item['left']} ↔ {item['right']}"),
+                      f"[{colour}]{escape(item['strength'])}[/{colour}]",
+                      escape(item["explanation"][:170]))
+    near = Text("\nnot linked — the coincidence is the better explanation:\n"
+                + "\n".join(f"  · {line[:150]}"
+                            for line in correlation.get("near_misses") or [])
+                if correlation.get("near_misses") else "", style="dim")
+
+    duplicates = payload["deduplication"]
+    dedup = Text(
+        f"\nduplicate evidence: {duplicates.get('describe', '')}\n"
+        + "\n".join(f"  · {line[:140]}" for line in duplicates.get("distinct") or []),
+        style="dim")
+    summary = Text(
+        f"\n{timeline.get('describe', '')}\n"
+        f"{correlation.get('describe', '')}\n"
+        "a shared indicator explains a comparison; it never names a person",
+        style="dim")
+    return Group(table, Text(""), links, near, dedup, summary)
+
+
+def render_timeline_self_test(checks: Sequence[Any]) -> Any:
+    table = Table(title="timeline self-test", title_justify="left", box=None,
+                  pad_edge=False)
+    table.add_column("", width=2)
+    table.add_column("check", no_wrap=True)
+    table.add_column("detail", overflow="fold")
+    for check in checks:
+        glyph, colour = ("✔", "green") if check.ok else ("✘", "red")
+        table.add_row(f"[{colour}]{glyph}[/{colour}]", escape(check.name),
+                      escape(check.detail))
+    return table
+
+
+def run_timeline_self_test() -> list[TimelineCheck]:
+    """Prove the two acceptance clauses, and the machinery behind each.
+
+    Clause one: the timeline distinguishes *source* timestamps from this tool's
+    *derived ordering* — so the order is never presented as a fact the sources state.
+    Clause two: correlation explains why records were linked — every link carries a
+    sentence naming the shared indicators and the strength, and no link claims identity.
+    """
+
+    checks: list[TimelineCheck] = []
+
+    def add(name: str, ok: Any, detail: Any = "") -> None:
+        checks.append(TimelineCheck(name=name, ok=bool(ok), detail=str(detail)[:150]))
+
+    # ---- 1. the vocabulary -------------------------------------------------
+    add("six timestamp origins are defined", len(TimestampOrigin) == 6,
+        [origin.value for origin in TimestampOrigin])
+    add("six certainty levels are defined", len(TimeCertainty) == 6,
+        [level.value for level in TimeCertainty])
+    add("only an exact timestamp is quotable",
+        [level for level in TimeCertainty if level.quotable] == [TimeCertainty.EXACT])
+    add("certainty is ordered from exact to unverified",
+        TimeCertainty.EXACT.rank < TimeCertainty.APPROXIMATE.rank
+        < TimeCertainty.AMBIGUOUS.rank < TimeCertainty.UNVERIFIED.rank)
+    add("ten indicator kinds are defined", len(IndicatorKind) == 10,
+        [kind.value for kind in IndicatorKind])
+    add("a normalised timestamp cannot be extended",
+        not _constructs(NormalisedTimestamp, original="x", reinterpreted="y"))
+    add("a link has no field for an identity",
+        not (set(CorrelationLink.model_fields)
+             & {"person", "actor", "identity", "attribution", "owner", "suspect"}),
+        sorted(set(CorrelationLink.model_fields) & {"person", "actor", "identity"}))
+    add("a link can never be constructed as one",
+        not _constructs(CorrelationLink, left="a", right="b", identity="someone"))
+    add("a link says in words that it is not an identity",
+        "do not establish" in CorrelationLink(left="a", right="b").not_identity_note)
+    add("a record cannot be extended with an order",
+        not _constructs(CorrelationRecord, id="r", execute=True))
+
+    # ---- 2. normalisation preserves the original and the zone --------------
+    stated = parse_timestamp("2026-05-04T12:00:00+02:00")
+    add("an explicit offset is exact", stated.certainty is TimeCertainty.EXACT)
+    add("an explicit offset is normalised to UTC",
+        stated.utc == datetime(2026, 5, 4, 10, 0, tzinfo=timezone.utc), stated.utc)
+    add("the wall clock is preserved as written",
+        stated.wall_clock == datetime(2026, 5, 4, 12, 0), stated.wall_clock)
+    add("the offset is preserved in minutes", stated.offset_minutes == 120)
+    add("the local time can be reconstructed exactly",
+        stated.local == datetime(2026, 5, 4, 12, 0,
+                                 tzinfo=timezone(timedelta(hours=2))))
+    add("the original string is kept verbatim",
+        stated.original == "2026-05-04T12:00:00+02:00")
+    add("the zone is labelled in words", stated.tz_label == "UTC+02:00", stated.tz_label)
+    add("Z means UTC", parse_timestamp("2026-05-04T12:00:00Z").offset_minutes == 0)
+    add("a negative offset is preserved",
+        parse_timestamp("2026-05-04T12:00:00-05:00").offset_minutes == -300)
+    add("two zones for one instant normalise to the same UTC",
+        parse_timestamp("2026-05-04T12:00:00+02:00").utc
+        == parse_timestamp("2026-05-04T10:00:00Z").utc)
+    add("the same instant in two zones is not the same wall clock",
+        parse_timestamp("2026-05-04T12:00:00+02:00").wall_clock
+        != parse_timestamp("2026-05-04T10:00:00Z").wall_clock)
+    add("normalisation is deterministic",
+        parse_timestamp("2026-05-04T12:00:00+02:00").to_dict()
+        == parse_timestamp("2026-05-04T12:00:00+02:00").to_dict())
+
+    # ---- 3. uncertain timestamps are flagged ------------------------------
+    no_zone = parse_timestamp("2026-05-04 12:00")
+    add("a timestamp with no offset is ambiguous",
+        no_zone.certainty is TimeCertainty.AMBIGUOUS)
+    add("the missing offset is stated as a caveat",
+        any("no UTC offset" in caveat for caveat in no_zone.caveats))
+    date_only = parse_timestamp("2026-05-04")
+    add("a date with no time is reduced", date_only.certainty is TimeCertainty.REDUCED)
+    add("the midnight placeholder is stated",
+        any("placeholder" in caveat for caveat in date_only.caveats))
+    ambiguous = parse_timestamp("04/05/2026 12:00")
+    add("a day/month ambiguity is marked ambiguous",
+        ambiguous.certainty is TimeCertainty.AMBIGUOUS)
+    add("the ambiguity is stated in words",
+        any("day/month" in caveat for caveat in ambiguous.caveats))
+    add("the alternative reading is preserved",
+        ambiguous.alternatives == [datetime(2026, 4, 5, 12, 0)],
+        [value.isoformat() for value in ambiguous.alternatives])
+    add("an unambiguous slash date keeps one reading",
+        parse_timestamp("13/05/2026").alternatives == []
+        and parse_timestamp("13/05/2026").utc.month == 5)
+    approximate = parse_timestamp("~2026-05-04T12:00:00Z")
+    add("an approximate marker is flagged",
+        approximate.certainty is TimeCertainty.APPROXIMATE)
+    add("an approximate timestamp is not quotable", not approximate.certainty.quotable)
+    add("an unrecognised value is unverified",
+        parse_timestamp("sometime last spring").certainty is TimeCertainty.UNVERIFIED)
+    add("an unrecognised value invents nothing",
+        parse_timestamp("sometime last spring").utc is None)
+    add("the refusal says nothing was assumed",
+        "nothing was assumed" in " ".join(
+            parse_timestamp("sometime last spring").caveats))
+    add("an explicit 'unknown' is unverified",
+        parse_timestamp("unknown").certainty is TimeCertainty.UNVERIFIED)
+    add("an empty value is unverified", parse_timestamp("").certainty
+        is TimeCertainty.UNVERIFIED)
+    add("an impossible date is refused, not rolled over",
+        parse_timestamp("2026-13-40T99:99:99Z").utc is None)
+    add("an epoch in seconds is read as one",
+        parse_timestamp("1714824000").utc == datetime(2024, 5, 4, 12, 0,
+                                                     tzinfo=timezone.utc))
+    add("an epoch in milliseconds is read as one",
+        parse_timestamp("1714824000000").utc == parse_timestamp("1714824000").utc)
+    far_off = parse_timestamp("100000000",
+                              now=datetime(2026, 5, 4, tzinfo=timezone.utc))
+    add("an epoch far from the case clock is flagged",
+        far_off.certainty is TimeCertainty.AMBIGUOUS, far_off.certainty)
+    add("the implausible epoch says the unit may be wrong",
+        any("unit may be different" in caveat for caveat in far_off.caveats),
+        far_off.caveats)
+    add("a plausible epoch is not flagged",
+        parse_timestamp("1777888800",
+                        now=datetime(2026, 5, 4, tzinfo=timezone.utc)).certainty
+        is TimeCertainty.EXACT)
+    add("an RFC-2822 date is read",
+        parse_timestamp("Mon, 04 May 2026 12:00:00 +0000").utc
+        == datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc))
+    add("a named month with no zone is ambiguous",
+        parse_timestamp("4 May 2026 12:00").certainty is TimeCertainty.AMBIGUOUS)
+    add("a bare datetime without a zone is marked ambiguous, not guessed",
+        parse_timestamp(datetime(2026, 5, 4, 12, 0)).certainty
+        is TimeCertainty.AMBIGUOUS)
+    add("an aware datetime needs no caveat",
+        parse_timestamp(datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)).caveats == [])
+
+    # ---- 4. the timeline separates source order from derived order --------
+    timeline = build_timeline(_timeline_demo_events(), title="case")
+    add("the timeline orders by instant",
+        [event.at.utc for event in timeline.events
+         if event.at.known] == sorted(event.at.utc for event in timeline.events
+                                      if event.at.known))
+    add("events in different zones are ordered by what happened",
+        [event.label for event in timeline.events][:3]
+        == ["document created", "advisory published",
+            "DNS query for evil.example.org"],
+        [event.label for event in timeline.events][:3])
+    add("a zone offset changes the position, not the wall clock",
+        next(event for event in timeline.events
+             if event.label == "document created").at.wall_clock
+        == datetime(2026, 5, 3, 23, 0),
+        next(event for event in timeline.events
+             if event.label == "document created").at.wall_clock)
+    add("an undated event is listed last",
+        timeline.events[-1].at.known is False)
+    add("the undated event is marked undated",
+        timeline.events[-1].ordering_basis == "undated")
+    add("undated events are not interleaved",
+        all(event.at.known for event in timeline.events
+            if event.ordering_basis != "undated"))
+    add("a source-stated instant is marked source-timestamp",
+        any(event.ordering_basis == "source-timestamp" for event in timeline.events))
+    add("an instant this tool recorded is marked derived",
+        any(event.ordering_basis == "derived" for event in timeline.events))
+    add("the derived event is the one this tool wrote",
+        next(event for event in timeline.events
+             if event.ordering_basis == "derived").source == "this tool")
+    add("the timeline states the ordering rule",
+        "ascending" in timeline.ordering_rule, timeline.ordering_rule)
+    add("the timeline says the sequence is this tool's",
+        any("this tool's ordering" in caveat for caveat in timeline.caveats))
+    add("the timeline counts the events placed by a source",
+        len(timeline.source_ordered)
+        == len([event for event in timeline.events
+                if event.ordering_basis == "source-timestamp"]))
+    add("the timeline counts the events it timed itself",
+        any("this tool" in caveat and "recorded" in caveat
+            for caveat in timeline.caveats), timeline.caveats)
+    add("the timeline reports the zones it read",
+        any("UTC" in zone for zone in timeline.zones), timeline.zones)
+    add("the timeline describes itself",
+        "placed by a source timestamp" in timeline.describe(), timeline.describe())
+    add("the order is not wholly derived when a source timestamp exists",
+        timeline.order_is_derived is False)
+    add("the timeline has a stable id",
+        timeline.id == build_timeline(_timeline_demo_events(), title="case").id)
+    add("the timeline is deterministic",
+        timeline.to_dict()["events"][0]["id"] == timeline.events[0].id)
+    add("sequence numbers are 1-based and contiguous",
+        [event.sequence for event in timeline.events]
+        == list(range(1, len(timeline.events) + 1)))
+
+    # ---- 5. ties assert nothing ------------------------------------------
+    tied = build_timeline([
+        TimelineEvent(label="alpha", at=parse_timestamp("2026-05-04T12:00:00Z"),
+                      source="a.log"),
+        TimelineEvent(label="beta", at=parse_timestamp("2026-05-04T14:00:00+02:00"),
+                      source="b.log"),
+        TimelineEvent(label="gamma", at=parse_timestamp("2026-05-04T12:00:01Z"),
+                      source="c.log")])
+    add("both members of a tie are marked tie-break",
+        [event.ordering_basis for event in tied.events]
+        == ["tie-break", "tie-break", "source-timestamp"],
+        [event.ordering_basis for event in tied.events])
+    add("a tie is ordered by source, deterministically",
+        [event.source for event in tied.events][:2] == ["a.log", "b.log"])
+    add("tied events are not claimed as source-ordered",
+        all(not event.from_source for event in tied.tied))
+    add("the tie count is reported", tied.to_dict()["tie_broken"] == 2)
+    derived_only = build_timeline([
+        TimelineEvent(label="an access", source="this tool",
+                      at=parse_timestamp(utc_now(), origin=TimestampOrigin.DERIVED)),
+        TimelineEvent(label="a copy", source="this tool",
+                      at=parse_timestamp(utc_now(), origin=TimestampOrigin.DERIVED))])
+    add("a timeline of only derived instants says so",
+        derived_only.order_is_derived is True)
+    add("no event in it is claimed as source-ordered",
+        derived_only.source_ordered == [])
+    empty = build_timeline([])
+    add("an empty timeline is honest about being empty",
+        empty.events == [] and "0 dated" in empty.describe())
+
+    # ---- 6. correlation explains every link ------------------------------
+    report = correlate_records(_correlation_demo_records())
+    add("the report links the records that overlap", len(report.links) >= 3,
+        len(report.links))
+    add("every link carries an explanation in a sentence",
+        all(len(link.explanation) > 40 and "." in link.explanation
+            for link in report.links))
+    add("the explanation names the shared indicators",
+        all(any(indicator.value in link.explanation for indicator in link.shared
+                if not indicator.record_id)
+            for link in report.links))
+    add("the explanation names both records",
+        all(link.left in link.explanation and link.right in link.explanation
+            for link in report.links))
+    add("the explanation states the strength",
+        all("Strength:" in link.explanation for link in report.links))
+    add("no link claims an identity",
+        all(link.identity_claimed is False for link in report.links))
+    add("every link repeats the not-an-identity note",
+        all("do not establish" in link.not_identity_note for link in report.links))
+    add("identical content is a strong link",
+        any(link.strength == "strong" for link in report.links))
+    add("the strong link is attributed to the hash",
+        next(link for link in report.links
+             if link.strength == "strong").basis.startswith("identical content"))
+    add("two independent indicators are moderate or better",
+        all(_STRENGTH_ORDER[link.strength] >= 2 for link in report.links
+            if len([indicator for indicator in link.shared
+                    if not _is_coincidental(indicator)[0]]) >= 2))
+    add("one indicator alone is weak",
+        all(link.strength == "weak" for link in report.links
+            if len([indicator for indicator in link.shared
+                    if not _is_coincidental(indicator)[0]]) == 1))
+    add("the report lists the rules it applied",
+        len(report.rules) == len(CORRELATION_RULES) and "identity" in " ".join(
+            report.rules))
+    add("the report says absence of a link is not independence",
+        any("absence of a link" in caveat for caveat in report.caveats))
+    add("the report describes itself",
+        "no identity is inferred" in report.describe(), report.describe())
+    add("links are ordered strongest first",
+        [_STRENGTH_ORDER[link.strength] for link in report.links]
+        == sorted((_STRENGTH_ORDER[link.strength] for link in report.links),
+                  reverse=True))
+    add("the report has a stable id",
+        report.id == correlate_records(list(reversed(
+            _correlation_demo_records()))).id)
+    add("correlation is order-independent",
+        [(link.left, link.right) for link in report.links]
+        == [(link.left, link.right) for link in
+            correlate_records(list(reversed(_correlation_demo_records()))).links])
+
+    # ---- 7. coincidence is not identity ----------------------------------
+    add("a free mail provider is not an identity",
+        not any(link.pair() == ("rec-advisory", "rec-mail") for link in report.links))
+    add("the mail near-miss is explained",
+        any("free mail provider" in line for line in report.near_misses),
+        report.near_misses[:1])
+    add("a default file name is not an identity",
+        not any(link.pair() == ("rec-index-a", "rec-index-b") for link in report.links))
+    add("the file-name near-miss is explained",
+        any("commonly coincides" in line for line in report.near_misses))
+    add("a private address does not link two records",
+        not any("10.0.0.5" in link.explanation and len(link.shared) == 1
+                for link in report.links
+                if link.pair() == ("rec-advisory", "rec-scan")))
+    add("a default user agent never links",
+        not any(link.pair() == ("a", "b") for link in correlate_records([
+            CorrelationRecord.from_pairs("a", [(IndicatorKind.USER_AGENT, "Mozilla/5.0")]),
+            CorrelationRecord.from_pairs("b", [(IndicatorKind.USER_AGENT, "Mozilla/5.0")]),
+        ]).links))
+    add("a private IP is refused as an indicator of ownership",
+        _is_coincidental(Indicator(kind=IndicatorKind.IP, raw="10.0.0.5",
+                                   value="10.0.0.5"))[0])
+    add("a public IP is not refused",
+        not _is_coincidental(Indicator(kind=IndicatorKind.IP, raw="93.184.216.34",
+                                       value="93.184.216.34"))[0])
+    add("a documentation-range address is refused",
+        _is_coincidental(Indicator(kind=IndicatorKind.IP, raw="198.51.100.7",
+                                   value="198.51.100.7"))[0])
+    add("a loopback address is refused",
+        _is_coincidental(Indicator(kind=IndicatorKind.IP, raw="127.0.0.1",
+                                   value="127.0.0.1"))[0])
+    add("a very short username is a coincidence",
+        _is_coincidental(Indicator(kind=IndicatorKind.USERNAME, raw="bob",
+                                   value="bob"))[0])
+    add("a distinctive username is not",
+        not _is_coincidental(Indicator(kind=IndicatorKind.USERNAME,
+                                       raw="analyst-kestrel",
+                                       value="analyst-kestrel"))[0])
+    add("a coincidental overlap is listed, not dropped",
+        len(report.near_misses) >= 2, report.near_misses)
+
+    # ---- 8. indicators are normalised, and refused when they are not ------
+    add("a domain is lowercased and de-www'd",
+        normalise_indicator(IndicatorKind.DOMAIN, "WWW.Evil.Example.org.") 
+        == "evil.example.org")
+    add("a URL is normalised through the research rules",
+        normalise_indicator(IndicatorKind.URL,
+                            "https://WWW.Example.com:443/a/?utm_source=x#f")
+        == "https://example.com/a")
+    add("an email is lowercased",
+        normalise_indicator(IndicatorKind.EMAIL, "Analyst@Example.ORG")
+        == "analyst@example.org")
+    add("a filename is reduced to its base name",
+        normalise_indicator(IndicatorKind.FILENAME, "C:\\x\\Report.DOCX")
+        == "report.docx")
+    add("a hash is accepted at the right length",
+        normalise_indicator(IndicatorKind.HASH, "A" * 64) == "a" * 64)
+    add("a hash of the wrong length is refused",
+        normalise_indicator(IndicatorKind.HASH, "abc123") is None)
+    add("a non-hex hash is refused",
+        normalise_indicator(IndicatorKind.HASH, "z" * 64) is None)
+    add("an IP is canonicalised",
+        normalise_indicator(IndicatorKind.IP, "2001:0db8::1") == "2001:db8::1")
+    add("a non-address is refused as an IP",
+        normalise_indicator(IndicatorKind.IP, "10.0.0.256") is None)
+    add("a URL is refused as a domain",
+        normalise_indicator(IndicatorKind.DOMAIN, "https://example.com/x") is None)
+    add("an invalid indicator is dropped from a record",
+        CorrelationRecord.from_pairs("r", [(IndicatorKind.IP, "not-an-ip")]).indicators
+        == [])
+    add("a record keeps the original beside the normalised value",
+        CorrelationRecord.from_pairs(
+            "r", [(IndicatorKind.DOMAIN, "EVIL.example.org")]).indicators[0].raw
+        == "EVIL.example.org")
+
+    # ---- 9. de-duplication uses content, never a name or a size -----------
+    fixture = _artifact_fixture()
+    try:
+        evidence = fixture.evidence
+        # Two identical files under different names, plus a same-size look-alike.
+        (evidence / "copy-of-notes.txt").write_bytes((evidence / "notes.txt").read_bytes())
+        (evidence / "same-size-different.txt").write_bytes(b"x" * (
+            evidence / "nested" / "deep.log").stat().st_size)
+        case = ArtifactCase(roots=[str(evidence)], case_dir=fixture.case_dir)
+        manifest = case.walk(str(evidence))
+        report = deduplicate_manifest(manifest)
+        add("identical bytes are grouped", len(report.groups) >= 1, len(report.groups))
+        group = next((group for group in report.groups
+                      if any("notes.txt" in member for member in group.members)), None)
+        add("the renamed copy is in the group", group is not None
+            and any("copy-of-notes" in member for member in group.members))
+        add("the group names the canonical member", bool(group and group.canonical))
+        add("the canonical member is the first by path",
+            bool(group and group.canonical
+                 == sorted(group.members, key=lambda member: member)[0]))
+        add("the redundant members are listed",
+            bool(group and len(group.members) == len(group.redundant) + 1))
+        add("the group explains itself",
+            bool(group and "identical sha256" in group.explanation))
+        add("a renamed copy is described as one",
+            bool(group and "renamed" in group.explanation))
+        add("a same-size look-alike is not a duplicate",
+            not any("same-size-different" in member for member in report.redundant))
+        add("the look-alike is reported, with the reason",
+            any("size is not content" in line for line in report.distinct),
+            report.distinct[:1])
+        add("the rule is stated", "sha256" in report.rule and "size" in report.rule)
+        add("a duplicate is not removed from the case",
+            any("never from the case" in caveat for caveat in report.caveats))
+        add("the report describes itself",
+            "duplicate group" in report.describe(), report.describe())
+        add("the duplicate report is deterministic",
+            report.id == deduplicate_manifest(case.walk(str(evidence))).id)
+        add("a manifest with no duplicates reports none",
+            find_duplicate_evidence(manifest.entries[:1]).groups == [])
+
+        # ---- 10. correlation over a real manifest -------------------------
+        artifact_report_ = correlate_artifacts(manifest)
+        add("a manifest correlates into records",
+            len(artifact_report_.records) == len(manifest.entries)
+            or len(artifact_report_.records) > 0)
+        add("the manifest correlation is explained",
+            all(link.explanation for link in artifact_report_.links))
+        add("the manifest correlation claims no identity",
+            all(link.identity_claimed is False for link in artifact_report_.links))
+
+        # ---- 11. a timeline from a real case ------------------------------
+        artifact_timeline = timeline_from_manifest(manifest)
+        add("the artifact timeline has events", len(artifact_timeline.events) > 0)
+        add("file times are marked as filesystem facts",
+            any(event.kind == "file-modified" for event in artifact_timeline.events))
+        add("the tool's own accesses are marked derived",
+            any(event.kind == "case-access"
+                and event.ordering_basis == "derived"
+                for event in artifact_timeline.events))
+        add("the artifact timeline says what it derived",
+            any("this tool" in caveat for caveat in artifact_timeline.caveats))
+        add("the artifact timeline is ordered",
+            [event.at.utc for event in artifact_timeline.events if event.at.known]
+            == sorted(event.at.utc for event in artifact_timeline.events
+                      if event.at.known))
+    finally:
+        fixture.cleanup()
+
+    # ---- 12. serialisation and the demo ---------------------------------
+    demo = timeline_demo()
+    add("the demo builds a timeline", bool(demo["timeline"]["events"]))
+    add("the demo builds a correlation", bool(demo["correlation"]["links"]))
+    add("the demo's correlation explains every link",
+        all(item["explanation"] for item in demo["correlation"]["links"]))
+    add("the demo's links all disclaim identity",
+        all(item["identity_claimed"] is False
+            for item in demo["correlation"]["links"]))
+    add("the demo builds a de-duplication report", "groups" in demo["deduplication"])
+    add("the demo builds a timeline from a manifest",
+        "artifact_timeline" in demo)
+    add("every piece serialises to JSON",
+        bool(json.dumps(demo, default=str)))
+    # ``to_dict`` adds derived display fields; the round trip is of the *model*, which
+    # is what a case file stores and what a later run must be able to reload.
+    rebuilt_timeline = ForensicTimeline(**json.loads(json.dumps(
+        build_timeline(_timeline_demo_events(), title="case").model_dump(mode="json"))))
+    add("the timeline round-trips through its own model",
+        len(rebuilt_timeline.events) == len(demo["timeline"]["events"]))
+    rebuilt_report = CorrelationReport(**json.loads(json.dumps(
+        correlate_records(_correlation_demo_records()).model_dump(mode="json"))))
+    add("the correlation round-trips through its own model",
+        len(rebuilt_report.links) == len(demo["correlation"]["links"]))
+    return checks
+
+
+@app.command("timeline", help="Forensic time: normalise, order, correlate, de-duplicate.")
+def timeline_command(
+    self_test: bool = typer.Option(False, "--self-test",
+                                   help="Prove the source-vs-derived contract offline."),
+    demo: bool = typer.Option(False, "--demo",
+                              help="A timeline, a correlation and a duplicate report."),
+    path: list[str] = typer.Option([], "--path", "-p",
+                                   help="An artifact case to place on a timeline. Repeatable."),
+    record: list[str] = typer.Option(
+        [], "--record",
+        help="Correlate these records, given as 'id:kind=value;kind=value'. Repeatable."),
+    timestamp: list[str] = typer.Option([], "--timestamp",
+                                        help="Normalise this timestamp and show the reading."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Put evidence in order without claiming the order is evidence.
+
+    ``--timestamp`` shows how one value is read, including what was *not* stated; to
+    build a timeline from files use ``artifacts --path`` and this command's ``--path``.
+    """
+
+    console = get_console()
+
+    if self_test:
+        checks = run_timeline_self_test()
+        failures = [check for check in checks if not check.ok]
+        if as_json:
+            _emit(json.dumps({"ok": not failures,
+                              "checks": [asdict(check) for check in checks]}, indent=2))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        console.print()
+        console.print(render_timeline_self_test(checks))
+        colour = "green" if not failures else "red"
+        console.print(f"\n[{colour}]{len(checks) - len(failures)} passed[/] · "
+                      f"{len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    if demo:
+        payload = timeline_demo()
+        if as_json:
+            _emit(json.dumps(payload, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(render_timeline_demo(payload))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    if timestamp:
+        rows = [parse_timestamp(item) for item in timestamp]
+        if as_json:
+            _emit(json.dumps({"timestamps": [row.to_dict() for row in rows]}, indent=2,
+                             default=str))
+            raise typer.Exit(ExitCode.OK)
+        table = Table(title="timestamp normalisation — what was stated, what was read",
+                      title_justify="left", box=None, pad_edge=False)
+        table.add_column("source value", overflow="fold", max_width=30)
+        table.add_column("UTC", no_wrap=True)
+        table.add_column("local", no_wrap=True)
+        table.add_column("certainty", no_wrap=True)
+        table.add_column("caveat", overflow="fold", max_width=44)
+        for row in rows:
+            table.add_row(
+                escape(row.original[:40] or "—"),
+                escape(row.utc.strftime("%Y-%m-%d %H:%M:%S") if row.utc else "—"),
+                escape(row.local.strftime("%Y-%m-%d %H:%M:%S %z") if row.local else "—"),
+                escape(row.certainty.value),
+                escape("; ".join(row.caveats)[:120] or "—"))
+        console.print()
+        console.print(table)
+        console.print(Text(
+            "\nUTC is this build's reading; the local column is what the source said.\n"
+            "Only 'exact' may be quoted as the time of an event.", style="dim"))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    if record:
+        records: list[CorrelationRecord] = []
+        for item in record:
+            try:
+                record_id, pairs_text = item.split(":", 1)
+            except ValueError:
+                console.print(f"[red]✘[/red] {escape(item[:80])} is not "
+                              "'id:kind=value;kind=value'")
+                raise typer.Exit(ExitCode.USAGE) from None
+            pairs: list[tuple[IndicatorKind, str]] = []
+            for chunk in pairs_text.split(";"):
+                if not chunk.strip():
+                    continue
+                try:
+                    kind_text, value = chunk.split("=", 1)
+                    pairs.append((IndicatorKind(kind_text.strip().lower()), value.strip()))
+                except ValueError:
+                    console.print(f"[red]✘[/red] {escape(chunk[:40])} is not "
+                                  "'kind=value'; kinds are "
+                                  f"{', '.join(kind.value for kind in IndicatorKind)}")
+                    raise typer.Exit(ExitCode.USAGE) from None
+            records.append(CorrelationRecord.from_pairs(record_id.strip(), pairs,
+                                                        label=record_id.strip()))
+        report = correlate_records(records)
+        if as_json:
+            _emit(json.dumps(report.to_dict(), indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(render_correlation_report(report))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    if path:
+        supplied = [str(Path(item).expanduser()) for item in path]
+        missing = [item for item in supplied if not Path(item).exists()]
+        if missing:
+            console.print(f"[red]✘[/red] not found: {escape(', '.join(missing)[:160])}")
+            raise typer.Exit(ExitCode.USAGE)
+        base = next((item for item in supplied if Path(item).is_dir()),
+                    str(Path(supplied[0]).parent))
+        case = ArtifactCase(roots=[str(Path(base).resolve())],
+                            case_dir=resolve_default_output_dir() / "cases",
+                            actor=os.environ.get("ARGUS_OPERATOR") or "operator")
+        manifests = [case.walk(item) for item in supplied]
+        events: list[TimelineEvent] = []
+        duplicates = DeduplicationReport()
+        for manifest in manifests:
+            events.extend(timeline_from_manifest(manifest).events)
+            found = deduplicate_manifest(manifest)
+            duplicates = DeduplicationReport(
+                groups=[*duplicates.groups, *found.groups],
+                distinct=sorted({*duplicates.distinct, *found.distinct}),
+                rule=found.rule, caveats=found.caveats)
+        timeline = build_timeline(events, title=", ".join(
+            Path(manifest.root).name for manifest in manifests))
+        correlation = correlate_records([
+            record for manifest in manifests
+            for record in correlate_artifacts(manifest).records])
+        payload = {"timeline": timeline.to_dict(), "correlation": correlation.to_dict(),
+                   "deduplication": duplicates.to_dict(),
+                   "events": [event.to_dict() for event in timeline.events]}
+        if as_json:
+            _emit(json.dumps(payload, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(render_timeline_demo(payload))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    console.print("[red]✘[/red] name evidence with --path, a record with --record, a "
+                  "value with --timestamp, or use --demo/--self-test")
+    raise typer.Exit(ExitCode.USAGE)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 33. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 

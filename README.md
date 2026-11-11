@@ -22,6 +22,7 @@ python vedant_osint.py browser --self-test    # browser research, guaranteed clo
 python vedant_osint.py research --self-test   # source-aware web research
 python vedant_osint.py extract --self-test    # bounded, untrusted document extraction
 python vedant_osint.py artifacts --self-test  # read-only artifact handling, no writes
+python vedant_osint.py timeline --self-test   # source vs derived time, explained links
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -688,6 +689,45 @@ python vedant_osint.py artifacts --limits               # ceilings, and what is 
   skip. Previews of text artefacts go through the Task 20 scanner and defanger,
   so a file whose first line is an instruction appears in the record quoted.
 
+## Forensic timeline and correlation
+
+A timeline is a list sorted by a rule, not evidence of order; a correlation is a
+statement about observables, not about a person. `timeline` keeps both distinctions
+visible in the schema itself.
+
+```bash
+python vedant_osint.py timeline --self-test        # 145 forensic-time checks, offline
+python vedant_osint.py timeline --demo             # order, links, duplicates
+python vedant_osint.py timeline --timestamp "04/05/2026 12:00" "2026-05-04T12:00:00+02:00"
+python vedant_osint.py timeline --record "a:domain=evil.example.org;hash=<sha256>"
+python vedant_osint.py timeline --path ~/evidence  # a case, ordered
+```
+
+- **The source's timestamp and this build's reading are different fields.**
+  `NormalisedTimestamp` keeps `original` verbatim, `wall_clock` as written,
+  `offset_minutes` as stated, and `utc` as the normalisation — plus a `certainty`.
+  Only `exact` may be quoted as the time of an event; `approximate`, `reduced` (a
+  date with no time), `ambiguous` (no offset, or a day/month order that could
+  differ) and `unverified` each carry the reason. The original zone is preserved,
+  so the local time can be reconstructed exactly, and an ambiguous `04/05/2026`
+  keeps the other reading in `alternatives`.
+- **The order states its own provenance.** Every event carries an
+  `ordering_basis`: `source-timestamp`, `tie-break` (both members of a tie, since
+  neither can be shown to have happened first), `derived` (a time this tool wrote),
+  or `undated` — listed last and never interleaved. `order_is_derived` is true when
+  nothing was placed by a source.
+- **Every link is explained in a sentence** naming the shared indicators and the
+  strength: identical content is strong, two independent observables moderate, one
+  weak. `CorrelationLink` has no field for a person, an actor or an identity.
+- **A coincidence is not a match.** A free mail provider, a default file name, a
+  private or documentation address, a stock user agent or a four-letter username
+  never links two records alone — the pair is reported as a near-miss *with the
+  reason*, so a reader sees what was excluded, not only what survived.
+- **Duplicates are content, never names.** Same evidence means same sha256 *and*
+  same size; a shared name or a shared size is a look-alike kept distinct, and the
+  canonical member is chosen by path so a re-run makes the same choice. Neither
+  copy is deleted: both paths stay on the record.
+
 ## Status
 
 | Phase | Scope | State |
@@ -697,7 +737,7 @@ python vedant_osint.py artifacts --limits               # ceilings, and what is 
 | 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control) |
 | 4 | Browser — browser-use / Playwright sessions and capture | 🟡 started (policy, scope, capture, guarded closure, agent mode) |
 | 5 | Collection — passive OSINT sources, artefact hashing | 🟡 started (source-aware web research; safe document/page extraction with injection defence; read-only artifact manifests, hashing and access ledger) |
-| 6 | Synthesis — cross-source correlation and reporting | ⬜ |
+| 6 | Synthesis — cross-source correlation and reporting | 🟡 started (deterministic timelines, explained indicator correlation, content de-duplication) |
 | 7 | Operations — resume, budgets, audit trail, hardening | 🟡 started (checkpoints, resumable missions, capability router, budgets) |
 
 ## Install
