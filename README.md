@@ -20,6 +20,7 @@ python vedant_osint.py resume --self-test     # checkpointing and resumable miss
 python vedant_osint.py router --self-test     # the controlled capability router
 python vedant_osint.py browser --self-test    # browser research, guaranteed closure
 python vedant_osint.py research --self-test   # source-aware web research
+python vedant_osint.py extract --self-test    # bounded, untrusted document extraction
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -594,6 +595,48 @@ python vedant_osint.py research --subject "example.com proxy flaw" --url https:/
   research report (`research_first`, on by default) and sends a failing Worker
   back with the remedy.
 
+## Safe document and page extraction
+
+A document read during a mission is evidence, and evidence is not an order.
+`extract` reads HTML, plain text, PDF, `.docx`, `.xlsx` and RTF — the standard
+library plus `pypdf` for PDFs — under hard ceilings, and everything it returns
+is treated as a third party's claim:
+
+```bash
+python vedant_osint.py extract --self-test      # 128 extraction checks, offline
+python vedant_osint.py extract --demo           # a hostile page, quoted and refused
+python vedant_osint.py extract --file review.docx --json
+python vedant_osint.py extract --url https://example.com/advisory --scope example.com
+python vedant_osint.py extract --limits         # the size, time and text ceilings
+```
+
+- **Bounded before parsing.** Empty, oversize and unsupported input is refused
+  before a parser sees a byte; the parse runs on its own thread against a
+  wall-clock deadline; text is truncated at a stated ceiling; a zip that expands
+  past four times the byte cap is refused before a member is read. A source
+  outside the approved scope is never read at all (`--scope`, or `Scope` in code).
+- **Identified by content.** Magic number, then file name, then the declared
+  content type — a `.txt` starting `%PDF-` is a PDF, and a spreadsheet renamed
+  `.docx` is still read as a spreadsheet, because the archive's entries decide.
+- **Nothing executable is opened.** `<script>`, forms and embedded objects are
+  skipped and recorded; macro projects, embedded files and external links are
+  refused by name; an encrypted PDF is never guessed at (`encrypted`, no
+  password attempted); an RTF object is never decoded.
+- **Instructions are quoted, never obeyed.** A scanner finds override,
+  scope-change, secret-request, tool-trigger, role-switch, exfiltration and forged
+  delimiter patterns, plus eleven kinds of concealment (`display:none`,
+  white-on-white, zero font, off-screen positioning, `aria-hidden`, comments…).
+  Every line carrying one is wrapped whole in quarantine markers, and any
+  remaining line that reads as an imperative is quoted too — so a phrasing nobody
+  wrote a pattern for is still data. `InjectionFinding.span` keeps the hostile
+  text verbatim, so the report *shows* what the page tried.
+- **There is nothing to obey with.** `ExtractedDocument` has no field for a tool,
+  a capability, a scope entry, a router or a browser: an extraction cannot reach
+  one and an embedded instruction cannot become one. What it offers instead is
+  `untrusted_block` — the text fenced and labelled **DATA ONLY**, with the three
+  prohibitions spelled out — and `document_claims`, which cites a hostile page for
+  its *hostility* rather than for its demands.
+
 ## Status
 
 | Phase | Scope | State |
@@ -602,7 +645,7 @@ python vedant_osint.py research --subject "example.com proxy flaw" --url https:/
 | 2 | Contracts — settings, `doctor`, preflight, models, state, renderer, lifecycle, resilience, model adapter | ✅ done |
 | 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control) |
 | 4 | Browser — browser-use / Playwright sessions and capture | 🟡 started (policy, scope, capture, guarded closure, agent mode) |
-| 5 | Collection — passive OSINT sources, artefact hashing | 🟡 started (source-aware web research: grading, corroboration, dates, audit) |
+| 5 | Collection — passive OSINT sources, artefact hashing | 🟡 started (source-aware web research; safe document/page extraction with injection defence) |
 | 6 | Synthesis — cross-source correlation and reporting | ⬜ |
 | 7 | Operations — resume, budgets, audit trail, hardening | 🟡 started (checkpoints, resumable missions, capability router, budgets) |
 
