@@ -26,6 +26,7 @@ python vedant_osint.py timeline --self-test   # source vs derived time, explaine
 python vedant_osint.py outcomes --self-test  # Worker statuses, no verdicts
 python vedant_osint.py review --self-test    # seven dimensions, pass or revise
 python vedant_osint.py retask --self-test    # a revise becomes a specific assignment
+python vedant_osint.py aggregate --self-test # reviewed work only, and never early
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -844,13 +845,52 @@ python vedant_osint.py retask --next report.json --schema EvidenceSet --objectiv
   `retask_fingerprint` digests the substance of an instruction, so a repeated prompt is
   detected even when re-worded — the demo shows one being caught.
 
+## Subagent aggregation and readiness
+
+A Subagent's report is a judgement of its team. It may not start until every Worker it
+required has reached a terminal state, it may use only what the reviews forwarded, and
+it must answer four questions in the record it writes: what was the same, what
+disagreed, what failed, and whether its own completion criteria were met.
+
+```bash
+python vedant_osint.py aggregate --self-test   # 87 aggregation checks, offline
+python vedant_osint.py aggregate --demo        # a merge, a disagreement, a bounded stop
+python vedant_osint.py aggregate --next team.json   # aggregate reviewed results
+```
+
+- **Aggregation never begins early.** `check_ready` requires two independent facts per
+  Worker — the branch reported settled *and* its outcome is in `terminal_states` — and
+  raises `EarlyAggregate` naming the outstanding ids, so a mis-wired join fails loudly
+  instead of summarising half a mission. The barrier travels in the report as
+  `aggregate_basis`, so the aggregate carries the proof that it was not premature.
+- **Duplicates are reconciled; corroboration is kept.** Rows whose claims normalise to
+  the same statement collapse to one canonical row, the copies' ids move into its
+  `supports`, and `Reconciliation` names which Worker also found it. Nothing is deleted:
+  two Workers independently finding one thing is worth more than one of them.
+- **Disagreements are preserved, never settled.** A `Disagreement` records both sides,
+  the evidence each cites, and what would settle it. Picking the more confident side
+  would delete the other Worker's finding, which is the failure this record prevents.
+- **Failed subtasks stay visible.** Every withheld review becomes a `FailedSubtask` —
+  status, gate, reason, attempts, and *what the mission loses* — and becomes a gap on
+  the report. A failed unit is named, not merely absent from the evidence.
+- **The Subagent judges its own criteria mechanically.** `assess_criteria` applies four
+  tests (`at least N`, `every`/`each`, `integrity`/`hash`, `attributed`/`named`); a
+  criterion it cannot test is reported unmet-but-checkable rather than silently met, and
+  a met one must cite the evidence that met it.
+- **One more Worker, bounded twice.** With a critical gap and budget it plans exactly
+  one runtime Worker — narrow, one gap, one completion criterion — which runs through
+  the *same* planning, review and retask path as the planned ones. Its number is capped
+  by `FlowPolicy.max_runtime_workers_per_subagent` and by a `SpawnLedger` seat that
+  cannot be topped up; with either exhausted the Subagent returns a bounded partial
+  report naming what it could not get and why it stopped asking.
+
 ## Status
 
 | Phase | Scope | State |
 |-------|-------|-------|
 | 1 | Foundation — CLI skeleton, config probing, version reporting | ✅ done |
 | 2 | Contracts — settings, `doctor`, preflight, models, state, renderer, lifecycle, resilience, model adapter | ✅ done |
-| 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control, Worker outcome contract, Subagent quality review, targeted Worker retasking) |
+| 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control, Worker outcome contract, Subagent quality review, targeted Worker retasking, Subagent aggregation with bounded runtime Workers) |
 | 4 | Browser — browser-use / Playwright sessions and capture | 🟡 started (policy, scope, capture, guarded closure, agent mode) |
 | 5 | Collection — passive OSINT sources, artefact hashing | 🟡 started (source-aware web research; safe document/page extraction with injection defence; read-only artifact manifests, hashing and access ledger) |
 | 6 | Synthesis — cross-source correlation and reporting | 🟡 started (deterministic timelines, explained indicator correlation, content de-duplication) |

@@ -840,6 +840,40 @@ last one, and specific enough to act on without having seen the review.
     python vedant_osint.py retask --demo                # retask, repeat, spent budget
     python vedant_osint.py retask --next report.json    # the assignment for a revise
 
+Subagent aggregation: only reviewed work, and only when it is ready
+-------------------------------------------------------------------
+A Subagent's report is a judgement of its *team*, so it may not begin until every
+Worker it required has reached a terminal state — and it may only use what the reviews
+forwarded.
+
+*   **Never early.**  :func:`check_ready` demands two independent facts per Worker — the
+    branch reported settled *and* its outcome is in :data:`terminal_states` — and raises
+    :class:`EarlyAggregate` naming the outstanding ids, so a mis-wired join fails loudly
+    instead of summarising half a mission.
+*   **Duplicates reconciled, corroboration kept.**  Rows that make the same claim, after
+    normalisation, collapse to one canonical row; the copies' ids move into its
+    ``supports`` and :class:`Reconciliation` names who else found them.  Nothing is
+    deleted, because two Workers finding the same thing is worth more than one.
+*   **Disagreements preserved.**  A :class:`Disagreement` records both sides, the
+    evidence each cites, and what would settle it — never a verdict.  Picking the more
+    confident side would delete the other Worker's finding.
+*   **Failed subtasks listed.**  Every withheld review becomes a :class:`FailedSubtask`
+    with its status, gate, reason, attempts and *what the mission loses*, and it becomes
+    a gap on the report: a failed unit is named, not merely absent.
+*   **Its own criteria assessed.**  :func:`assess_criteria` applies four mechanical tests
+    (``at least N``, ``every``/``each``, ``integrity``/``hash``, ``attributed``/``named``);
+    a criterion it cannot test is reported unmet-but-checkable rather than silently met.
+*   **One more Worker, bounded.**  With a critical gap and budget it plans exactly one
+    runtime Worker through the *same* planning, review and retask path, spending a
+    :class:`SpawnLedger` seat that cannot be topped up; otherwise it returns a bounded
+    partial report that says what it could not get and why it stopped asking.
+
+::
+
+    python vedant_osint.py aggregate --self-test        # 87 aggregation checks
+    python vedant_osint.py aggregate --demo             # merge, disagreement, stop
+    python vedant_osint.py aggregate --next team.json   # aggregate reviewed results
+
 Structured model adapter
 ------------------------
 One model-calling interface sits between orchestration and every provider, so
@@ -1046,7 +1080,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 25
+VERSION_MINOR: int = 26
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -21623,6 +21657,12 @@ class FlowPolicy(StrictModel):
     max_review_rounds: int = Field(default=2, ge=0, le=5)
     #: Abort synthesis when any Subagent reports a blocking failure.
     stop_on_blocking_failure: bool = True
+    #: May a Subagent plan one more Worker when its own criteria are unmet and the
+    #: budget allows (§36)?  Off makes every aggregation bounded by the declared plan.
+    allow_runtime_workers: bool = True
+    #: How many extra Workers one Subagent may create across its whole run.  The
+    #: SpawnLedger licence is a second, lower ceiling; both bind.
+    max_runtime_workers_per_subagent: int = Field(default=2, ge=0, le=8)
     #: Simulated per-stage latency used by the demo so parallelism is observable.
     stage_delay_seconds: float = Field(default=0.0, ge=0.0, le=5.0)
     #: How long a unit waits for a dependency before its gate fails it.  Bounded
@@ -22282,6 +22322,16 @@ class SubagentOutcome(StrictModel):
     #: Worker ids whose results were reviewed and *not* forwarded (§34).  A name
     #: here is a unit that ran, was judged, and whose work the aggregate refused.
     withheld: list[str] = Field(default_factory=list)
+    #: §36: the four questions the aggregate had to answer — what was the same, what
+    #: disagreed, what failed, and whether the Subagent met its own criteria.
+    reconciliation: "Reconciliation" = Field(default_factory=lambda: Reconciliation())
+    disagreements: list["Disagreement"] = Field(default_factory=list)
+    failed: list["FailedSubtask"] = Field(default_factory=list)
+    criteria_checks: list["CriterionCheck"] = Field(default_factory=list)
+    #: Why the aggregation stopped where it did, and whether it may still expand.
+    readiness: "Readiness | None" = None
+    #: The runtime Workers it planned, including any that were refused.
+    runtime_workers: list["RuntimeSpawnRecord"] = Field(default_factory=list)
 
     @property
     def evidence_ids(self) -> list[str]:
@@ -22470,6 +22520,9 @@ class _WorkerState(TypedDict, total=False):
     #: collect again.  ``None`` when the branch is not retried.
     retask: dict[str, Any] | None
     inherited: Annotated[list[str], operator.add]
+    #: §36: the round's runtime Workers, so a node can rebuild one that is not on the
+    #: Subagent's declared plan.  Empty for every planned Worker.
+    runtime_workers: list[dict[str, Any]]
 
 
 #: The state of one Subagent's graph.  Worker branches merge their outcomes and
@@ -22481,6 +22534,16 @@ class _SubagentState(TypedDict, total=False):
     outcomes: Annotated[list[dict[str, Any]], operator.add]
     reviews: Annotated[list[dict[str, Any]], operator.add]
     report: dict[str, Any]
+    #: §36: the runtime round.  ``runtime`` is what the aggregate decided to execute,
+    #: ``runtime_workers`` that decision materialised, and ``spawned`` the record of
+    #: every runtime Worker this Subagent has ever created — the bound the loop reads.
+    runtime: list[dict[str, Any]]
+    runtime_workers: list[dict[str, Any]]
+    #: Every runtime Worker this Subagent has created, accumulated across rounds: this
+    #: is the list the per-Subagent cap counts.  ``runtime`` is the per-round plan and
+    #: is *replaced* each round — appending there is what would re-queue a plan for ever.
+    spawned: Annotated[list[dict[str, Any]], operator.add]
+    round: int
 
 
 #: The state of the Master's graph.  Subagent branches merge their reports here.
@@ -22503,10 +22566,27 @@ def _master_state(mission_id: str, objective: str) -> dict[str, Any]:
             "waves": [], "reports": [], "stopped": False, "stop_reason": ""}
 
 
+def _runtime_worker_in(state: Mapping[str, Any], subagent: "FlowSubagent") -> "FlowWorker | None":
+    """The runtime Worker this branch is running, if it is running one (§36)."""
+
+    wanted = str(state.get("worker") or "")
+    if not wanted.startswith("wrk-"):         # every Worker id this build makes
+        return None
+    for item in state.get("runtime_workers") or []:
+        worker = FlowWorker.model_validate(item)
+        if worker.id == wanted:
+            return worker
+    return None
+
+
 def _subagent_state() -> dict[str, Any]:
     """The initial state of one Subagent graph."""
 
-    return {"subagent": "", "wave": 0, "waves": [], "outcomes": [], "reviews": []}
+    return {"subagent": "", "wave": 0, "waves": [], "outcomes": [], "reviews": [],
+            # §36: the runtime round of this Subagent, if it is on one.  ``runtime`` is
+            # the list of plans the aggregate decided to execute; ``runtime_workers`` is
+            # that list materialised, so the fan-out and the reconcile agree on ids.
+            "runtime": [], "runtime_workers": [], "round": 1, "spawned": []}
 
 
 def _worker_state() -> dict[str, Any]:
@@ -22672,6 +22752,10 @@ class HierarchicalFlow:
         #: The evidence ids each Worker's current attempt inherited from an earlier one,
         #: so a retask never offers an inherited item as if this attempt found it.
         self._inherited: dict[str, list[str]] = {}
+        #: §36: how many runtime Worker seats each Subagent has spent, and the record of
+        #: every one it created — the report carries these, and the cap counts them.
+        self._runtime_spawned: dict[str, int] = {}
+        self._runtime_records: dict[str, list[RuntimeSpawnRecord]] = {}
 
     def _limits_for_run(self) -> ResourceLimits:
         """The mission's limits, derived from the policy when none were given."""
@@ -22925,7 +23009,12 @@ class HierarchicalFlow:
                                        [FlowStage.WORKER.value])
         # The join: every Worker branch arrives here, so this node runs once.
         subagent.add_edge(FlowStage.WORKER.value, FlowStage.SUBAGENT_AGGREGATE.value)
-        subagent.add_edge(FlowStage.SUBAGENT_AGGREGATE.value, END)
+        # §36: an aggregate that planned a runtime Worker loops back for another round
+        # of the *same* Worker → review → retask graph.  The loop is bounded by the
+        # Subagent's own record (`runtime` below) rather than by the recursion limit.
+        subagent.add_conditional_edges(FlowStage.SUBAGENT_AGGREGATE.value,
+                                       self._after_aggregate,
+                                       [FlowStage.SUBAGENT.value, END])
         self._subagent_graph = subagent.compile()
 
         # ---- level 3: one Worker's attempt → review → retry loop --------
@@ -23246,8 +23335,51 @@ class HierarchicalFlow:
 
     # -- 2. a Subagent plans its Workers, then fans them out ----------------
 
+    def _after_aggregate(self, state: Mapping[str, Any]) -> str:
+        """Loop back for one runtime Worker, or finish this Subagent (§36).
+
+        The decision was made *inside* the aggregate and written to the branch's own
+        state, so this router only reads it.  That is deliberate: a router cannot refuse
+        an expansion for a reason it cannot see, and every refusal — the policy switch,
+        the per-Subagent cap, an exhausted licence, a deadline, a cancellation — is
+        already on the record that produced ``runtime``.
+        """
+
+        from langgraph.graph import END
+        pending = list(state.get("runtime") or [])
+        if not pending or state.get("report") is None:
+            return END
+        # ``spawned`` accumulates and ``runtime`` is replaced each round, so this cannot
+        # loop for ever: the aggregate stops writing ``runtime`` once the cap, the licence
+        # or a refusal stops it planning.  The guard here is belt and braces for a state
+        # edited by hand, and it reads the same numbers the planner did.
+        spent = len(state.get("spawned") or [])
+        if spent > int(self.policy.max_runtime_workers_per_subagent):
+            return END
+        return FlowStage.SUBAGENT.value
+
     def _node_subagent_plan(self, state: Mapping[str, Any]) -> dict[str, Any]:
         subagent = self._by_id[str(state.get("subagent"))]
+        round_no = int(state.get("round") or 1)
+        runtime = [RuntimePlan.model_validate(item) for item in state.get("runtime") or []]
+        if runtime:
+            # A second round: the set of Workers for *this* round is exactly the ones
+            # the aggregate planned, so the fan-out below creates only those.
+            planned = list(runtime)
+            workers = [runtime_worker_from_plan(plan, index=round_no, subagent=subagent)
+                       for plan in planned]
+            self._record(FlowStage.SUBAGENT, unit=subagent.id, parent="master",
+                         wave=0, detail=f"round {round_no}: {len(workers)} runtime "
+                                        f"worker(s) for unmet criteria")
+            if self.tracker is not None:
+                for worker in workers:
+                    self.tracker.spawn(worker.id, worker.name, kind=LifecycleKind.WORKER,
+                                       parent=subagent.id, detail=worker.objective[:60])
+            return {"subagent": subagent.id, "waves": [[worker.id for worker in workers]],
+                    "runtime_workers": [json.loads(model_to_json(worker))
+                                        for worker in workers],
+                    "round": round_no}
+
         waves = self.worker_waves(subagent)
         self._record(FlowStage.SUBAGENT, unit=subagent.id, parent="master",
                      wave=int(state.get("wave") or 0),
@@ -23256,7 +23388,8 @@ class HierarchicalFlow:
             for worker in subagent.workers:
                 self.tracker.spawn(worker.id, worker.name, kind=LifecycleKind.WORKER,
                                    parent=subagent.id, detail=worker.objective[:60])
-        return {"subagent": subagent.id, "waves": [list(wave) for wave in waves]}
+        return {"subagent": subagent.id, "waves": [list(wave) for wave in waves],
+                "runtime": [], "runtime_workers": [], "round": 1}
 
     def _worker_sends(self, state: Mapping[str, Any]) -> list[Any]:
         """The Worker fan-out: one ``Send`` per Worker of this Subagent."""
@@ -23265,10 +23398,22 @@ class HierarchicalFlow:
         subagent = self._by_id[str(state.get("subagent"))]
         waves = [list(item) for item in state.get("waves") or []]
         wave_of = {wid: index for index, wave in enumerate(waves) for wid in wave}
+        # Round 2 fans out the runtime Workers, rebuilt from the plans this branch
+        # carries — the same shape a planned Worker has, so nothing downstream changes.
+        round_no = int(state.get("round") or 1)
+        if state.get("runtime_workers"):
+            workers = [FlowWorker.model_validate(item)
+                       for item in state.get("runtime_workers") or []]
+        else:
+            workers = list(subagent.workers)
+        # The round's runtime Workers travel in the payload: a branch cannot look them
+        # up on the Subagent's plan, because an aggregate created them after the plan.
+        runtime = list(state.get("runtime_workers") or [])
         return [send_cls(FlowStage.WORKER.value,
                          {**_subagent_state(), "subagent": subagent.id, "worker": worker.id,
-                          "wave": wave_of.get(worker.id, 0)})
-                for worker in subagent.workers]
+                          "wave": wave_of.get(worker.id, 0), "round": round_no,
+                          "runtime_workers": runtime})
+                for worker in workers]
 
     def _node_worker(self, state: Mapping[str, Any]) -> dict[str, Any]:
         """Run one Worker's attempt→review→retry graph, inside its own branch.
@@ -23280,7 +23425,11 @@ class HierarchicalFlow:
         """
 
         subagent = self._by_id[str(state.get("subagent"))]
-        worker = subagent.worker(str(state.get("worker")))
+        # §36: a runtime Worker is not on the Subagent's declared plan — it was created
+        # by an aggregate — so the branch rebuilds it from the round's state instead of
+        # looking it up in the plan.
+        worker = (subagent.worker(str(state.get("worker")))
+                  or _runtime_worker_in(state, subagent))
         if worker is None:                    # pragma: no cover - guarded by the fan-out
             return {"outcomes": [], "reviews": []}
         gate = self._blocked(subagent, worker)
@@ -23313,7 +23462,10 @@ class HierarchicalFlow:
             with self.runtime.slot(ResourceKind.WORKER, unit=worker.id,
                                    deadline=self._worker_deadline(subagent, worker)):
                 payload = {**_worker_state(), "subagent": subagent.id, "worker": worker.id,
-                           "deadline": self._worker_deadline(subagent, worker)}
+                           "deadline": self._worker_deadline(subagent, worker),
+                           # §36: both nodes of the Worker graph rebuild a runtime
+                           # Worker from the round's plan, so it travels with the branch.
+                           "runtime_workers": list(state.get("runtime_workers") or [])}
                 result = self._worker_graph.invoke(payload)
         except (QueueTimeout, BudgetExceeded) as exc:
             # Backpressure, not a crash: the unit is deferred with its reason and
@@ -23389,7 +23541,11 @@ class HierarchicalFlow:
         return {"outcomes": [json.loads(model_to_json(outcome))],
                 "reviews": ([] if keep_verdict is None
                             else [json.loads(model_to_json(keep_verdict))]),
-                "verdict": json.loads(model_to_json(verdict))}
+                "verdict": json.loads(model_to_json(verdict)),
+                # §36 counts retries on the report: a branch that recorded a failed
+                # attempt and then passed is a retry even though its final status is a
+                # success, so the branch says so rather than being inferred.
+                "revisions": 1 if self._inherited.get(worker.id) else 0}
 
     @staticmethod
     def _verdict_for(review: QualityReview, worker: FlowWorker) -> ReviewVerdict:
@@ -23650,7 +23806,8 @@ class HierarchicalFlow:
 
     def _node_worker_attempt(self, state: Mapping[str, Any]) -> dict[str, Any]:
         subagent = self._by_id[str(state.get("subagent"))]
-        worker = subagent.worker(str(state.get("worker")))
+        worker = (subagent.worker(str(state.get("worker")))
+                  or _runtime_worker_in(state, subagent))
         attempt = int(state.get("round") or 0) + 1
         self._record(FlowStage.WORKER, unit=worker.id, parent=subagent.id,
                      wave=int(state.get("wave") or 0),
@@ -23727,7 +23884,8 @@ class HierarchicalFlow:
 
     def _node_worker_review(self, state: Mapping[str, Any]) -> dict[str, Any]:
         subagent = self._by_id[str(state.get("subagent"))]
-        worker = subagent.worker(str(state.get("worker")))
+        worker = (subagent.worker(str(state.get("worker")))
+                  or _runtime_worker_in(state, subagent))
         outcome = WorkerOutcome.model_validate(state.get("outcome"))
         round_number = int(state.get("round") or 1)
         verdict = self.runner.review_worker(subagent, worker, outcome, round_number=round_number)
@@ -23873,116 +24031,228 @@ class HierarchicalFlow:
     # -- 5. the Subagent's join ----------------------------------------------
 
     def _node_subagent_aggregate(self, state: Mapping[str, Any]) -> dict[str, Any]:
-        """Aggregate one Subagent — only after every one of its Workers settled."""
+        """Aggregate one Subagent — only after every one of its Workers settled (§36).
+
+        The node answers the four questions the task names, in this order:
+
+        1.  **is it ready?**  :func:`check_ready` refuses while any required Worker
+            lacks a terminal outcome, so an early aggregate is a loud error rather than
+            a partial summary;
+        2.  **what may it use?**  only results the reviews forwarded, with duplicates
+            reconciled into one canonical row and the copies kept as corroboration;
+        3.  **what must it keep visible?**  disagreements between Workers, every failed
+            subtask with its consequence, and whether its own criteria are met;
+        4.  **may it do something about an unmet criterion?**  with budget it plans one
+            more Worker, which goes through the same review and retask gates; otherwise
+            it returns the bounded partial report.
+
+        A runtime Worker cannot be run from inside this node — the graph's fan-out has
+        already happened — so the node *decides and records*, and :meth:`run` runs what
+        it decided through the same machinery as the planned ones.
+        """
 
         subagent = self._by_id[str(state.get("subagent"))]
-        # An aggregate recorded by an earlier attempt is a fact with its own
-        # barrier; recomputing it would replace the record with a new opinion.
+        # An aggregate recorded by an earlier attempt is a fact with its own barrier;
+        # recomputing it would replace the record with a new opinion.
         recorded = self._adopted_reports.get(subagent.id)
         if recorded is not None:
             self._record(FlowStage.SUBAGENT_AGGREGATE, unit=subagent.id, parent="master",
                          detail=f"adopted from checkpoint: {len(recorded.evidence)} evidence "
                                 f"item(s), {len(recorded.gaps)} gap(s)")
             return {"report": json.loads(model_to_json(recorded))}
-        outcomes = [WorkerOutcome.model_validate(item) for item in state.get("outcomes") or []]
-        reviews = [ReviewVerdict.model_validate(item) for item in state.get("reviews") or []]
-        expected = [worker.id for worker in subagent.workers]
-        received = list(dict.fromkeys(outcome.worker_id for outcome in outcomes))
-        # The edge guarantees this; the check makes a mis-wired edge loud.
-        barrier = check_join(f"subagent-aggregate:{subagent.role}", expected, received)
 
-        latest: dict[str, WorkerOutcome] = {}
-        for outcome in outcomes:
-            latest[outcome.worker_id] = outcome
-        evidence: list[EvidenceItem] = []
+        outcomes = [WorkerOutcome.model_validate(item) for item in state.get("outcomes") or []]
+        # Every Worker this Subagent has required, across rounds: the planned ones and
+        # the runtime ones it decided to create.  On round 1 that is exactly its plan.
+        spawned = [RuntimeSpawnRecord.model_validate(item)
+                   for item in state.get("spawned") or []]
+        round_no = int(state.get("round") or 1)
+        required = [worker.id for worker in subagent.workers] + [
+            record.worker_id for record in spawned]
+        settled = list(dict.fromkeys(outcome.worker_id for outcome in outcomes))
+        # §36: the barrier is the statuses, not the edge.  A branch that reported
+        # itself settled without a terminal outcome is as unfinished as one that never
+        # reported, and both are refused here rather than summarised.
+        barrier = check_ready(subagent.id, required, settled, outcomes)
+
+        judged = [self.review_ledger().for_worker(outcome.worker_id) for outcome in outcomes]
+        missing = [outcome.worker_id for outcome, result in zip(outcomes, judged)
+                   if result is None]
+        if missing:                           # pragma: no cover - the node always judges
+            raise UnreviewedResult(missing[0], stage="subagent-aggregate")
+
+        forwarded_ids = {result.worker_id for result in judged if result and result.forwarded}
+        self._mark_runtime_answered(subagent.id, judged)
         gaps: list[UnknownValue] = []
-        withheld: list[QualityReview] = []
-        retries = 0
-        for worker in subagent.workers:
-            outcome = latest.get(worker.id)
-            # Reset per Worker: a report from the previous iteration must never be
-            # read as this unit's (§33).
-            report: WorkerReport | None = None
-            approved = any(review.worker_id == worker.id and review.approved
-                           for review in reviews)
-            if outcome is not None:
-                retries += max(0, outcome.attempt - 1)
-                if worker.id in self._adopted:
-                    # The adopted outcome keeps its recorded evidence *ids*; the
-                    # items themselves are the ones already on record, so adding
-                    # them again here would duplicate the evidence this whole
-                    # section exists to protect.
-                    evidence.extend(self._adopted_evidence.get(worker.id, []))
-                else:
-                    for payload in outcome.payload.get("evidence", []):
-                        evidence.append(EvidenceItem.model_validate(payload))
-                # §34: the aggregate may not take a Worker's word for it.  Every
-                # result that reaches this loop has a review — the node refuses to
-                # return without one — and the review decides whether its work is
-                # forwarded or withheld.
-                judged = self.review_ledger().for_worker(worker.id)
-                if judged is None:            # pragma: no cover - the node always judges
-                    raise UnreviewedResult(worker.id, stage="subagent-aggregate")
-                if not judged.forwarded:
-                    withheld.append(judged.review)
-                    mine = set(judged.report.evidence_ids if judged.report else [])
-                    kept = [item for item in evidence if item.id not in mine]
-                    evidence.clear()
-                    evidence.extend(kept)
-                report = _report_of(outcome)
-                if report is not None:
-                    # The gaps the Worker itself declared travel with its evidence: a
-                    # partial result is useful *and* incomplete, and the aggregate has
-                    # to carry both facts.  They are not cast as review failures — the
-                    # Worker already said what is missing, and the graph already has
-                    # its own gap for a unit that never passed review.
-                    gaps.extend(report.gaps)
-            if not approved:
-                gate = self._gates.get(worker.id) or FlowGate.REVIEW_REJECTED
-                if report is not None and report.gaps:
-                    # The Worker declared why it could not finish.  That gap is in
-                    # ``gaps`` already, and a second one for the same unit would
-                    # double-count the mission's unknowns.
-                    continue
-                gaps.append(UnknownValue(
-                    reason=UnknownReason.FAILED, determined_by=subagent.id,
-                    detail=f"{worker.name}: {gate.value}"
-                           + (f" ({outcome.error})"
-                              if outcome is not None and outcome.error else ""),
-                ))
-        failing_gate = next((self._gates.get(worker.id) for worker in subagent.workers
-                             if not any(review.worker_id == worker.id and review.approved
-                                        for review in reviews)), FlowGate.REVIEW_REJECTED)
-        started = self._started.get(subagent.id, time.monotonic())
-        report = SubagentOutcome(
-            subagent_id=subagent.id, role=subagent.role, objective=subagent.objective,
-            status=(EntityStatus.FAILED if not evidence
-                    else EntityStatus.SUCCEEDED if not gaps else EntityStatus.BLOCKED),
-            gate=(FlowGate.NONE if not gaps else failing_gate or FlowGate.REVIEW_REJECTED),
-            outcomes=[latest[worker.id] for worker in subagent.workers if worker.id in latest],
-            reviews=reviews, evidence=evidence, aggregate_basis=barrier,
-            open_questions=list(subagent.addresses_questions), gaps=gaps,
-            retries=retries, seconds=time.monotonic() - started,
-            # What was judged and not forwarded, so a withheld result is visible in
-            # the aggregate rather than merely absent from it (§34).
-            withheld=sorted({review.worker_id for review in withheld}),
-        )
-        self._record(FlowStage.SUBAGENT_AGGREGATE, unit=subagent.id, parent="master",
-                     detail=f"{barrier.describe()}; {len(evidence)} evidence item(s), "
-                            f"{len(gaps)} gap(s)")
+        for result in judged:
+            report = _report_of(result.outcome)
+            if report is not None:
+                # The gaps the Worker itself declared travel with its evidence: a
+                # partial result is useful *and* incomplete, and the aggregate has to
+                # carry both facts.
+                gaps.extend(report.gaps)
+
+        aggregate = aggregate_subagent(
+            subagent, outcomes=outcomes, judged=[result for result in judged if result],
+            settled=settled, gaps=gaps, scope=self.context.scope_entries,
+            # The barrier names every Worker this Subagent required, including the
+            # runtime ones it created after its plan was made.
+            required=required)
+
+        # Refusals are collected before the decision, so the readiness record explains
+        # itself even when it decides to expand.
+        licence = self.runtime.spawns.licence(subagent.id)
+        allowed, refusals = runtime_spawn_allowed(
+            subagent, policy=self.policy, spawned=len(spawned),
+            licence_remaining=licence.remaining if licence is not None else None,
+            deadline_expired=self.runtime.expired(), cancelled=self._cancelled())
+        readiness = assess_readiness(
+            subagent, checks=aggregate.checks, gaps=gaps, settled=settled,
+            required=required, runtime_spawned=len(spawned),
+            runtime_limit=self.policy.max_runtime_workers_per_subagent,
+            refusals=[] if allowed else refusals,
+            runtime_gaps=[record.plan.gap for record in spawned
+                          if record.plan and record.worker_id in forwarded_ids],
+            failed=aggregate.failed)
+        # On a later round the criteria are judged again against everything collected so
+        # far: a runtime Worker that closed its gap takes the Subagent from `expand` to
+        # `ready` without any new threshold being invented.
+        self._record(
+            FlowStage.SUBAGENT_AGGREGATE, unit=subagent.id, parent="master",
+            detail=f"round {round_no}: {barrier.describe()}; {aggregate.summary()}; "
+                   f"{readiness.summary()}")
+
+        # The plan for one more Worker, when the record says one is warranted.  Nothing
+        # is created here: this round's fan-out already happened, so the node writes the
+        # plan and the conditional edge routes back for a fresh round of the same
+        # Worker → review → retask graph.
+        update: dict[str, Any] = {}
+        blocker = ""
+        if readiness.decision == "expand":
+            plan = self._runtime_plan(subagent, readiness)
+            if plan is not None:
+                blocker = self._spawn_runtime_worker(subagent, plan, round_no=round_no,
+                                                     licence=licence, update=update)
+                if blocker:
+                    # A plan that was refused is not a plan: the Subagent is bounded by
+                    # whichever ceiling refused it, and says so in its report.
+                    readiness = readiness.model_copy(update={
+                        "decision": "partial", "ready": False,
+                        "expansion_refusals": [*readiness.expansion_refusals, blocker]})
+
+        # A provisional report is written on every round — the loop's `report` key is
+        # only read once the router stops — so a run that raises mid-round still has a
+        # readable aggregate instead of a bare traceback.
+        report = (
+            complete_report(aggregate, readiness, subagent=subagent,
+                            retries=sum(max(0, outcome.attempt - 1) for outcome in outcomes),
+                            seconds=time.monotonic() - self._started.get(
+                                subagent.id, time.monotonic()),
+                            spawned=self._runtime_records.get(subagent.id, ()))
+            if readiness.ready else
+            bounded_partial_report(aggregate, readiness, subagent=subagent,
+                                   spawned=self._runtime_records.get(subagent.id, ())))
+        if update:
+            # An expanding Subagent has not finished: its report is a draft, so the
+            # ledger and the resume store must not record it as settled (§36).
+            self._record(FlowStage.SUBAGENT_AGGREGATE, unit=subagent.id, parent="master",
+                         detail=f"expanding: {len(update.get('spawned') or [])} runtime "
+                                f"worker(s) queued; report is provisional")
+            return {"report": json.loads(model_to_json(report)), **update}
         if self.tracker is not None:
             self.tracker.complete(subagent.id, state=(
                 LifecycleState.DONE if report.succeeded else LifecycleState.FAILED),
-                note=f"{len(evidence)} evidence item(s), {len(gaps)} gap(s)")
+                note=f"{len(aggregate.evidence)} evidence item(s), {len(report.gaps)} gap(s)")
         if self.store is not None:
-            for item in evidence:
+            for item in aggregate.evidence:
                 try:
                     self.store.add_evidence(item, actor=subagent.id)
                 except (StateError, ValueError):     # pragma: no cover - defensive
                     pass
         if self.resume is not None:
             self.resume.settle_subagent(report)
-        return {"report": json.loads(model_to_json(report))}
+        # No new round was planned, so the loop keys are cleared: leaving last round's
+        # plan in `runtime` is what would make this Subagent run a Worker for ever.
+        return {"report": json.loads(model_to_json(report)),
+                "runtime": [], "runtime_workers": []}
+
+    def _mark_runtime_answered(self, subagent_id: str,
+                               judged: Sequence["ReviewedWorkerResult | None"]) -> None:
+        """Record whether each runtime Worker actually closed the gap it was planned for.
+
+        ``answered`` is a property of the *review*, not of the attempt: a runtime Worker
+        whose result was withheld did not answer anything, however much it collected.
+        """
+
+        decisions = {result.worker_id: result.review.decision.value
+                     for result in judged if result is not None}
+        records = self._runtime_records.get(subagent_id, [])
+        for index, record in enumerate(records):
+            decision = decisions.get(record.worker_id)
+            if decision is None:
+                continue
+            answered = decision == ReviewDecision.PASS.value
+            if answered != record.answered or decision != record.review_decision:
+                records[index] = record.model_copy(
+                    update={"answered": answered, "review_decision": decision})
+
+    def _spawn_runtime_worker(self, subagent: FlowSubagent, plan: RuntimePlan, *,
+                              round_no: int, licence: Any,
+                              update: dict[str, Any]) -> str:
+        """Turn an approved plan into a Worker for the next round, and spend the seat.
+
+        Both ceilings are spent here and nowhere else: the plan is counted against
+        :attr:`FlowPolicy.max_runtime_workers_per_subagent` and the Worker against the
+        Subagent's :class:`SpawnLedger` licence.  If either is exhausted the plan never
+        becomes a Worker, and the reason is on the record.
+        """
+
+        try:
+            worker = runtime_worker_from_plan(plan, index=round_no + 1, subagent=subagent)
+        except (ValueError, TypeError) as exc:
+            self._record(FlowStage.SUBAGENT_AGGREGATE, unit=subagent.id, parent="master",
+                         detail=f"runtime Worker refused: {str(exc)[:120]}")
+            return f"the runtime Worker could not be built: {str(exc)[:120]}"
+        remaining = max(0, (licence.remaining if licence is not None else 0) - 1)
+        try:
+            self.runtime.spawns.spawn(subagent.id, worker.id, SpawnTier.WORKER)
+        except Exception as exc:              # the ledger's refusal is the binding one
+            self._record(FlowStage.SUBAGENT_AGGREGATE, unit=subagent.id, parent="master",
+                         detail=f"runtime Worker refused by the spawn ledger: "
+                                f"{str(exc)[:100]}")
+            return f"the spawn licence refused another Worker: {str(exc)[:100]}"
+        self._runtime_spawned[subagent.id] = self._runtime_spawned.get(subagent.id, 0) + 1
+        record = RuntimeSpawnRecord(subagent_id=subagent.id, worker_id=worker.id,
+                                    name=worker.name, gap=plan.gap, plan=plan,
+                                    round=round_no + 1, licence_remaining=remaining)
+        self._runtime_records.setdefault(subagent.id, []).append(record)
+        self._record(FlowStage.SUBAGENT_AGGREGATE, unit=subagent.id, parent="master",
+                     detail=f"runtime Worker queued for round {round_no + 1}: "
+                            f"{plan.gap[:80]}")
+        update.update({
+            "runtime": [json.loads(model_to_json(plan))],
+            "runtime_workers": [json.loads(model_to_json(worker))],
+            "spawned": [json.loads(model_to_json(record))],
+            "round": round_no + 1,
+        })
+        return ""
+
+    def _runtime_plan(self, subagent: FlowSubagent,
+                      readiness: Readiness) -> RuntimePlan | None:
+        """Plan one more Worker for the first unmet criterion, or decline with a reason."""
+
+        try:
+            return plan_runtime_worker(subagent, readiness=readiness)
+        except (ValueError, TypeError) as exc:
+            self._record(FlowStage.SUBAGENT_AGGREGATE, unit=subagent.id, parent="master",
+                         detail=f"runtime Worker refused: {str(exc)[:120]}")
+            return None
+
+    def _cancelled(self) -> bool:
+        try:
+            return bool(self.runtime.token is not None and self.runtime.token.cancelled)
+        except AttributeError:                # pragma: no cover - older runtime shape
+            return False
 
     def _record_in_store(self, subagent: FlowSubagent, worker: FlowWorker,
                          outcome: WorkerOutcome) -> None:
@@ -24395,8 +24665,11 @@ def run_flow_self_test(console: "Console | None" = None) -> list[FlowCheck]:
     add("each join was satisfied",
         all(report.aggregate_basis.satisfied for report in result.reports))
     add("each join names every worker of its subagent",
-        all(len(report.aggregate_basis.expected) == len(report.outcomes)
-            for report in result.reports),
+        all({worker.id for worker in next(subagent for subagent in units
+                                          if subagent.id == report.subagent_id).workers}
+            <= set(report.aggregate_basis.expected) for report in result.reports)
+        and all(len(report.aggregate_basis.expected) >= len(report.outcomes)
+                for report in result.reports),
         [(len(report.aggregate_basis.expected), len(report.outcomes))
          for report in result.reports])
     add("the synthesis carries the master's join",
@@ -24434,8 +24707,12 @@ def run_flow_self_test(console: "Console | None" = None) -> list[FlowCheck]:
         stages = [(event["stage"], event["at"]) for event in result.trace
                   if event["unit"] == subagent.id or event["parent"] == subagent.id]
         workers = [moment for stage, moment in stages if stage == FlowStage.WORKER.value]
-        aggregate = next((moment for stage, moment in stages
-                          if stage == FlowStage.SUBAGENT_AGGREGATE.value), None)
+        # §36 can aggregate more than once (a round that planned a runtime Worker aggregates
+        # again afterwards), so the invariant is about the *last* aggregate: the report the
+        # Subagent returns must come after the last Worker it ran.
+        aggregates = [moment for stage, moment in stages
+                      if stage == FlowStage.SUBAGENT_AGGREGATE.value]
+        aggregate = max(aggregates) if aggregates else None
         add(f"{subagent.role}: its aggregate follows its last worker",
             aggregate is not None and bool(workers) and aggregate >= max(workers),
             f"aggregate {aggregate}, last worker {max(workers) if workers else None}")
@@ -24538,10 +24815,19 @@ def run_flow_self_test(console: "Console | None" = None) -> list[FlowCheck]:
     fail_result = fail_flow.run()
     failing_report = next(report for report in fail_result.reports
                           if report.subagent_id == flaky.id)
+    # §36: a failed subtask is named as a failed subtask, not merely absent from the
+    # evidence and not merely implied by a gap.
+    add("a permanent failure is listed as a failed subtask", bool(failing_report.failed),
+        [item.describe for item in failing_report.failed])
+    add("the failed subtask is the unit that failed",
+        any(item.worker_id == failing_id for item in failing_report.failed),
+        [item.worker_id for item in failing_report.failed])
     add("a permanent failure is recorded as a gap", bool(failing_report.gaps),
         [gap.describe() for gap in failing_report.gaps])
     add("the gap names the worker that failed",
-        any(failing_id in outcome.worker_id for outcome in failing_report.outcomes))
+        any(failing_id in outcome.worker_id for outcome in failing_report.outcomes)
+        or any(item.worker_id == failing_id and failing_id in item.describe
+               for item in failing_report.failed))
     add("the failed worker was not approved",
         not any(review.worker_id == failing_id and review.approved
                 for review in failing_report.reviews))
@@ -24553,10 +24839,12 @@ def run_flow_self_test(console: "Console | None" = None) -> list[FlowCheck]:
     # ---- 9. a mission that cannot report produces no synthesis ---------
     dead_units = flow_units_for(_selftest_context("exposure"), "exposure")
     everything = [worker.id for subagent in dead_units for worker in subagent.workers]
+    # Runtime Workers off: §36 lets a Subagent rescue such a mission by planning one more
+    # Worker, which is a good outcome but not the one this check is about.
     dead_flow = HierarchicalFlow(
         context=context, subagents=dead_units,
         runner=_CountingRunner(scope=context.scope_entries, failing=everything),
-        policy=FlowPolicy(max_review_rounds=1))
+        policy=FlowPolicy(max_review_rounds=1, allow_runtime_workers=False))
     dead_result = dead_flow.run()
     add("a mission with nothing to report produces no aggregate",
         dead_result.synthesis is None, dead_result.synthesis is not None)
@@ -26386,7 +26674,11 @@ def interrupt_then_resume(root: Path, *, limit: int = 2) -> tuple[
     units = _resume_units(context)
     store = CheckpointStore(root)
     crasher = _SparkRunner(scope=context.scope_entries, limit=limit)
+    # Runtime Workers off: this fixture is about resuming a fixed plan, and a Subagent
+    # that plans one more Worker (§36) changes which units the resume has to repeat.
+    fixed_plan = FlowPolicy(allow_runtime_workers=False)
     flow = HierarchicalFlow(context=context, subagents=units, runner=crasher,
+                            policy=fixed_plan,
                             runtime=ConcurrencyRuntime(ResourceLimits(
                                 max_concurrent_workers=1, max_concurrent_subagents=1)))
     flow.attach_resume(store)
@@ -26400,6 +26692,7 @@ def interrupt_then_resume(root: Path, *, limit: int = 2) -> tuple[
 
     runner = _SparkRunner(scope=context.scope_entries)
     resumed = HierarchicalFlow(context=context, subagents=units, runner=runner,
+                               policy=fixed_plan,
                                runtime=ConcurrencyRuntime(ResourceLimits(
                                    max_concurrent_workers=1, max_concurrent_subagents=1)))
     decision = resumed.attach_resume(store)
@@ -26415,6 +26708,9 @@ def run_resume_self_test() -> list[ResumeCheck]:
     """
 
     checks: list[ResumeCheck] = []
+    # The resumption fixture is a fixed plan: a Subagent that plans one more Worker (§36)
+    # would change which units the resume has to repeat, which is a different question.
+    fixed_plan = FlowPolicy(allow_runtime_workers=False)
 
     def add(name: str, ok: bool, detail: Any = "") -> None:
         checks.append(ResumeCheck(name=name, ok=bool(ok), detail=str(detail)[:150]))
@@ -26506,6 +26802,7 @@ def run_resume_self_test() -> list[ResumeCheck]:
     # ---- 5. evidence is neither duplicated nor lost ---------------------
     fresh = HierarchicalFlow(context=context, subagents=_resume_units(context),
                              runner=DeterministicRunner(scope=context.scope_entries),
+                             policy=fixed_plan,
                              runtime=ConcurrencyRuntime(ResourceLimits())).run()
     baseline = sorted(item.id for item in fresh.evidence)
     resumed_ids = sorted(item.id for item in result.evidence)
@@ -26574,6 +26871,7 @@ def run_resume_self_test() -> list[ResumeCheck]:
     redo_store = CheckpointStore(redo_root)
     first = HierarchicalFlow(context=context, subagents=_resume_units(context),
                              runner=DeterministicRunner(scope=context.scope_entries),
+                             policy=fixed_plan,
                              runtime=ConcurrencyRuntime(ResourceLimits()))
     first.attach_resume(redo_store)
     first.run()
@@ -26582,7 +26880,7 @@ def run_resume_self_test() -> list[ResumeCheck]:
                              first.mission_id, CheckpointKind.ARCHIVE)).evidence)
     redo_runner = _SparkRunner(scope=context.scope_entries)
     redo = HierarchicalFlow(context=context, subagents=_resume_units(context),
-                            runner=redo_runner,
+                            runner=redo_runner, policy=fixed_plan,
                             runtime=ConcurrencyRuntime(ResourceLimits()))
     redo_decision = redo.attach_resume(redo_store, mode=ResumeMode.REDO)
     redo_result = redo.run()
@@ -41487,7 +41785,10 @@ def run_outcome_self_test() -> list[OutcomeCheck]:
     partial_flow = HierarchicalFlow(
         context=context, subagents=units,
         runner=_CountingRunner(scope=context.scope_entries,
-                               failing=[target.workers[0].id]))
+                               failing=[target.workers[0].id]),
+        # Runtime Workers off: §36 can replace a failed unit with one more Worker, which
+        # is a good answer but not the one this check is about.
+        policy=FlowPolicy(allow_runtime_workers=False))
     partial_result = partial_flow.run()
     partial_report = next(report for report in partial_result.reports
                           if report.subagent_id == target.id)
@@ -45640,8 +45941,2031 @@ def retask_command(
     console.print("[red]✘[/red] choose --demo, --self-test or --next FILE")
     raise typer.Exit(ExitCode.USAGE)
 
+# --------------------------------------------------------------------------
+# 36. Subagent aggregation: only reviewed work, and only when it is ready
+# --------------------------------------------------------------------------
+#
+# §34 decided what may be forwarded, §35 what a retry is told.  This section is the
+# Subagent's own judgement of its *team*: it may not begin until every Worker it
+# requires has reached a terminal state, it takes only what the reviews forwarded, and
+# it answers four questions in the record it writes — what was the same, what
+# disagreed, what failed, and whether the Subagent's own completion criteria were met.
+#
+# When a critical gap remains and the budget allows, the Subagent may plan one more
+# Worker.  That Worker goes through the *same* planning, review and retask path as the
+# planned ones (§34, §35): a runtime Worker is not a shortcut around the gates, and its
+# number is bounded by a licence that cannot be topped up.
+
+
+class Reconciliation(StrictModel):
+    """What was the same across the reviewed results, and which copy was kept.
+
+    Duplicates are not deleted evidence: two Workers independently finding the same
+    record is corroboration, and the record has to say so.  One copy is kept as the
+    canonical one; the others are named as supporting it, with their ids intact.
+    """
+
+    #: Rows judged to be the same observation, by normalised statement.
+    merged: int = Field(default=0, ge=0)
+    #: How sameness was decided.  Stated, so a reader can disagree with it.
+    rule: str = (
+        "two rows are the same observation when their statements are identical after "
+        "whitespace and case normalisation; a shared subject with a different claim is "
+        "not a duplicate")
+    groups: list["ReconciledGroup"] = Field(default_factory=list)
+    #: The rows the reconciliation worked on, so a reader can see the merge decision.
+    rows: list["AggregateRow"] = Field(default_factory=list)
+    #: Rows kept, one per group plus every row that was not in a group.
+    kept_ids: list[str] = Field(default_factory=list)
+    #: Ids that corroborate a kept row rather than standing alone.
+    supporting_ids: list[str] = Field(default_factory=list)
+
+    @property
+    def distinct(self) -> int:
+        return len(self.kept_ids)
+
+    def explain(self) -> str:
+        if not self.merged:
+            return ("no two reviewed rows made the same claim, so nothing was reconciled "
+                    "away")
+        return (f"{self.merged} duplicate row(s) in {len(self.groups)} group(s) merged; "
+                f"{len(self.kept_ids)} distinct row(s) kept")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"merged": self.merged, "rule": self.rule,
+                "groups": [_plain(group) for group in self.groups],
+                "rows": [_plain(row) for row in self.rows],
+                "kept_ids": list(self.kept_ids),
+                "supporting_ids": list(self.supporting_ids),
+                "explanation": self.explain()}
+
+
+class ReconciledGroup(StrictModel):
+    """One set of rows that made the same claim."""
+
+    statement: str = Field(min_length=1)
+    #: The row that was kept.  ``canonical`` is the same id under its §36.2 name.
+    kept: str = Field(min_length=1)
+    canonical: str = Field(min_length=1)
+    #: Worker ids that independently found the same thing.
+    also_found_by: list[str] = Field(default_factory=list)
+    #: The evidence ids folded into the kept row as corroboration.
+    merged: list[str] = Field(default_factory=list)
+    redundant: list[str] = Field(default_factory=list)
+
+
+class DisagreementSide(StrictModel):
+    """One Worker's claim in a disagreement, and what it rests on."""
+
+    worker_id: str = Field(min_length=1)
+    statement: str = Field(min_length=1)
+    evidence_ids: list[str] = Field(default_factory=list)
+
+
+class AggregateRow(StrictModel):
+    """One reviewed statement, as the reconciliation sees it."""
+
+    statement: str = Field(min_length=1)
+    worker_id: str = Field(min_length=1)
+    confidence: str = "unknown"
+    evidence_ids: list[str] = Field(default_factory=list)
+    supporting_ids: list[str] = Field(default_factory=list)
+
+    @property
+    def subject(self) -> set[str]:
+        return _subject(self.statement)
+
+
+class Disagreement(StrictModel):
+    """Two reviewed results that cannot both be right, preserved rather than settled.
+
+    The Subagent's job is to keep the disagreement visible and say what would settle
+    it.  Picking the more confident side would delete the other Worker's finding, which
+    is the outcome this record exists to prevent.
+    """
+
+    topic: str = Field(min_length=3)
+    left_worker: str = Field(min_length=1)
+    right_worker: str = Field(min_length=1)
+    left_statement: str = Field(min_length=1)
+    right_statement: str = Field(min_length=1)
+    #: ``negation``, ``value`` or ``presence`` — how the two were found to conflict.
+    kind: str = Field(default="negation", pattern="^(negation|value|presence)$")
+    left_evidence: list[str] = Field(default_factory=list)
+    right_evidence: list[str] = Field(default_factory=list)
+    #: What would settle it.  A disagreement nobody can act on is just noise.
+    resolution: str = Field(min_length=12)
+    resolved: bool = False
+
+    @model_validator(mode="after")
+    def _two_sides(self) -> "Disagreement":
+        if self.left_worker == self.right_worker:
+            raise ValueError("a disagreement is between two Workers, not one")
+        if not self.left_evidence and not self.right_evidence:
+            raise ValueError(
+                "a disagreement must cite the evidence on at least one side, or it is "
+                "an impression")
+        return self
+
+    @property
+    def sides(self) -> list[DisagreementSide]:
+        """Both sides of the conflict, in the order they were found."""
+
+        return [DisagreementSide(worker_id=self.left_worker, statement=self.left_statement,
+                                 evidence_ids=list(self.left_evidence)),
+                DisagreementSide(worker_id=self.right_worker,
+                                 statement=self.right_statement,
+                                 evidence_ids=list(self.right_evidence))]
+
+    @property
+    def describe(self) -> str:
+        state = "resolved" if self.resolved else "unresolved"
+        return (f"{self.kind} on {self.topic}: {self.left_worker} vs {self.right_worker} "
+                f"({state}) — {self.resolution[:110]}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"topic": self.topic, "kind": self.kind,
+                "sides": [{"worker_id": self.left_worker, "statement": self.left_statement,
+                           "evidence_ids": list(self.left_evidence)},
+                          {"worker_id": self.right_worker,
+                           "statement": self.right_statement,
+                           "evidence_ids": list(self.right_evidence)}],
+                "resolution": self.resolution, "resolved": self.resolved,
+                "describe": self.describe}
+
+
+def _plain(model: Any) -> dict[str, Any]:
+    """A model's fields as JSON-ready values, without pydantic's json-mode detours."""
+
+    return json.loads(model_to_json(model))
+
+
+class FailedSubtask(StrictModel):
+    """One subtask that did not deliver, and what the aggregate did about it.
+
+    A list, not a count: "3 of 5 Workers failed" is not actionable, and the mission
+    cannot say what it is missing if it only knows how much.
+    """
+
+    worker_id: str = Field(min_length=1)
+    name: str = ""
+    status: str = Field(min_length=1)
+    #: ``review-rejected``, ``retry-exhausted``, ``failed``, ``blocked``, ``deferred``
+    #: or ``error`` — the gate that decided it.
+    gate: str = ""
+    reason: str = Field(min_length=1)
+    #: What the mission loses because of it, in the Subagent's words.
+    consequence: str = Field(min_length=8)
+    attempts: int = Field(default=0, ge=0)
+    #: What was done about it: ``retasked``, ``runtime-worker`` or ``recorded``.
+    handled: str = Field(default="recorded", pattern="^(retasked|runtime-worker|recorded)$")
+    #: The gap string a runtime Worker planned to replace this subtask closes, so a
+    #: later round can tell whether the replacement actually delivered.
+    gap: str = ""
+
+    @property
+    def describe(self) -> str:
+        return (f"{self.name or self.worker_id} {self.status} ({self.gate or 'unknown'}): "
+                f"{self.reason[:90]} — {self.consequence[:90]}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"worker_id": self.worker_id, "name": self.name, "status": self.status,
+                "gate": self.gate, "reason": self.reason,
+                "consequence": self.consequence, "attempts": self.attempts,
+                "handled": self.handled, "gap": self.gap, "describe": self.describe}
+
+
+class CriterionCheck(StrictModel):
+    """Whether one of the Subagent's own completion criteria was met, and the proof."""
+
+    criterion: str = Field(min_length=8)
+    met: bool
+    #: The evidence ids that satisfy it, or the gap that prevents it.
+    evidence_ids: list[str] = Field(default_factory=list)
+    #: Why it is unmet — always populated when ``met`` is false.
+    shortfall: str = ""
+    #: Whether the shortfall is critical (the report may not claim the objective) or
+    #: merely incomplete (the report is partial and says so).
+    critical: bool = True
+
+    @model_validator(mode="after")
+    def _proof(self) -> "CriterionCheck":
+        if self.met and not self.evidence_ids:
+            raise ValueError(
+                "a met criterion must cite the evidence that meets it; otherwise the "
+                "claim is the Subagent's opinion of itself")
+        if not self.met and not self.shortfall.strip():
+            raise ValueError("an unmet criterion must say what is missing")
+        return self
+
+    @property
+    def describe(self) -> str:
+        if self.met:
+            return f"met: {self.criterion} ({len(self.evidence_ids)} item(s))"
+        return f"unmet ({'critical' if self.critical else 'partial'}): {self.criterion} — " \
+               f"{self.shortfall[:100]}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"criterion": self.criterion, "met": self.met,
+                "evidence_ids": list(self.evidence_ids),
+                "shortfall": self.shortfall, "critical": self.critical,
+                "describe": self.describe}
+
+
+class Readiness(StrictModel):
+    """The state :func:`assess_readiness` decides: ready, expandable, or bounded.
+
+    Its three answers map onto the task's three branches — aggregate now, plan one more
+    Worker, or return a bounded partial report — and every one of them is decided from
+    the record rather than from a feeling that the Subagent is "done enough".
+    """
+
+    subagent_id: str = Field(min_length=1)
+    ready: bool
+    #: ``ready``, ``expand`` or ``partial``.
+    decision: str = Field(pattern="^(ready|expand|partial)$")
+    #: Workers the aggregate required, and the ones that reached a terminal state.
+    required: list[str] = Field(default_factory=list)
+    settled: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+    #: Open questions from the plan this Subagent was created to answer.
+    open_questions: list[str] = Field(default_factory=list)
+    unmet_criteria: list[str] = Field(default_factory=list)
+    critical_gaps: list[str] = Field(default_factory=list)
+    #: Why it may *not* expand, when it wanted to.
+    expansion_refusals: list[str] = Field(default_factory=list)
+    runtime_spawned: int = Field(default=0, ge=0)
+    runtime_remaining: int = Field(default=0, ge=0)
+
+    @property
+    def explained(self) -> bool:
+        """Every decision carries its reason, including the boring ones."""
+
+        if self.decision == "ready":
+            return self.ready and not self.missing and not self.unmet_criteria
+        if self.decision == "expand":
+            return bool(self.critical_gaps) and not self.expansion_refusals
+        return True
+
+    def summary(self) -> str:
+        if self.decision == "ready":
+            return (f"ready: {len(self.settled)}/{len(self.required)} worker(s) settled, "
+                    f"every criterion met")
+        if self.decision == "expand":
+            return (f"expand: {len(self.critical_gaps)} critical gap(s), "
+                    f"{self.runtime_remaining} runtime Worker seat(s) left")
+        return (f"partial: {len(self.critical_gaps)} critical gap(s) remain and the "
+                f"budget does not allow another Worker ("
+                + ", ".join(self.expansion_refusals) + ")")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"subagent_id": self.subagent_id, "ready": self.ready,
+                "decision": self.decision, "required": list(self.required),
+                "settled": list(self.settled), "missing": list(self.missing),
+                "open_questions": list(self.open_questions),
+                "unmet_criteria": list(self.unmet_criteria),
+                "critical_gaps": list(self.critical_gaps),
+                "expansion_refusals": list(self.expansion_refusals),
+                "runtime_spawned": self.runtime_spawned,
+                "runtime_remaining": self.runtime_remaining,
+                "summary": self.summary()}
+
+
+class RuntimePlan(StrictModel):
+    """The Subagent's proposal for one more Worker, before anything is created.
+
+    Narrow by construction: one Worker, one gap, one question.  A Subagent that could
+    ask for "more research" would be re-planning its whole assignment at the end of it,
+    which is the Master's job and not a remedy for a specific gap.
+    """
+
+    subagent_id: str = Field(min_length=1)
+    #: The gap this Worker exists to close: a criterion or an open question.
+    gap: str = Field(min_length=12)
+    name: str = Field(min_length=3)
+    objective: str = Field(min_length=15)
+    work_unit: str = Field(min_length=3)
+    tools: list[str] = Field(min_length=1)
+    expected_evidence: str = Field(min_length=12)
+    output_schema: str = "EvidenceSet"
+    completion_criteria: list[str] = Field(min_length=1)
+    max_attempts: int = Field(default=2, ge=1, le=10)
+    #: Where the gap came from: ``criterion`` or ``question``.
+    source: str = Field(default="criterion", pattern="^(criterion|question)$")
+    #: The criterion or question itself, so a later round can tell whether the gap a
+    #: runtime Worker was planned for is still open.
+    target: str = ""
+    #: How the plan is justified, in one line the record keeps.
+    rationale: str = Field(min_length=12)
+
+    @model_validator(mode="after")
+    def _narrow(self) -> "RuntimePlan":
+        if len(self.completion_criteria) > 1:
+            raise ValueError(
+                "a runtime Worker closes one gap: several completion criteria is a "
+                "second plan, not a remedy")
+        if any(word in self.objective.lower() for word in ("everything", "all of", "any")):
+            raise ValueError("a runtime Worker's objective must name the gap it closes")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"subagent_id": self.subagent_id, "gap": self.gap, "target": self.target,
+                "source": self.source, "name": self.name, "objective": self.objective,
+                "work_unit": self.work_unit, "tools": list(self.tools),
+                "expected_evidence": self.expected_evidence,
+                "output_schema": self.output_schema,
+                "completion_criteria": list(self.completion_criteria),
+                "max_attempts": self.max_attempts, "rationale": self.rationale}
+
+
+class RuntimeSpawnRecord(StrictModel):
+    """One runtime Worker: what it was planned for, and what became of it."""
+
+    subagent_id: str = ""
+    worker_id: str = Field(min_length=1)
+    name: str = ""
+    gap: str = ""
+    plan: "RuntimePlan | None" = None
+    round: int = Field(default=1, ge=1)
+    attempt: int = Field(default=1, ge=1)
+    spawned: bool = True
+    refusal: str = ""
+    answered: bool = False
+    review_decision: str = ""
+    licence_remaining: int = Field(default=0, ge=0)
+    evidence_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _consistent(self) -> "RuntimeSpawnRecord":
+        if self.plan is not None and self.plan.subagent_id not in ("", self.subagent_id):
+            raise ValueError("a spawn record's plan belongs to another Subagent")
+        if self.spawned and self.refusal:
+            raise ValueError("a spawned Worker was not refused and carries no refusal")
+        if not self.spawned and not self.refusal:
+            raise ValueError("a refused spawn must say why")
+        return self
+
+    @property
+    def describe(self) -> str:
+        if not self.spawned:
+            return f"refused: {self.gap[:60]} — {self.refusal[:80]}"
+        verdict = "answered the gap" if self.answered else "did not answer the gap"
+        return f"runtime Worker for {self.gap[:60]}: {verdict}"
+
+
+# --------------------------------------------------------------------------
+# 36.1 Readiness: never aggregate early, and know when to stop
+# --------------------------------------------------------------------------
+
+class EarlyAggregate(PrematureAggregate):
+    """A Subagent tried to aggregate while one of its Workers was still running."""
+
+    def __init__(self, subagent_id: str, outstanding: Sequence[str],
+                 settled: Sequence[str] = ()) -> None:
+        self.subagent_id = subagent_id
+        self.outstanding = list(outstanding)
+        super().__init__(JoinBarrier(
+            stage=f"subagent-aggregate:{subagent_id}",
+            expected=[*settled, *self.outstanding], received=list(settled),
+            missing=self.outstanding))
+
+
+def terminal_states() -> frozenset[EntityStatus]:
+    """The statuses a Worker branch can settle in — the only ones a join accepts."""
+
+    return frozenset({EntityStatus.SUCCEEDED, EntityStatus.FAILED, EntityStatus.BLOCKED,
+                      EntityStatus.CANCELLED, EntityStatus.SKIPPED,
+                      EntityStatus.BUDGET_EXCEEDED})
+
+
+def outstanding_workers(required: Sequence[str], settled: Sequence[str],
+                        outcomes: Sequence["WorkerOutcome"]) -> list[str]:
+    """Workers still without a terminal outcome.
+
+    Two independent facts must agree: the branch reported settled, and the branch
+    produced an outcome in a terminal state.  A branch that reported settled without the
+    outcome is as unfinished as one that never reported at all.
+    """
+
+    reported = set(settled)
+    finished = {outcome.worker_id for outcome in outcomes
+                if outcome.status in terminal_states()}
+    return [worker_id for worker_id in required
+            if worker_id not in reported or worker_id not in finished]
+
+
+def check_ready(subagent_id: str, required: Sequence[str], settled: Sequence[str],
+                outcomes: Sequence["WorkerOutcome"]) -> JoinBarrier:
+    """The gate: no aggregate until every required Worker is terminal.
+
+    Raises :class:`EarlyAggregate` naming exactly what is outstanding, so a mis-wired
+    edge fails loudly instead of summarising a team that is still working.
+    """
+
+    outstanding = outstanding_workers(required, settled, outcomes)
+    if outstanding:
+        raise EarlyAggregate(subagent_id, outstanding,
+                             settled=[wid for wid in required if wid in set(settled)
+                                      and wid not in set(outstanding)])
+    # ``received`` is what arrived, not what was required re-read: the barrier is the
+    # record of an arrival, and a barrier that echoes its own expectation proves nothing.
+    received = list(dict.fromkeys(outcome.worker_id for outcome in outcomes))
+    return check_join(f"subagent-aggregate:{subagent_id}", required, received)
+
+
+# --------------------------------------------------------------------------
+# 36.2 Reconciling duplicates, preserving disagreements
+# --------------------------------------------------------------------------
+
+#: Words that flip a claim's polarity.  Used only to decide that two statements *disagree*,
+#: never to decide which one is right.
+_NEGATIONS: frozenset[str] = frozenset({"no", "not", "never", "none", "absent",
+                                        "missing", "without", "unable", "failed",
+                                        "did", "does", "cannot", "unknown"})
+
+
+def _claim_key(statement: str) -> str:
+    return " ".join("".join(ch for ch in statement.lower() if ch.isalnum() or ch == " ")
+                    .split())
+
+
+def _claim_stem(word: str) -> str:
+    """A crude plural/verb agreement fold, for comparing two claims about one thing.
+
+    Only the trailing ``s`` is removed, and never from a word that already ends in
+    ``ss``: "affects" and "affect" are the same claim, "access" and "acces" are not.
+    """
+
+    if len(word) > 4 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
+
+
+def _subject(statement: str) -> set[str]:
+    """The words a claim is *about*, with the polarity words removed and stems folded."""
+
+    return {_claim_stem(word) for word in _claim_key(statement).split()
+            if word not in _NEGATIONS}
+
+
+def _reconciliation_rows(evidence: Sequence["EvidenceItem"]) -> list["AggregateRow"]:
+    """The rows a reconciliation kept: one per distinct statement.
+
+    ``supporting_ids`` is the corroboration the canonical row absorbed — the redundant
+    copies' ids — so a reader can see that two Workers found this, not merely that two
+    copies were deleted.
+    """
+
+    return [AggregateRow(statement=item.statement, worker_id=item.collected_by or "",
+                         confidence=item.confidence.value, evidence_ids=[item.id],
+                         supporting_ids=list(dict.fromkeys([*item.supports, item.id])))
+            for item in evidence]
+
+
+def reconcile(evidence: Sequence["EvidenceItem"]) -> tuple[list["EvidenceItem"],
+                                                          Reconciliation]:
+    """Collapse rows that make the same claim, keeping one canonical copy.
+
+    The kept row carries the corroboration: the redundant ids move into its ``supports``
+    so the second Worker's finding is still visible as agreement rather than vanishing.
+    """
+
+    groups: dict[str, list["EvidenceItem"]] = {}
+    order: list[str] = []
+    for item in evidence:
+        key = _claim_key(item.statement)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(item)
+    kept: list[EvidenceItem] = []
+    reconciled = Reconciliation()
+    for key in order:
+        group = groups[key]
+        canonical = group[0]
+        if len(group) > 1:
+            redundant = [item.id for item in group[1:]]
+            supporting = list(dict.fromkeys([*canonical.supports, *redundant]))
+            canonical = canonical.model_copy(update={"supports": supporting})
+            reconciled.groups.append(ReconciledGroup(
+                statement=canonical.statement, canonical=canonical.id,
+                kept=canonical.id,
+                also_found_by=[item.collected_by or "" for item in group[1:]],
+                merged=redundant, redundant=redundant))
+            reconciled.merged += len(group) - 1
+            reconciled.supporting_ids.extend(redundant)
+        kept.append(canonical)
+        reconciled.kept_ids.append(canonical.id)
+    reconciled.rows = _reconciliation_rows(kept)
+    return kept, reconciled
+
+
+def _finding_rows(report: "WorkerReport | None", worker_id: str,
+                  forwarded_ids: set[str]) -> list[tuple[str, str, str, list[str]]]:
+    """``(worker_id, statement, confidence, evidence_ids)`` for one reviewed report."""
+
+    if report is None:
+        return []
+    rows: list[tuple[str, str, str, list[str]]] = []
+    for finding in report.findings:
+        cited = [item for item in finding.evidence_ids if item in forwarded_ids]
+        if finding.evidence_ids and not cited:
+            # Its evidence was withheld: the finding did not survive review, so it is
+            # not something this Subagent may assert (§34).
+            continue
+        rows.append((worker_id, finding.statement, finding.confidence.value, cited))
+    return rows
+
+
+def _contradicts(left: str, right: str, *, minimum_overlap: int = 2) -> bool:
+    """Whether two statements cannot both be true, by the same rules the aggregate uses."""
+
+    left_key, right_key = _claim_key(left), _claim_key(right)
+    if left_key == right_key:
+        return False
+    left_subject, right_subject = _subject(left), _subject(right)
+    if len(left_subject & right_subject) < minimum_overlap:
+        return False
+    if left_subject == right_subject and left_key != right_key:
+        return True
+    return bool(_numbers(left) and _numbers(right) and _numbers(left) != _numbers(right)
+                and len(left_subject & right_subject) >= 3)
+
+
+def find_disagreements(rows: Sequence[tuple[str, str, str, list[str]]]) -> list[Disagreement]:
+    """Two Workers asserting opposite things about the same subject.
+
+    Deliberately conservative: only statements that share their subject words and differ
+    in polarity, or that quantify the same thing differently, are reported.  A looser
+    rule would fill the record with false conflicts and train a reader to ignore them.
+    """
+
+    disagreements: list[Disagreement] = []
+    seen: set[tuple[str, str]] = set()
+    for index, (left_worker, left, left_confidence, left_ids) in enumerate(rows):
+        for right_worker, right, right_confidence, right_ids in rows[index + 1:]:
+            if left_worker == right_worker:
+                continue
+            pair = tuple(sorted((left_worker, right_worker)))
+            left_key, right_key = _claim_key(left), _claim_key(right)
+            if left_key == right_key:
+                continue
+            left_subject, right_subject = _subject(left), _subject(right)
+            overlap = left_subject & right_subject
+            if len(overlap) < 2:
+                continue
+            kind = ""
+            if (left_subject - _NEGATIONS) == (right_subject - _NEGATIONS) \
+                    and left_key != right_key:
+                kind = "negation"
+            elif _numbers(left) and _numbers(right) and _numbers(left) != _numbers(right) \
+                    and len(overlap) >= 3:
+                kind = "value"
+            if not kind:
+                continue
+            topic = " ".join(sorted(left_subject & right_subject)[:4])
+            if (pair, topic) in seen:
+                continue
+            seen.add((pair, topic))
+            disagreements.append(Disagreement(
+                topic=topic, left_worker=left_worker, right_worker=right_worker,
+                left_statement=left[:300], right_statement=right[:300], kind=kind,
+                left_evidence=left_ids, right_evidence=right_ids,
+                resolution=(f"re-read the primary record both Workers cite for "
+                            f"{topic[:60]}; one of the two statements is wrong and the "
+                            f"record, not the confidence, decides which")))
+    return disagreements
+
+
+def _numbers(statement: str) -> set[str]:
+    return set(re.findall(r"\d+(?:\.\d+)?", statement))
+
+
+# --------------------------------------------------------------------------
+# 36.3 Did this Subagent meet its own criteria?
+# --------------------------------------------------------------------------
+
+def assess_criteria(criteria: Sequence[str], *, evidence: Sequence["EvidenceItem"],
+                    reports: Sequence["WorkerReport"], scope: Sequence[str] = (),
+                    gaps: Sequence["UnknownValue"] = (),
+                    questions: Sequence[str] = ()) -> list[CriterionCheck]:
+    """Judge each of the Subagent's own criteria against what actually came back.
+
+    Four mechanical tests, one per kind of criterion this build's plans write, each
+    answered from the record:
+
+    *   ``every``/``each`` — every named item is covered by some cited evidence;
+    *   ``at least N`` — the volume is there;
+    *   ``integrity``/``hash`` — every forwarded item is hashed;
+    *   ``attributed``/``named`` — a candidate is named, or the absence is stated.
+
+    A criterion of none of those kinds is *not* silently declared met: it is reported as
+    unmet-but-checkable-by-a-reader, because a Subagent marking its own homework with no
+    test behind it is the failure mode this section is written against.
+    """
+
+    lowered = [criterion.lower() for criterion in criteria]
+    ids = [item.id for item in evidence]
+    checks: list[CriterionCheck] = []
+    for criterion, text in zip(criteria, lowered):
+        volume = re.search(r"at least (\d+)", text)
+        if volume:
+            want = int(volume.group(1))
+            checks.append(CriterionCheck(
+                criterion=criterion, met=len(evidence) >= want, evidence_ids=ids[:want],
+                shortfall="" if len(evidence) >= want else
+                (f"{len(evidence)} item(s) came back, the criterion asks for {want}"),
+                critical=True))
+            continue
+        # Custody before coverage: "every item carries a hash" is a hash question, and
+        # the coverage rule would answer it from statement overlap instead.
+        if any(word in text for word in ("integrity", "hash")):
+            hashed = [item for item in evidence if item.custody and item.custody.integrity_hash]
+            checks.append(CriterionCheck(
+                criterion=criterion, met=bool(hashed) and len(hashed) == len(evidence),
+                evidence_ids=[item.id for item in hashed],
+                shortfall="" if hashed and len(hashed) == len(evidence) else
+                (f"{len(evidence) - len(hashed)} forwarded item(s) carry no recorded hash"),
+                critical=True))
+            continue
+        if "every" in text or "each" in text:
+            subjects = [item for item in evidence if _matches_subject(item, text,
+                                                                     reports)]
+            checks.append(CriterionCheck(
+                criterion=criterion, met=bool(subjects) and not _uncovered(text, reports),
+                evidence_ids=[item.id for item in subjects],
+                shortfall="" if subjects and not _uncovered(text, reports) else
+                ("no reviewed item addresses this criterion" if not subjects else
+                 f"no item addresses: {_uncovered(text, reports)[0][:80]}"),
+                critical=True))
+            continue
+        if questions and not any(word in text for word in ("integrity", "hash")) \
+                and any(_shares_subject(text, question) for question in questions):
+            # The criterion restates a question the Subagent had to answer.  "Answered"
+            # means a reviewed item addresses it *and* an earlier criterion covering the
+            # same subject was met — the aggregate may not call it answered by fiat.
+            answered = [check for check in checks if check.met]
+            addressed = [item for item in evidence if _matches_subject(item, text, reports)]
+            checks.append(CriterionCheck(
+                criterion=criterion, met=bool(answered) and bool(addressed),
+                evidence_ids=[item.id for item in addressed],
+                shortfall="" if answered and addressed else
+                ("no reviewed item addresses the question this criterion restates"
+                 if not addressed else
+                 "the question is not answered by any criterion that was met"),
+                critical=True))
+            continue
+        if any(word in text for word in ("attributed", "candidate", "named")):
+            named = [item for item in evidence
+                     if re.search(r"process|pid|binary|/usr/|/bin/", item.statement.lower())]
+            stated = [gap for gap in gaps if "process" in gap.detail.lower()]
+            checks.append(CriterionCheck(
+                criterion=criterion, met=bool(named) or bool(stated),
+                evidence_ids=[item.id for item in named],
+                shortfall="" if named or stated else
+                "no reviewed item names a candidate process and no gap states its absence",
+                critical=True))
+            continue
+        checks.append(CriterionCheck(
+            criterion=criterion, met=False,
+            shortfall=("no mechanical test exists for this criterion; a reader must "
+                       "check it against the report"),
+            critical=False))
+    return checks
+
+
+def _shares_subject(criterion: str, question: str) -> bool:
+    """Whether a criterion is a restatement of a question the plan had to answer."""
+
+    left = {word for word in _claim_key(criterion).split()
+            if len(word) > 3 and word not in _RELEVANCE_STOPWORDS}
+    right = {word for word in _claim_key(question).split()
+             if len(word) > 3 and word not in _RELEVANCE_STOPWORDS}
+    return len(left & right) >= 2
+
+
+def _matches_subject(item: "EvidenceItem", criterion: str,
+                     reports: Sequence["WorkerReport"]) -> bool:
+    tokens = {word for word in _claim_key(criterion).split()
+              if len(word) > 3 and word not in _RELEVANCE_STOPWORDS}
+    return bool(tokens & set(_claim_key(item.statement).split()))
+
+
+def _uncovered(criterion: str, reports: Sequence["WorkerReport"]) -> list[str]:
+    """The ``each``-named items no finding addresses."""
+
+    names = re.findall(r"each ([a-z /-]{3,40})", criterion)
+    if not names:
+        return []
+    covered: list[str] = []
+    for report in reports:
+        covered.extend(finding.statement.lower() for finding in report.findings)
+    joined = " ".join(covered)
+    return [name.strip() for name in names if name.strip() not in joined]
+
+
+# --------------------------------------------------------------------------
+# 36.4 Whether another Worker may be planned at all
+# --------------------------------------------------------------------------
+
+def assess_readiness(subagent: "FlowSubagent", *, checks: Sequence[CriterionCheck],
+                     gaps: Sequence["UnknownValue"], settled: Sequence[str],
+                     required: Sequence[str], runtime_spawned: int,
+                     runtime_limit: int, refusals: Sequence[str] = (),
+                     runtime_gaps: Sequence[str] = (),
+                     failed: Sequence["FailedSubtask"] = ()) -> Readiness:
+    """The three-way decision, from the record and the budget only."""
+
+    unmet = [check for check in checks if not check.met]
+    # A gap a runtime Worker was already planned for is not a gap that justifies *another*
+    # Worker: sending a second copy to the same question would be a repeat, not a remedy.
+    # Planned gaps therefore drop out of the critical list, and the round that planned
+    # them is recorded as the round that answered them (§36.4).
+    covered = {word for gap in runtime_gaps for word in _claim_key(gap).split()
+               if len(word) > 3}
+    critical = [check for check in unmet if check.critical
+                and not (_words(check.criterion) <= covered)]
+    critical_gaps = [f"{check.criterion}: {check.shortfall}"[:300] for check in critical]
+    missing = [worker_id for worker_id in required if worker_id not in set(settled)]
+    remaining = max(0, runtime_limit - runtime_spawned)
+    open_questions = list(subagent.addresses_questions)
+    unanswered = [question for question in open_questions
+                  if not _question_answered(question, checks)
+                  and not (_words(question) <= covered)]
+    # A subtask that ran and whose work was withheld is a critical gap of its own: the
+    # Subagent lost a unit's finding, and no criterion passing can make that untrue.  A
+    # replacement retires the gap only by actually forwarding — ``runtime_gaps`` carries
+    # forward-only records, so ``covered`` means "a replacement delivered", not "was tried".
+    failed_gaps = [f"{item.name or item.worker_id}: {item.reason[:160]}" for item in failed
+                   if not (_words(item.gap) <= covered)]
+    gaps_and_questions = list(dict.fromkeys([
+        *critical_gaps, *failed_gaps,
+        *[f"question: {question}" for question in unanswered]]))
+    if not gaps_and_questions:
+        decision = "ready"
+    elif remaining > 0 and not refusals:
+        decision = "expand"
+    else:
+        decision = "partial"
+    return Readiness(
+        subagent_id=subagent.id, ready=decision == "ready", decision=decision,
+        required=list(required), settled=list(settled), missing=missing,
+        open_questions=unanswered,
+        unmet_criteria=[check.criterion for check in unmet],
+        critical_gaps=gaps_and_questions,
+        expansion_refusals=list(refusals), runtime_spawned=runtime_spawned,
+        runtime_remaining=remaining)
+
+
+def _words(text: str) -> set[str]:
+    """The content words of a criterion or question, for the "already planned" test."""
+
+    return {word for word in _claim_key(text).split()
+            if len(word) > 3 and word not in _RELEVANCE_STOPWORDS}
+
+
+def _question_answered(question: str, checks: Sequence[CriterionCheck]) -> bool:
+    """Whether a *met* criterion answers this question, by shared content words.
+
+    Only met checks count: an unmet criterion whose wording happens to match the
+    question is the gap, not its closure.
+    """
+
+    tokens = {word for word in _claim_key(question).split()
+              if len(word) > 4 and word not in _RELEVANCE_STOPWORDS}
+    if not tokens:
+        return True
+    return any(check.met and tokens & set(_claim_key(check.criterion).split())
+               for check in checks)
+
+
+def expansion_refusals(subagent: "FlowSubagent", *, policy: "FlowPolicy",
+                       runtime_spawned: int, licence_remaining: int | None,
+                       deadline_expired: bool = False,
+                       cancelled: bool = False) -> list[str]:
+    """Every reason this Subagent may not plan another Worker, in order of precedence.
+
+    All of them are checked and all of them are reported: an operator asked "why did it
+    stop here?" deserves the whole list, not the first branch that returned.
+    """
+
+    reasons: list[str] = []
+    if cancelled:
+        reasons.append("the mission was cancelled")
+    if deadline_expired:
+        reasons.append("the mission deadline has expired")
+    if not policy.allow_runtime_workers:
+        reasons.append("runtime Workers are disabled for this mission")
+    if runtime_spawned >= policy.max_runtime_workers_per_subagent:
+        reasons.append(f"the runtime Worker budget of "
+                       f"{policy.max_runtime_workers_per_subagent} is spent")
+    if licence_remaining is not None and licence_remaining <= 0:
+        reasons.append("the Subagent's SpawnLedger licence is exhausted")
+    return reasons
+
+
+class AggregationOutcome(StrictModel):
+    """One pass of the Subagent's aggregation, before it is written as a report."""
+
+    barrier: JoinBarrier
+    forwarded: list["ReviewedWorkerResult"] = Field(default_factory=list)
+    withheld: list["ReviewedWorkerResult"] = Field(default_factory=list)
+    evidence: list["EvidenceItem"] = Field(default_factory=list)
+    reconciliation: Reconciliation = Field(default_factory=Reconciliation)
+    disagreements: list[Disagreement] = Field(default_factory=list)
+    failed: list[FailedSubtask] = Field(default_factory=list)
+    checks: list[CriterionCheck] = Field(default_factory=list)
+    gaps: list["UnknownValue"] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _only_reviewed_evidence(self) -> "AggregationOutcome":
+        forwarded_ids = {item.id for result in self.forwarded
+                         for item in (result.report.evidence if result.report else [])}
+        stray = [item.id for item in self.evidence if item.id not in forwarded_ids]
+        if stray:
+            raise ValueError(
+                "an aggregate may only contain evidence a review forwarded; "
+                f"{len(stray)} item(s) came from somewhere else")
+        return self
+
+    @property
+    def forwardable(self) -> int:
+        return len(self.forwarded)
+
+    @property
+    def unresolved(self) -> list[Disagreement]:
+        """The disagreements nothing has settled yet — the ones a report must carry."""
+
+        return [item for item in self.disagreements if not item.resolved]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"barrier": {**_plain(self.barrier),
+                            "satisfied": self.barrier.satisfied,
+                            "describe": self.barrier.describe()},
+                "forwarded": [result.worker_id for result in self.forwarded],
+                "withheld": [result.worker_id for result in self.withheld],
+                "evidence": [item.id for item in self.evidence],
+                "reconciliation": self.reconciliation.to_dict(),
+                "disagreements": [item.to_dict() for item in self.disagreements],
+                "failed": [item.to_dict() for item in self.failed],
+                "checks": [item.to_dict() for item in self.checks],
+                "gaps": [gap.detail for gap in self.gaps],
+                "summary": self.summary()}
+
+    def summary(self) -> str:
+        return (f"{self.forwardable} forwarded, {len(self.withheld)} withheld; "
+                f"{self.reconciliation.merged} duplicate(s) merged, "
+                f"{len(self.disagreements)} disagreement(s), "
+                f"{len(self.failed)} failed subtask(s); "
+                f"{sum(1 for check in self.checks if check.met)}/"
+                f"{len(self.checks)} criteria met")
+
+
+# --------------------------------------------------------------------------
+# 36.5 The aggregate the Subagent writes
+# --------------------------------------------------------------------------
+
+def aggregate_subagent(subagent: "FlowSubagent", *, outcomes: Sequence["WorkerOutcome"],
+                       judged: Sequence["ReviewedWorkerResult"],
+                       settled: Sequence[str], gaps: Sequence["UnknownValue"] = (),
+                       scope: Sequence[str] = (),
+                       reconciliation: Reconciliation | None = None,
+                       required: Sequence[str] | None = None) -> AggregationOutcome:
+    """Build the aggregate from reviewed results only, and check it is not early.
+
+    The order is the contract: **barrier first** (nothing is summarised until every
+    required Worker is terminal), **review second** (a result with no verdict is
+    refused), and only then the four reconciliation questions.  A caller that has the
+    outcomes but not the reviews gets an :class:`UnreviewedResult`, not an aggregate
+    with the unreviewed rows quietly dropped.
+    """
+
+    barrier = check_ready(
+        subagent.id,
+        [worker.id for worker in subagent.workers] if required is None else list(required),
+        settled, outcomes)
+    by_worker = {result.worker_id: result for result in judged}
+    forwarded: list[ReviewedWorkerResult] = []
+    withheld: list[ReviewedWorkerResult] = []
+    for outcome in outcomes:
+        result = by_worker.get(outcome.worker_id)
+        if result is None:
+            raise UnreviewedResult(outcome.worker_id, stage="subagent-aggregate")
+        require_review(result, stage="subagent-aggregate")
+        (forwarded if result.forwarded else withheld).append(result)
+
+    # Only forwarded work contributes evidence or findings.
+    evidence = [item for result in forwarded for item in (result.report.evidence
+                                                         if result.report else [])]
+    kept, reconciled = reconcile(evidence)
+    if reconciliation is not None:
+        reconciled = reconciliation
+    reports = [result.report for result in forwarded if result.report is not None]
+    # Disagreements are found on the *raw* rows, one per Worker, before the duplicates
+    # are collapsed: after reconciliation the two sides of a conflict can land on the
+    # same canonical id, and the pair would then look like agreement (§36.2).
+    rows = [row for result in forwarded
+            for row in _finding_rows(result.report, result.worker_id,
+                                     {item.id for item in evidence})]
+    failed = [
+        FailedSubtask(
+            worker_id=result.worker_id,
+            name=next((worker.name for worker in subagent.workers
+                       if worker.id == result.worker_id), ""),
+            status=(result.review.worker_status.value
+                    or result.outcome.status.value),
+            gate=result.review.path if result.review.decision is not ReviewDecision.PASS
+            else "",
+            reason=(result.review.deficiencies[0].detail if result.review.deficiencies
+                    else (result.outcome.error or result.review.stop_reason
+                          or f"{result.review.decision.value} on attempt "
+                             f"{result.review.attempt}")),
+            consequence=_consequence_for(subagent, result),
+            attempts=result.review.attempt,
+            handled="recorded",
+            gap=f"subtask {result.worker_id}: {result.review.decision.value}")
+        for result in withheld]
+    checks = assess_criteria(subagent.completion_criteria, evidence=kept, reports=reports,
+                             scope=scope, gaps=gaps, questions=subagent.addresses_questions)
+    return AggregationOutcome(
+        barrier=barrier, forwarded=forwarded, withheld=withheld, evidence=kept,
+        reconciliation=reconciled, disagreements=find_disagreements(rows),
+        failed=failed, checks=checks, gaps=list(gaps))
+
+
+def _consequence_for(subagent: "FlowSubagent", result: ReviewedWorkerResult) -> str:
+    """What the mission loses because this result was withheld, in one line."""
+
+    report = result.report
+    if report is not None and report.gaps:
+        return f"the unit declared its own gap: {report.gaps[0].detail[:120]}"
+    if result.review.decision is ReviewDecision.BLOCKED:
+        return (f"the unit never ran ({result.review.stop_reason[:100]}), so anything "
+                f"only it could observe is missing from this report")
+    if report is not None and report.limitations:
+        return f"the unit's own limitation stands: {report.limitations[0][:120]}"
+    return ("the unit's work was not forwarded, so its finding is not in this report "
+            "and is not counted as met")
+
+
+# --------------------------------------------------------------------------
+# 36.6 Planning one more Worker, at run time, through the same gates
+# --------------------------------------------------------------------------
+
+def plan_runtime_worker(subagent: "FlowSubagent", *, readiness: Readiness,
+                        plan: RuntimePlan | None = None) -> RuntimePlan:
+    """The Subagent's proposal for the Worker its gap needs.
+
+    A plan may be supplied (a caller that knows what is missing); otherwise one is
+    derived from the *first* critical gap — one Worker, one gap — because a Subagent that
+    could spawn "a few more units" would be re-planning its assignment, which is the
+    Master's decision (§25) and not a remedy for a named shortfall.
+    """
+
+    if plan is not None:
+        if plan.subagent_id != subagent.id:
+            raise ValueError("a runtime plan belongs to the Subagent that proposed it")
+        return plan
+    gap = next((item for item in readiness.critical_gaps if not item.startswith("question:")),
+               None) or next((item for item in readiness.critical_gaps), "")
+    if not gap:
+        raise ValueError("this Subagent has no critical gap to close, so it needs no "
+                         "runtime Worker")
+    source = "question" if gap.startswith("question:") else "criterion"
+    target = gap.split(":", 1)[1].strip() if source == "question" else gap.split(":")[0].strip()
+    tools = _tools_for_runtime_worker(subagent)
+    derived = RuntimePlan(
+        subagent_id=subagent.id, gap=gap,
+        name=f"gap-{content_id('gap', gap, length=6)}",
+        target=target,
+        objective=f"close this gap for {subagent.role}: {target[:120]}",
+        work_unit=f"{subagent.role} gap closure",
+        tools=tools,
+        expected_evidence="≥1 observation item(s) from ≥1 source(s)",
+        output_schema="EvidenceSet",
+        completion_criteria=[f"the result addresses: {target[:80]}"],
+        source=source,
+        rationale=f"the reviewed results left the gap '{target[:80]}' open and the "
+                  f"Subagent still holds a runtime Worker seat")
+    return derived
+
+
+def _tools_for_runtime_worker(subagent: "FlowSubagent") -> list[str]:
+    """The narrowest tool set any of the Subagent's own Workers already holds."""
+
+    for worker in subagent.workers:
+        if worker.tools:
+            return [worker.tools[0]]
+    return ["evidence.read"]
+
+
+def runtime_worker_from_plan(plan: RuntimePlan, *, index: int,
+                             subagent: "FlowSubagent") -> "FlowWorker":
+    """Materialise the plan as a Worker the graph can run.
+
+    The same shape as a planned Worker, so every downstream gate — the join, the seven
+    dimensions, the retask, the aggregate — applies without a special case.
+    """
+
+    return FlowWorker(
+        id=content_id("wrk", subagent.id, plan.name, index),
+        name=plan.name, objective=plan.objective, work_unit=plan.work_unit,
+        tools=list(plan.tools), input_names=["the reviewed results so far"],
+        completion_criteria=list(plan.completion_criteria),
+        expected_evidence=plan.expected_evidence, output_schema=plan.output_schema,
+        max_attempts=plan.max_attempts)
+
+
+def runtime_spawn_allowed(subagent: "FlowSubagent", *, policy: "FlowPolicy",
+                          spawned: int, licence_remaining: int | None,
+                          deadline_expired: bool = False,
+                          cancelled: bool = False) -> tuple[bool, list[str]]:
+    """Whether one more runtime Worker may be created, and every reason it may not."""
+
+    reasons = expansion_refusals(
+        subagent, policy=policy, runtime_spawned=spawned, licence_remaining=licence_remaining,
+        deadline_expired=deadline_expired, cancelled=cancelled)
+    return (not reasons, reasons)
+
+
+def _verdict_of(result: "ReviewedWorkerResult") -> "ReviewVerdict":
+    """The graph's verdict for a reviewed result, derived from the review (§34.6)."""
+
+    review = result.review
+    return ReviewVerdict(
+        worker_id=result.worker_id, approved=review.passed,
+        verdict=("pass" if review.passed else
+                 "revise" if review.decision is ReviewDecision.REVISE else "reject"),
+        # The criteria the *review* was judged against are the Subagent's; the report's
+        # own list is the Worker's, which is the clearer record of what was asked.
+        criteria=[],
+        findings=[item.describe for item in review.deficiencies] or
+                 [f"no deficiency recorded ({review.decision.value})"],
+        retry=review.retry, guidance=review.guidance or review.stop_reason or
+        "record the gap and stop this unit", reviewer="subagent-review")
+
+
+# --------------------------------------------------------------------------
+# 36.7 The bounded partial report
+# --------------------------------------------------------------------------
+
+def bounded_partial_report(outcome: AggregationOutcome, readiness: Readiness, *,
+                           subagent: "FlowSubagent",
+                           spawned: Sequence["RuntimeSpawnRecord"] = ()) -> "SubagentOutcome":
+    """The report a Subagent returns when it cannot close its gaps.
+
+    *Bounded* means three things, and each is in the record: the report claims only what
+    the reviews forwarded, it names every gap it could not close, and it says why no
+    further Worker was planned.  The status is ``BLOCKED`` rather than ``FAILED`` when
+    something usable came back — the mission continues with a named uncertainty, which
+    is the whole point of not stopping early (§34's blocking rule).
+    """
+
+    gaps = list(outcome.gaps)
+    gaps.extend(UnknownValue(
+        reason=UnknownReason.FAILED, determined_by=subagent.id,
+        detail=f"{item.name or item.worker_id}: {item.reason[:200]}")
+        for item in outcome.failed)
+    # Only a *critical* unmet criterion becomes a gap.  A criterion no mechanical test
+    # covers is still reported — in ``criteria_checks``, for a reader to judge — but
+    # promoting every uncheckable sentence to a mission gap would bury the real ones.
+    for check in outcome.checks:
+        if not check.met and check.critical:
+            gaps.append(UnknownValue(
+                reason=UnknownReason.UNAVAILABLE, determined_by=subagent.id,
+                detail=f"{check.criterion[:120]}: {check.shortfall[:160]}"))
+    for disagreement in outcome.disagreements:
+        if not disagreement.resolved:
+            gaps.append(UnknownValue(
+                reason=UnknownReason.UNKNOWN, determined_by=subagent.id,
+                detail=disagreement.describe[:240]))
+    evidence = outcome.evidence
+    return SubagentOutcome(
+        subagent_id=subagent.id, role=subagent.role, objective=subagent.objective,
+        status=(EntityStatus.FAILED if not evidence else EntityStatus.BLOCKED),
+        gate=(FlowGate.REVIEW_REJECTED if not evidence else FlowGate.NONE),
+        # Every unit that ran, not only the ones that were forwarded: `withheld` says
+        # which of them were refused, and a report that omitted them would make a
+        # reviewed-and-refused unit indistinguishable from one that never ran.
+        outcomes=[result.outcome for result in [*outcome.forwarded, *outcome.withheld]],
+        reviews=[_verdict_of(result) for result in [*outcome.forwarded, *outcome.withheld]],
+        evidence=evidence, aggregate_basis=outcome.barrier,
+        open_questions=readiness.open_questions, gaps=gaps,
+        withheld=[result.worker_id for result in outcome.withheld],
+        # The four answers the task asks for travel with the report even when it is
+        # bounded: a partial report that dropped them would be a summary of a summary.
+        reconciliation=outcome.reconciliation, disagreements=list(outcome.disagreements),
+        failed=list(outcome.failed), criteria_checks=list(outcome.checks),
+        readiness=readiness, runtime_workers=list(spawned))
+
+
+def complete_report(outcome: AggregationOutcome, readiness: Readiness, *,
+                    subagent: "FlowSubagent", retries: int = 0,
+                    seconds: float = 0.0,
+                    spawned: Sequence["RuntimeSpawnRecord"] = ()) -> "SubagentOutcome":
+    """The report when every required Worker settled and every criterion is met."""
+
+    return SubagentOutcome(
+        subagent_id=subagent.id, role=subagent.role, objective=subagent.objective,
+        status=EntityStatus.SUCCEEDED, gate=FlowGate.NONE,
+        # Every unit that ran, not only the ones that were forwarded: `withheld` says
+        # which of them were refused, and a report that omitted them would make a
+        # reviewed-and-refused unit indistinguishable from one that never ran.
+        outcomes=[result.outcome for result in [*outcome.forwarded, *outcome.withheld]],
+        reviews=[_verdict_of(result) for result in [*outcome.forwarded, *outcome.withheld]],
+        evidence=outcome.evidence, aggregate_basis=outcome.barrier,
+        open_questions=list(subagent.addresses_questions), gaps=list(outcome.gaps),
+        withheld=[result.worker_id for result in outcome.withheld],
+        reconciliation=outcome.reconciliation, disagreements=list(outcome.disagreements),
+        failed=list(outcome.failed), criteria_checks=list(outcome.checks),
+        retries=retries, seconds=seconds, readiness=readiness,
+        runtime_workers=list(spawned))
+
+
+def render_aggregate(outcome: AggregationOutcome, readiness: Readiness | None = None,
+                     *, subagent: "FlowSubagent | None" = None) -> Group:
+    """One aggregate: what it waited for, what it merged, and what it refused to hide."""
+
+    head = Table(title="aggregate — the four questions", title_justify="left", box=None,
+                 pad_edge=False)
+    head.add_column("question", style="dim", no_wrap=True)
+    head.add_column("answer", overflow="fold", max_width=78)
+    head.add_row("ready?", escape(outcome.barrier.describe() + (
+        "" if outcome.barrier.satisfied else " — REFUSED")))
+    head.add_row("forwarded", escape(", ".join(
+        result.worker_id for result in outcome.forwarded) or "nothing"))
+    head.add_row("withheld", escape(", ".join(
+        result.worker_id for result in outcome.withheld) or "nothing"))
+    head.add_row("what was the same", escape(outcome.reconciliation.explain()))
+    head.add_row("what disagreed", escape(
+        f"{len(outcome.disagreements)} disagreement(s), "
+        f"{len(outcome.unresolved)} unresolved" if outcome.disagreements
+        else "no two reviewed results contradicted each other"))
+    head.add_row("what failed", escape(
+        f"{len(outcome.failed)} failed subtask(s)" if outcome.failed
+        else "every subtask that ran was forwarded"))
+
+    rows: list[Any] = [head]
+
+    if outcome.reconciliation.groups:
+        merged = Table(title="duplicates reconciled", title_justify="left", box=None,
+                       pad_edge=False)
+        merged.add_column("kept", no_wrap=True)
+        merged.add_column("merged in", overflow="fold", max_width=30)
+        merged.add_column("what they both said", overflow="fold", max_width=44)
+        for group in outcome.reconciliation.groups:
+            merged.add_row(escape(group.kept), escape(", ".join(group.merged) or "—"),
+                           escape(group.statement[:150]))
+        rows += [Text(""), merged]
+
+    if outcome.disagreements:
+        disputed = Table(title="disagreements preserved, not resolved", title_justify="left",
+                         box=None, pad_edge=False)
+        disputed.add_column("kind", no_wrap=True)
+        disputed.add_column("side", no_wrap=True)
+        disputed.add_column("claim", overflow="fold", max_width=38)
+        disputed.add_column("resolution", overflow="fold", max_width=38)
+        for disagreement in outcome.disagreements:
+            for side in disagreement.sides:
+                disputed.add_row(escape(disagreement.kind), escape(side.worker_id),
+                                 escape(f"{side.statement[:90]} "
+                                        f"[{', '.join(side.evidence_ids) or 'no evidence'}]"),
+                                 escape(disagreement.resolution[:120]))
+        rows += [Text(""), disputed]
+
+    if outcome.failed:
+        failures = Table(title="failed subtasks", title_justify="left", box=None,
+                         pad_edge=False)
+        failures.add_column("unit", no_wrap=True)
+        failures.add_column("status", no_wrap=True)
+        failures.add_column("reason", overflow="fold", max_width=34)
+        failures.add_column("what the mission loses", overflow="fold", max_width=34)
+        for item in outcome.failed:
+            failures.add_row(escape(item.name or item.worker_id), escape(item.status),
+                             escape(item.reason[:140]), escape(item.consequence[:140]))
+        rows += [Text(""), failures]
+
+    if outcome.checks:
+        criteria = Table(title="its own completion criteria", title_justify="left", box=None,
+                         pad_edge=False)
+        criteria.add_column("", width=2)
+        criteria.add_column("criterion", overflow="fold", max_width=44)
+        criteria.add_column("how it was judged", overflow="fold", max_width=40)
+        for check in outcome.checks:
+            glyph, colour = ("✔", "green") if check.met else ("✘", "red")
+            criteria.add_row(f"[{colour}]{glyph}[/{colour}]", escape(check.criterion[:160]),
+                             escape(check.evidence_ids[0] if check.met and check.evidence_ids
+                                    else check.shortfall[:160] or "met"))
+        rows += [Text(""), criteria]
+    else:
+        rows += [Text(""), Text("no completion criteria were declared, so none were "
+                                "judged — an aggregate does not mark its own homework",
+                                style="dim")]
+
+    if readiness is not None:
+        rows += [Text(""), render_readiness(readiness)]
+    return Group(*rows)
+
+
+def render_readiness(readiness: Readiness) -> Group:
+    """The decision, and *every* reason behind it — including the boring ones."""
+
+    table = Table(title="readiness", title_justify="left", box=None, pad_edge=False)
+    table.add_column("field", style="dim", no_wrap=True)
+    table.add_column("value", overflow="fold", max_width=78)
+    table.add_row("decision", escape(readiness.decision.upper()))
+    table.add_row("workers", escape(f"{len(readiness.settled)}/{len(readiness.required)} "
+                                    f"settled"))
+    if readiness.missing:
+        table.add_row("still outstanding", escape(", ".join(readiness.missing)))
+    seats = readiness.runtime_spawned + readiness.runtime_remaining
+    table.add_row("runtime workers",
+                  escape(f"{readiness.runtime_spawned} of {seats} seat(s) spent"))
+    if readiness.critical_gaps:
+        table.add_row("critical gaps", escape("; ".join(readiness.critical_gaps)[:400]))
+    if readiness.expansion_refusals:
+        table.add_row("may not expand because",
+                      escape("; ".join(readiness.expansion_refusals)))
+    return Group(table, Text(readiness.summary(), style="dim"))
+
+
+def render_report(report: "SubagentOutcome") -> Group:
+    """A whole Subagent report as a reader sees it: evidence, gaps, and the four answers."""
+
+    head = Table(title=f"{report.role} — {report.status.value}", title_justify="left",
+                 box=None, pad_edge=False)
+    head.add_column("field", style="dim", no_wrap=True)
+    head.add_column("value", overflow="fold", max_width=78)
+    head.add_row("subagent", escape(report.subagent_id))
+    head.add_row("objective", escape(report.objective))
+    head.add_row("evidence", str(len(report.evidence)))
+    head.add_row("gaps", str(len(report.gaps)))
+    head.add_row("withheld", escape(", ".join(report.withheld) or "none"))
+    head.add_row("runtime workers", escape(
+        ", ".join(item.describe for item in report.runtime_workers) or "none"))
+    rows: list[Any] = [head]
+    if report.gaps:
+        gaps = Table(title="gaps this report carries", title_justify="left", box=None,
+                     pad_edge=False)
+        gaps.add_column("reason", no_wrap=True)
+        gaps.add_column("detail", overflow="fold", max_width=72)
+        for gap in report.gaps:
+            gaps.add_row(escape(str(gap.reason)), escape(gap.detail[:240]))
+        rows += [Text(""), gaps]
+    if report.reconciliation.groups or report.disagreements or report.failed:
+        rows += [Text(""), render_aggregate(
+            AggregationOutcome(barrier=report.aggregate_basis or JoinBarrier(
+                stage="adopted", expected=[], received=[], missing=[]),
+                evidence=list(report.evidence), reconciliation=report.reconciliation,
+                disagreements=list(report.disagreements), failed=list(report.failed),
+                checks=list(report.criteria_checks)), report.readiness)]
+    return Group(*rows)
+
+
+# --------------------------------------------------------------------------
+# 36.8 Scripted results: an aggregate that has something to reconcile
+# --------------------------------------------------------------------------
+
+def _aggregate_evidence(statement: str, *, tag: str, worker: str,
+                        url: str) -> "EvidenceItem":
+    return EvidenceItem(
+        id=content_id("ev", worker, statement, length=10),
+        kind=EvidenceKind.OBSERVATION, statement=statement,
+        sources=[SourceReference(
+            kind=SourceKind.PUBLIC_WEB, url=url, title=tag,
+            retrieved_at=datetime(2026, 5, 4, 10, 0, tzinfo=timezone.utc),
+            retrieval_method=RetrievalMethod.HTTP, http_status=200)],
+        confidence=Confidence.LOW, confidence_basis="one retrieval",
+        collected_by=worker)
+
+
+def _demo_pair() -> list["ReviewedWorkerResult"]:
+    """The demo's three reviewed results, shared with the self-test's early case."""
+
+    return _build_demo_cases()[1]
+
+
+def _build_demo_cases() -> tuple[dict[str, Any], list["ReviewedWorkerResult"]]:
+    """Three aggregates: one clean, one that reconciles, and one that must stop.
+
+    The middle case is the section's argument.  Two Workers found the same advisory and
+    one of them found its mirror: the statement is the same claim twice, and the
+    *corroboration* is the thing worth keeping.  A third Worker says the affected
+    component is something else, and that is a disagreement the report must carry rather
+    than settle.
+    """
+
+    # The same claim, word for word, from two independent sources: this is the duplicate
+    # the reconciliation must merge.  The forum's claim shares the subject and disagrees
+    # with both, which is the disagreement it must preserve rather than settle.
+    merged_claim = "CVE-2026-1188 affects the edge gateway session handling"
+    clash = "CVE-2026-1188 does not affect the edge gateway session handling"
+
+    # Keyed by Worker, not by statement: two Workers finding the same claim hold two
+    # distinct items, and that distinction is the corroboration being reconciled.
+    evidence: list["EvidenceItem"] = [
+        _aggregate_evidence(merged_claim, tag="vendor advisory", worker="wrk-a",
+                            url="https://vendor.test/a"),
+        _aggregate_evidence(merged_claim, tag="mirror", worker="wrk-b",
+                            url="https://mirror.test/a"),
+        _aggregate_evidence(clash, tag="forum post", worker="wrk-c",
+                            url="https://forum.test/a"),
+    ]
+    worker = FlowWorker(
+        id="wrk-clean", name="advisory-reader", objective="read the vendor advisories",
+        work_unit="advisory reading", tools=["advisory.fetch"],
+        completion_criteria=["at least 1 source retrieved"],
+        expected_evidence="≥1 observation item(s) from ≥1 source(s)",
+        output_schema="EvidenceSet")
+    clean_report = WorkerReport(
+        worker_id="wrk-clean", subagent_id="sa-demo", status=WorkerStatus.COMPLETED,
+        summary="read one advisory", evidence=evidence[:1],
+        sources=list(evidence[0].sources),
+        findings=[WorkerFinding(statement=evidence[0].statement,
+                                evidence_ids=[evidence[0].id],
+                                confidence=Confidence.LOW,
+                                confidence_basis="one retrieval on record")],
+        attempt=1)
+    reviewed = ReviewedWorkerResult(
+        worker_id="wrk-clean", subagent_id="sa-demo",
+        outcome=outcome_from_report(clean_report), report=clean_report,
+        review=review_outcome(outcome_from_report(clean_report), worker=worker,
+                              subagent_id="sa-demo").review)
+    barrier = check_join("subagent-aggregate:sa-demo", ["wrk-clean"], ["wrk-clean"])
+    clean = aggregate_subagent(
+        FlowSubagent(id="sa-demo", role="advisory", objective="read the advisories",
+                     workers=[worker]), outcomes=[reviewed.outcome], judged=[reviewed],
+        settled=["wrk-clean"])
+    clean = clean.model_copy(update={"barrier": barrier})
+
+    # ---- the case with something to reconcile -------------------------------
+    # One item each: the demo is about what the *aggregate* does with three reviewed
+    # results, so every result is one the review forwarded.
+    reader = FlowWorker(
+        id="wrk-a", name="advisory-reader", objective="read the vendor advisory",
+        work_unit="edge gateway advisory", tools=["advisory.fetch"],
+        completion_criteria=["at least 1 source retrieved"],
+        expected_evidence="≥1 observation item(s) from ≥1 source(s)",
+        output_schema="EvidenceSet")
+    mirror_reader = FlowWorker(
+        id="wrk-b", name="mirror-reader", objective="read the mirror of the advisory",
+        work_unit="edge gateway advisory", tools=["advisory.fetch"],
+        completion_criteria=["at least 1 source retrieved"],
+        expected_evidence="≥1 observation item(s) from ≥1 source(s)",
+        output_schema="EvidenceSet")
+    forum = FlowWorker(
+        id="wrk-c", name="forum-scout", objective="read the operator forum thread",
+        work_unit="edge gateway advisory", tools=["forum.fetch"],
+        completion_criteria=["at least 1 source retrieved"],
+        expected_evidence="≥1 observation item(s) from ≥1 source(s)",
+        output_schema="EvidenceSet")
+    pair: list[ReviewedWorkerResult] = []
+    for unit, statements in ((reader, [merged_claim]), (mirror_reader, [merged_claim]),
+                             (forum, [clash])):
+        items = [item for item in evidence
+                 if item.collected_by == unit.id and item.statement in statements]
+        report = WorkerReport(
+            worker_id=unit.id, subagent_id="sa-demo", status=WorkerStatus.COMPLETED,
+            summary=(f"{unit.name}: read {len(items)} source(s); at least 1 source "
+                     f"retrieved; advisory component named"), evidence=list(items),
+            sources=[source for item in items for source in item.sources],
+            findings=[WorkerFinding(statement=item.statement, evidence_ids=[item.id],
+                                    confidence=Confidence.LOW,
+                                    confidence_basis="one retrieval on record")
+                      for item in items],
+            attempt=1)
+        reviewed_pair = ReviewedWorkerResult(
+            worker_id=unit.id, subagent_id="sa-demo",
+            outcome=outcome_from_report(report), report=report,
+            review=review_outcome(outcome_from_report(report), worker=unit,
+                                  subagent_id="sa-demo").review)
+        pair.append(reviewed_pair)
+    team = FlowSubagent(
+        id="sa-demo", role="advisory", objective="read the advisories and say what they mean",
+        workers=[reader, mirror_reader, forum],
+        completion_criteria=["at least 2 sources retrieved"],
+        addresses_questions=["the published advisories name the affected component"])
+    reconciled = aggregate_subagent(team, outcomes=[item.outcome for item in pair],
+                                    judged=pair,
+                                    settled=[item.worker_id for item in pair])
+
+    # ---- the case that must stop -------------------------------------------
+    blocked = pair[1].model_copy(update={
+        "review": pair[1].review.model_copy(update={
+            "decision": ReviewDecision.BLOCKED, "passed": False, "blocking": True,
+            "stop_reason": "the mirror refused every request"})})
+    stopped = aggregate_subagent(
+        FlowSubagent(id="sa-demo2", role="advisory", objective="read the advisories",
+                     workers=[reader, mirror_reader],
+                     completion_criteria=["at least 2 sources retrieved"],
+                     addresses_questions=["the published advisories name the affected "
+                                          "component"]),
+        outcomes=[pair[0].outcome, blocked.outcome], judged=[pair[0], blocked],
+        settled=[pair[0].worker_id, blocked.worker_id])
+    readiness = assess_readiness(
+        FlowSubagent(id="sa-demo2", role="advisory", objective="read the advisories",
+                     workers=[reader, mirror_reader],
+                     completion_criteria=["at least 2 sources retrieved"]),
+        checks=stopped.checks, gaps=stopped.gaps, settled=[item.worker_id for item in pair],
+        required=[reader.id, mirror_reader.id], runtime_spawned=0, runtime_limit=0,
+        refusals=["the runtime Worker budget of 0 is spent"], failed=stopped.failed)
+    return ({"clean": {"outcome": clean, "readiness": None},
+             "reconciled": {"outcome": reconciled, "readiness": None},
+             "stopped": {"outcome": stopped, "readiness": readiness}}, pair)
+
+
+def aggregate_demo_cases() -> dict[str, dict[str, Any]]:
+    """The three cases, without the helper's second return value."""
+
+    cases, _pair = _build_demo_cases()
+    return cases
+
+
+def aggregate_demo() -> dict[str, Any]:
+    """The demo payload: three aggregates and the acceptance signals over them."""
+
+    cases = aggregate_demo_cases()
+    reconciled = cases["reconciled"]["outcome"]
+    clean = cases["clean"]["outcome"]
+    stopped = cases["stopped"]["outcome"]
+    signals = {
+        "the aggregate waited for a terminal outcome": clean.barrier.satisfied,
+        "a duplicate claim was merged": bool(reconciled.reconciliation.groups),
+        "the corroborating copy was kept": any(
+            group.merged for group in reconciled.reconciliation.groups),
+        "two contradictory claims were preserved": bool(reconciled.disagreements),
+        "the disagreement was not auto-resolved": not any(
+            item.resolved for item in reconciled.disagreements),
+        "a withheld result is listed as a failed subtask": bool(stopped.failed),
+        "the criteria were judged against the evidence": bool(reconciled.checks),
+        "the stopped aggregate says why it cannot expand": bool(
+            cases["stopped"]["readiness"] is not None
+            and cases["stopped"]["readiness"].expansion_refusals),
+    }
+    return {"cases": {name: {"outcome": case["outcome"].summary(),
+                             "readiness": (case["readiness"].summary()
+                                           if case["readiness"] else None)}
+                      for name, case in cases.items()},
+            "evidence": [{"worker": item.collected_by, "statement": item.statement}
+                         for item in reconciled.evidence],
+            "reconciliation": reconciled.reconciliation.to_dict(),
+            "reconciliation_line": reconciled.reconciliation.explain(),
+            "disagreements": [item.to_dict() for item in reconciled.disagreements],
+            "failed": [item.describe for item in stopped.failed],
+            "checks": [item.describe for item in reconciled.checks],
+            "signals": signals,
+            "acceptance": {"all_signals": all(signals.values()),
+                           "signals": signals}}
+
+
+def render_aggregate_demo(payload: Mapping[str, Any]) -> Group:
+    """The demo: one merged claim, one preserved disagreement, one bounded stop."""
+
+    signals = Table(title="is the aggregate honest about its own team?", title_justify="left",
+                    box=None, pad_edge=False, expand=False)
+    signals.add_column("", width=2)
+    signals.add_column("signal", overflow="fold", max_width=64)
+    for name, ok in payload["acceptance"]["signals"].items():
+        glyph, colour = ("✔", "green") if ok else ("✘", "red")
+        signals.add_row(f"[{colour}]{glyph}[/{colour}]", escape(name.replace("_", " ")))
+
+    merged = Table(title=f"the same claim, twice — {payload['reconciliation_line']}",
+                   title_justify="left", box=None, pad_edge=False, expand=False)
+    merged.add_column("worker", no_wrap=True)
+    merged.add_column("statement", overflow="fold", max_width=72)
+    for item in payload["evidence"]:
+        merged.add_row(escape(item["worker"] or "—"), escape(item["statement"][:150]))
+
+    disagreements = Table(title="preserved, not decided", title_justify="left", box=None,
+                          pad_edge=False, expand=False)
+    disagreements.add_column("the two claims", overflow="fold", max_width=44)
+    disagreements.add_column("what would settle it", overflow="fold", max_width=40)
+    seen_resolution: set[str] = set()
+    for item in payload["disagreements"]:
+        sides = " vs ".join(side["worker_id"] for side in item["sides"])
+        shown = ("" if item["resolution"] in seen_resolution
+                 else item["resolution"][:160])
+        seen_resolution.add(item["resolution"])
+        disagreements.add_row(escape(f"{sides}: {item['sides'][0]['statement'][:60]}"),
+                              escape(shown))
+
+    failures = Table(title="failed subtasks stay visible", title_justify="left", box=None,
+                     pad_edge=False, expand=False)
+    failures.add_column("subtask", overflow="fold", max_width=86)
+    for item in payload["failed"]:
+        failures.add_row(escape(item[:200]))
+
+    tail = Text("a bounded partial report names what it could not get, and why it stopped "
+                "asking", style="dim")
+    rows: list[Any] = [signals, Text(""), merged, Text(""), disagreements]
+    if payload["failed"]:
+        rows += [Text(""), failures]
+    rows += [Text(""), tail]
+    return Group(*rows)
+
+
+@app.command("aggregate",
+             help="Subagent aggregation: reviewed work only, and only when it is ready.")
+def aggregate_command(
+    self_test: bool = typer.Option(False, "--self-test",
+                                   help="Prove the aggregation contract offline."),
+    demo: bool = typer.Option(False, "--demo",
+                              help="One merge, one disagreement, one bounded stop."),
+    next_report: str | None = typer.Option(
+        None, "--next",
+        help="Aggregate a Subagent's reviewed reports from JSON ('-' for stdin)."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+    runtime_workers: int | None = typer.Option(
+        None, "--runtime-workers",
+        help="Override the per-Subagent runtime Worker budget for this aggregation."),
+) -> None:
+    """Aggregate reviewed Worker reports, or explain why the aggregate cannot start."""
+
+    console = get_console()
+
+    if self_test:
+        checks = run_aggregate_self_test()
+        failures = [check for check in checks if not check.ok]
+        if as_json:
+            _emit(json.dumps({"checks": [check.to_dict() for check in checks],
+                              "passed": len(checks) - len(failures),
+                              "failed": len(failures)}, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        table = Table(box=None, pad_edge=False)
+        table.add_column("check", no_wrap=True)
+        table.add_column("detail", overflow="fold")
+        for check in checks:
+            glyph, colour = ("✔", "green") if check.ok else ("✘", "red")
+            table.add_row(f"[{colour}]{glyph}[/{colour}]", escape(check.name),
+                          escape(check.detail))
+        console.print(table)
+        colour = "green" if not failures else "red"
+        console.print(f"\n[{colour}]{len(checks) - len(failures)} passed[/] · "
+                      f"{len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    if demo:
+        payload = aggregate_demo()
+        if as_json:
+            _emit(json.dumps(payload, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(render_aggregate_demo(payload))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    if next_report:
+        try:
+            raw = (sys.stdin.read() if next_report == "-"
+                   else Path(next_report).expanduser().read_text(encoding="utf-8"))
+            payload = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            console.print(f"[red]✘[/red] not a Subagent report set: "
+                          f"{escape(_first_sentence(str(exc))[:200])}")
+            raise typer.Exit(ExitCode.USAGE) from exc
+        try:
+            subagent = FlowSubagent.model_validate(payload["subagent"])
+            judged = [ReviewedWorkerResult.model_validate(item)
+                      for item in payload["results"]]
+            settled = [str(item) for item in payload.get("settled") or
+                       [result.worker_id for result in judged]]
+            spawned = [RuntimeSpawnRecord.model_validate(item)
+                       for item in payload.get("spawned") or []]
+            gaps = [UnknownValue.model_validate(item) for item in payload.get("gaps") or []]
+        except (KeyError, ValueError) as exc:
+            console.print(f"[red]✘[/red] not a Subagent report set: "
+                          f"{escape(_first_sentence(str(exc))[:200])}")
+            raise typer.Exit(ExitCode.USAGE) from exc
+        budget = (FlowPolicy().max_runtime_workers_per_subagent
+                  if runtime_workers is None else runtime_workers)
+        policy = FlowPolicy(max_runtime_workers_per_subagent=budget)
+        try:
+            outcome = aggregate_subagent(
+                subagent, outcomes=[result.outcome for result in judged], judged=judged,
+                settled=settled, gaps=gaps,
+                required=[worker.id for worker in subagent.workers]
+                + [record.worker_id for record in spawned])
+        except PrematureAggregate as exc:
+            # The acceptance clause itself: an aggregate that would have started early is
+            # refused, with the units it was waiting for named.
+            if as_json:
+                _emit(json.dumps({"refused": str(exc), "outstanding": exc.barrier.missing,
+                                  "decision": "wait"}, indent=2, default=str))
+                raise typer.Exit(ExitCode.POLICY) from exc
+            console.print()
+            console.print(f"[red]✘[/red] this aggregate is not ready: "
+                          f"{escape(exc.barrier.describe())}")
+            console.print(Text("nothing was summarised; a Subagent that aggregates before "
+                               "its Workers are terminal is reporting on its own "
+                               "impatience", style="dim"))
+            raise typer.Exit(ExitCode.POLICY) from exc
+        refusals = expansion_refusals(
+            subagent, policy=policy, runtime_spawned=len(spawned),
+            licence_remaining=policy.max_runtime_workers_per_subagent - len(spawned))
+        readiness = assess_readiness(
+            subagent, checks=outcome.checks, gaps=outcome.gaps, settled=settled,
+            required=[worker.id for worker in subagent.workers], runtime_spawned=len(spawned),
+            runtime_limit=budget, refusals=refusals, failed=outcome.failed)
+        plan = None
+        if readiness.decision == "expand":
+            try:
+                plan = plan_runtime_worker(subagent, readiness=readiness)
+            except ValueError:
+                plan = None
+        if as_json:
+            _emit(json.dumps({
+                "aggregate": outcome.summary(),
+                "reconciliation": outcome.reconciliation.to_dict(),
+                "disagreements": [item.to_dict() for item in outcome.disagreements],
+                "failed": [item.describe for item in outcome.failed],
+                "criteria": [item.describe for item in outcome.checks],
+                "readiness": readiness.to_dict(),
+                "next_worker": plan.to_dict() if plan else None,
+                "decision": readiness.decision,
+            }, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK if readiness.ready else ExitCode.POLICY)
+        console.print()
+        console.print(render_aggregate(outcome, readiness))
+        if plan is not None:
+            console.print()
+            console.print(Text("one more Worker, through the same gates: "
+                               f"{plan.objective}", style="dim"))
+        console.print()
+        raise typer.Exit(ExitCode.OK if readiness.ready else ExitCode.POLICY)
+
+    console.print("[red]✘[/red] choose --demo, --self-test or --next FILE")
+    raise typer.Exit(ExitCode.USAGE)
+
+
+class AggregateCheck(StrictModel):
+    """One assertion in the §36 self-test."""
+
+    name: str = Field(min_length=1)
+    ok: bool
+    detail: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "ok": self.ok, "detail": self.detail}
+
+
+def _demo_team() -> "FlowSubagent":
+    """One Worker, so a report can be built for a Subagent the demo already described."""
+
+    return FlowSubagent(
+        id="sa-demo2", role="advisory", objective="read the advisories",
+        workers=[FlowWorker(id="wrk-demo", name="demo", objective="read the advisory",
+                            tools=["advisory.fetch"],
+                            completion_criteria=["at least 1 source retrieved"])])
+
+
+def run_aggregate_self_test() -> list[AggregateCheck]:
+    """Prove the acceptance clause: no early aggregate, bounded extra Workers, visible gaps."""
+
+    checks: list[AggregateCheck] = []
+
+    def add(name: str, ok: bool, detail: Any = "") -> None:
+        checks.append(AggregateCheck(name=name, ok=bool(ok), detail=str(detail)[:150]))
+
+    def raises(fn: Callable[[], Any], exc: type[BaseException]) -> bool:
+        try:
+            fn()
+        except exc:
+            return True
+        except Exception:                     # noqa: BLE001 - a wrong error is a failure
+            return False
+        return False
+
+    cases = aggregate_demo_cases()
+    clean, reconciled = cases["clean"]["outcome"], cases["reconciled"]["outcome"]
+    stopped, stop_ready = cases["stopped"]["outcome"], cases["stopped"]["readiness"]
+
+    # ---- 1. aggregation never begins early -----------------------------
+    add("a complete join aggregates", clean.barrier.satisfied,
+        clean.barrier.describe())
+    add("the barrier names what it waited for", clean.barrier.expected == ["wrk-clean"],
+        clean.barrier.expected)
+
+    def aggregate_early() -> None:
+        aggregate_subagent(
+            FlowSubagent(id="sa-early", role="r", objective="o", workers=[
+                FlowWorker(id="wrk-1", name="a", objective="o", completion_criteria=["c"]),
+                FlowWorker(id="wrk-2", name="b", objective="o", completion_criteria=["c"])]),
+            outcomes=[_demo_pair()[0].outcome], judged=[_demo_pair()[0]],
+            settled=[_demo_pair()[0].worker_id])
+
+    add("aggregating with a Worker still running raises", raises(aggregate_early,
+                                                                 PrematureAggregate))
+    add("the refusal is an EarlyAggregate, not a generic one",
+        raises(aggregate_early, EarlyAggregate))
+
+    def early_names_the_outstanding() -> None:
+        try:
+            aggregate_early()
+        except EarlyAggregate as exc:
+            # Both Workers are outstanding: neither has a terminal outcome yet, and the
+            # refusal has to name them rather than describe a count.
+            assert set(exc.outstanding) == {"wrk-1", "wrk-2"}, exc.outstanding
+            raise
+
+    add("the refusal names the outstanding Worker", raises(early_names_the_outstanding,
+                                                           EarlyAggregate))
+    # A terminal outcome from one Worker and nothing from the other: the branch that
+    # reported *settled* without a terminal state is still outstanding.
+    add("a branch that settled without a terminal outcome is not ready",
+        outstanding_workers(
+            ["a", "b"], ["a", "b"],
+            [WorkerOutcome(worker_id="a", subagent_id="s",
+                           status=EntityStatus.SUCCEEDED, attempt=1)]) == ["b"],
+        outstanding_workers(
+            ["a", "b"], ["a", "b"],
+            [WorkerOutcome(worker_id="a", subagent_id="s",
+                           status=EntityStatus.SUCCEEDED, attempt=1)]))
+    add("every terminal state satisfies the join",
+        all(not outstanding_workers(["a"], ["a"], [
+            WorkerOutcome(worker_id="a", subagent_id="s", status=state, attempt=1)])
+            for state in terminal_states()),
+        [state.name for state in terminal_states()])
+    add("an unreviewed result cannot be aggregated",
+        raises(lambda: require_review(
+            _demo_pair()[0].outcome, stage="test"), UnreviewedResult))
+    add("a reviewed result may be aggregated",
+        require_review(_demo_pair()[0], stage="test") is not None)
+
+    # ---- 2. duplicates are reconciled, corroboration is kept ------------
+    add("the same claim from two Workers becomes one row",
+        len(reconciled.reconciliation.groups) >= 1,
+        reconciled.reconciliation.explain())
+    add("the merged copy is kept as corroboration",
+        any(group.merged for group in reconciled.reconciliation.groups),
+        [_plain(group) for group in reconciled.reconciliation.groups])
+    add("the canonical row cites the corroborating item",
+        any(row.supporting_ids for row in reconciled.reconciliation.rows),
+        [row.supporting_ids for row in reconciled.reconciliation.rows])
+    # Two Workers made the same claim, so those two rows become one; the third is a
+    # different claim and stays.  Nothing else is discarded (§36.2).
+    add("reconciliation merges the duplicate rows and keeps the rest",
+        len(reconciled.evidence) == 2, len(reconciled.evidence))
+    add("a claim made once is not merged", all(
+        not group.merged for group in clean.reconciliation.groups))
+    add("the reconciliation can explain itself", bool(reconciled.reconciliation.explain()))
+
+    # ---- 3. disagreements are preserved, never resolved ----------------
+    add("two contradictory claims are a disagreement", bool(reconciled.disagreements),
+        [item.describe for item in reconciled.disagreements])
+    add("the disagreement names both sides",
+        all(len(item.sides) >= 2 for item in reconciled.disagreements))
+    add("a disagreement carries a resolution note, not a verdict",
+        all(item.resolution and not item.resolved for item in reconciled.disagreements),
+        [item.resolution[:60] for item in reconciled.disagreements])
+    add("a negation counts as a contradiction",
+        _contradicts("the gateway is affected", "the gateway is not affected"))
+    add("another value of the same property is a contradiction",
+        _contradicts("the attack began at 04:00", "the attack began at 05:30"))
+    add("an agreeing restatement is not a contradiction",
+        not _contradicts("the gateway is affected", "the gateway was affected"))
+    add("a disagreement with no evidence on either side is refused",
+        raises(lambda: Disagreement(
+            statement="x", kind="value", sides=[
+                DisagreementSide(worker_id="a", statement="one", evidence_ids=[]),
+                DisagreementSide(worker_id="b", statement="two", evidence_ids=[])],
+            resolution="the two Workers were asked again with the same brief"),
+            ValueError))
+    add("an agreement is not reported as a disagreement",
+        not find_disagreements([
+            ("a", "the gateway is affected", "low", ["ev-1"]),
+            ("b", "the gateway is affected", "low", ["ev-2"])]))
+    add("the reconciled rows are the ones that were kept",
+        len(reconciled.reconciliation.rows) == len(reconciled.evidence),
+        f"{len(reconciled.reconciliation.rows)} row(s), "
+        f"{len(reconciled.evidence)} item(s)")
+
+    # ---- 4. failed subtasks stay visible -------------------------------
+    add("the withheld result is a failed subtask", bool(stopped.failed),
+        [item.describe for item in stopped.failed])
+    add("the failed subtask names its unit",
+        stopped.failed and stopped.failed[0].worker_id == "wrk-b",
+        [item.worker_id for item in stopped.failed])
+    add("the failed subtask says what the mission loses",
+        stopped.failed and len(stopped.failed[0].consequence) >= 8,
+        stopped.failed[0].consequence if stopped.failed else "")
+    add("the failed subtask records its attempt count",
+        stopped.failed and stopped.failed[0].attempts >= 1)
+    add("a forwarded result is not a failed subtask",
+        not any(item.worker_id == "wrk-a" for item in stopped.failed))
+    add("a failed subtask becomes a gap on the report",
+        any("mirror-reader" in gap.detail or "wrk-b" in gap.detail
+            for gap in bounded_partial_report(
+                stopped, stop_ready,
+                subagent=_demo_team()).gaps))
+
+    # ---- 5. its own criteria are assessed, not asserted ----------------
+    add("criteria are judged", bool(reconciled.checks), len(reconciled.checks))
+    add("a met criterion cites the evidence that met it",
+        all(check.evidence_ids for check in reconciled.checks if check.met),
+        [check.evidence_ids for check in reconciled.checks])
+    add("an unmet criterion states its shortfall",
+        all(check.shortfall for check in reconciled.checks if not check.met),
+        [check.shortfall for check in reconciled.checks if not check.met])
+    checks_volume = assess_criteria(["at least 3 sources retrieved"], evidence=[
+        _aggregate_evidence("one", tag="a", worker="w", url="https://a.test"),
+        _aggregate_evidence("two", tag="b", worker="w", url="https://b.test")], reports=[])
+    add("a volume criterion is counted, not assumed",
+        checks_volume and not checks_volume[0].met and "2 item(s)" in checks_volume[0].shortfall,
+        checks_volume[0].shortfall if checks_volume else "")
+    checks_uncheckable = assess_criteria(["the report is convincing"], evidence=[
+        _aggregate_evidence("one", tag="a", worker="w", url="https://a.test")], reports=[])
+    add("an uncheckable criterion is not silently marked met",
+        checks_uncheckable and not checks_uncheckable[0].met
+        and "no mechanical test" in checks_uncheckable[0].shortfall,
+        checks_uncheckable[0].shortfall if checks_uncheckable else "")
+    add("an uncheckable criterion is not made critical",
+        checks_uncheckable and not checks_uncheckable[0].critical)
+    checks_hash = assess_criteria(["every item carries an integrity hash"], evidence=[
+        _aggregate_evidence("one", tag="a", worker="w", url="https://a.test")], reports=[])
+    add("a custody criterion is judged against the custody records",
+        checks_hash and not checks_hash[0].met
+        and "no recorded hash" in checks_hash[0].shortfall,
+        checks_hash[0].shortfall if checks_hash else "")
+    add("the aggregate declares no criteria rather than inventing them",
+        not clean.checks, [check.describe for check in clean.checks])
+
+    # ---- 6. the readiness decision, and every reason behind it ---------
+    add("a clean aggregate is ready", clean.barrier.satisfied)
+    add("a stopped aggregate is bounded, not ready", stop_ready.decision == "partial",
+        stop_ready.summary())
+    add("a bounded aggregate lists its critical gaps", bool(stop_ready.critical_gaps),
+        stop_ready.critical_gaps)
+    add("a bounded aggregate says why it cannot expand",
+        bool(stop_ready.expansion_refusals), stop_ready.expansion_refusals)
+    add("every refusal is reported, not just the first",
+        len(expansion_refusals(
+            _demo_team(),
+            policy=FlowPolicy(allow_runtime_workers=False,
+                              max_runtime_workers_per_subagent=0),
+            runtime_spawned=1, licence_remaining=0)) >= 3,
+        expansion_refusals(_demo_team(),
+                           policy=FlowPolicy(allow_runtime_workers=False,
+                                             max_runtime_workers_per_subagent=0),
+                           runtime_spawned=1, licence_remaining=0))
+    add("a cancelled mission may not expand",
+        any("cancelled" in reason for reason in expansion_refusals(
+            _demo_team(), policy=FlowPolicy(),
+            runtime_spawned=0, licence_remaining=8, cancelled=True)))
+    add("an expired deadline stops expansion",
+        any("deadline" in reason for reason in expansion_refusals(
+            _demo_team(), policy=FlowPolicy(),
+            runtime_spawned=0, licence_remaining=8, deadline_expired=True)))
+    add("a spent per-Subagent budget stops expansion",
+        any("budget" in reason for reason in expansion_refusals(
+            _demo_team(), policy=FlowPolicy(),
+            runtime_spawned=2, licence_remaining=8)))
+    add("an exhausted licence stops expansion",
+        any("licence" in reason for reason in expansion_refusals(
+            _demo_team(), policy=FlowPolicy(),
+            runtime_spawned=0, licence_remaining=0)))
+    add("the readiness summary is never empty", all(
+        readiness.summary() for readiness in (stop_ready,)))
+    add("a missing Worker is named as outstanding",
+        assess_readiness(_demo_team(),
+                         checks=[], gaps=[], settled=["a"], required=["a", "b"],
+                         runtime_spawned=0, runtime_limit=2).missing == ["b"])
+
+    # ---- 7. one more Worker, narrow and bounded ------------------------
+    team = FlowSubagent(
+        id="sa-plan", role="advisory", objective="read the advisories",
+        workers=[FlowWorker(id="wrk-1", name="a", objective="read", tools=["advisory.fetch"],
+                            completion_criteria=["at least 1 source retrieved"],
+                            expected_evidence="≥1 observation item(s) from ≥1 source(s)")],
+        completion_criteria=["at least 4 sources retrieved"],
+        addresses_questions=["the published advisories name the affected component"])
+    expand_ready = assess_readiness(team, checks=assess_criteria(
+        team.completion_criteria, evidence=[], reports=[], questions=team.addresses_questions),
+        gaps=[], settled=["wrk-1"], required=["wrk-1"], runtime_spawned=0, runtime_limit=2)
+    add("an unmet criterion with budget is expandable", expand_ready.decision == "expand",
+        expand_ready.summary())
+    plan = plan_runtime_worker(team, readiness=expand_ready)
+    add("the plan names the gap it closes", bool(plan.gap), plan.gap)
+    add("the plan closes one gap, not all of them", len(plan.completion_criteria) == 1,
+        plan.completion_criteria)
+    add("the plan inherits the narrowest tool set it has",
+        plan.tools == ["advisory.fetch"], plan.tools)
+    add("the plan refuses to re-plan the whole assignment",
+        raises(lambda: RuntimePlan(
+            subagent_id="sa-plan", gap="close the whole mission", name="gap",
+            objective="research everything about the target", work_unit="all",
+            tools=["web.fetch"], expected_evidence="≥1 observation item(s) from ≥1 source",
+            completion_criteria=["all of it"], rationale="the Subagent wants another go"),
+            ValueError))
+    add("a Subagent with no gap needs no Worker",
+        raises(lambda: plan_runtime_worker(FlowSubagent(
+            id="s", role="r", objective="o"), readiness=Readiness(
+                subagent_id="s", ready=True, decision="ready")), ValueError))
+    runtime_worker = runtime_worker_from_plan(plan, index=2, subagent=team)
+    add("the runtime Worker is a Worker like any other",
+        runtime_worker.output_schema and runtime_worker.completion_criteria,
+        runtime_worker.name)
+    add("the runtime Worker has its own id", runtime_worker.id not in
+        {worker.id for worker in team.workers})
+    add("the runtime Worker is bounded by the same attempts",
+        runtime_worker.max_attempts <= 10)
+    add("a license seat is spent, not borrowed",
+        RuntimeSpawnRecord(subagent_id="sa-plan", worker_id=runtime_worker.id,
+                           plan=plan, round=2, licence_remaining=6).licence_remaining == 6)
+
+    # ---- 8. the flow really runs a runtime Worker ----------------------
+    context = _selftest_context("exposure")
+    units = flow_units_for(context, "exposure")
+    flow = HierarchicalFlow(context=context, subagents=units,
+                            runner=_CountingRunner(scope=context.scope_entries),
+                            policy=FlowPolicy(max_review_rounds=2))
+    result = flow.run()
+    add("the mission completes with runtime Workers enabled",
+        result.synthesis is not None and not result.stopped, result.stop_reason)
+    aggregate_events = [event for event in result.trace
+                        if event["stage"] == FlowStage.SUBAGENT_AGGREGATE.value]
+    add("an aggregate can run more than once", len(aggregate_events) > len(units),
+        f"{len(aggregate_events)} aggregate(s) for {len(units)} subagent(s)")
+    runtime_rows = [row for report in result.reports for row in report.runtime_workers]
+    add("a runtime Worker is recorded on the report", bool(runtime_rows),
+        [row.describe for row in runtime_rows])
+    add("the runtime Worker went through review",
+        all(row.review_decision for row in runtime_rows),
+        [row.review_decision for row in runtime_rows])
+    add("the runtime Worker answered the gap it was planned for",
+        all(row.answered for row in runtime_rows), [row.answered for row in runtime_rows])
+    add("every report says whether it is ready", all(
+        report.readiness is not None for report in result.reports))
+    add("every report carries its reconciliation", all(
+        report.reconciliation is not None for report in result.reports))
+    add("a ready report met its criteria", all(
+        report.readiness.ready for report in result.reports))
+
+    bounded = HierarchicalFlow(
+        context=context, subagents=flow_units_for(context, "exposure"),
+        runner=_CountingRunner(scope=context.scope_entries),
+        policy=FlowPolicy(max_review_rounds=2, allow_runtime_workers=False)).run()
+    add("with expansion off no runtime Worker is created",
+        not any(report.runtime_workers for report in bounded.reports),
+        [len(report.runtime_workers) for report in bounded.reports])
+    add("with expansion off the mission still reports",
+        bool(bounded.reports) and bounded.synthesis is not None)
+    add("the aggregate still waits for every Worker with expansion off",
+        all(report.aggregate_basis and report.aggregate_basis.satisfied
+            for report in bounded.reports))
+
+    ceiling = HierarchicalFlow(
+        context=context, subagents=flow_units_for(context, "exposure"),
+        runner=_CountingRunner(scope=context.scope_entries),
+        policy=FlowPolicy(max_review_rounds=2,
+                          max_runtime_workers_per_subagent=1)).run()
+    add("the per-Subagent ceiling binds", all(
+        len([row for row in report.runtime_workers if row.spawned]) <= 1
+        for report in ceiling.reports),
+        [len(report.runtime_workers) for report in ceiling.reports])
+    add("a mission at its ceiling still returns a report",
+        bool(ceiling.reports) and ceiling.synthesis is not None)
+
+    # ---- 9. the bounded partial report -------------------------------
+    partial = bounded_partial_report(stopped, stop_ready, subagent=_demo_team())
+    add("a bounded report is blocked rather than failed when anything survived",
+        partial.status in {EntityStatus.BLOCKED, EntityStatus.FAILED},
+        partial.status)
+    add("a bounded report carries its gaps", bool(partial.gaps))
+    add("a bounded report carries the failed subtasks", bool(partial.failed))
+    add("a bounded report carries the criteria it missed",
+        bool(partial.criteria_checks) or not stopped.checks)
+    add("a bounded report keeps the readiness record", partial.readiness is not None)
+    add("a bounded report with no evidence at all is a failure",
+        bounded_partial_report(
+            stopped.model_copy(update={"evidence": [], "forwarded": []}), stop_ready,
+            subagent=_demo_team()).status is EntityStatus.FAILED)
+    complete = complete_report(clean, Readiness(subagent_id="sa-demo", ready=True,
+                                                decision="ready"),
+                               subagent=_demo_team())
+    add("a complete report succeeds", complete.succeeded, complete.status)
+    add("a complete report keeps the reconciliation", complete.reconciliation is not None)
+
+    # ---- 10. the record survives serialisation ------------------------
+    payload = reconciled.to_dict()
+    add("the aggregate serialises", payload["barrier"]["satisfied"])
+    add("the serialised aggregate keeps its disagreements",
+        len(payload["disagreements"]) == len(reconciled.disagreements))
+    add("the serialised aggregate keeps its failed subtasks",
+        len(payload["failed"]) == len(reconciled.failed))
+    add("the readiness record serialises",
+        stop_ready.to_dict()["decision"] == "partial")
+    add("the plan serialises", plan.to_dict()["gap"] == plan.gap)
+    demo = aggregate_demo()
+    add("the demo payload is serialisable",
+        json.loads(json.dumps(demo, default=str))["acceptance"]["all_signals"])
+    add("the demo shows every signal passing",
+        all(demo["acceptance"]["signals"].values()),
+        [name for name, ok in demo["acceptance"]["signals"].items() if not ok])
+    return checks
+
+
 # ══════════════════════════════════════════════════════════════════════════
-# 36. Entry point
+# 37. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 
