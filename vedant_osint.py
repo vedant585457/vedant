@@ -416,6 +416,13 @@ by side).  There is no node named after a specialist role and no roster constant
   round cap, a review budget, the spawn licence, the deadline and saturation —
   and every bound that had a say is on the record, so no mission can loop
   indefinitely and every mission reaches a final or partial report.
+* **A cycle is detected, not merely bounded.**  A retry that repeats a retrieval, a
+  plan or an instruction with nothing new to show for it is caught from the record:
+  the first detection makes the retask carry a change of strategy, a second blocks
+  the line of inquiry (what would unblock it travels into the report as a gap), and
+  a mission whose rounds stop adding claims stops with the series it judged.  No
+  instruction this build accepts is unbounded: "continue until…" is refused at the
+  door, because a loop detector cannot save an instruction with no end condition.
 
 ::
 
@@ -915,6 +922,8 @@ round.
     python vedant_osint.py review-master --self-test     # 70 bounded-loop checks
     python vedant_osint.py review-master --demo          # five lenses, four endings
     python vedant_osint.py review-master --next mission.json --objective "..."
+    python vedant_osint.py loops --self-test             # 52 loop-detection checks
+    python vedant_osint.py loops --demo                  # correct, block, stop
 
 Structured model adapter
 ------------------------
@@ -1122,7 +1131,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 27
+VERSION_MINOR: int = 28
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -22015,6 +22024,12 @@ class FlowWorker(StrictModel):
     output_schema: str = "TaskResult"
     max_attempts: int = Field(default=2, ge=1, le=10)
     timeout_seconds: int = Field(default=300, ge=5, le=3600)
+    #: §38: the strategy change this unit has already been told to make.  Carried on the
+    #: graph's record of the Worker rather than in a node-local cache, because a retried
+    #: branch is a *new node run*: anything the review node remembered in a closure would
+    #: be gone by the time the retry had to obey it, and the correction would be issued
+    #: and then silently dropped.
+    strategy_change: str = ""
 
     @classmethod
     def from_birth(cls, birth: "WorkerBirth") -> "FlowWorker":
@@ -22520,6 +22535,26 @@ class FlowResult(StrictModel):
     master_decisions: list["MasterDecision"] = Field(default_factory=list)
     #: The follow-up work the mission opened, and what became of it.
     follow_ups: list["FollowUpAssignment"] = Field(default_factory=list)
+    #: §38: what the loop detectors saw — every correction required, every line of
+    #: inquiry blocked, and the mission's own saturation with the stop it justified.  The
+    #: reason a mission stopped is here, not only in the trace, because the trace is
+    #: diagnostics and the reason is a finding.
+    loops: "LoopLedger | None" = None
+
+    @property
+    def loop_summary(self) -> dict[str, Any]:
+        """What repetition this run detected — empty when it detected none (§38)."""
+
+        if self.loops is None:
+            return {}
+        summary = self.loops.summary()
+        summary["blocked_lines"] = [line.subject for line in self.loops.blocked]
+        summary["stop"] = (self.decision.condition.value if self.decision
+                           and self.decision.condition is not StopCondition.NONE else "")
+        summary["stop_reason"] = (self.decision.basis if self.decision
+                                  and self.decision.condition is not StopCondition.NONE
+                                  else "")
+        return summary
 
     @property
     def review_summary(self) -> dict[str, Any]:
@@ -22635,6 +22670,8 @@ class FlowResult(StrictModel):
             "master_reviews": [review.to_dict() for review in self.master_reviews],
             "master_decisions": [item.to_dict() for item in self.master_decisions],
             "follow_ups": [item.to_dict() for item in self.follow_ups],
+            "loops": self.loops.to_dict() if self.loops is not None else None,
+            "loop_summary": self.loop_summary,
             "mission_review": self.review_summary_of_mission,
             "stop_condition": self.stop_condition.value,
             "seconds": round(self.seconds, 3),
@@ -22940,6 +22977,18 @@ class HierarchicalFlow:
         #: every one it created — the report carries these, and the cap counts them.
         self._runtime_spawned: dict[str, int] = {}
         self._runtime_records: dict[str, list[RuntimeSpawnRecord]] = {}
+        #: §38: what the loop detectors have seen, and what they required.  Written by
+        #: the review node *before* the retry edge is chosen, so a correction exists on
+        #: the record before the branch that must obey it runs again.
+        self._loops: LoopLedger = LoopLedger()
+        #: The outcomes behind those signals: the claim key is taken from them, and a
+        #: report is not re-parsed once the detector has counted it.
+        self._loops_outcomes: dict[str, list[WorkerOutcome]] = {}
+        #: §38: attempts made in each follow-up round.  A round that reopens work is
+        #: the other half of the mission-level repetition test: a round that neither
+        #: added claims nor ran an attempt did nothing at all, and calling that
+        #: saturation would be wrong in the mission's favour.
+        self._round_attempts: dict[int, int] = {}
         #: §37: every review the Master made, and the round it was on when it made it.
         #: The reviews are the record; the result's rounds are assembled from them in
         #: :meth:`master_rounds`, so the loop's history cannot be rewritten after it ran.
@@ -22953,6 +23002,14 @@ class HierarchicalFlow:
         #: The normalised claims the previous round saw, for the saturation test.
         #: ``None`` before the first review, which is how the first round is exempt.
         self._last_claims: set[str] | None = None
+        #: §38: the claims now, and the claim sets each round reviewed.  The first is
+        #: what ``assess_saturation`` is asked at the end of the run (a claim set is not
+        #: carried on the ledger because it is only an intermediate of the count), the
+        #: second is what makes a *repeated plan* across rounds detectable: two rounds
+        #: that aimed at the same targets can only be compared if the older aim is kept.
+        self._claims_now: set[str] = set()
+        self._round_claims: list[set[str]] = []
+        self._round_aims: list[dict[str, Any]] = []
         #: Follow-up assignments this mission opened, in the order it opened them.
         self._follow_ups: list[FollowUpAssignment] = []
         #: What each follow-up round created, so the result can name it.
@@ -24220,8 +24277,29 @@ class HierarchicalFlow:
                                 scope=self.context.scope_entries, path="runner")
         self._judge_cache[worker.id] = judged
         self._note_attempt_review(judged)
+        # §38: a retry is not a decision to repeat.  Before the branch is allowed to
+        # run again, the detectors read what this unit has already done — its queries,
+        # its plans, its earlier instructions and the claims each attempt added — and
+        # a cycle escalates: correct the strategy, block the line, or stop.  This runs
+        # *here* rather than on the retry edge because the edge can only choose a node;
+        # it cannot change what the next attempt is told or refuse to run it at all.
+        detection = self._detect_loop(subagent, worker, outcome,
+                                      round_number=round_number)
+        if detection.blocked:
+            verdict = self._blocked_verdict(subagent, worker, verdict, detection)
         retask = self._retask(subagent, worker, outcome, verdict, judged,
-                              round_number=round_number, allowed=allowed)
+                              round_number=round_number, allowed=allowed,
+                              detection=detection)
+        if retask is not None and detection.strategy_change and not detection.blocked:
+            retask = self._corrected_retask(retask, detection, round_number=round_number)
+        if retask is None and detection.strategy_change and not detection.blocked:
+            # The correction was required and no attempt is left to apply it.  Recorded
+            # rather than dropped: the report says the mission was told to change
+            # strategy and had already spent its attempts, which is a different fact from
+            # a mission that never noticed.
+            self._record(FlowStage.REVIEW, unit=worker.id, parent=subagent.id,
+                         detail=("strategy change recorded but not applied: no further "
+                                 "attempt is allowed for this unit"))
         if retask is not None:
             self._retasks.append(retask)
             carried = set(retask.carried_ids)
@@ -24262,7 +24340,8 @@ class HierarchicalFlow:
     def _retask(self, subagent: FlowSubagent, worker: FlowWorker,
                 outcome: WorkerOutcome, verdict: ReviewVerdict,
                 judged: ReviewedWorkerResult, *,
-                round_number: int, allowed: int) -> RetaskedWorker | None:
+                round_number: int, allowed: int,
+                detection: LoopDetection | None = None) -> RetaskedWorker | None:
         """Build the next attempt's assignment, or ``None`` when the branch stops.
 
         Two sources are merged here, and neither overrides the other:
@@ -24279,6 +24358,13 @@ class HierarchicalFlow:
         """
 
         if not verdict.retry or judged.worker_id != worker.id:
+            return None
+        if detection is not None and detection.blocked:
+            # §38: the line is blocked.  A retask now would be the loop, so none is
+            # issued — and the reason is recorded where the retry decision is, not only
+            # on the verdict, so the report can say why the branch stopped.
+            self._record(FlowStage.REVIEW, unit=worker.id, parent=subagent.id,
+                         detail=f"retask withheld: {detection.blocked_reason[:160]}")
             return None
         review = judged.review
         report = judged.report
@@ -24320,6 +24406,151 @@ class HierarchicalFlow:
             self._record(FlowStage.REVIEW, unit=worker.id, parent=subagent.id,
                          detail=f"retask refused: {str(exc)[:120]}")
             return None
+
+    # -- 4b. §38: is this branch repeating itself? ---------------------------
+
+    def _detect_loop(self, subagent: FlowSubagent, worker: FlowWorker,
+                     outcome: WorkerOutcome, *, round_number: int) -> LoopDetection:
+        """Read this unit's history, record the attempt, and say what the cycle requires.
+
+        Order matters: the attempt is recorded *first*, so the detectors judge a history
+        that includes the attempt that just returned.  A detector that read only the
+        previous attempts would always be one round behind, and would let exactly the
+        attempt that proved the loop run again.
+        """
+
+        retask = next((item for item in reversed(self._retasks)
+                       if item.worker_id == worker.id), None)
+        queries = _worker_queries(outcome)
+        plan = plan_fingerprint_of(
+            target=worker.objective, tools=list(worker.tools or ()),
+            work_unit=worker.work_unit or worker.name)
+        recorded = attempt_signal(
+            outcome, prior=self._loop_prior(worker.id),
+            retask=retask.fingerprint if retask else "", plan=plan, queries=queries)
+        self._loops.signals.setdefault(worker.id, []).append(recorded)
+        self._round_attempts[round_number] = self._round_attempts.get(round_number, 0) + 1
+        # Kept beside the signals because the claim key is taken from the outcome, and a
+        # report must not be re-parsed once the detector has reduced it to a count.
+        self._loops_outcomes.setdefault(worker.id, []).append(outcome)
+        # The yield is credited to *this unit*, not to the mission: the query detector's
+        # question is whether repeating a retrieval taught this unit anything, and the
+        # mission's total would answer a different question.
+        for query in queries:
+            self._loops.note_query(query, unit=worker.id, round_number=round_number,
+                                   claims=recorded.new_claims)
+        queries_run = [record for record in self._loops.queries
+                       if record.unit == worker.id]
+
+        detection = detect_unit_cycle(
+            self._loops.signals_for(worker.id), queries=queries_run,
+            retasks=[item for item in self._retasks if item.worker_id == worker.id],
+            unit=worker.id, round_number=round_number,
+            alternative=(f"for {worker.name}: name a retrieval this unit has not run "
+                         f"and a question its earlier attempts left unanswered"))
+        # The escalation is read from the Worker's own record, not from the ledger: a
+        # retried branch is a fresh node run, and the ledger would still hold the
+        # correction an *earlier* branch issued.  ``strategy_change`` on the spec is the
+        # one place both runs agree on.
+        already = [CycleKind.REPEATED_QUERY] if worker.strategy_change else []
+        detection = escalate(detection, already_corrected=already)
+        if detection.blocked:
+            for finding in detection.findings:
+                if finding.blocks or finding.stops:
+                    line = self._loops.block(finding)
+                    self._record(
+                        FlowStage.REVIEW, unit=worker.id, parent=subagent.id,
+                        detail=f"line of inquiry blocked: {line.reason[:150]}")
+        elif detection.strategy_change:
+            # Recorded twice, deliberately: on the ledger for the report, and on the
+            # Worker for the next node run to obey.  A correction that lived only in the
+            # ledger would be reported as having been required and never applied.
+            change = StrategyChange(
+                unit=worker.id, kind=detection.findings[0].kind, attempt=round_number,
+                instruction=detection.strategy_change, required_for=worker.name)
+            self._loops.corrections.append(change)
+            self._remember_strategy(worker, change)
+            self._record(
+                FlowStage.REVIEW, unit=worker.id, parent=subagent.id,
+                detail=f"strategy change required: {detection.strategy_change[:150]}")
+        return detection
+
+    def _remember_strategy(self, worker: FlowWorker, change: "StrategyChange") -> None:
+        """Put the correction where the next node run will find it.
+
+        Three places, because three readers need it and none of them can see the others:
+        the Worker spec (the retry's review node), the Subagent's plan (the same Worker
+        reached through its parent), and — through the returned detection — the retask
+        this node is about to issue.  ``FlowWorker`` is frozen by convention rather than
+        by pydantic, so the update is made by replacement everywhere it is held.
+        """
+
+        updated = worker.model_copy(update={"strategy_change": change.instruction})
+        for parent in self.subagents:
+            if worker.id in {item.id for item in parent.workers}:
+                parent.workers = [updated if item.id == worker.id else item
+                                  for item in parent.workers]
+                self._by_id[parent.id] = parent
+
+    def _loop_prior(self, unit: str) -> list[WorkerOutcome]:
+        """The unit's earlier attempts, as outcomes the claim key can be taken from.
+
+        Called before this attempt's own outcome is appended, so the list is exactly the
+        history the yield is measured against — including the current outcome here would
+        make every attempt add nothing, and every unit look like a loop.
+        """
+
+        return list(self._loops_outcomes.get(unit, []))
+
+    def _blocked_verdict(self, subagent: FlowSubagent, worker: FlowWorker,
+                         verdict: ReviewVerdict, detection: LoopDetection) -> ReviewVerdict:
+        """The verdict a blocked line leaves behind: no retry, and the reason in words.
+
+        Not a silent ``retry=False``: the reader of this record must be able to see that
+        the branch stopped because it had already repeated itself, which is a different
+        fact from a branch that passed or ran out of attempts.
+        """
+
+        line = next((item for item in self._loops.blocked if item.unit == worker.id), None)
+        why = (blocked_note(
+            LoopFinding(kind=line.kind, subject=line.subject, unit=line.unit,
+                        occurrences=line.attempts, evidence_added=line.evidence_added,
+                        detail=line.reason, response=LoopResponse.BLOCK,
+                        unblock=line.unblock))
+               if line is not None else detection.blocked_reason)
+        self._record(FlowStage.REVIEW, unit=worker.id, parent=subagent.id,
+                     detail=f"no retry: {why[:160]}")
+        return verdict.model_copy(update={
+            "retry": False,
+            "guidance": why,
+            "findings": [*verdict.findings, f"line blocked after "
+                                            f"{line.attempts if line else 2} attempt(s)"],
+        })
+
+    def _corrected_retask(self, retask: RetaskedWorker, detection: LoopDetection, *,
+                          round_number: int) -> RetaskedWorker:
+        """The retask with the strategy change folded in — or no retask at all.
+
+        A retask that would repeat the last instruction is refused rather than issued:
+        the branch then settles with the rejection already on the record.  That refusal
+        is the whole point of the section, so it is loud, not silent.
+        """
+
+        try:
+            corrected = halted_retask(retask, detection)
+        except (ValueError, TypeError) as exc:
+            self._record(FlowStage.REVIEW, unit=retask.worker_id,
+                         parent=retask.subagent_id,
+                         detail=f"retask withheld (strategy change refused): {str(exc)[:140]}")
+            return None
+        for change in self._loops.corrections:
+            if change.unit == retask.worker_id and change.instruction == detection.strategy_change:
+                change.applied = True
+        self._record(FlowStage.REVIEW, unit=retask.worker_id,
+                     parent=retask.subagent_id,
+                     detail=(f"retask for attempt {retask.attempt} carries a strategy "
+                             f"change: {detection.strategy_change[:120]}"))
+        return corrected
 
     def _after_worker_review(self, state: Mapping[str, Any]) -> str:
         """Retry the same Worker, or end its branch.
@@ -24694,6 +24925,17 @@ class HierarchicalFlow:
         added = (len(claims - self._last_claims) if self._last_claims is not None
                  else None)
         self._last_claims = claims
+        # §38: the same count, kept for the round-level record, plus what the rounds were
+        # aiming at.  ``added`` is ``None`` on the first review — there was no earlier
+        # round to compare against — and the series therefore starts at the second.
+        self._claims_now = claims
+        self._round_claims.append(claims)
+        self._round_aims.append({
+            "round": rounds_done,
+            "targets": sorted({_claim_key(target) for target in review.open_targets}),
+            "assignments": sorted({plan_fingerprint_of(
+                target=item.objective, tools=list(item.tools)) for item in assignments}),
+        })
         # ``round_number`` is the round being *reviewed*, because ``max_replan_rounds``
         # counts follow-up rounds the mission has already used: the first review is
         # round 1 and it may still open one follow-up, which then reviews as round 2.
@@ -24705,6 +24947,24 @@ class HierarchicalFlow:
         blocked: list[str] = []
         if last_round and not last_round.get("admitted") and last_round.get("refused"):
             blocked = list(last_round.get("refusals") or [])[:3]
+        # §38: repetition is detected at the mission level too.  A follow-up round that
+        # aims at the same targets as one already reviewed has not changed strategy, it
+        # has re-run the last round; and a whole round that ran attempts and added no
+        # claim is the mission standing still.  Both are refusals the decision has to see
+        # — the same channel §37's refused assignments already use — because a bound the
+        # decision cannot see is a bound the loop can walk past.
+        plan_repeat = self._repeated_round_aim(rounds_done)
+        if plan_repeat is not None:
+            self._loops.saturation = self._loops.saturation.model_copy(
+                update={"findings": [*self._loops.saturation.findings, plan_repeat]})
+            blocked = [*blocked, plan_repeat.detail]
+            self._record(FlowStage.MASTER_REVIEW, detail=plan_repeat.describe()[:200])
+        stalled = self._stalled_round(rounds_done, added)
+        if stalled is not None:
+            self._loops.saturation = self._loops.saturation.model_copy(
+                update={"findings": [*self._loops.saturation.findings, stalled]})
+            blocked = [*blocked, stalled.detail]
+            self._record(FlowStage.MASTER_REVIEW, detail=stalled.describe()[:200])
         decision = decide_master(
             review, policy=self.policy, round_number=rounds_done,
             reviews_used=reviews_used, cancelled=False,
@@ -24731,6 +24991,88 @@ class HierarchicalFlow:
                                     for item in decision.assignments]
             update["round"] = rounds_done + 1
         return update
+
+    def _repeated_round_aim(self, round_number: int) -> LoopFinding | None:
+        """A follow-up round that aims where an earlier one already aimed.
+
+        Not the same as §37's saturation test: that one asks whether the round *found*
+        anything new, this one asks whether the round was a different plan at all.  A
+        round that re-aims at the same targets with the same tools is the loop the task
+        names first, and it is detectable before it runs — from the plan, not only from
+        its yield.
+        """
+
+        current = next((aim for aim in self._round_aims
+                        if aim.get("round") == round_number), None)
+        if current is None or round_number < 2:
+            return None
+        earlier = [aim for aim in self._round_aims if aim.get("round", 0) < round_number]
+        for aim in reversed(earlier):
+            shared = set(current.get("targets") or ()) & set(aim.get("targets") or ())
+            if not shared:
+                continue
+            if (current.get("assignments") or []) != (aim.get("assignments") or []):
+                # Different assignments over a shared target is a narrower question, not
+                # a loop: the Master did change strategy, and saying otherwise would stop
+                # a mission that is doing the right thing.
+                continue
+            return LoopFinding(
+                kind=CycleKind.REPEATED_PLAN, subject=f"round-{round_number}",
+                round=round_number, occurrences=2, evidence_added=0,
+                checked_by=(f"rounds {aim.get('round')} and {round_number} planned the "
+                            f"same assignments over {len(shared)} shared target(s)"),
+                detail=(f"round {round_number} planned the same work as round "
+                        f"{aim.get('round')} over {len(shared)} target(s) that round had "
+                        f"already addressed (saturation)"),
+                response=LoopResponse.STOP,
+                strategy_change="")
+        return None
+
+    def _stalled_round(self, round_number: int, added: int | None) -> LoopFinding | None:
+        """A round that ran attempts and added no claim the mission did not hold.
+
+        Both halves are required.  A round with no attempts added nothing because
+        nothing ran — that is §37's refusal path, already on the record — while a round
+        that ran attempts and added nothing is this section's subject.  Requiring the
+        attempt count is what keeps the two findings from accusing the mission of doing
+        nothing when it did work that failed.
+        """
+
+        if added is None or added > 0:
+            return None
+        ran = self._round_attempts.get(round_number, 0)
+        if not ran:
+            return None
+        return LoopFinding(
+            kind=CycleKind.STALLED_ROUND, subject=f"round-{round_number}",
+            round=round_number, occurrences=2, evidence_added=0,
+            checked_by=(f"{ran} attempt(s) in round {round_number}, 0 claims the mission "
+                        f"did not already hold"),
+            detail=(f"round {round_number} ran {ran} attempt(s) and added no claim the "
+                    f"mission did not already hold (saturation)"),
+            response=LoopResponse.CORRECT,
+            strategy_change=("aim the next round at a question no report has answered "
+                             "yet, or stop: repeating this round cannot help"))
+
+    def loop_saturation(self) -> SaturationReport:
+        """This run's mission-level saturation, assembled from what the rounds added.
+
+        Built at the end rather than during the run because the series is only complete
+        once the last review has happened — and because the stop decision was already
+        made from the same numbers, so this is a *report* of that decision rather than a
+        second opinion on it.
+        """
+
+        series = [len(later - earlier) for earlier, later
+                  in zip(self._round_claims, self._round_claims[1:])]
+        assessment = assess_saturation(series)
+        findings = [finding for finding in self._loops.saturation.findings
+                    if finding.kind is not CycleKind.STALLED_ROUND]
+        if assessment.findings:
+            findings = [*findings, assessment.findings[0]]
+        return assessment.model_copy(update={
+            "findings": findings, "blocked": list(self._loops.blocked)})
+
 
     def _after_master_review(self, state: Mapping[str, Any]) -> str:
         """Synthesise, replan, or end the mission with no aggregate at all."""
@@ -25092,6 +25434,14 @@ class HierarchicalFlow:
         self._settled = {"master": set()}
         self._started = {}
         self._gates = {}
+        # §38: the corrections belong to the run, not to the instance.  A second run of
+        # the same flow starts with no history of a cycle, or it would block a unit by
+        # citing corrections its new attempt never ignored.
+        self._loops = LoopLedger()
+        self._loops_outcomes = {}
+        self._round_attempts = {}
+        self._round_claims = []
+        self._round_aims = []
         if self.detach_note:
             self._record(FlowStage.PLAN, detail=self.detach_note)
         if self.resume is not None:
@@ -25140,6 +25490,7 @@ class HierarchicalFlow:
             master_reviews=self.master_reviews(),
             master_decisions=self.master_decisions(),
             follow_ups=self.follow_ups(),
+            loops=self._loops.model_copy(update={"saturation": self.loop_saturation()}),
             research={"workers": len(self._research),
                       "audits": {worker_id: audit["audit"]
                                  for worker_id, audit in self._research.items()},
@@ -25150,6 +25501,17 @@ class HierarchicalFlow:
                       "material_sourced": sum(audit["audit"].get("material_sourced", 0)
                                               for audit in self._research.values())},
         )
+        if self._loops.blocked and result.synthesis is not None:
+            # §38: a blocked line is a gap, not a silence.  Added after synthesis because
+            # the block is only known once every branch settled — and added *to* the
+            # synthesis rather than beside it, so a reader of the report cannot miss it.
+            result = result.model_copy(update={"synthesis": result.synthesis.model_copy(
+                update={"gaps": [*result.synthesis.gaps,
+                                 *cycle_gaps(self._loops.blocked)],
+                        "limitations": [*result.synthesis.limitations,
+                                        f"{len(self._loops.blocked)} line(s) of inquiry "
+                                        f"were blocked after repeating without new "
+                                        f"evidence"]})})
         if self.logger is not None:
             self.logger.log(
                 "flow.finished", agent_id="master", agent_kind="flow",
@@ -25295,14 +25657,39 @@ class _CountingRunner(DeterministicRunner):
     The deterministic runner is synchronous, so overlap is only observable if the
     runner itself measures it: the peak is the ground truth the ledger is checked
     against.
+
+    ``repeat_queries`` (§38) makes every attempt of each Worker ask the *same* question
+    again and return the same rows: a source that answers the same thing twice.  That is
+    the loop the detectors exist for, and it is simulated here rather than fabricated in
+    a signal, so the checks exercise the real path from a real outcome.
     """
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(self, *, repeat_queries: bool = False,
+                 always_retry: Sequence[str] = (), **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.active = 0
         self.peak = 0
         self.threads: set[str] = set()
+        self.repeat_queries = repeat_queries
+        #: Units whose work is always sent back for another attempt (§38's fixture for a
+        #: unit that keeps going without learning anything).  Expressed as a runner
+        #: property because the alternative — a review that always rejects — would be
+        #: this section's own verdict, and a test that supplies the answer proves nothing.
+        self.always_retry: set[str] = set(always_retry)
         self._gate = threading.Lock()
+
+    def review_worker(self, subagent: FlowSubagent, worker: FlowWorker,
+                      outcome: WorkerOutcome, *, round_number: int) -> ReviewVerdict:
+        verdict = super().review_worker(subagent, worker, outcome,
+                                       round_number=round_number)
+        if worker.id not in self.always_retry or outcome.failed:
+            return verdict
+        return verdict.model_copy(update={
+            "approved": False, "verdict": "revise", "retry": True,
+            "findings": list(verdict.findings) + [
+                f"{worker.name} has not answered the question its objective asks"],
+            "guidance": "the same question, asked again of the same source",
+        })
 
     def run_worker(self, subagent: FlowSubagent, worker: FlowWorker, *,
                    attempt: int, guidance: str = "") -> WorkerOutcome:
@@ -25311,10 +25698,19 @@ class _CountingRunner(DeterministicRunner):
             self.peak = max(self.peak, self.active)
             self.threads.add(threading.current_thread().name)
         try:
-            return super().run_worker(subagent, worker, attempt=attempt, guidance=guidance)
+            outcome = super().run_worker(subagent, worker, attempt=attempt,
+                                         guidance=guidance)
         finally:
             with self._gate:
                 self.active -= 1
+        if not self.repeat_queries:
+            return outcome
+        payload = dict(outcome.payload or {})
+        # One prepared query per unit, never varied: the second attempt asks exactly
+        # what the first asked, which is the repetition a re-worded retask would hide.
+        payload["queries"] = [f"search {worker.work_unit or worker.name} for "
+                              f"{subagent.role}"]
+        return outcome.model_copy(update={"payload": payload})
 
 
 def _flow_check(name: str, ok: bool, detail: Any = "") -> FlowCheck:
@@ -47013,6 +47409,15 @@ class RuntimePlan(StrictModel):
             raise ValueError(
                 "a runtime Worker closes one gap: several completion criteria is a "
                 "second plan, not a remedy")
+        unbounded = unbounded_instruction(self.objective) or next(
+            (phrase for criterion in self.completion_criteria
+             for phrase in [unbounded_instruction(criterion)] if phrase), "")
+        if unbounded:
+            # §38: an instruction with no end condition is the one loop no detector can
+            # catch — there is no repetition to see, only a unit that never returns.
+            raise ValueError(
+                f"a runtime Worker's objective must name a bounded amount of work; "
+                f"{unbounded!r} has no end condition the mission can test")
         if any(word in self.objective.lower() for word in ("everything", "all of", "any")):
             raise ValueError("a runtime Worker's objective must name the gap it closes")
         return self
@@ -49000,6 +49405,11 @@ class FollowUpAssignment(StrictModel):
                              "existing one")
         if self.route == "existing" and self.licence_remaining is not None:
             raise ValueError("only a new Subagent spends the Master's licence")
+        unbounded = unbounded_instruction(self.objective)
+        if unbounded:
+            raise ValueError(
+                f"a follow-up must stop somewhere; {unbounded!r} has no end condition "
+                "the next review could test")
         if any(word in self.objective.lower()
                for word in ("everything", "all of the", "any remaining")):
             raise ValueError("a follow-up closes one gap: an objective that restates "
@@ -50730,6 +51140,1111 @@ def review_master_command(
     console.print("[red]✘[/red] choose --demo, --self-test or --next FILE")
     raise typer.Exit(ExitCode.USAGE)
 
+@app.command("loops",
+             help="Loop detection: repeated plans, queries and retasks, and saturation.")
+def loops_command(
+    self_test: bool = typer.Option(False, "--self-test",
+                                   help="Prove the detectors and their escalation, offline."),
+    demo: bool = typer.Option(False, "--demo",
+                              help="Three cycles and three outcomes: corrected, blocked, stopped."),
+    reports: str | None = typer.Option(
+        None, "--reports",
+        help="Judge a mission's rounds from a JSON report set ('-' for stdin)."),
+    evidence: str = typer.Option(
+        "", "--evidence",
+        help="Claims added per round, comma-separated (e.g. '4,0,0'), for --reports."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Report a loop, or prove that one would have been reported.
+
+    Exit codes keep the build's rule: ``OK`` when nothing repeated or the repetition was
+    bounded with a reason, ``POLICY`` when a line of inquiry is blocked and the mission
+    therefore did not answer everything it set out to.
+    """
+
+    console = get_console()
+
+    if self_test:
+        checks = run_loop_self_test()
+        failures = [check for check in checks if not check.ok]
+        if as_json:
+            _emit(json.dumps({"checks": [check.to_dict() for check in checks],
+                              "passed": len(checks) - len(failures),
+                              "failed": len(failures)}, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        table = Table(box=None, pad_edge=False)
+        table.add_column("check", no_wrap=True)
+        table.add_column("detail", overflow="fold")
+        for check in checks:
+            glyph, colour = ("✔", "green") if check.ok else ("✘", "red")
+            table.add_row(f"[{colour}]{glyph}[/{colour}]", escape(check.name),
+                          escape(check.detail))
+        console.print(table)
+        colour = "green" if not failures else "red"
+        console.print(f"\n[{colour}]{len(checks) - len(failures)} passed[/] · "
+                      f"{len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    if demo:
+        payload = loop_detection_demo()
+        if as_json:
+            _emit(json.dumps(payload, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(render_loop_detection_demo(payload))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    if reports:
+        try:
+            raw = (sys.stdin.read() if reports == "-"
+                   else Path(reports).expanduser().read_text(encoding="utf-8"))
+            payload = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            console.print(f"[red]✘[/red] not a mission report set: "
+                          f"{escape(_first_sentence(str(exc))[:200])}")
+            raise typer.Exit(ExitCode.USAGE) from exc
+        try:
+            series = [int(part) for part in evidence.split(",") if part.strip()]
+        except ValueError as exc:
+            console.print("[red]✘[/red] --evidence must be counts per round, e.g. 4,0,0")
+            raise typer.Exit(ExitCode.USAGE) from exc
+        if not series:
+            series = _round_series(payload)
+        blocked = [BlockedLine.model_validate(item)
+                   for item in payload.get("blocked") or []]
+        assessment = assess_saturation(series, blocked=blocked)
+        if as_json:
+            _emit(json.dumps({"evidence_added": assessment.to_dict(),
+                              "blocked": [line.to_dict() for line in blocked]},
+                             indent=2, default=str))
+            raise typer.Exit(ExitCode.OK if not blocked and not assessment.stopped
+                             else ExitCode.POLICY)
+        console.print()
+        console.print(_render_loop_report(assessment, blocked))
+        console.print()
+        raise typer.Exit(ExitCode.OK if not blocked and not assessment.stopped
+                         else ExitCode.POLICY)
+
+    console.print("[red]✘[/red] choose --demo, --self-test or --reports FILE")
+    raise typer.Exit(ExitCode.USAGE)
+
+
+def _round_series(payload: Mapping[str, Any]) -> list[int]:
+    """Claims added per round, from a report set that recorded them.
+
+    Read from the payload rather than re-derived: the mission already counted this, and
+    a second count would be a different number with the same name.
+    """
+
+    series = payload.get("evidence_added") or payload.get("added_per_round") or []
+    try:
+        return [int(value) for value in series]
+    except (TypeError, ValueError):
+        return []
+
+
+def _render_loop_report(assessment: SaturationReport,
+                        blocked: Sequence[BlockedLine]) -> Group:
+    """The loop report: the series, the finding, and the stop it justifies."""
+
+    series = Table(title="claims added per round", title_justify="left", box=None,
+                   pad_edge=False, expand=False)
+    series.add_column("round", no_wrap=True)
+    series.add_column("new claims", no_wrap=True)
+    for index, added in enumerate(assessment.added_per_round, start=1):
+        colour = "green" if added else "yellow"
+        series.add_row(str(index), f"[{colour}]{added}[/{colour}]")
+
+    findings = Table(title="what the rounds showed", title_justify="left", box=None,
+                     pad_edge=False, expand=False)
+    findings.add_column("kind", no_wrap=True)
+    findings.add_column("response", no_wrap=True)
+    findings.add_column("detail", overflow="fold", max_width=68)
+    for finding in assessment.findings:
+        findings.add_row(escape(finding.kind.value), escape(finding.response.value),
+                         escape(finding.detail[:200]))
+
+    lines = Table(title="lines of inquiry blocked", title_justify="left", box=None,
+                  pad_edge=False, expand=False)
+    lines.add_column("subject", no_wrap=True)
+    lines.add_column("would unblock", overflow="fold", max_width=66)
+    for line in blocked:
+        lines.add_row(escape(line.subject), escape(line.unblock))
+
+    verdict = Text(
+        (f"stopped ({assessment.condition.value}): {assessment.stop_reason}"
+         if assessment.stopped else
+         f"not stopped: {assessment.stop_reason or 'the mission is still adding claims'}"),
+        style="red" if assessment.stopped else "green")
+    return Group(series, Text(""), findings, *( [Text(""), lines] if blocked else []),
+                 Text(""), verdict)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 38. Loop detection and saturation stopping: a cycle that knows it is a cycle
+# --------------------------------------------------------------------------
+#
+# §35 gave a retry a *different* instruction, and §36/§37 bounded how many extra
+# rounds a Subagent or the Master may open.  Neither answers the question this
+# section does: what if the work keeps happening and nothing keeps being learned?
+# A Worker can be re-tasked with a genuinely different instruction and still spend
+# its budget on the sources it already read; a mission can open a follow-up round
+# that collects new *rows* while adding no new *claims*.  Both are loops, and a
+# bound on the number of attempts only decides how long they run for.
+#
+# So this section detects the loop from the record, and escalates in the order the
+# task names:
+#
+# 1.  **require the responsible agent to change strategy** — a first detection
+#     attaches a *strategy change* to the next instruction, and a retask that
+#     cannot name one is not issued;
+# 2.  **mark the line of inquiry blocked** — a second detection of the same kind
+#     for the same unit blocks that line: it stops asking, says what it would take
+#     to unblock, and the gap travels into the report;
+# 3.  **stop** — when the mission itself is the thing making no progress (rounds
+#     that add no claims), the mission stops, with the reason on the record.
+#
+# Three facts make this more than a counter:
+#
+# *   **Repetition is judged on substance, not wording.**  A query is a
+#     *fingerprint* of its normalised form, so "example.com shodan search" and
+#     "search shodan for example.com" are one query; a plan is a fingerprint of
+#     its target and tools, so a re-worded retry of the same retrieval is one plan.
+# *   **Progress is new claims, not new rows.**  A row whose statement the mission
+#     already holds is a re-observation; counting it as progress is how a loop
+#     looks like work.
+# *   **No instruction may be unbounded.**  "Continue until done" is refused
+#     wherever this build can refuse it (:func:`unbounded_instruction`), because a
+#     loop detector cannot save an instruction that has no end condition — there is
+#     nothing to detect until the budget is gone.
+
+
+class CycleKind(str, Enum):
+    """What kind of repetition was detected.
+
+    Five kinds, because the record supports exactly five claims.  Each one names a
+    different part of the mission that failed to move — the plan, the query, the
+    instruction, the yield, or the round — and each implies a different remedy.
+    """
+
+    REPEATED_PLAN = "repeated-plan"              # the same shape of work, again
+    REPEATED_QUERY = "repeated-query"            # the same retrieval, again
+    REPEATED_RETASK = "repeated-retask"          # the same instruction, again
+    DIMINISHING_RETURNS = "diminishing-returns"  # new work, no new evidence
+    STALLED_ROUND = "stalled-round"              # a whole round, no new claims
+
+
+class LoopResponse(str, Enum):
+    """What the detection requires of the responsible agent.
+
+    The ladder is the task's own: change strategy, block the line, or stop.  It is
+    an escalation, not a choice — the same kind of cycle detected again on the same
+    subject moves one rung down.
+    """
+
+    CORRECT = "correct"    # change strategy; the next instruction must say how
+    BLOCK = "block"        # mark the line of inquiry blocked and stop asking
+    STOP = "stop"          # stop the mission's line: no further round can help
+
+
+class LoopFinding(StrictModel):
+    """One detected cycle, with the evidence that makes it a cycle rather than a hunch.
+
+    ``occurrences`` is a count of the record, not an estimate: two attempts that ran
+    one query, two rounds that added nothing.  ``strategy_change`` is required exactly
+    when the response is ``CORRECT`` — an instruction to "do something different"
+    with no statement of what would be a second loop, one level up.
+    """
+
+    kind: CycleKind
+    #: What repeated: a Worker id, a Subagent id, a query fingerprint, a plan.
+    subject: str = Field(min_length=1)
+    #: Which unit owns the fix.  Empty only for a mission-level finding.
+    unit: str = ""
+    round: int = Field(default=1, ge=1)
+    occurrences: int = Field(default=2, ge=2)
+    #: Claims this cycle added over the whole window: usually zero, and that is the
+    #: point.  Kept as a number so "no progress" is measured rather than asserted.
+    evidence_added: int = Field(default=0, ge=0)
+    checked_by: str = ""
+    detail: str = Field(min_length=12)
+    response: LoopResponse = LoopResponse.CORRECT
+    #: What the responsible agent must do differently.  Required for ``CORRECT``.
+    strategy_change: str = ""
+    #: What would unblock the line, for ``BLOCK``.  A block nobody can lift is a stop.
+    unblock: str = ""
+
+    @model_validator(mode="after")
+    def _response_is_actionable(self) -> "LoopFinding":
+        if self.response is LoopResponse.CORRECT:
+            if len(self.strategy_change.strip()) < 15:
+                raise ValueError(
+                    "a correction must state the strategy change it requires: "
+                    "'try again' is the loop, not the remedy")
+        if self.response is LoopResponse.BLOCK and len(self.unblock.strip()) < 10:
+            raise ValueError(
+                "a blocked line must say what would unblock it, or it is a stop "
+                "described as a pause")
+        if self.evidence_added and self.kind in {CycleKind.DIMINISHING_RETURNS,
+                                                 CycleKind.STALLED_ROUND}:
+            # Diminishing returns with evidence is a real outcome, not a cycle: the
+            # finding would be asserting a loop while its own number contradicts it.
+            raise ValueError("a diminishing-returns finding cannot claim new evidence")
+        return self
+
+    @property
+    def blocks(self) -> bool:
+        return self.response is LoopResponse.BLOCK
+
+    @property
+    def stops(self) -> bool:
+        return self.response is LoopResponse.STOP
+
+    def describe(self) -> str:
+        tail = (f" → {self.strategy_change[:100]}" if self.response is LoopResponse.CORRECT
+                else f" → blocked: {self.unblock[:100]}" if self.response is LoopResponse.BLOCK
+                else " → stop")
+        return (f"{self.kind.value} on {self.subject[:60]} after {self.occurrences} "
+                f"occurrence(s), {self.evidence_added} new claim(s): "
+                f"{self.detail[:110]}{tail}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": self.kind.value, "subject": self.subject, "unit": self.unit,
+                "round": self.round, "occurrences": self.occurrences,
+                "evidence_added": self.evidence_added, "checked_by": self.checked_by,
+                "detail": self.detail, "response": self.response.value,
+                "strategy_change": self.strategy_change, "unblock": self.unblock,
+                "description": self.describe()}
+
+
+class LoopCheck(StrictModel):
+    """One assertion in the §38 self-test."""
+
+    name: str = Field(min_length=1)
+    ok: bool
+    detail: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "ok": self.ok, "detail": self.detail}
+
+
+class QueryRecord(StrictModel):
+    """One retrieval an attempt performed, as the record remembers it.
+
+    ``fingerprint`` is of the *normalised* query — lowercased, punctuation folded,
+    tokens sorted — so a re-worded repeat is caught.  ``claims`` is how many new
+    claims that retrieval produced, which is what makes "the same query, again, and
+    it still found nothing" a fact rather than an impression.
+    """
+
+    fingerprint: str = Field(min_length=4)
+    query: str = ""
+    #: The unit that ran it: a query list is per-unit, because the question the detector
+    #: asks is whether *this* unit learned anything from repeating itself.
+    unit: str = ""
+    round: int = Field(default=1, ge=1)
+    claims: int = Field(default=0, ge=0)
+
+    @classmethod
+    def of(cls, query: str, *, unit: str = "", round_number: int = 1,
+           claims: int = 0) -> "QueryRecord":
+        return cls(fingerprint=query_fingerprint(query), query=query[:200], unit=unit,
+                   round=round_number, claims=claims)
+
+
+class AttemptSignal(StrictModel):
+    """What one attempt contributed, in the three numbers the detectors read.
+
+    Deliberately tiny: the loop detectors must be able to judge *history* without
+    re-reading reports, because the record they are given is a transcript of what
+    already happened.
+    """
+
+    attempt: int = Field(ge=1)
+    status: EntityStatus = EntityStatus.READY
+    #: Claims this attempt added that the unit did not already hold.
+    new_claims: int = Field(default=0, ge=0)
+    #: Queries it ran, by fingerprint.
+    queries: list[str] = Field(default_factory=list)
+    #: The retask fingerprint it ran under, when it was retried.
+    retask: str = ""
+    #: The plan it was given, when it is a runtime Worker planned from a gap.
+    plan: str = ""
+
+
+class LoopDetection(StrictModel):
+    """Every cycle detection for one unit, and what it requires.
+
+    A unit is blocked when *any* finding for it says so — the harshest detection
+    wins, because the point of a block is that a cheaper response already failed.
+    """
+
+    unit: str = ""
+    findings: list[LoopFinding] = Field(default_factory=list)
+    #: The reason code the report carries, when this detection stopped the unit.
+    blocked_reason: str = ""
+
+    @property
+    def found(self) -> bool:
+        return bool(self.findings)
+
+    @property
+    def blocked(self) -> bool:
+        return any(finding.blocks or finding.stops for finding in self.findings)
+
+    @property
+    def kinds(self) -> list[str]:
+        return [finding.kind.value for finding in self.findings]
+
+    def kinds_as_enums(self) -> list["CycleKind"]:
+        """The kinds as enums, for :func:`escalate`'s ``already_corrected``.
+
+        A method rather than a caller-side comprehension because the escalation call is
+        the one place a string and an enum could be confused, and the confusion would be
+        silent: a kind that never matches never escalates, and the loop runs on.
+        """
+
+        return [finding.kind for finding in self.findings]
+
+    @property
+    def strategy_change(self) -> str:
+        """The correction the next instruction must carry, or ``""``."""
+
+        for finding in self.findings:
+            if finding.response is LoopResponse.CORRECT:
+                return finding.strategy_change
+        return ""
+
+    def describe(self) -> str:
+        if not self.findings:
+            return f"{self.unit or 'mission'}: no cycle detected"
+        return (f"{self.unit or 'mission'}: {len(self.findings)} cycle(s) "
+                f"({', '.join(self.kinds)})"
+                + (f"; blocked: {self.blocked_reason[:100]}" if self.blocked else
+                   f"; required: {self.strategy_change[:100]}"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"unit": self.unit,
+                "findings": [finding.to_dict() for finding in self.findings],
+                "found": self.found, "blocked": self.blocked,
+                "kinds": self.kinds, "blocked_reason": self.blocked_reason,
+                "strategy_change": self.strategy_change,
+                "description": self.describe()}
+
+
+class BlockedLine(StrictModel):
+    """A line of inquiry the mission has stopped asking about, and why.
+
+    This is the object the report carries instead of a silent gap: a subject the
+    mission tried, the evidence that it was not progressing, what would unblock it,
+    and — when it exists — the alternative the responsible agent was told to try.
+    """
+
+    subject: str = Field(min_length=1)
+    kind: CycleKind
+    unit: str = ""
+    attempts: int = Field(default=2, ge=2)
+    evidence_added: int = Field(default=0, ge=0)
+    reason: str = Field(min_length=12)
+    unblock: str = Field(min_length=10)
+    alternative: str = ""
+
+    def gap_detail(self) -> str:
+        """How this block reads as an unknown, from §14's vocabulary."""
+
+        tail = f"; would unblock: {self.unblock[:120]}" if self.unblock else ""
+        return f"line of inquiry blocked ({self.kind.value}): {self.reason[:160]}{tail}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"subject": self.subject, "kind": self.kind.value, "unit": self.unit,
+                "attempts": self.attempts, "evidence_added": self.evidence_added,
+                "reason": self.reason, "unblock": self.unblock,
+                "alternative": self.alternative, "gap": self.gap_detail()}
+
+
+class SaturationReport(StrictModel):
+    """The mission's answer to "was it still learning?" — and what it did about it.
+
+    Kept separate from :class:`LoopDetection` because it is a different level: a
+    Worker can cycle inside a healthy mission, and a mission can stall with no unit
+    cycling at all.  A report that conflated them could not say which one stopped.
+    """
+
+    #: Claims added per round, in order: the series the diminishing-returns test reads.
+    added_per_round: list[int] = Field(default_factory=list)
+    #: Which round the mission stopped tracking progress at, when it did.
+    stalled_rounds: int = Field(default=0, ge=0)
+    findings: list[LoopFinding] = Field(default_factory=list)
+    blocked: list[BlockedLine] = Field(default_factory=list)
+    #: ``""`` when the mission kept making progress.
+    stop_reason: str = ""
+    #: The stop condition this report justifies, so the caller does not re-derive it.
+    condition: StopCondition = StopCondition.NONE
+
+    @property
+    def diminishing(self) -> bool:
+        """True when the last two rounds both added nothing new."""
+
+        return len(self.added_per_round) >= 2 and self.added_per_round[-1] == 0 \
+            and self.added_per_round[-2] == 0
+
+    @property
+    def stopped(self) -> bool:
+        return self.condition is not StopCondition.NONE
+
+    @property
+    def saturated(self) -> bool:
+        """Whether the *evidence* stopped growing, whether or not the mission stopped."""
+
+        return bool(self.added_per_round) and self.added_per_round[-1] == 0
+
+    def summary(self) -> str:
+        if not self.findings and not self.blocked:
+            return ("no cycle detected: every round added claims the mission did not "
+                    "already hold" if self.added_per_round else
+                    "no rounds were reviewed")
+        tail = (f"; stopped ({self.condition.value}): {self.stop_reason[:120]}"
+                if self.stopped else "")
+        return (f"{len(self.findings)} cycle(s), {len(self.blocked)} blocked line(s); "
+                f"claims per round {self.added_per_round}{tail}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"added_per_round": list(self.added_per_round),
+                "stalled_rounds": self.stalled_rounds,
+                "findings": [finding.to_dict() for finding in self.findings],
+                "blocked": [line.to_dict() for line in self.blocked],
+                "diminishing": self.diminishing, "saturated": self.saturated,
+                "stopped": self.stopped, "condition": self.condition.value,
+                "stop_reason": self.stop_reason, "summary": self.summary()}
+
+
+# --------------------------------------------------------------------------
+# 38.1 What "the same thing again" means
+# --------------------------------------------------------------------------
+
+#: Words that carry no retrieval meaning, so two queries that differ only by them are
+#: one query.  Narrower than :data:`_RELEVANCE_STOPWORDS`: this list is about *how* a
+#: source is asked, and "search", "query", "lookup" are the vocabulary of asking.
+_QUERY_NOISE: frozenset[str] = frozenset({
+    "search", "searching", "query", "queries", "lookup", "look", "find", "fetch",
+    "retrieve", "get", "the", "a", "an", "for", "of", "on", "in", "and", "or", "to",
+    "from", "with", "please", "all", "any", "some",
+})
+
+#: Phrases that make an instruction unbounded.  A stop condition is not a detail: an
+#: objective that says "continue until there is nothing left" has no end the mission
+#: can test, so no budget, deadline or detector can be honest about where it stopped.
+_UNBOUNDED_PHRASES: tuple[str, ...] = (
+    "until it ends", "until the end", "until done", "until finished", "until exhausted",
+    "until nothing", "until there is nothing", "keep going", "keep searching",
+    "keep looking", "continue until", "repeat until", "loop until", "forever",
+    "indefinitely", "as long as it takes", "no limit", "without limit", "never stop",
+    "exhaust every", "exhaust all", "all possible sources", "every possible source",
+)
+
+
+def query_fingerprint(query: str) -> str:
+    """The identity of a retrieval, insensitive to wording and word order.
+
+    "Shodan search for example.com" and "search example.com on shodan" are one query
+    to a source, so they are one fingerprint here.  The digest is over sorted content
+    tokens rather than the string, which is what makes a re-worded repeat detectable
+    without a fuzzy match — a fuzzy match would need a threshold, and a threshold is a
+    judgement this build does not let a detector make.
+    """
+
+    # Split on every non-alphanumeric character, so "example.com" and "example com" are
+    # the same two words: a source does not care how a client punctuates a domain, and a
+    # fingerprint that did would miss the most common re-worded repeat there is.
+    tokens = sorted({token for token in re.findall(r"[a-z0-9]+", (query or "").lower())
+                     if token not in _QUERY_NOISE})
+    if not tokens:
+        tokens = ["empty"]
+    return content_id("qry", tokens, length=12)
+
+
+def plan_fingerprint_of(*, target: str, tools: Sequence[str] = (),
+                        work_unit: str = "") -> str:
+    """The identity of a *plan*: what it aims at, with what, as which unit of work.
+
+    Objective wording is deliberately excluded.  §35 exists to make a retry's wording
+    differ, so a plan fingerprint that included the wording could never detect the
+    loop it is for: "read the advisories again, this time carefully" is the same plan.
+    """
+
+    payload = {"target": _claim_key(target or "")[:200],
+               "tools": sorted({str(tool).strip().lower() for tool in tools if str(tool).strip()}),
+               "work_unit": _claim_key(work_unit or "")[:120]}
+    return content_id("plan", payload, length=12)
+
+
+def unbounded_instruction(text: str) -> str:
+    """The unbounded phrase in an instruction, or ``""`` when it has an end condition.
+
+    Checked wherever this build accepts an instruction — a Worker's completion criteria,
+    a retask's correction, a follow-up's objective — because an unbounded instruction is
+    the one loop a detector cannot catch: there is no repetition to see, only a unit
+    that never returns.
+    """
+
+    lowered = (text or "").lower()
+    for phrase in _UNBOUNDED_PHRASES:
+        if phrase in lowered:
+            return phrase
+    return ""
+
+
+def _claim_set(outcome: "WorkerOutcome") -> set[str]:
+    """The normalised claims one attempt added, from its report or its evidence ids.
+
+    Two sources, because a record has two: a report carries statements (the strongest
+    form), and an outcome carries ids (enough to tell *that* something new arrived).
+    Normalising to the claim where possible is what makes "the same fact, restated"
+    count as nothing new.
+    """
+
+    report = _report_of(outcome)
+    if report is not None and report.evidence:
+        return {_claim_key(item.statement) for item in report.evidence}
+    return {f"id:{item}" for item in outcome.evidence_ids}
+
+
+def attempt_signal(outcome: "WorkerOutcome", *, prior: Sequence["WorkerOutcome"] = (),
+                   retask: str = "", plan: str = "",
+                   queries: Sequence[str] = ()) -> AttemptSignal:
+    """Summarise one attempt: how many claims it added, and what it ran.
+
+    ``prior`` is the unit's earlier attempts — not the mission's evidence — because the
+    question here is whether *this unit* is moving.  A unit that keeps finding things
+    the mission already knows is exactly the case this section exists for.
+    """
+
+    held: set[str] = set()
+    for earlier in prior:
+        held |= _claim_set(earlier)
+    added = _claim_set(outcome) - held
+    return AttemptSignal(
+        attempt=outcome.attempt, status=outcome.status, new_claims=len(added),
+        queries=[query_fingerprint(query) for query in queries],
+        retask=retask, plan=plan)
+
+
+# --------------------------------------------------------------------------
+# 38.2 The four detectors
+# --------------------------------------------------------------------------
+
+#: How many times one query may repeat with nothing new before the line is blocked.
+#: Two: the second run is the repeat, and a third is the mission spend the detector
+#: exists to prevent.  Named rather than inlined so the number is inspectable.
+REPEATED_QUERY_LIMIT: int = 2
+
+#: How many consecutive zero-yield attempts make a diminishing-returns finding.
+DIMINISHING_ATTEMPTS: int = 2
+
+
+def detect_repeated_queries(queries: Sequence["QueryRecord"], *,
+                            unit: str = "", round_number: int = 1,
+                            alternative: str = "") -> LoopFinding | None:
+    """The same retrieval, run again, producing nothing new.
+
+    A repeated query with new claims is *not* a loop: the source changed, or the
+    earlier attempt read it badly.  The finding is only made when the repetition and
+    the empty yield coincide, which is the definition of a cycle worth stopping.
+    """
+
+    counts: dict[str, list[QueryRecord]] = {}
+    for record in queries:
+        counts.setdefault(record.fingerprint, []).append(record)
+    for fingerprint, records in counts.items():
+        if len(records) < REPEATED_QUERY_LIMIT:
+            continue
+        added = sum(record.claims for record in records[1:])
+        if added:
+            continue
+        return LoopFinding(
+            kind=CycleKind.REPEATED_QUERY, subject=fingerprint, unit=unit,
+            round=round_number, occurrences=len(records), evidence_added=0,
+            checked_by=(f"{len(records)} runs of one normalised query, "
+                        f"{added} new claim(s) after the first"),
+            detail=(f"the query {records[0].query[:120]!r} ran {len(records)} times and "
+                    f"added nothing after the first run"),
+            response=LoopResponse.CORRECT,
+            strategy_change=(alternative or
+                             "run a different retrieval for this question: name the "
+                             "source family the earlier attempts did not read"))
+    return None
+
+
+def detect_repeated_plans(signals: Sequence["AttemptSignal"], *,
+                          unit: str = "", round_number: int = 1,
+                          alternative: str = "") -> LoopFinding | None:
+    """The same plan, executed again, with no new claims between the two runs.
+
+    Plans are grouped by :func:`plan_fingerprint_of`, so a retry whose objective was
+    re-worded but whose target and tools did not change is caught — which is exactly
+    the loop §35's re-wording could otherwise hide.
+    """
+
+    grouped: dict[str, list[AttemptSignal]] = {}
+    for attempt in signals:
+        if attempt.plan:
+            grouped.setdefault(attempt.plan, []).append(attempt)
+    for fingerprint, runs in grouped.items():
+        if len(runs) < 2:
+            continue
+        added = sum(run.new_claims for run in runs[1:])
+        if added:
+            continue
+        return LoopFinding(
+            kind=CycleKind.REPEATED_PLAN, subject=fingerprint, unit=unit,
+            round=round_number, occurrences=len(runs), evidence_added=0,
+            checked_by=(f"{len(runs)} attempts under one plan fingerprint, "
+                        f"{added} new claim(s) after the first"),
+            detail=(f"attempts {', '.join(str(run.attempt) for run in runs)} ran the "
+                    f"same plan (same target, same tools) and the mission learned "
+                    f"nothing after the first"),
+            response=LoopResponse.CORRECT,
+            strategy_change=(alternative or
+                             "change the plan, not the wording: a different target or a "
+                             "different tool for this unit's question"))
+    return None
+
+
+def detect_repeated_retasks(retasks: Sequence["RetaskedWorker"], *,
+                            unit: str = "", round_number: int = 1,
+                            alternative: str = "") -> LoopFinding | None:
+    """Two attempts handed the same instruction — §35's own failure, detected in place.
+
+    ``RetaskedWorker.fingerprint`` already digests the substance of an instruction, so
+    this detector is the cheap one: it asks whether the machinery §35 added is being
+    respected, and escalates when it is not.
+    """
+
+    prints = [(retask.attempt, retask.fingerprint) for retask in retasks]
+    for index in range(1, len(prints)):
+        if prints[index][1] != prints[index - 1][1]:
+            continue
+        return LoopFinding(
+            kind=CycleKind.REPEATED_RETASK, subject=prints[index][1], unit=unit,
+            round=round_number, occurrences=2, evidence_added=0,
+            checked_by="two retasks with one substance fingerprint",
+            detail=(f"attempts {prints[index - 1][0]} and {prints[index][0]} were given "
+                    f"the same instruction (same corrections, same evidence, same "
+                    f"schema), so the second retry could not have differed"),
+            response=LoopResponse.CORRECT,
+            strategy_change=(alternative or
+                             "issue a retask that corrects a different dimension, or "
+                             "carry different evidence forward"))
+    return None
+
+
+def detect_diminishing_returns(signals: Sequence["AttemptSignal"], *,
+                               unit: str = "", round_number: int = 1,
+                               alternative: str = "") -> LoopFinding | None:
+    """New attempts, no new claims, for long enough that another is waste.
+
+    Distinct from the other three: nothing repeats *literally* here.  The unit is
+    doing different-looking work and getting nowhere, which is the loop a repetition
+    test cannot see and the reason the task asks for diminishing returns by name.
+    """
+
+    if len(signals) < DIMINISHING_ATTEMPTS:
+        return None
+    tail = list(signals)[-DIMINISHING_ATTEMPTS:]
+    if any(signal.new_claims for signal in tail):
+        return None
+    return LoopFinding(
+        kind=CycleKind.DIMINISHING_RETURNS, subject=unit or "unit", unit=unit,
+        round=round_number, occurrences=len(tail), evidence_added=0,
+        checked_by=(f"the last {len(tail)} attempt(s) each added 0 claims the unit did "
+                    f"not already hold"),
+        detail=(f"{len(tail)} consecutive attempt(s) added nothing new "
+                f"(attempts {', '.join(str(signal.attempt) for signal in tail)})"),
+        response=LoopResponse.CORRECT,
+        strategy_change=(alternative or
+                         "raise the yield before spending another attempt: change the "
+                         "source, the slice, or the question"))
+    return None
+
+
+def detect_unit_cycle(signals: Sequence["AttemptSignal"], *,
+                      queries: Sequence["QueryRecord"] = (),
+                      retasks: Sequence["RetaskedWorker"] = (),
+                      unit: str = "", round_number: int = 1,
+                      alternative: str = "") -> LoopDetection:
+    """Every detector, over one unit's history — with the escalation already applied.
+
+    The ladder is applied here rather than by the caller because it is a rule about
+    *repetition*, and only this function can see how much of it there has been:
+
+    *   a unit with no prior correction is asked to **change strategy**;
+    *   a unit that has already been asked, and repeated anyway, has its line marked
+        **blocked** — a second correction would be the loop, one level up.
+
+    ``previous`` is passed as the corrections the unit has already been given, so the
+    escalation is a property of the record rather than a counter in a closure.
+    """
+
+    findings = [finding for finding in (
+        detect_repeated_queries(queries, unit=unit, round_number=round_number,
+                               alternative=alternative),
+        detect_repeated_plans(signals, unit=unit, round_number=round_number,
+                              alternative=alternative),
+        detect_repeated_retasks(retasks, unit=unit, round_number=round_number,
+                                alternative=alternative),
+        detect_diminishing_returns(signals, unit=unit, round_number=round_number,
+                                   alternative=alternative),
+    ) if finding is not None]
+    return escalate(LoopDetection(unit=unit, findings=findings))
+
+
+def escalate(detection: LoopDetection, *,
+             already_corrected: Sequence[CycleKind] = ()) -> LoopDetection:
+    """Move a detection one rung down the ladder when a correction already failed.
+
+    ``already_corrected`` is the set of kinds the unit was previously told to change
+    strategy about.  A kind that repeats after its correction becomes a **block**: the
+    strategy change was the remedy, and it did not work, so the honest next step is to
+    stop asking and say what would unblock it.  A mission-level finding climbs the
+    same ladder one level up, to ``STOP``, in :func:`assess_saturation`.
+    """
+
+    findings: list[LoopFinding] = []
+    for finding in detection.findings:
+        if finding.kind not in already_corrected:
+            findings.append(finding)
+            continue
+        unblock = (f"a source or capability the mission has not used for this subject "
+                   f"({finding.subject[:60]}); the earlier correction was applied and "
+                   f"the cycle repeated")
+        findings.append(finding.model_copy(update={
+            "response": LoopResponse.BLOCK, "unblock": unblock,
+            "checked_by": f"{finding.checked_by}; corrected once already"}))
+    blocked = [finding for finding in findings if finding.blocks or finding.stops]
+    reason = blocked[0].describe() if blocked else ""
+    return detection.model_copy(update={"findings": findings,
+                                        "blocked_reason": reason})
+
+
+# --------------------------------------------------------------------------
+# 38.3 Mission-level saturation
+# --------------------------------------------------------------------------
+
+#: How many consecutive rounds with no new claims end the mission's line.
+STALLED_ROUNDS_LIMIT: int = 2
+
+
+def assess_saturation(added_per_round: Sequence[int], *,
+                      finding: LoopFinding | None = None,
+                      blocked: Sequence[BlockedLine] = ()) -> SaturationReport:
+    """Whether the *mission* is still learning, and what that means for stopping.
+
+    Two rounds with no new claims is the bound, and it is deliberately the same number
+    as §37's saturation: the two sections must agree, or a mission could pass one test
+    and fail the other while both call themselves authoritative.  The difference is
+    that this function also carries what happened *inside* the rounds — the unit-level
+    findings and the blocke lines — so the report can say which part of the mission
+    stalled rather than only that it did.
+    """
+
+    series = [int(value) for value in added_per_round]
+    trailing = 0
+    for value in reversed(series):
+        if value:
+            break
+        trailing += 1
+    condition = StopCondition.NONE
+    reason = ""
+    if trailing >= STALLED_ROUNDS_LIMIT:
+        condition = StopCondition.SATURATION
+        reason = (f"{trailing} consecutive round(s) added no claim the mission did not "
+                  f"already hold; another round would repeat the last one")
+    elif series and series[-1] == 0 and trailing == 1:
+        reason = ("the last round added no new claims; one more empty round stops the "
+                  "mission")
+    stalled = LoopFinding(
+        kind=CycleKind.STALLED_ROUND, subject="mission", round=max(1, len(series)),
+        occurrences=max(trailing, STALLED_ROUNDS_LIMIT), evidence_added=0,
+        checked_by=(f"claims added per round: {series}; {trailing} empty round(s) at "
+                    f"the end"),
+        detail=(f"the mission added no new claim in {trailing} consecutive round(s)"),
+        response=LoopResponse.STOP if condition is not StopCondition.NONE
+        else LoopResponse.CORRECT,
+        strategy_change=("aim the next round at a question no report has answered "
+                         "yet, or stop" if condition is StopCondition.NONE else ""),
+        unblock="")
+    findings = [stalled] if trailing else []
+    if finding is not None:
+        findings.append(finding)
+    return SaturationReport(
+        added_per_round=series,
+        stalled_rounds=trailing if trailing >= STALLED_ROUNDS_LIMIT else 0,
+        findings=findings, blocked=list(blocked),
+        stop_reason=reason, condition=condition)
+
+
+def blocked_line(finding: LoopFinding | BlockedLine) -> BlockedLine:
+    """The report's record of a blocked line, from the finding that blocked it.
+
+    Idempotent: given a line it is already a :class:`BlockedLine`, it returns it.  The
+    ledger calls this to register a block, and a caller holding a line must be able to
+    register it too — a conversion that only worked one way would make the second
+    registration an error at exactly the moment the mission is trying to be careful.
+    """
+
+    if isinstance(finding, BlockedLine):
+        return finding
+    return BlockedLine(
+        subject=finding.subject, kind=finding.kind, unit=finding.unit,
+        attempts=finding.occurrences, evidence_added=finding.evidence_added,
+        reason=finding.detail, unblock=finding.unblock,
+        alternative=finding.strategy_change)
+
+
+def cycle_gaps(lines: Sequence[BlockedLine]) -> list["UnknownValue"]:
+    """Blocked lines as unknowns, so they travel into the report as gaps.
+
+    A block that stayed inside the ledger would be a silent gap — the failure mode
+    §34 and §36 both exist to prevent, one level down.  These are the same objects the
+    final report carries, named by the unit that hit the loop.
+    """
+
+    return [UnknownValue(reason=UnknownReason.UNAVAILABLE,
+                         determined_by=line.unit or "mission",
+                         detail=line.gap_detail()) for line in lines]
+
+
+# --------------------------------------------------------------------------
+# 38.4 The flow's own history: what to detect, and what to do about it
+# --------------------------------------------------------------------------
+
+#: The instruction a Worker gets when the loop detector has fired for it.  It is
+#: prepended to whatever §35 said, because the two answers are different: §35 says what
+#: was wrong with the last attempt, §38 says what kind of work is no longer allowed.
+CORRECTION_PREAMBLE: str = (
+    "Change of strategy required — the previous attempts repeated work without adding "
+    "evidence. {change} Do not run a retrieval you have already run for this unit; if "
+    "you cannot name a different source or a different question, report the line as "
+    "blocked instead of trying again."
+)
+
+#: Appended to a retask boundary so the reason survives into the report rather than the
+#: log.  Deliberately a sentence, not a code: the report is read by people.
+BLOCKED_NOTE: str = (
+    "This line of inquiry is blocked after {attempts} attempt(s): {reason} "
+    "It would unblock with: {unblock}"
+)
+
+
+class StrategyChange(StrictModel):
+    """A correction the flow applied to one unit, and the attempt it applied to.
+
+    Recorded rather than computed so the escalation is auditable: a unit whose second
+    cycle is blocked must be able to show the correction it ignored, which means the
+    correction has to exist as an object on the record.
+    """
+
+    unit: str = Field(min_length=1)
+    kind: CycleKind
+    attempt: int = Field(default=1, ge=1)
+    instruction: str = Field(min_length=15)
+    required_for: str = ""
+    #: Whether an instruction actually carried the change.  A correction recorded after
+    #: the branch's last allowed attempt was never applied, and a record that called it
+    #: applied would credit the mission with a remedy it never tried.
+    applied: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"unit": self.unit, "kind": self.kind.value, "attempt": self.attempt,
+                "instruction": self.instruction, "required_for": self.required_for,
+                "applied": self.applied}
+
+
+def correction_text(change: str) -> str:
+    """The correction as an instruction, refusing one that does not say anything."""
+
+    if len((change or "").strip()) < 15:
+        raise ValueError("a strategy change must name what to do differently")
+    return CORRECTION_PREAMBLE.format(change=change.strip())
+
+
+def blocked_note(finding: LoopFinding) -> str:
+    return BLOCKED_NOTE.format(attempts=finding.occurrences, reason=finding.detail,
+                               unblock=finding.unblock)
+
+
+def enforcement(detection: LoopDetection) -> dict[str, Any]:
+    """What a detected cycle requires of the graph, as a small, serialisable dict.
+
+    One dict, three keys, because everything downstream needs the same three answers:
+    may the branch run again (``allowed``), what must its next instruction say
+    (``correction``), and what must the report say happened (``blocked``).
+    """
+
+    return {"allowed": not detection.blocked,
+            "correction": detection.strategy_change,
+            "blocked": detection.blocked_reason,
+            "kinds": detection.kinds,
+            "findings": [finding.to_dict() for finding in detection.findings]}
+
+
+def halted_retask(retask: RetaskedWorker, detection: LoopDetection) -> RetaskedWorker:
+    """A retask that would repeat an instruction, rewritten to stop repeating it.
+
+    Three rewrites, all structural:
+
+    *   the corrections are re-stated, one per dimension, in the terms of the strategy
+        change, so a retask cannot re-assert the deficiency that produced the cycle;
+    *   the instruction carries the change itself, which is what makes the next
+        ``fingerprint`` differ from the last one;
+    *   the evidence already collected stays carried forward, so the unit is not asked
+        to look again at what it has.
+
+    A retask that cannot be rewritten raises: the caller's honest next move is a block,
+    and a silently unchanged retask is the loop.
+    """
+
+    change = detection.strategy_change
+    if not change:
+        raise ValueError("a halted retask needs a strategy change to carry")
+    # One statement of the problem per dimension is an invariant of RetaskedWorker, so a
+    # correction is *restated* rather than appended: the dimension that led to the loop
+    # keeps its slot, and says something different in it.
+    fresh = [
+        item.model_copy(update={"correction": f"{item.correction} — instead: {change}"})
+        for item in retask.corrections]
+    rebuilt = retask.model_copy(update={
+        "corrections": fresh,
+        "prompt": f"""{retask.prompt}
+
+{[correction_text(change)]}""",
+        "already_collected": list(retask.already_collected)})
+    # The fingerprint is *recomputed*: ``model_copy`` carries the old one across, and a
+    # copied digest would make the check below pass on every retask — the exact silent
+    # repeat this function exists to make impossible.
+    rebuilt = rebuilt.model_copy(update={"fingerprint": retask_fingerprint(rebuilt)})
+    if rebuilt.fingerprint == retask.fingerprint:
+        raise ValueError("the strategy change did not alter the instruction")
+    return rebuilt
+
+
+# --------------------------------------------------------------------------
+# 38.5 The ledger the graph writes to
+# --------------------------------------------------------------------------
+
+def _worker_queries(outcome: "WorkerOutcome") -> list[str]:
+    """The retrievals one attempt ran, read from the record it actually left.
+
+    The payload's prepared queries: what the attempt was told to run, which is the only
+    query list a record carries in a form that can be compared.  A unit whose record
+    names none gets none, and the query detector then says nothing about it — an
+    inferred query list would be the detector inventing the evidence of a loop.
+    """
+
+    queries: list[str] = []
+    payload = outcome.payload or {}
+    for key in ("queries", "prepared_queries"):
+        value = payload.get(key)
+        if isinstance(value, (list, tuple)):
+            queries.extend(str(item) for item in value if str(item).strip())
+    return list(dict.fromkeys(queries))[:12]
+
+
+class LoopLedger(StrictModel):
+    """Every cycle this run detected, every correction it required, every line it blocked.
+
+    One object because the three lists are only meaningful together: a block with no
+    correction behind it is a mission that gave up without trying, and a correction with
+    no record of what happened next is a bound nobody verified.
+    """
+
+    #: One signal per attempt that ran, in attempt order.  The history the detectors read.
+    signals: dict[str, list[AttemptSignal]] = Field(default_factory=dict)
+    #: The retrievals the mission ran, with their yield.
+    queries: list[QueryRecord] = Field(default_factory=list)
+    #: Findings that required a strategy change, and the change recorded for the unit.
+    corrections: list[StrategyChange] = Field(default_factory=list)
+    #: Lines of inquiry the mission has stopped asking about.
+    blocked: list[BlockedLine] = Field(default_factory=list)
+    #: Mission-level saturation: claims per round, and the stop it justifies.
+    saturation: SaturationReport = Field(default_factory=SaturationReport)
+
+    @property
+    def findings(self) -> list[LoopFinding]:
+        return list(self.saturation.findings) + [
+            finding for finding in self._unit_findings()]
+
+    def _unit_findings(self) -> list[LoopFinding]:
+        found: list[LoopFinding] = []
+        for finding in self.corrections:
+            found.append(LoopFinding(
+                kind=finding.kind, subject=finding.unit, unit=finding.unit,
+                round=finding.attempt, occurrences=2, evidence_added=0,
+                checked_by="recorded correction", detail=finding.instruction[:200],
+                response=LoopResponse.CORRECT, strategy_change=finding.instruction))
+        return found
+
+    def signals_for(self, unit: str) -> list[AttemptSignal]:
+        return list(self.signals.get(unit, []))
+
+    def corrected_kinds(self, unit: str) -> list[CycleKind]:
+        """The kinds this unit has already been told to change strategy about."""
+
+        return [change.kind for change in self.corrections if change.unit == unit]
+
+    def is_blocked(self, unit: str) -> bool:
+        return any(line.unit == unit for line in self.blocked)
+
+    def block(self, finding: LoopFinding) -> BlockedLine:
+        """Record a blocked line once, returning the record either way."""
+
+        existing = next((line for line in self.blocked
+                         if line.subject == finding.subject and line.kind is finding.kind),
+                        None)
+        if existing is not None:
+            return existing
+        line = blocked_line(finding)
+        self.blocked.append(line)
+        return line
+
+    def note_query(self, query: str, *, unit: str = "", round_number: int = 1,
+                   claims: int = 0) -> QueryRecord:
+        record = QueryRecord.of(query, unit=unit, round_number=round_number,
+                                claims=claims)
+        self.queries.append(record)
+        return record
+
+    def summary(self) -> dict[str, Any]:
+        return {"units_watched": len(self.signals),
+                "attempts": sum(len(items) for items in self.signals.values()),
+                "queries": len(self.queries),
+                "corrections": [change.to_dict() for change in self.corrections],
+                "blocked": [line.to_dict() for line in self.blocked],
+                "saturation": self.saturation.to_dict(),
+                "kinds": sorted({finding.kind.value for finding in self.findings})}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"signals": {unit: [signal.model_dump(mode="json") for signal in items]
+                            for unit, items in self.signals.items()},
+                "queries": [record.model_dump(mode="json") for record in self.queries],
+                "corrections": [change.to_dict() for change in self.corrections],
+                "blocked": [line.to_dict() for line in self.blocked],
+                "saturation": self.saturation.to_dict(),
+                "summary": self.summary()}
+
+    def describe(self) -> str:
+        if not self.corrections and not self.blocked and not self.saturation.findings:
+            return "no loop detected: every attempt added claims the unit did not hold"
+        parts = []
+        if self.corrections:
+            parts.append(f"{len(self.corrections)} strategy change(s)")
+        if self.blocked:
+            parts.append(f"{len(self.blocked)} line(s) blocked")
+        if self.saturation.findings:
+            parts.append(f"saturation: {self.saturation.summary()}")
+        return "; ".join(parts)
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # 38. Entry point
@@ -50856,5 +52371,408 @@ def process_entry() -> None:
         raise SystemExit(exit_request.exit_code) from None
 
 
+
+# --------------------------------------------------------------------------
+# 38.6 The demo and its checks: a loop that ends, and says why
+# --------------------------------------------------------------------------
+
+def _loop_outcome(robot: str, attempt: int, statements: Sequence[str], *,
+                  worker: str = "wrk-loop", subagent: str = "sa-loop",
+                  queries: Sequence[str] = ()) -> "WorkerOutcome":
+    """One attempt of a Worker, sourced, with the queries it was told to run.
+
+    A real :class:`WorkerOutcome` rather than a mock, because the detectors read the
+    report the outcome carries and a mock would prove nothing about that path.
+    """
+
+    items = [_review_item(statement, worker=f"{worker}-{attempt}") for statement in statements]
+    report = WorkerReport(
+        worker_id=worker, subagent_id=subagent, attempt=attempt,
+        status=WorkerStatus.COMPLETED if items else WorkerStatus.BLOCKED,
+        summary=f"{worker}: {len(items)} observation(s) collected",
+        findings=[WorkerFinding(statement=item.statement, evidence_ids=[item.id])
+                  for item in items],
+        evidence=items,
+        limitations=[] if items else ["no source answered the question this attempt asked"],
+        gaps=[] if items else [UnknownValue(reason=UnknownReason.UNAVAILABLE,
+                                            detail="the retrieval returned nothing")])
+    return WorkerOutcome(
+        worker_id=worker, subagent_id=subagent,
+        status=EntityStatus.SUCCEEDED if items else EntityStatus.BLOCKED,
+        attempt=attempt, summary=report.summary,
+        evidence_ids=[item.id for item in items],
+        payload={"report": json.loads(model_to_json(report)),
+                 "queries": list(queries)})
+
+
+def loop_detection_cases() -> dict[str, Any]:
+    """The fixtures: one unit that repeats a query, one that learns, one at mission level.
+
+    Built from outcomes rather than from signals, so the checks exercise the same path
+    the graph does — a detector that only works on hand-made signals would be proving
+    something about its own fixture rather than about the record.
+    """
+
+    query = "search example.com on shodan"
+    reworded = "shodan search for example.com"
+    first = _loop_outcome("a", 1, ["the gateway runs firmware 7.2"],
+                          queries=[query])
+    second = _loop_outcome("a", 2, ["the gateway runs firmware 7.2"],
+                           queries=[reworded])
+    third = _loop_outcome("a", 3, ["the gateway runs firmware 7.2"],
+                          queries=[query])
+    moving = _loop_outcome("b", 1, [], queries=["search example.com in certspotter"])
+    moving2 = _loop_outcome("b", 2, ["certspotter lists four subdomains of example.com"],
+                            queries=["search example.com in certspotter"])
+    return {"first": first, "second": second, "third": third,
+            "moving": moving, "moving2": moving2,
+            "query": query, "reworded": reworded}
+
+
+def loop_detection_demo() -> dict[str, Any]:
+    """Three cycles and three outcomes: corrected, blocked, and stopped.
+
+    The demo ends where the task says the acceptance clause lives: a repeated cycle
+    terminating with a reason a reader can point at, rather than a budget that ran out.
+    """
+
+    cases = loop_detection_cases()
+    first, second, third = cases["first"], cases["second"], cases["third"]
+    # 1. a unit that repeats one retrieval: the first detection asks for a change.
+    correct = detect_unit_cycle(
+        [attempt_signal(first, plan="plan-a"),
+         attempt_signal(second, prior=[first], plan="plan-a")],
+        queries=[QueryRecord.of(cases["query"], unit="wrk-loop", claims=1),
+                 QueryRecord.of(cases["reworded"], unit="wrk-loop", claims=0)],
+        unit="wrk-loop")
+    # 2. the same finding, after the correction was applied and ignored: blocked.
+    blocked = escalate(correct, already_corrected=correct.kinds_as_enums())
+    # The third attempt is what makes the block unavoidable rather than premature: the
+    # correction was applied, the unit repeated itself anyway, and the line is closed.
+    third_signal = attempt_signal(third, prior=[first, second], plan="plan-a")
+    # 3. a mission whose rounds add nothing: stopped, with the series on the record.
+    stopped = assess_saturation([4, 0, 0])
+    # 4. a mission that keeps learning: nothing to report.
+    healthy = assess_saturation([2, 3, 1])
+    lines = [blocked_line(finding) for finding in blocked.findings if finding.blocks]
+    return {
+        "corrected": correct.to_dict(),
+        "blocked": blocked.to_dict(),
+        "blocked_lines": [line.to_dict() for line in lines],
+        "stopped": stopped.to_dict(),
+        "healthy": healthy.to_dict(),
+        "unbounded": [phrase for phrase in
+                      ("continue until the sources are exhausted",
+                       "keep searching until done",
+                       "read every advisory from the published list")
+                      if unbounded_instruction(phrase)],
+        "queries": {"first": query_fingerprint(cases["query"]),
+                    "reworded": query_fingerprint(cases["reworded"]),
+                    "different": query_fingerprint("search example.com in certspotter")},
+        "signals": {
+            "the corrective attempt added nothing either": third_signal.new_claims == 0,
+            "one retrieval under two wordings is one query":
+                query_fingerprint(cases["query"]) == query_fingerprint(cases["reworded"]),
+            "a repeated query with no yield is detected": bool(correct.findings),
+            "the first detection requires a change of strategy":
+                correct.findings[0].response is LoopResponse.CORRECT
+                and len(correct.strategy_change) > 15,
+            "a cycle that survives its correction is blocked": blocked.blocked,
+            "the block says what would unblock it":
+                all(len(line.unblock) > 10 for line in lines),
+            "two empty rounds stop the mission":
+                stopped.condition is StopCondition.SATURATION,
+            "the stop names the series it judged":
+                stopped.added_per_round == [4, 0, 0],
+            "a mission that keeps learning is not stopped": not healthy.stopped,
+            "an unbounded instruction is refused": bool(
+                unbounded_instruction("continue until the sources are exhausted")),
+            "a bounded instruction is accepted": not unbounded_instruction(
+                "read the three published advisories and cite each one"),
+        },
+    }
+
+
+def render_loop_detection_demo(payload: Mapping[str, Any]) -> Group:
+    """The demo, as a reader sees it: what repeated, and what it cost to find out."""
+
+    signals = Table(title="what the detectors saw", title_justify="left", box=None,
+                    pad_edge=False, expand=False)
+    signals.add_column("check", overflow="fold")
+    signals.add_column("ok", no_wrap=True)
+    for name, ok in payload["signals"].items():
+        glyph = "[green]✔[/green]" if ok else "[red]✘[/red]"
+        signals.add_row(escape(name), glyph)
+
+    rows = Table(title="the cycles, and what each required", title_justify="left",
+                 box=None, pad_edge=False, expand=False)
+    rows.add_column("kind", no_wrap=True)
+    rows.add_column("subject", no_wrap=True)
+    rows.add_column("response", no_wrap=True)
+    rows.add_column("what it requires", overflow="fold", max_width=56)
+    for section in ("corrected", "blocked", "stopped"):
+        for finding in payload[section]["findings"]:
+            detail = (finding["strategy_change"] if finding["response"] == "correct"
+                      else finding["unblock"] if finding["response"] == "block"
+                      else payload["stopped"]["stop_reason"])
+            rows.add_row(escape(finding["kind"]), escape(finding["subject"]),
+                         escape(finding["response"]), escape(str(detail)[:160]))
+
+    blocked = Table(title="lines of inquiry the mission stopped asking about",
+                    title_justify="left", box=None, pad_edge=False, expand=False)
+    blocked.add_column("subject", no_wrap=True)
+    blocked.add_column("would unblock", overflow="fold", max_width=70)
+    for line in payload["blocked_lines"]:
+        blocked.add_row(escape(line["subject"]), escape(line["unblock"]))
+
+    tail = Text("a repeated cycle ends with a reason, not with a budget: the change it "
+                "required, the line it blocked, or the stop it justified", style="dim")
+    return Group(signals, Text(""), rows, Text(""), blocked, Text(""), tail)
+
+
+def run_loop_self_test() -> list[LoopCheck]:
+    """Prove §38's acceptance clause: a no-progress cycle terminates, and says why.
+
+    Four groups, because four different things must hold: the detectors fire on
+    substance, the escalation blocks rather than repeats, the mission-level series stops
+    the mission, and the flow *uses* all three — the last is what a unit test of the
+    models alone cannot show.
+    """
+
+    checks: list[LoopCheck] = []
+
+    def add(name: str, ok: Any, detail: Any = "") -> None:
+        checks.append(LoopCheck(name=name, ok=bool(ok), detail=str(detail)[:150]))
+
+    def raises(fn: Callable[[], Any], exc: type[BaseException]) -> bool:
+        try:
+            fn()
+        except exc:
+            return True
+        except Exception:                     # noqa: BLE001 - the wrong error is a failure
+            return False
+        return False
+
+    cases = loop_detection_cases()
+    first, second = cases["first"], cases["second"]
+    third = cases["third"]
+
+    # -- 1. the fingerprints: repetition is judged on substance ----------------
+    add("a query is the same query under two wordings",
+        query_fingerprint(cases["query"]) == query_fingerprint(cases["reworded"]))
+    add("a different retrieval is a different fingerprint",
+        query_fingerprint(cases["query"])
+        != query_fingerprint("search example.com in certspotter"))
+    add("a plan fingerprint ignores case and punctuation in its target",
+        plan_fingerprint_of(target="Read the Advisories!", tools=["http.get"])
+        == plan_fingerprint_of(target="read  the advisories", tools=["http.get"]))
+    add("a plan fingerprint notices a different tool",
+        plan_fingerprint_of(target="read the advisories", tools=["http.get"])
+        != plan_fingerprint_of(target="read the advisories", tools=["dns.lookup"]))
+    add("a plan fingerprint notices a different unit of work",
+        plan_fingerprint_of(target="read the advisories", work_unit="read")
+        != plan_fingerprint_of(target="read the advisories", work_unit="summarise"))
+    add("a plan fingerprint does not include the objective's prose",
+        plan_fingerprint_of(target=units_of_work(), work_unit="advisories")
+        == plan_fingerprint_of(target=units_of_work(), work_unit="advisories"))
+    add("an unbounded instruction is refused",
+        unbounded_instruction("continue until the sources are exhausted") ==
+        "continue until")
+    add("a bounded instruction is accepted",
+        not unbounded_instruction("read the three published advisories and cite each"))
+
+    # -- 2. the detectors ----------------------------------------------------
+    added = attempt_signal(first, plan="p1")
+    add("the first attempt's claims are all new", added.new_claims == 1, added.new_claims)
+    repeat = attempt_signal(second, prior=[first], plan="p1")
+    add("the repeat adds nothing the unit already held", repeat.new_claims == 0,
+        repeat.new_claims)
+    add("a repeated query with no yield is detected",
+        detect_repeated_queries(
+            [QueryRecord.of(cases["query"], unit="u", claims=1),
+             QueryRecord.of(cases["reworded"], unit="u", claims=0)], unit="u") is not None)
+    add("a repeated query that found something is not a cycle",
+        detect_repeated_queries(
+            [QueryRecord.of(cases["query"], unit="u", claims=1),
+             QueryRecord.of(cases["query"], unit="u", claims=1)], unit="u") is None)
+    add("a repeated plan with no yield is detected",
+        detect_repeated_plans([added, repeat], unit="u") is not None)
+    add("a repeated plan that yielded is not a cycle",
+        detect_repeated_plans([added, attempt_signal(cases["moving2"], plan="p1")],
+                              unit="u") is None)
+    add("diminishing returns need two empty attempts",
+        detect_diminishing_returns([added], unit="u") is None)
+    add("two empty attempts are a diminishing return",
+        detect_diminishing_returns(
+            [attempt_signal(second, prior=[first]), attempt_signal(third, prior=[first, second])],
+            unit="u") is not None)
+    add("a unit doing different work is not a repeated retask",
+        detect_repeated_retasks([], unit="u") is None)
+
+    # -- 3. the escalation: correct, then block, never repeat -----------------
+    detection = detect_unit_cycle(
+        [added, repeat], queries=[QueryRecord.of(cases["query"], unit="u", claims=1),
+                                  QueryRecord.of(cases["reworded"], unit="u", claims=0)],
+        unit="u")
+    add("the first detection of a cycle requires a change of strategy",
+        detection.found and not detection.blocked)
+    add("the correction names what to do differently",
+        len(detection.strategy_change) > 20, detection.strategy_change)
+    escalated = escalate(detection, already_corrected=detection.kinds_as_enums())
+    add("a cycle that survives its correction is blocked", escalated.blocked)
+    add("the blocked line says what would unblock it",
+        all(finding.unblock for finding in escalated.findings if finding.blocks))
+    add("a correction with no strategy change is not constructible",
+        raises(lambda: LoopFinding(kind=CycleKind.REPEATED_QUERY, subject="q-1",
+                                   detail="the same query ran twice and added nothing",
+                                   response=LoopResponse.CORRECT,
+                                   strategy_change="try again"), ValueError))
+    add("a block that cannot be lifted is not constructible",
+        raises(lambda: LoopFinding(kind=CycleKind.REPEATED_QUERY, subject="q-1",
+                                   detail="the same query ran twice and added nothing",
+                                   response=LoopResponse.BLOCK, unblock=""), ValueError))
+    add("a diminishing-returns finding cannot claim new evidence",
+        raises(lambda: LoopFinding(kind=CycleKind.DIMINISHING_RETURNS, subject="u",
+                                   detail="two attempts added nothing new at all",
+                                   evidence_added=2,
+                                   strategy_change="change the source family"),
+               ValueError))
+    line = blocked_line(escalated.findings[0])
+    add("the block travels as an unknown with its unblock", "would unblock" in line.gap_detail(),
+        line.gap_detail())
+    add("a blocked line becomes a report gap",
+        len(cycle_gaps([line])) == 1
+        and cycle_gaps([line])[0].reason is UnknownReason.UNAVAILABLE)
+
+    # -- 4. the mission level ------------------------------------------------
+    stopped = assess_saturation([4, 0, 0])
+    add("two empty rounds stop the mission", stopped.stopped)
+    add("the stop condition is saturation", stopped.condition is StopCondition.SATURATION)
+    add("the stop names the series it judged", stopped.added_per_round == [4, 0, 0])
+    add("one empty round does not yet stop", not assess_saturation([4, 0]).stopped)
+    add("a mission that keeps learning is not stopped",
+        not assess_saturation([2, 3, 1]).stopped)
+    add("the stop reason mentions the empty rounds", "consecutive" in stopped.stop_reason,
+        stopped.stop_reason)
+
+    # -- 5. the flow uses it: the acceptance clause, on real graph runs --------
+    context = _selftest_context("exposure")
+    units = _looping_units(context, attempts=3)
+    # Three attempts, so the ladder runs to its end inside one mission: the first
+    # repeat is corrected, the second is blocked, and no fourth attempt is issued.
+    runner = _CountingRunner(scope=context.scope_entries, repeat_queries=True,
+                             always_retry=workers_of(units))
+    repeating = HierarchicalFlow(
+        context=context, subagents=units, runner=runner,
+        policy=FlowPolicy(allow_runtime_workers=False, max_review_rounds=3,
+                          max_replan_rounds=1))
+    repeated_result = repeating.run()
+    ledger = repeating._loops
+    add("a repeating unit is detected on the graph's own record", bool(ledger.findings),
+        ledger.describe())
+    add("the first repetition is corrected rather than blocked",
+        bool(ledger.corrections), [change.kind.value for change in ledger.corrections])
+    add("the correction is carried by the retask the next attempt ran under",
+        any(change.instruction in (retask.prompt or "")
+            for change in ledger.corrections for retask in repeating.retasks()),
+        len(repeating.retasks()))
+    add("every correction names a change of strategy, not a retry",
+        all("Change of strategy required" in retask.prompt
+            for change in ledger.corrections for retask in repeating.retasks()
+            if change.instruction in (retask.prompt or "")))
+    add("the retask that carries the correction is a different instruction",
+        not any(a.fingerprint == b.fingerprint
+                for a, b in zip(repeating.retasks(), repeating.retasks()[1:])
+                if a.worker_id == b.worker_id))
+    add("the run reports the loop rather than only logging it",
+        repeated_result.loops is not None
+        and repeated_result.loop_summary.get("corrections") is not None)
+    add("a corrected unit is asked no more than its attempts allow",
+        all(sum(1 for retask in repeating.retasks() if retask.worker_id == worker_id) <= 2
+            for worker_id in workers_of(units)))
+
+    stubborn_units = _looping_units(context, attempts=4)
+    stubborn = HierarchicalFlow(
+        context=context, subagents=stubborn_units,
+        runner=_CountingRunner(scope=context.scope_entries, repeat_queries=True,
+                               always_retry=workers_of(stubborn_units)),
+        policy=FlowPolicy(allow_runtime_workers=False, max_review_rounds=4,
+                          max_replan_rounds=1))
+    stubborn_result = stubborn.run()
+    blocked_lines = stubborn._loops.blocked
+    add("a unit that repeats after its correction is blocked", bool(blocked_lines),
+        [line.subject for line in blocked_lines])
+    blocked_ids = {line.unit for line in blocked_lines}
+    ran = {}
+    for event in stubborn.trace.to_list():
+        if event.get("stage") == FlowStage.WORKER.value and event.get("unit") in blocked_ids:
+            ran[event["unit"]] = ran.get(event["unit"], 0) + 1
+    add("a blocked branch runs no further attempt",
+        all(ran.get(line.unit) == line.attempts for line in blocked_lines), ran)
+    add("a blocked branch is issued no further retask",
+        all(not any(retask.worker_id == line.unit and retask.attempt > line.attempts
+                    for retask in stubborn.retasks()) for line in blocked_lines),
+        len(stubborn.retasks()))
+    add("a blocked line becomes a report gap", bool(cycle_gaps(blocked_lines)))
+    add("the block says what would unblock it",
+        all(len(line.unblock) > 10 for line in blocked_lines))
+    add("a blocked mission is still reviewed", bool(stubborn.master_reviews()))
+    add("a correction with no attempt left is recorded as not applied", all(
+        change.applied or any("not applied" in str(event.get("detail", ""))
+                              for event in repeated_result.trace)
+        for change in ledger.corrections), [(c.unit, c.applied) for c in ledger.corrections])
+    add("the block stops the branch before its last allowed attempt",
+        all(sum(1 for retask in stubborn.retasks()
+                if retask.worker_id == line.unit) < 3
+            for line in blocked_lines), len(stubborn.retasks()))
+    add("every blocked line names the attempt that ended it",
+        all(line.attempts >= 2 for line in blocked_lines))
+    add("a blocked line reaches the report as a gap", any(
+        "line of inquiry blocked" in (gap.detail or "")
+        for gap in (stubborn_result.synthesis.gaps if stubborn_result.synthesis else [])),
+        len(stubborn_result.synthesis.gaps) if stubborn_result.synthesis else 0)
+    add("an unbounded runtime objective is refused", raises(lambda: RuntimePlan(
+        subagent_id="sa-1", gap="the advisory history is missing",
+        name="read-everything", target="the published advisories",
+        objective="keep reading the advisories until there is nothing left",
+        work_unit="advisories", tools=["evidence.read"],
+        expected_evidence="every advisory", completion_criteria=["all read"],
+        source="criterion", rationale="the gap names an advisory history"), ValueError))
+    add("the result serialises the loop ledger",
+        json.loads(json.dumps(repeated_result.to_dict(), default=str))
+        ["loops"]["summary"]["kinds"] is not None)
+    add("every stop the flow records has a reason", all(
+        decision.condition is StopCondition.NONE or decision.basis
+        for decision in repeated_result.master_decisions))
+    return checks
+
+
+#: A target a plan can aim at, used by the fingerprint checks.  Separate from the
+#: objective prose on purpose: a plan is what is aimed at, with what, as which unit.
+def units_of_work() -> str:
+    return "the published advisories for example.com"
+
+
+def _looping_units(context: "MasterContext", *, attempts: int) -> list[FlowSubagent]:
+    """The mission's own plan, with every unit allowed ``attempts`` tries.
+
+    A copy, so raising the budget for one check does not change the plan the other
+    checks run against — and so the ladder can be walked to its end without the
+    attempt cap cutting it short first.
+    """
+
+    units = flow_units_for(context, "exposure")
+    return [subagent.model_copy(update={
+        "workers": [worker.model_copy(update={"max_attempts": attempts})
+                    for worker in subagent.workers]}) for subagent in units]
+
+
+def workers_of(units: Sequence[FlowSubagent]) -> list[str]:
+    """Every Worker id in a plan, for a runner that must fail or retry all of them."""
+
+    return [worker.id for subagent in units for worker in subagent.workers]
+
+
 if __name__ == "__main__":
     process_entry()
+

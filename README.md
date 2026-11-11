@@ -28,6 +28,7 @@ python vedant_osint.py review --self-test    # seven dimensions, pass or revise
 python vedant_osint.py retask --self-test    # a revise becomes a specific assignment
 python vedant_osint.py aggregate --self-test # reviewed work only, and never early
 python vedant_osint.py review-master --self-test # five lenses, five ways to stop
+python vedant_osint.py loops --self-test      # repeated work, blocked lines, saturation
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -929,13 +930,50 @@ python vedant_osint.py review-master --next mission.json --objective "…"
   round it opened and the evidence that round added — so "it was bounded" is a number a
   reader can check rather than a property the code claims about itself.
 
+## Loop detection and saturation stopping
+
+Retry budgets and round caps decide how long a cycle *may* run; this section decides
+whether it is a cycle at all, and what to do about it. It reads the record, detects the
+loop in four forms, and escalates in the order the remedy implies.
+
+- **Four detectors, one question each.** A **repeated query** (the same retrieval, in
+  different words, adding nothing), a **repeated plan** (the same target and tools under a
+  re-worded objective), a **repeated retask** (two attempts handed one instruction) and
+  **diminishing returns** (different-looking attempts, no new claims). A **stalled round**
+  is the mission-level form: a round that ran work and added no claim the mission did not
+  already hold.
+- **Repetition is judged on substance.** Queries are fingerprinted over normalised,
+  sorted tokens, so "shodan search for example.com" and "search example.com on shodan" are
+  one query; plans are fingerprinted over target, tools and work unit, so re-wording a
+  retry cannot hide a repeat. Progress is counted in *new claims*, never in rows.
+- **The escalation is a ladder, not a choice.** A first detection requires the responsible
+  agent to change strategy: the correction is carried by the retask itself, and a retask
+  whose fingerprint would not move is refused rather than issued. A unit that repeats
+  after its correction has its line of inquiry **blocked** — it stops being asked, the
+  record says what would unblock it, and the block travels into the report as a gap and a
+  limitation. A mission whose rounds stop adding claims **stops**, with the series it
+  judged on the record.
+- **No instruction may be unbounded.** "Continue until…", "keep searching", "exhaust
+  every source" are refused wherever this build accepts an instruction — a runtime
+  Worker's objective, a follow-up — because a loop detector cannot catch an instruction
+  that has no end condition for the mission to test.
+- **The reason is a finding, not a log line.** `FlowResult.loops` carries every
+  correction (with whether any attempt carried it), every blocked line, the claims added
+  per round, and the stop condition it justified; `loop_summary` is the same in counts.
+
+```
+python vedant_osint.py loops --self-test                # 52 loop-detection checks
+python vedant_osint.py loops --demo                     # correct, block, stop
+python vedant_osint.py loops --reports mission.json --evidence 4,0,0
+```
+
 ## Status
 
 | Phase | Scope | State |
 |-------|-------|-------|
 | 1 | Foundation — CLI skeleton, config probing, version reporting | ✅ done |
 | 2 | Contracts — settings, `doctor`, preflight, models, state, renderer, lifecycle, resilience, model adapter | ✅ done |
-| 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control, Worker outcome contract, Subagent quality review, targeted Worker retasking, Subagent aggregation with bounded runtime Workers, Master review with bounded replanning) |
+| 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control, Worker outcome contract, Subagent quality review, targeted Worker retasking, Subagent aggregation with bounded runtime Workers, Master review with bounded replanning, loop detection with strategy change, blocked lines and saturation stops) |
 | 4 | Browser — browser-use / Playwright sessions and capture | 🟡 started (policy, scope, capture, guarded closure, agent mode) |
 | 5 | Collection — passive OSINT sources, artefact hashing | 🟡 started (source-aware web research; safe document/page extraction with injection defence; read-only artifact manifests, hashing and access ledger) |
 | 6 | Synthesis — cross-source correlation and reporting | 🟡 started (deterministic timelines, explained indicator correlation, content de-duplication) |
