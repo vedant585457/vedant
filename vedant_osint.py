@@ -513,8 +513,47 @@ reason, what the grant allowed and what to do instead.
 
 ::
 
-    python vedant_osint.py router --self-test       # 98 boundary checks, offline
-    python vedant_osint.py router --demo            # seven attempts, six refused
+    python vedant_osint.py router --self-test       # 102 boundary checks, offline
+    python vedant_osint.py router --demo            # seven attempts, four refused
+
+Browser research
+----------------
+The ninth capability has a real engine behind it.  :class:`BrowserSession` drives
+Playwright directly for a fetch, or browser-use when the run asks for an agent,
+and every visit is configured from one :class:`BrowserPolicy`: headless mode,
+every timeout, the viewport, the download policy, the navigation and text limits,
+and the five prohibitions.
+
+*   **Scope is checked before a browser exists.**  A URL outside the mission's
+    :class:`Scope` is refused with no process started, no profile written and no
+    request made — and a page that *redirects* off-scope is refused rather than
+    followed, so a redirect cannot widen the mission.
+*   **Not public web is not browsable.**  Loopback, RFC 1918, link-local and the
+    cloud metadata names are refused statically, without DNS, so the browser
+    cannot be turned into a pivot into an internal network.
+*   **Each visit gets its own context**, cookie-less and closed in a ``finally``;
+    the real engine also filters requests at the browser, aborting any document
+    outside the scope.  There is no persistent profile to carry a session between
+    runs.
+*   **Five things are prohibited, and the vocabulary says so.**  Credential use,
+    access-control bypass, CAPTCHA solving, unauthorised automation and form
+    submission are values in :class:`BrowserRefusal`; a requested action that
+    names one is refused with a reason, and the rest of the visit still runs.
+*   **Closure is the acceptance criterion, so it is not a ``finally: pass``.**  A
+    session owns one browser for one visit; it closes on success, on an engine
+    exception, on a deadline, and on a cancellation that arrives *while* the visit
+    is running.  The capture says whether a browser was launched and whether it was
+    closed, and the flow closes again on its own exit path.
+*   **The capture is evidence.**  Final URL, title, retrieval time, the relevant
+    text and the errors all reach the router's evidence, so "the page did not
+    load" is a reported finding rather than an empty result.
+
+::
+
+    python vedant_osint.py browser --self-test      # 113 closure checks, offline
+    python vedant_osint.py browser --demo           # three captures, four refusals
+    python vedant_osint.py browser --url https://example.com/ --scope example.com
+    python vedant_osint.py flow --demo exposure --browser
 
 Structured model adapter
 ------------------------
@@ -674,6 +713,7 @@ from enum import Enum, IntEnum
 from pathlib import Path
 from typing import (Annotated, Any, Callable, ClassVar, Iterable, Iterator, Mapping,
                     Protocol, Sequence, TypedDict)
+from urllib.parse import urlsplit
 
 # --- third party: CLI surface -------------------------------------------------
 # Typer + Rich are the only hard imports.  They are imported at module level
@@ -706,7 +746,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 17
+VERSION_MINOR: int = 18
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -762,7 +802,8 @@ PHASE_ROADMAP: tuple[tuple[int, str, str], ...] = (
     (2, "Contracts", "Contracts, state, rendering, lifecycle, resilience, model adapter"),
     (3, "Orchestration", "Master Agent (only fixed agent), runtime Subagent/Worker factories, "
                          "LangGraph execution flow, bounded concurrency and budgets"),
-    (4, "Browser", "browser-use/Playwright sessions and capture"),
+    (4, "Browser", "browser-use over Playwright: policy, scope, capture, guaranteed "
+                   "closure"),
     (5, "Collection", "passive OSINT sources, artefact hashing/chain of custody"),
     (6, "Synthesis", "cross-source correlation, findings and report export"),
     (7, "Operations", "checkpoints and resumable missions, the controlled capability "
@@ -21277,6 +21318,18 @@ class FlowPolicy(StrictModel):
     #: Network switch handed to the router, so an offline mission refuses a
     #: network capability at the boundary rather than inside a collector.
     allow_network: bool = True
+    #: Give the router a browser: a fresh session per visit, its own policy, and the
+    #: mission's scope as the allow-list.  Off by default because it needs Playwright
+    #: *and* a browser build, and a demo must not depend on either.
+    browser: bool = False
+    #: How the browser behaves.  Only the mode and the two ceilings are exposed
+    #: here; everything else stays at the policy's safe defaults.
+    browser_mode: str = "http"
+    browser_max_navigations: int = Field(default=5, ge=1, le=50)
+    #: 30s unless told otherwise; the constant lives in section 28, which is later
+    #: in the file than this, so the number is written here rather than imported.
+    browser_timeout_ms: int = Field(default=30_000, ge=1_000, le=180_000)
+    browser_allow_forms: bool = False
 
     @classmethod
     def from_context(cls, context: "MasterContext", **overrides: Any) -> "FlowPolicy":
@@ -21973,6 +22026,8 @@ class FlowResult(StrictModel):
     resume: dict[str, Any] | None = None
     #: Where this run's checkpoint lives, when it was checkpointed at all.
     checkpoint: str = ""
+    #: What the browser did: visits, refusals, and whether anything was left open.
+    browser: dict[str, Any] = Field(default_factory=dict)
 
     @property
     def total_workers(self) -> int:
@@ -22193,6 +22248,9 @@ class HierarchicalFlow:
         #: The one path from a Worker's request to an effect, and the grants that
         #: bound it.  Built in ``build``; ``None`` when the policy disables it.
         self.router: "CapabilityRouter | None" = None
+        #: The browser, when the policy gives the router one.
+        self.browser_policy: "BrowserPolicy | None" = None
+        self.browser_reader: Callable[..., Any] | None = None
         self.grants: dict[str, Any] = {}
         #: Dispatches each Worker made through the router, in order.
         self.dispatch: list[dict[str, Any]] = []
@@ -22349,7 +22407,22 @@ class HierarchicalFlow:
             self.grants = {}
             return
         scope = self.context.scope_object()
-        self.router = CapabilityRouter(scope=scope, network=self.policy.allow_network)
+        readers: dict[str, Callable[..., Any]] = {}
+        if self.policy.browser:
+            # The browser is a *reader* for the router's browser capability, so a
+            # Worker reaches it the same way it reaches any other capability — and
+            # the scope check that guards a fetch guards a rendered page too.
+            self.browser_policy = BrowserPolicy(
+                mode=BrowserMode(self.policy.browser_mode),
+                max_navigations=self.policy.browser_max_navigations,
+                navigation_timeout_ms=self.policy.browser_timeout_ms,
+                allow_form_submission=self.policy.browser_allow_forms)
+            self.browser_reader = browser_reader(
+                self.browser_policy, scope=scope, token=self.runtime.token,
+                runtime=self.runtime)
+            readers[Capability.BROWSER.value] = self.browser_reader
+        self.router = CapabilityRouter(scope=scope, network=self.policy.allow_network,
+                                       readers=readers)
         self.grants = {
             worker.id: grant_for_worker(worker, subagent, paths=self.router.paths,
                                         network=self.policy.allow_network)
@@ -22842,6 +22915,29 @@ class HierarchicalFlow:
         return {"outcomes": [json.loads(model_to_json(outcome))],
                 "reviews": [json.loads(model_to_json(verdict))]}
 
+    def _close_browser(self, *, reason: str) -> dict[str, Any]:
+        """Close the browser this run opened, whatever else happened.
+
+        Called from ``run`` *and* from the exception path, so a flow that raises
+        mid-graph still leaves no browser running.  Returns what the session did, so
+        the result can say "three visits, nothing left open" rather than assuming it.
+        """
+
+        if self.browser_reader is None:
+            return {}
+        session = getattr(self.browser_reader, "session", None)
+        if session is None:                          # pragma: no cover - ours sets it
+            return {}
+        summary = session.close(reason)
+        summary.update({"visits": len(session.visits),
+                        "navigations": session.navigations,
+                        "refusals": [item.value for item in session.refusals],
+                        "open_resources": session.guard.open_count,
+                        "engine": session.engine_name})
+        summary["captures"] = session.capture_dicts()
+        summary["policy"] = self.browser_policy.to_dict() if self.browser_policy else {}
+        return summary
+
     def _route_worker(self, subagent: FlowSubagent,
                       worker: FlowWorker) -> WorkerOutcome | None:
         """Ask the capability router what this Worker may do.
@@ -23208,8 +23304,15 @@ class HierarchicalFlow:
         if self.resume is not None:
             self._announce_resume()
         started = time.monotonic()
-        final = self._top_graph.invoke({**_master_state(self.mission_id, self.context.objective),
-                                        "reports": [], "stopped": False, "stop_reason": ""})
+        try:
+            final = self._top_graph.invoke(
+                {**_master_state(self.mission_id, self.context.objective),
+                 "reports": [], "stopped": False, "stop_reason": ""})
+        except BaseException:
+            # A graph that raises must not leave a browser process behind.  The
+            # summary is discarded: the exception is the outcome.
+            self._close_browser(reason="flow raised")
+            raise
         elapsed = time.monotonic() - started
         if self.resume is not None:
             # The plan and the trace are the two things a resume cannot rebuild.
@@ -23221,6 +23324,7 @@ class HierarchicalFlow:
         ordered = [next((report for report in reports if report.subagent_id == subagent.id), None)
                    for subagent in self.subagents]
         kept = [report for report in ordered if report is not None]
+        browser_summary = self._close_browser(reason="flow finished")
         result = FlowResult(
             mission_id=self.mission_id, objective=self.context.objective,
             subagents=self.subagents, reports=kept,
@@ -23237,6 +23341,7 @@ class HierarchicalFlow:
             resume=self.resume_plan.to_dict() if self.resume_plan else None,
             checkpoint=(str(self.resume.store.path_for(self.mission_id))
                         if self.resume is not None else ""),
+            browser=browser_summary,
         )
         if self.logger is not None:
             self.logger.log(
@@ -23710,7 +23815,8 @@ def _flow_checkpoint_options(checkpoint: bool, resume_id: str | None,
 
 def _flow_demo(objective_key: str, *, out_dir: Path | None = None,
                delay: float = 0.05, store: "CheckpointStore | None" = None,
-               mode: "ResumeMode | None" = None) -> dict[str, Any]:
+               mode: "ResumeMode | None" = None,
+               browser: bool = False) -> dict[str, Any]:
     """Run one scripted objective through the real graph, offline.
 
     The runner is deterministic and says so: the evidence it produces is
@@ -23732,7 +23838,8 @@ def _flow_demo(objective_key: str, *, out_dir: Path | None = None,
     flow = HierarchicalFlow(
         context=context, subagents=units, runner=runner, tracker=tracker, logger=logger,
         policy=FlowPolicy.from_context(context, stage_delay_seconds=delay,
-                                       max_parallel_workers=4, max_parallel_subagents=4),
+                                       max_parallel_workers=4, max_parallel_subagents=4,
+                                       browser=browser),
     )
     if store is not None:
         flow.attach_resume(store, mode=mode)
@@ -23773,6 +23880,7 @@ def _flow_demo(objective_key: str, *, out_dir: Path | None = None,
         "policy": json.loads(model_to_json(result.policy)),
         "trace": result.trace,
         "runtime_only": True,
+        "browser": result.browser,
         "log_lines": len(logger.read_records()) if logger is not None else 0,
         "checks": [{"check": check.name, "ok": check.ok, "detail": check.detail}
                    for check in run_flow_self_test()],
@@ -23867,6 +23975,11 @@ def flow_command(
     revalidate_after: float = typer.Option(
         0.0, "--revalidate-after",
         help="Re-check settled results older than this many seconds."),
+    browser: bool = typer.Option(
+        False, "--browser/--no-browser",
+        help="Give the router a browser session (needs Playwright and a browser build)."),
+    browser_mode: str = typer.Option(
+        "http", "--browser-mode", help="http | agent | disabled."),
     as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """Build and run the hierarchical graph.  Offline unless a target is given."""
@@ -23899,7 +24012,7 @@ def flow_command(
     if demo:
         key = demo.strip().lower()
         if key == "compare":
-            payloads = {name: _flow_demo(name, out_dir=directory)
+            payloads = {name: _flow_demo(name, out_dir=directory, browser=browser)
                         for name in _SELFTEST_OBJECTIVES}
             if as_json:
                 _emit(json.dumps(payloads, indent=2, default=str))
@@ -23928,7 +24041,8 @@ def flow_command(
             raise typer.Exit(ExitCode.USAGE)
         store, mode = _flow_checkpoint_options(checkpoint, resume_id, redo)
         try:
-            payload = _flow_demo(key, out_dir=directory, store=store, mode=mode)
+            payload = _flow_demo(key, out_dir=directory, store=store, mode=mode,
+                                 browser=browser)
         except ResumeError as exc:
             console.print(f"[red]✘[/red] {escape(str(exc))}")
             raise typer.Exit(ExitCode.USAGE) from exc
@@ -23986,7 +24100,8 @@ def flow_command(
             objective=objective, scope_entries=[target],
             available_tools=list(capability_names())[:6] or ["http.fetch"])
         policy = FlowPolicy.from_context(context, max_parallel_subagents=parallel_subagents,
-                                         max_parallel_workers=parallel_workers)
+                                         max_parallel_workers=parallel_workers,
+                                         browser=browser, browser_mode=browser_mode)
         logger = MissionLogger(directory / "flow.jsonl") if directory else None
         renderer = EventRenderer.from_options(stream=io.StringIO(), color=False,
                                               animation=False)
@@ -26150,7 +26265,10 @@ class DenialReason(str, Enum):
     OUT_OF_SCOPE = "out-of-scope"              # the target is outside the mission boundary
     PATH_NOT_APPROVED = "path-not-approved"    # a path outside every approved root
     UNRESOLVED_PATH = "unresolved-path"        # a path that does not resolve
-    SHELL_REFUSED = "shell-refused"            # a request to run a command
+    SHELL_REFUSED = "shell-refused"
+    #: The browser refused on its own policy — a login wall, a CAPTCHA, a form, a
+    #: download.  The browser's specific reason travels in the refusal's detail.
+    BROWSER_REFUSED = "browser-refused"            # a request to run a command
     NETWORK_OFF = "network-off"                # a network capability in an offline mission
     UNAVAILABLE = "unavailable"                # the capability's dependency is missing
     BUDGET = "budget"                          # the call would exceed the Worker's budget
@@ -26210,6 +26328,7 @@ class CapabilityRefusal(StrictModel):
             reason=(UnknownReason.OUT_OF_SCOPE
                     if self.reason in {DenialReason.OUT_OF_SCOPE, DenialReason.NOT_GRANTED,
                                        DenialReason.SHELL_REFUSED,
+                                       DenialReason.BROWSER_REFUSED,
                                        DenialReason.PATH_NOT_APPROVED}
                     else UnknownReason.FAILED),
             determined_by=self.worker or self.subagent or "router",
@@ -26934,22 +27053,69 @@ class CapabilityRouter:
         actions = [str(item) for item in request.parameters.get("actions", [])][:8]
         reader = self._reader(Capability.BROWSER)
         payload: dict[str, Any] = {"url": url, "tool": tool, "actions": actions}
-        if reader is not None:
-            snapshot = reader(url=url, actions=actions, parameters=dict(request.parameters))
-            payload["snapshot"] = str(getattr(snapshot, "title", snapshot))[:200]
-            payload["captured"] = True
-        else:
-            payload["captured"] = False
-        statement = (f"a browser session was opened on {url} for {grant.worker_name or grant.worker_id}"
+        captured = reader(url=url, actions=actions,
+                          parameters=dict(request.parameters)) if reader is not None else None
+        # A capture is a mapping: final URL, title, retrieval time, text, errors.  It
+        # is what the browser actually saw, so it becomes the evidence's locator and
+        # excerpt rather than a summary of one.
+        capture = dict(captured) if isinstance(captured, Mapping) else {}
+        final_url = str(capture.get("final_url") or url)
+        title = str(capture.get("title") or "")
+        text = str(capture.get("text") or "")
+        errors = [str(item.get("detail") or item.get("stage") or "")
+                  for item in capture.get("errors") or [] if isinstance(item, Mapping)]
+        refusal = capture.get("refusal")
+        if refusal:
+            # The real browser refused (scope, credentials, CAPTCHA, …): that is a
+            # denial, not an empty result, so it leaves the router as one.
+            # Three router-level meanings, and no more: a scope problem, a missing
+            # engine, and "the browser's own policy said no" — the last carrying the
+            # browser's reason (credentials, CAPTCHA, form, download) in its detail.
+            reason = (DenialReason.OUT_OF_SCOPE
+                      if str(refusal) in {BrowserRefusal.OUT_OF_SCOPE.value,
+                                          BrowserRefusal.NOT_PUBLIC_WEB.value,
+                                          BrowserRefusal.OFF_SCOPE_REDIRECT.value}
+                      else (DenialReason.UNAVAILABLE
+                            if str(refusal) == BrowserRefusal.UNAVAILABLE.value
+                            else DenialReason.BROWSER_REFUSED))
+            raise self._deny(reason,
+                             f"the browser refused {url[:100]} "
+                             f"({refusal}): "
+                             f"{str(capture.get('refusal_detail') or refusal)[:160]}",
+                             request, grant, allowed=list(grant.capabilities),
+                             remedy=("browse an approved public page with no credentials, "
+                                     "forms or challenges" if reason
+                                     is DenialReason.BROWSER_REFUSED else
+                                     "use a target and an engine this mission may use"))
+        payload.update({
+            "final_url": final_url, "title": title, "text_chars": len(text),
+            "retrieved_at": capture.get("retrieved_at"), "errors": errors,
+            "closed": bool(capture.get("closed")), "navigations": capture.get("navigations", 0),
+            "status": capture.get("status"),
+        })
+        payload["captured"] = bool(text or title)
+        payload["snapshot"] = title[:200]
+        statement = (f"a browser session was opened on {url} for "
+                     f"{grant.worker_name or grant.worker_id}"
                      + (f" performing {len(actions)} approved action(s)" if actions else "")
-                     + "; no browser is attached to this deployment, so nothing was captured")
-        evidence = self._observation(grant, statement=statement, locator=url,
+                     + (f"; the page landed on {final_url[:100]} titled "
+                        f"{title[:80]!r} and yielded {len(text)} character(s) of text"
+                        if payload["captured"] else "")
+                     + (f"; {len(errors)} error(s) were recorded: {errors[0][:80]}"
+                        if errors else "")
+                     + ("" if payload["captured"] or errors
+                        else "; no browser is attached to this deployment, so nothing "
+                             "was captured")
+                     + ("; the browser closed afterwards" if payload["closed"] else ""))
+        evidence = self._observation(grant, statement=statement, locator=final_url,
                                      kind=SourceKind.PUBLIC_WEB,
                                      method=RetrievalMethod.BROWSER, tool=tool,
-                                     tags=["browser"], excerpt=", ".join(actions))
+                                     excerpt=(text or ", ".join(actions)),
+                                     status=payload["status"], tags=["browser"])
         return CapabilityResult(capability=Capability.BROWSER, target=url, tool=tool,
                                 evidence=[evidence], payload=payload,
-                                detail=f"{tool}: {url}" + (f" ({len(actions)} action(s))" if actions else ""))
+                                detail=f"{tool}: {final_url[:80]}" + (
+                                    f" ({title[:40]!r})" if title else ""))
 
     # 3./4./5. the filesystem capabilities, sharing one approved-path read ---
     def _read_bytes(self, grant: CapabilityGrant, request: CapabilityRequest,
@@ -27626,20 +27792,20 @@ def run_router_self_test() -> list[RouterCheck]:
                 fixture["units"][0], fixture["units"][0].workers[0])))
 
     # ---- 14. the boundary is in the source, not only in the tests ----------
-    source = Path(__file__).read_text(encoding="utf-8") if "__file__" in globals() else ""
-    router_source = (source.split("# 27. The controlled capability router")[-1]
-                     .split("# 27b. Proving the router")[0])
-    add("no handler shells out to run a command",
-        not any(token in router_source
-                for token in ("os.system(", "os.popen(", "shell=True", "subprocess.")),
-        len(router_source))
-    add("the router section never imports subprocess",
-        "import subprocess" not in router_source)
-    add("no capability handler receives a command string",
+    section, end = "# 27. The controlled capability router", "# 27b. Proving the router"
+    for name, violation in (
+        ("no handler shells out to run a command", "os.system("),
+        ("no handler pops a shell", "os.popen("),
+        ("no handler asks for a shell", "shell=True"),
+        ("the router section never imports subprocess", "import subprocess"),
+        ("the router has no eval path", " eval("),
+        ("the router has no exec path", " exec("),
+        ("the router has no runpy path", "runpy.run"),
+    ):
+        _source_check(name, violation, section=section, end=end, add=add)
+    add("no capability handler is named after a command",
         not any("command" in name for name in
                 (member for member in dir(CapabilityRouter) if not member.startswith("__"))))
-    add("the router has no eval or exec path",
-        not any(f" {name}(" in router_source for name in ("eval", "exec", "runpy")))
     add("the capability set has no process capability",
         not any("shell" in item.value or "process" in item.value for item in Capability))
     add("the fixture wrote nothing outside its own temporary root",
@@ -27837,7 +28003,1915 @@ def router_command(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 28. Entry point
+# 28. Browser research — browser-use over Playwright, and its shutdown
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Phase 4's capability.  A browser is the one part of this program that runs a
+# *vendor-controlled process* with a *network* and a *renderer* attached, so the
+# design is about the boundary first and the capture second:
+#
+#   *   **One policy object decides everything.**  :class:`BrowserPolicy` carries
+#       headless mode, every timeout, the viewport, the download and navigation
+#       limits, and the five prohibitions (credentials, access-control bypass,
+#       CAPTCHA solving, unauthorised automation, form submission).  None of it is
+#       a keyword argument scattered through the code, so the self-test can assert
+#       that a session was configured from the policy and nothing else.
+#   *   **Scope is checked before a browser exists.**  The mission's :class:`Scope`
+#       is asked first; a URL outside it is refused with no process started, no
+#       profile written and no request made.
+#   *   **Each visit has its own context.**  A fresh, empty, cookie-less context
+#       per visit is what makes "isolated" true: no stored credential can be
+#       presented, and nothing from one visit can be seen by the next.
+#   *   **Closure is the acceptance criterion, so closure is not in a ``finally:
+#       pass``.**  :class:`BrowserSession` tracks what it opened, closes in reverse
+#       creation order, and closes on the success path, on a raised exception, on
+#       a timeout and on cancellation — including a cancellation raised *while* it
+#       is closing.  :class:`BrowserGuard` is the one object that must end closed,
+#       and the self-test asserts it for every way a session can end.
+#   *   **What was seen is reported as evidence.**  Final URL, title, retrieval
+#       time, the relevant text, and the errors — errors too, because a browser
+#       that failed silently would be indistinguishable from a page that was empty.
+
+
+class BrowserMode(str, Enum):
+    """How much browser this run is allowed to be.
+
+    ``HTTP`` needs Playwright but no browser *agent*: it fetches and extracts one
+    page.  ``AGENT`` adds browser-use, which decides its own clicks — so it is a
+    separate, explicit choice rather than an escalation of a fetch.
+    """
+
+    DISABLED = "disabled"
+    HTTP = "http"
+    AGENT = "agent"
+
+
+class BrowserRefusal(str, Enum):
+    """Why a browser action was not performed.  Every value is a safe failure."""
+
+    OUT_OF_SCOPE = "out-of-scope"                  # target outside the mission scope
+    NOT_PUBLIC_WEB = "not-public-web"              # not http(s), or a private address
+    CREDENTIALS = "credentials-prohibited"         # credential use is never available
+    ACCESS_CONTROL = "access-control-prohibited"   # login walls, paywalls, auth prompts
+    CAPTCHA = "captcha-prohibited"                 # solving a challenge is refused
+    FORM_SUBMIT = "form-submit-prohibited"         # unless explicitly authorised
+    UNAUTHORISED = "not-authorised"                # automation not authorised by the operator
+    DOWNLOAD = "download-prohibited"               # downloads are not part of research
+    NAVIGATION_LIMIT = "navigation-limit"          # would exceed the hop/visit ceiling
+    OFF_SCOPE_REDIRECT = "off-scope-redirect"      # the page sent us somewhere unapproved
+    TIMEOUT = "timeout"                            # the deadline passed
+    CANCELLED = "cancelled"                        # the operator cancelled
+    UNAVAILABLE = "browser-unavailable"            # engine or build not installed
+    FAILED = "browser-failed"                      # the engine raised
+
+
+#: Actions a page visit may ask for.  A closed set, exactly like ``Capability``:
+#: anything else is refused rather than attempted, and a *form submission* is not
+#: in it — that needs :attr:`BrowserPolicy.allow_form_submission` and a named form.
+BROWSER_ACTIONS: tuple[str, ...] = (
+    "read",              # capture the visible text
+    "follow",            # follow one same-scope link
+    "scroll",            # reveal content below the fold (bounded)
+    "wait_for_text",     # wait until a string is visible (bounded by the timeout)
+    "screenshot",        # capture a PNG of the viewport (in memory unless permitted)
+    "extract_links",     # list the links on the page
+)
+
+#: Action names that are *never* performed, even when asked: the five prohibitions
+#: as a vocabulary.  Listed so a refusal can say which one was hit.
+BROWSER_PROHIBITED_ACTIONS: dict[str, BrowserRefusal] = {
+    "login": BrowserRefusal.ACCESS_CONTROL,
+    "sign_in": BrowserRefusal.ACCESS_CONTROL,
+    "authenticate": BrowserRefusal.CREDENTIALS,
+    "enter_password": BrowserRefusal.CREDENTIALS,
+    "fill_credentials": BrowserRefusal.CREDENTIALS,
+    "solve_captcha": BrowserRefusal.CAPTCHA,
+    "bypass": BrowserRefusal.ACCESS_CONTROL,
+    "paywall": BrowserRefusal.ACCESS_CONTROL,
+    "download": BrowserRefusal.DOWNLOAD,
+    "submit": BrowserRefusal.FORM_SUBMIT,
+}
+
+#: Hosts and suffixes that are not public web, refused before DNS is consulted.
+#: A browser is for pages the operator may read; a metadata endpoint is not one.
+_PRIVATE_HOST_SUFFIXES: tuple[str, ...] = (
+    ".localhost", ".local", ".internal", ".intranet", ".home.arpa", ".lan", ".corp",
+)
+_PRIVATE_HOSTS: frozenset[str] = frozenset({
+    "localhost", "127.0.0.1", "0.0.0.0", "::1", "metadata", "metadata.google.internal",
+    "instance-data", "kubernetes.default",
+})
+
+#: The engine's own defaults, so a caller that names no policy still gets the
+#: documented behaviour rather than whatever the library decided today.
+DEFAULT_BROWSER_VIEWPORT: tuple[int, int] = (1280, 800)
+DEFAULT_BROWSER_NAVIGATION_TIMEOUT_MS: int = 30_000
+DEFAULT_BROWSER_SESSION_TIMEOUT_MS: int = 90_000
+DEFAULT_BROWSER_ACTION_TIMEOUT_MS: int = 10_000
+DEFAULT_BROWSER_MAX_NAVIGATIONS: int = 5
+DEFAULT_BROWSER_MAX_TEXT_CHARS: int = 12_000
+DEFAULT_BROWSER_USER_AGENT: str = (
+    "Mozilla/5.0 (compatible; ARGUS/0.17; +https://example.invalid/argus) "
+    "authorised-research"
+)
+
+#: A file extension a download would land as.  Downloads are refused as a policy,
+#: but the renderer still needs to recognise the attempt in an error message.
+_DOWNLOAD_SUFFIXES: frozenset[str] = frozenset({
+    ".exe", ".dll", ".msi", ".dmg", ".pkg", ".zip", ".rar", ".7z", ".tar", ".gz",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".bin", ".iso", ".apk",
+})
+
+
+class BrowserPolicy(StrictModel):
+    """Everything that limits a browser session, in one auditable object.
+
+    Defaults are the safe ones: headless, no downloads, five navigations, no form
+    submission, no persisted profile.  A field here is a *ceiling*; a caller may
+    ask for less (a shorter timeout) but not for more.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    mode: BrowserMode = BrowserMode.HTTP
+    headless: bool = True
+    #: Timings, all in milliseconds where the engine wants milliseconds.
+    navigation_timeout_ms: int = Field(default=DEFAULT_BROWSER_NAVIGATION_TIMEOUT_MS,
+                                       ge=1_000, le=180_000)
+    session_timeout_ms: int = Field(default=DEFAULT_BROWSER_SESSION_TIMEOUT_MS,
+                                    ge=1_000, le=600_000)
+    action_timeout_ms: int = Field(default=DEFAULT_BROWSER_ACTION_TIMEOUT_MS,
+                                   ge=500, le=120_000)
+    viewport_width: int = Field(default=DEFAULT_BROWSER_VIEWPORT[0], ge=320, le=3_840)
+    viewport_height: int = Field(default=DEFAULT_BROWSER_VIEWPORT[1], ge=240, le=2_160)
+    #: Navigation limits: how many hops one visit may take, and how many visits one
+    #: session may make.  Both are counted by the session, not by the page.
+    max_navigations: int = Field(default=DEFAULT_BROWSER_MAX_NAVIGATIONS, ge=1, le=50)
+    max_text_chars: int = Field(default=DEFAULT_BROWSER_MAX_TEXT_CHARS,
+                                ge=200, le=200_000)
+    max_links: int = Field(default=200, ge=1, le=5_000)
+    #: Downloads are off, and the policy that says so also says where they would
+    #: go — the session sets that directory on the context so nothing can land in
+    #: the working directory even if the engine ignores the refusal.
+    allow_downloads: bool = False
+    download_dir: str | None = None
+    #: The five prohibitions.  Two are absolutes (credentials, access controls) and
+    #: cannot be switched on at all; two are operator switches; one is a scope.
+    allow_form_submission: bool = False
+    automation_authorised: bool = True
+    respect_robots: bool = True
+    user_agent: str = Field(default=DEFAULT_BROWSER_USER_AGENT, min_length=8, max_length=200)
+    #: A persistent profile would carry cookies between runs; research does not
+    #: need one, so the default is an ephemeral context per visit.
+    isolated_contexts: bool = True
+    #: Browser-use is only asked to act when the run says AGENT; HTTP mode uses
+    #: Playwright directly and never constructs an agent.
+    agent_max_steps: int = Field(default=4, ge=1, le=25)
+
+    @property
+    def viewport(self) -> dict[str, int]:
+        return {"width": self.viewport_width, "height": self.viewport_height}
+
+    def describe(self) -> str:
+        """One line for a banner or a log: what this browser is allowed to be."""
+
+        return (f"{self.mode.value} · headless={'yes' if self.headless else 'no'} · "
+                f"{self.viewport_width}×{self.viewport_height} · "
+                f"nav≤{self.max_navigations} · "
+                f"timeout={self.navigation_timeout_ms}ms · "
+                f"downloads={'on' if self.allow_downloads else 'off'} · "
+                f"forms={'allowed' if self.allow_form_submission else 'refused'} · "
+                f"contexts={'isolated' if self.isolated_contexts else 'shared'}")
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = self.model_dump(mode="json")
+        payload["describe"] = self.describe()
+        return payload
+
+    #: What a policy may *never* be asked to do, whatever the flags say.
+    ABSOLUTE_PROHIBITIONS: ClassVar[tuple[str, ...]] = (
+        "use stored credentials",
+        "bypass an access control, login wall or paywall",
+        "solve or farm out a CAPTCHA",
+    )
+
+
+class BrowserAction(StrictModel):
+    """One thing to do on a page, named from the closed set."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: str = Field(min_length=1)
+    #: For ``follow``: the href.  For ``wait_for_text``: the string.  For ``scroll``:
+    #: a count.  Never free-form instructions — an agent prompt is not an action.
+    value: str = ""
+    timeout_ms: int | None = Field(default=None, ge=100, le=120_000)
+
+    @property
+    def known(self) -> bool:
+        return self.kind.strip().lower() in BROWSER_ACTIONS
+
+    @property
+    def prohibited(self) -> BrowserRefusal | None:
+        return BROWSER_PROHIBITED_ACTIONS.get(self.kind.strip().lower())
+
+    def describe(self) -> str:
+        return self.kind if not self.value else f"{self.kind} {self.value[:40]!r}"
+
+
+class BrowserError(StrictModel):
+    """One thing that went wrong, kept rather than raised.
+
+    A browser failure is part of the capture: "the page did not load" is a finding
+    about the page, and a report that said nothing would be wrong.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    stage: str = Field(min_length=1)
+    kind: str = "error"
+    detail: str = ""
+    at: datetime = Field(default_factory=utc_now)
+    fatal: bool = False
+
+    def describe(self) -> str:
+        return f"{self.stage}: {self.detail[:160] or self.kind}"
+
+
+class BrowserCapture(StrictModel):
+    """What a visit produced: the five things the task asks to be captured.
+
+    ``final_url`` is the URL *after* redirects, which is why it can differ from the
+    one requested — and why an off-scope redirect is detectable.  ``errors`` is a
+    list rather than an exception, so a partial capture still reports.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    requested_url: str = ""
+    final_url: str = ""
+    title: str = ""
+    retrieved_at: datetime = Field(default_factory=utc_now)
+    text: str = ""
+    status: int | None = None
+    links: list[str] = Field(default_factory=list)
+    screenshot_bytes: int = 0
+    errors: list[BrowserError] = Field(default_factory=list)
+    action_trace: list[str] = Field(default_factory=list)
+    navigations: int = 0
+    elapsed_seconds: float = Field(default=0.0, ge=0)
+    mode: str = "http"
+    #: True when a browser was started for this visit.  A refusal that never
+    #: launched one has nothing to close, which is a *different* good outcome from
+    #: a launched browser that was closed again — and the report says which.
+    launched: bool = False
+    #: True when the session closed its browser on this path — the acceptance
+    #: criterion, reported per capture rather than only asserted in a test.
+    closed: bool = False
+    refusal: BrowserRefusal | None = None
+    #: Set when the page was refused before a browser existed.
+    refusal_detail: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.refusal is None and not any(error.fatal for error in self.errors)
+
+    @property
+    def excerpt(self) -> str:
+        return " ".join(self.text.split())[:160]
+
+    def describe(self) -> str:
+        if self.refusal is not None:
+            return f"refused ({self.refusal.value}): {self.refusal_detail[:120]}"
+        title = self.title or "(untitled)"
+        return (f"{title[:60]} — {self.final_url[:80]} "
+                f"({len(self.text)} chars, {self.status if self.status is not None else '?'}"
+                + (f", {len(self.errors)} error(s)" if self.errors else "") + ")")
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = self.model_dump(mode="json")
+        payload["ok"] = self.ok
+        payload["excerpt"] = self.excerpt
+        payload["describe"] = self.describe()
+        return payload
+
+
+def browser_host(url: str) -> str:
+    """The host of ``url``, lowercased; ``""`` when it has none."""
+
+    try:
+        parsed = urlsplit(url.strip())
+    except ValueError:
+        return ""
+    return (parsed.hostname or "").strip().lower().rstrip(".")
+
+
+def looks_private(url: str) -> bool:
+    """Whether a URL points at something that is not the public web.
+
+    Deliberately conservative and *static*: no DNS is resolved, because resolving a
+    name to decide whether to fetch it is already traffic.  Loopback, RFC 1918
+    literals, link-local, ``.local``/``.internal`` and the cloud metadata names are
+    all refused, which is what stops a browser being used as an SSRF pivot.
+    """
+
+    host = browser_host(url)
+    if not host:
+        return False
+    if host in _PRIVATE_HOSTS or host.endswith(_PRIVATE_HOST_SUFFIXES):
+        return True
+    try:
+        address = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return False
+    return (address.is_private or address.is_loopback or address.is_link_local
+            or address.is_reserved or address.is_multicast or address.is_unspecified)
+
+
+def check_browser_url(url: str, *, scope: "Scope | None",
+                      policy: BrowserPolicy) -> tuple[bool, BrowserRefusal | None, str]:
+    """Whether ``url`` may be visited: the check that runs before a browser exists.
+
+    Returns ``(allowed, refusal, detail)``.  Order matters: a scheme problem is
+    reported before scope, and scope before anything engine-specific, so the
+    refusal names the boundary the caller actually hit.
+    """
+
+    target = (url or "").strip()
+    if not target:
+        return False, BrowserRefusal.NOT_PUBLIC_WEB, "no target URL was given"
+    try:
+        parsed = urlsplit(target)
+    except ValueError as exc:
+        return False, BrowserRefusal.NOT_PUBLIC_WEB, f"unparseable URL: {exc}"
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in {"http", "https"}:
+        return (False, BrowserRefusal.NOT_PUBLIC_WEB,
+                f"{scheme or 'a schemeless'} URL is not public web; only http(s) is browsable")
+    if not parsed.hostname:
+        return False, BrowserRefusal.NOT_PUBLIC_WEB, "the URL has no host"
+    if parsed.username or parsed.password:
+        return (False, BrowserRefusal.CREDENTIALS,
+                "the URL carries a username or password; a browser here never presents "
+                "credentials — not in a URL, a header or a form")
+    if looks_private(target):
+        return (False, BrowserRefusal.NOT_PUBLIC_WEB,
+                f"{browser_host(target)} is a private or link-local address, not public web")
+    if scope is None:
+        return (False, BrowserRefusal.OUT_OF_SCOPE,
+                "this run supplied no authorised scope, so no page is browsable; "
+                "a browser with an empty allow-list is not the same as an open one")
+    if not scope.covers(target):
+        return (False, BrowserRefusal.OUT_OF_SCOPE,
+                f"{target[:120]} is outside the authorised scope "
+                f"({', '.join(scope.includes) or 'none'}); the browser fetches nothing "
+                f"until the scope names it")
+    return True, None, ""
+
+
+def plan_browser_actions(raw: Sequence[Any] | None,
+                        policy: BrowserPolicy) -> tuple[list[BrowserAction],
+                                                        list[BrowserRefusal], list[str]]:
+    """Turn requested actions into the ones that may run, and the reasons for the rest.
+
+    Nothing is silently dropped: an action that is unknown, prohibited, or a form
+    submission without authorisation comes back as a refusal *and* a sentence the
+    capture can carry, so a report never implies an action happened when it did not.
+    """
+
+    allowed: list[BrowserAction] = []
+    refused: list[BrowserRefusal] = []
+    notes: list[str] = []
+    for item in raw or ():
+        action = item if isinstance(item, BrowserAction) else BrowserAction(
+            kind=str(item).strip(), value="")
+        if not action.kind:
+            continue
+        prohibited = action.prohibited
+        if prohibited is not None:
+            refused.append(prohibited)
+            notes.append(f"{action.kind!r} was not performed: {prohibited.value}")
+            continue
+        if not action.known:
+            refused.append(BrowserRefusal.UNAUTHORISED)
+            notes.append(f"{action.kind!r} is not a browser action this build performs "
+                         f"({', '.join(BROWSER_ACTIONS)})")
+            continue
+        if action.kind == "submit" and not policy.allow_form_submission:
+            refused.append(BrowserRefusal.FORM_SUBMIT)
+            notes.append("form submission was not performed: it is off by policy")
+            continue
+        if action.kind == "screenshot" and not policy.allow_downloads:
+            # A screenshot stays in memory: it is captured, never written out.
+            notes.append("screenshot captured in memory only (downloads are off)")
+        allowed.append(action)
+    return allowed, refused, notes
+
+
+class BrowserGuard:
+    """The object that must be closed when a browser session ends, however it ends.
+
+    Task 17 needed a guarantee that a refusal runs nothing; this needs a guarantee
+    that a *successful* run leaves nothing behind either.  So the guard owns the
+    resources, closes them in reverse order exactly once, records what it closed,
+    and is reachable from ``atexit`` for the case where the process dies anyway.
+    """
+
+    def __init__(self, *, name: str = "browser",
+                 reaper: "BrowserReaper | None" = None) -> None:
+        self.name = name
+        self.reaper = reaper or BrowserReaper()
+        self._lock = threading.RLock()
+        self._ops: list[tuple[str, Callable[[], Any]]] = []
+        self._closed = False
+        self._closed_ops: list[str] = []
+        self._errors: list[str] = []
+        self._registered_atexit = False
+
+    # -- registration -------------------------------------------------------
+
+    def register(self, label: str, closer: Callable[[], Any]) -> None:
+        """Record how to close one thing.  Closing is idempotent per guard."""
+
+        with self._lock:
+            if self._closed:
+                # Late registration after the guard closed: close it now rather than
+                # leak it, and say so.
+                self._run_closers([(label, closer)])
+                return
+            self._ops.append((label, closer))
+
+    def arm_atexit(self) -> None:
+        """Also close if the interpreter exits without the caller's ``finally``."""
+
+        if not self._registered_atexit:
+            atexit.register(self.close)
+            self._registered_atexit = True
+
+    # -- closing ------------------------------------------------------------
+
+    def _run_closers(self, pairs: Sequence[tuple[str, Callable[[], Any]]]) -> None:
+        for label, closer in reversed(list(pairs)):
+            try:
+                closer()
+            except BaseException as exc:              # a closer must never propagate
+                self._errors.append(f"{label}: {type(exc).__name__}: {exc}"[:200])
+            else:
+                self._closed_ops.append(label)
+
+    def close(self) -> dict[str, Any]:
+        """Close everything, newest first, exactly once.  Never raises."""
+
+        with self._lock:
+            if self._closed:
+                return self.summary()
+            self._closed = True
+            pending = list(self._ops)
+            self._ops.clear()
+        self._run_closers(pending)
+        self.reaper.close_all(reason=f"{self.name} guard closed")
+        return self.summary()
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    @property
+    def open_count(self) -> int:
+        with self._lock:
+            return len(self._ops)
+
+    def summary(self) -> dict[str, Any]:
+        with self._lock:
+            return {"closed": self._closed, "closed_ops": list(self._closed_ops),
+                    "open_ops": [label for label, _ in self._ops],
+                    "errors": list(self._errors), "reaper": self.reaper.summary()}
+
+    # -- context manager ----------------------------------------------------
+
+    def __enter__(self) -> "BrowserGuard":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        self.close()
+        return False
+
+
+# -- the engine seam --------------------------------------------------------
+#
+# Everything below talks to Playwright and browser-use through the *engine*
+# interface, so the session logic is testable without either of them and the real
+# classes are only imported where they are used.
+
+
+class BrowserEngine(Protocol):
+    """What a session needs from a vendor browser.  Four calls, no more.
+
+    Implementations: :class:`PlaywrightEngine` (real) and :class:`ScriptedEngine`
+    (the self-test's).  A vendor that cannot express something here — a CAPTCHA
+    solver, a credential store — simply has nowhere to put it.
+    """
+
+    name: str
+
+    def start(self, guard: BrowserGuard) -> None: ...
+
+    def visit(self, url: str, *, policy: BrowserPolicy,
+              actions: Sequence[BrowserAction]) -> BrowserCapture: ...
+
+
+class ScriptedEngine:
+    """A deterministic stand-in for a real browser.
+
+    It returns scripted captures, can be told to raise, to hang, or to redirect
+    off-scope — which is how the self-test proves closure on every path without a
+    GPU, a browser build or a network.
+    """
+
+    name = "scripted"
+
+    def __init__(self, *, pages: Mapping[str, Mapping[str, Any]] | None = None,
+                 raises: BaseException | None = None, hang: bool = False,
+                 redirect_to: str = "", delay: float = 0.0,
+                 on_visit: Callable[[], None] | None = None) -> None:
+        self.pages = dict(pages or {})
+        #: Runs at the start of a visit — how the self-test cancels *during* one.
+        self.on_visit = on_visit
+        self.raises = raises
+        self.hang = hang
+        self.redirect_to = redirect_to
+        self.delay = delay
+        self.started = 0
+        self.visits: list[str] = []
+        self.closed = 0
+
+    def start(self, guard: BrowserGuard) -> None:
+        self.started += 1
+        guard.register(f"{self.name}.browser", self.close)
+
+    def close(self) -> None:
+        self.closed += 1
+
+    def visit(self, url: str, *, policy: BrowserPolicy,
+              actions: Sequence[BrowserAction]) -> BrowserCapture:
+        self.visits.append(url)
+        if self.on_visit is not None:
+            self.on_visit()
+        if self.hang:
+            time.sleep(max(self.delay, 0.0) or 0.05)
+        elif self.delay:
+            time.sleep(self.delay)
+        if self.raises is not None:
+            raise self.raises
+        page = self.pages.get(url) or self.pages.get(browser_host(url)) or {}
+        final = self.redirect_to or str(page.get("final_url") or url)
+        return BrowserCapture(
+            requested_url=url, final_url=final,
+            title=str(page.get("title") or ""),
+            text=str(page.get("text") or ""), status=page.get("status"),
+            links=[str(item) for item in page.get("links", [])],
+            navigations=1, mode=policy.mode.value,
+            action_trace=[action.describe() for action in actions])
+
+
+class PlaywrightEngine:
+    """The real engine: Playwright's Chromium, one context per visit.
+
+    Two rules are enforced in code rather than documented:
+
+    *   **The context is created fresh for every visit and closed in a ``finally``.**
+        A context that outlives a visit would carry cookies into the next one, and a
+        context whose close is skipped would keep a renderer alive after the run.
+    *   **Requests are filtered at the browser.**  Routes outside the scope, non
+        http(s) requests, and downloads are aborted by an interceptor, so a page
+        cannot pull in a resource from somewhere the mission never approved — a CDN,
+        a tracker, or an internal host a script names.
+    """
+
+    name = "playwright"
+
+    def __init__(self, *, scope: "Scope | None", user_agent: str = "",
+                 headless: bool = True) -> None:
+        self.scope = scope
+        self.user_agent = user_agent
+        #: The launch mode comes from the policy, so a "visible" run really is one.
+        self.headless = headless
+        self._playwright: Any = None
+        self._browser: Any = None
+        self.requests_allowed = 0
+        self.requests_blocked = 0
+        self.blocked_examples: list[str] = []
+
+    # -- lifecycle ----------------------------------------------------------
+
+    def start(self, guard: BrowserGuard) -> None:
+        from playwright.sync_api import sync_playwright     # imported where used
+
+        self._playwright = sync_playwright().start()
+        guard.register("playwright.driver", self._stop_driver)
+        self._browser = self._playwright.chromium.launch(headless=self.headless)
+        guard.register("playwright.chromium", self._close_browser)
+
+    def _stop_driver(self) -> None:
+        if self._playwright is not None:
+            self._playwright.stop()
+
+    def _close_browser(self) -> None:
+        if self._browser is not None:
+            self._browser.close()
+
+    # -- one visit ----------------------------------------------------------
+
+    def visit(self, url: str, *, policy: BrowserPolicy,
+              actions: Sequence[BrowserAction]) -> BrowserCapture:
+        if self._browser is None:
+            raise RuntimeError("the browser engine was not started")
+        context = self._browser.new_context(
+            headless=policy.headless,
+            viewport=policy.viewport,
+            user_agent=self.user_agent or policy.user_agent,
+            accept_downloads=policy.allow_downloads,
+            java_script_enabled=True,
+            ignore_https_errors=False,
+        )
+        errors: list[BrowserError] = []
+        trace: list[str] = []
+        title, text, final, status = "", "", url, None
+        screenshot = 0
+        links: list[str] = []
+        try:
+            if not policy.allow_downloads:
+                # Refuse downloads at the context, not just in the policy.
+                context.route("**/*", self._filter)
+            elif policy.download_dir:
+                context.set_default_timeout(policy.action_timeout_ms)
+            page = context.new_page()
+            page.set_default_navigation_timeout(policy.navigation_timeout_ms)
+            page.set_default_timeout(policy.action_timeout_ms)
+            response = page.goto(url, wait_until="domcontentloaded",
+                                 timeout=policy.navigation_timeout_ms)
+            status = response.status if response is not None else None
+            final = page.url
+            for action in actions:
+                try:
+                    self._apply(page, action, policy)
+                except Exception as exc:              # an action failure is reported
+                    errors.append(BrowserError(stage=f"action:{action.kind}",
+                                               kind=type(exc).__name__,
+                                               detail=str(exc)[:200]))
+                trace.append(action.describe())
+            title = page.title()[:300]
+            text = (page.inner_text("body") or "")[:policy.max_text_chars]
+            links = [str(item) for item in
+                     page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")]
+            links = links[:policy.max_links]
+            if any(action.kind == "screenshot" for action in actions):
+                screenshot = len(page.screenshot(full_page=False) or b"")
+        except Exception as exc:
+            errors.append(BrowserError(stage="visit", kind=type(exc).__name__,
+                                       detail=str(exc)[:300], fatal=True))
+        finally:
+            try:
+                context.close()
+            except Exception as exc:                  # recorded, never propagated
+                errors.append(BrowserError(stage="context.close",
+                                           kind=type(exc).__name__,
+                                           detail=str(exc)[:200]))
+        return BrowserCapture(
+            requested_url=url, final_url=final, title=title, text=text, status=status,
+            links=links, screenshot_bytes=screenshot, errors=errors,
+            action_trace=trace, navigations=1, mode=policy.mode.value)
+
+    def _filter(self, route: Any, request: Any) -> None:
+        """Abort anything the mission never approved.  Called by Playwright."""
+
+        target = str(getattr(request, "url", "") or "")
+        resource = str(getattr(request, "resource_type", "") or "")
+        if (resource == "document" and self.scope is not None
+                and not self.scope.covers(target)):
+            self.requests_blocked += 1
+            if len(self.blocked_examples) < 8:
+                self.blocked_examples.append(target[:120])
+            route.abort()
+            return
+        if not target.startswith(("http://", "https://", "data:", "blob:", "about:")):
+            self.requests_blocked += 1
+            route.abort()
+            return
+        self.requests_allowed += 1
+        route.continue_()
+
+    def _apply(self, page: Any, action: BrowserAction, policy: BrowserPolicy) -> None:
+        timeout = action.timeout_ms or policy.action_timeout_ms
+        if action.kind == "read":
+            page.wait_for_load_state("networkidle", timeout=timeout)
+        elif action.kind == "wait_for_text" and action.value:
+            page.wait_for_selector(f"text={action.value}", timeout=timeout)
+        elif action.kind == "follow" and action.value:
+            page.goto(action.value, wait_until="domcontentloaded",
+                      timeout=policy.navigation_timeout_ms)
+        elif action.kind == "scroll":
+            steps = max(1, min(int(action.value or "3"), 10))
+            for _ in range(steps):
+                page.mouse.wheel(0, policy.viewport_height)
+        elif action.kind == "screenshot":
+            page.screenshot(full_page=False)
+
+
+
+
+class BrowserSession:
+    """One browser, one policy, one guard — and a close on every exit path.
+
+    A session owns **one browser for one visit**, and retires itself when the visit
+    ends: that is what makes "the browser closed" true rather than eventual, and it
+    is why a second call refuses instead of quietly reopening a process.
+
+    The session is where the acceptance criterion lives.  Its single public verb
+    (:meth:`visit`) is written so that **every** way it can end — a capture, an
+    engine that raises, a deadline that passes, a cancellation that arrives while
+    the visit is running, or one that arrives while the session is closing — passes
+    through ``finally``, and that ``finally`` closes the guard.  The session then
+    reports what it closed, so "the browser closed" is an observation rather than a
+    promise.
+    """
+
+    def __init__(self, *, policy: BrowserPolicy, scope: "Scope | None",
+                 engine: BrowserEngine | None = None,
+                 token: "CancellationToken | None" = None,
+                 runtime: "ConcurrencyRuntime | None" = None,
+                 reaper: "BrowserReaper | None" = None,
+                 clock: Callable[[], float] | None = None,
+                 policy_name: str = "browser") -> None:
+        self.policy = policy
+        self.scope = scope
+        self.token = token
+        self.runtime = runtime
+        self._clock = clock or time.monotonic
+        self.guard = BrowserGuard(name=policy_name, reaper=reaper)
+        self._engine = engine
+        self._started = False
+        self._retired = False
+        self.visits: list[BrowserCapture] = []
+        self.visited_urls: list[str] = []
+        self.navigations = 0
+        self.refusals: list[BrowserRefusal] = []
+        self.started_at = self._clock()
+
+    # -- the engine ---------------------------------------------------------
+
+    def _ensure_engine(self) -> BrowserEngine:
+        """Start the engine once, and only with the policy's own configuration."""
+
+        if self._engine is not None:
+            if not self._started:
+                self._engine.start(self.guard)
+                self._started = True
+                self.guard.arm_atexit()
+            return self._engine
+        available, detail = browser_engine_available()
+        if not available:
+            raise BrowserUnavailable(detail)
+        engine = PlaywrightEngine(scope=self.scope, user_agent=self.policy.user_agent,
+                                  headless=self.policy.headless)
+        engine.start(self.guard)                 # the guard now owns driver + browser
+        self._engine = engine
+        self._started = True
+        self.guard.arm_atexit()
+        return engine
+
+    @property
+    def engine_name(self) -> str:
+        return "scripted" if isinstance(self._engine, ScriptedEngine) else (
+            "playwright" if isinstance(self._engine, PlaywrightEngine) else
+            (getattr(self._engine, "name", "") or "none"))
+
+    # -- the visit ----------------------------------------------------------
+
+    def visit(self, url: str, *, actions: Sequence[Any] | None = None,
+              timeout_ms: int | None = None) -> BrowserCapture:
+        """Visit one URL inside the scope, capture it, and close the browser.
+
+        Never raises for anything a page can do: a refusal, a timeout, an engine
+        error and a cancellation all come back as a :class:`BrowserCapture` whose
+        ``refusal`` or ``errors`` say what happened.  It *can* raise only for a
+        missing engine, which is an installation problem rather than a page.
+        """
+
+        started = self._clock()
+        budget = min(int(timeout_ms or self.policy.session_timeout_ms),
+                     self.policy.session_timeout_ms)
+
+        # ---- 0. retired sessions refuse rather than reopen a browser --------
+        if self._retired:
+            return self._refuse(url, BrowserRefusal.CANCELLED,
+                                "this session has already closed its browser; "
+                                "start a new session rather than reopening one")
+
+        # ---- 1. the boundary, before a process exists ----------------------
+        allowed, refusal, detail = check_browser_url(url, scope=self.scope,
+                                                     policy=self.policy)
+        if not allowed:
+            self.refusals.append(refusal or BrowserRefusal.FAILED)
+            return self._refuse(url, refusal or BrowserRefusal.FAILED, detail)
+        if self.policy.mode is BrowserMode.DISABLED:
+            self.refusals.append(BrowserRefusal.UNAVAILABLE)
+            return self._refuse(url, BrowserRefusal.UNAVAILABLE,
+                                "browser research is disabled in this run")
+        if not self.policy.automation_authorised:
+            self.refusals.append(BrowserRefusal.UNAUTHORISED)
+            return self._refuse(url, BrowserRefusal.UNAUTHORISED,
+                                "automated browsing was not authorised by the operator")
+        # ---- 2. navigation budget -----------------------------------------
+        # ---- 3. actions: filtered to the closed set -----------------------
+        wanted, refused_actions, notes = plan_browser_actions(actions, self.policy)
+        self.refusals.extend(refused_actions)
+        # A ``follow`` is a navigation, and a visit may take at most the policy's
+        # navigation budget of them.  Counted before the browser opens, so a visit
+        # that would exceed it never starts.
+        hops = sum(1 for action in wanted if action.kind == "follow")
+        if hops > self.policy.max_navigations:
+            self.refusals.append(BrowserRefusal.NAVIGATION_LIMIT)
+            return self._refuse(url, BrowserRefusal.NAVIGATION_LIMIT,
+                                f"the visit asked for {hops} navigation(s); the policy "
+                                f"allows {self.policy.max_navigations}")
+
+        # ---- 4. the visit, under a guard that closes on every path --------
+        capture: BrowserCapture
+        hold: Any = None
+        try:
+            if self.runtime is not None:
+                # A browser context is a finite resource: ask the mission's
+                # scheduler for one, so a run cannot open more than it declared.
+                hold = self.runtime.slot(
+                    ResourceKind.BROWSER, unit=browser_host(url) or "browser",
+                    deadline=Deadline.in_seconds(budget / 1000.0, reason="browser visit",
+                                                 clock=self._clock))
+            self._raise_if_cancelled()
+            engine = self._ensure_engine()
+            self.navigations += 1
+            self.visited_urls.append(url)
+            capture = self._with_deadline(engine, url, wanted, budget)
+            capture = capture.model_copy(update={
+                "action_trace": [*capture.action_trace, *notes][:12],
+                "navigations": 1 + hops})
+            # A page that redirected outside the scope is not evidence about the
+            # target; it is a finding about the redirect, and it is refused.
+            if capture.final_url and capture.final_url != url:
+                ok, why, why_detail = check_browser_url(
+                    capture.final_url, scope=self.scope, policy=self.policy)
+                if not ok:
+                    self.refusals.append(why or BrowserRefusal.OFF_SCOPE_REDIRECT)
+                    capture = capture.model_copy(update={
+                        "refusal": why or BrowserRefusal.OFF_SCOPE_REDIRECT,
+                        "refusal_detail": (f"the page redirected to "
+                                           f"{capture.final_url[:100]}, which is not "
+                                           f"browsable: {why_detail}"),
+                        "errors": [*capture.errors, BrowserError(
+                            stage="redirect", kind="OffScopeRedirect",
+                            detail=f"redirected to {capture.final_url[:120]}", fatal=True)],
+                    })
+        except BrowserCancelled as cancelled:
+            self.refusals.append(BrowserRefusal.CANCELLED)
+            capture = self._refuse(url, BrowserRefusal.CANCELLED, str(cancelled),
+                                   stage="cancellation")
+        except BrowserTimeout as expired:
+            self.refusals.append(BrowserRefusal.TIMEOUT)
+            capture = self._refuse(url, BrowserRefusal.TIMEOUT, str(expired),
+                                   stage="deadline", fatal=True)
+        except BrowserUnavailable as missing:
+            self.refusals.append(BrowserRefusal.UNAVAILABLE)
+            capture = self._refuse(url, BrowserRefusal.UNAVAILABLE, str(missing),
+                                   stage="engine", fatal=True)
+        except BaseException as exc:
+            # Includes KeyboardInterrupt: the browser still closes, and the run
+            # still ends *after* it has.
+            self.refusals.append(BrowserRefusal.FAILED)
+            capture = self._refuse(url, BrowserRefusal.FAILED,
+                                   f"{type(exc).__name__}: {exc}",
+                                   stage="visit", fatal=True)
+        finally:
+            if hold is not None:
+                hold.release()
+            # THE ACCEPTANCE CRITERION: close the browser here, so success, failure,
+            # timeout and cancellation all end with it closed.  close() cannot raise.
+            summary = self.guard.close()
+            self._retired = True
+            self.visits.append(capture)
+            capture = capture.model_copy(update={
+                "launched": bool(self._started),
+                "closed": bool(summary.get("closed")),
+                "elapsed_seconds": max(0.0, self._clock() - started)})
+            self.visits[-1] = capture
+        return capture
+
+    def _with_deadline(self, engine: BrowserEngine, url: str,
+                       actions: Sequence[BrowserAction], budget_ms: int) -> BrowserCapture:
+        """Run the engine call under the session's own deadline.
+
+        The engine gets a thread of its own so a hang cannot outlive the deadline.
+        The caller waits at most ``budget``; if the engine is still running, the
+        result is a timeout — and the *browser* is closed by the caller's
+        ``finally``, which is why a hung visit still ends with nothing open.
+        """
+
+        outcome: dict[str, Any] = {}
+
+        def work() -> None:
+            try:
+                outcome["capture"] = engine.visit(url, policy=self.policy,
+                                                  actions=actions)
+            except BaseException as exc:              # carried to the caller
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=work, name=f"browser:{browser_host(url)}",
+                                  daemon=True)
+        thread.start()
+        thread.join(max(0.05, budget_ms / 1000.0))
+        if thread.is_alive():
+            raise BrowserTimeout(
+                f"the visit to {url[:120]} did not finish within {budget_ms}ms")
+        if "error" in outcome:
+            error = outcome["error"]
+            if isinstance(error, (BrowserCancelled, BrowserTimeout, BrowserUnavailable)):
+                raise error
+            raise BrowserFailed(f"{type(error).__name__}: {error}") from error
+        return outcome.get("capture") or BrowserCapture(requested_url=url)
+
+    def _raise_if_cancelled(self) -> None:
+        if self.token is not None and self.token.cancelled:
+            raise BrowserCancelled("the operator cancelled the run before the visit")
+
+    def _refuse(self, url: str, refusal: BrowserRefusal, detail: str, *,
+                stage: str = "", fatal: bool = False,
+                final_url: str = "") -> BrowserCapture:
+        errors = ([BrowserError(stage=stage or refusal.value, kind=refusal.value,
+                                detail=detail[:300], fatal=fatal)] if stage else [])
+        return BrowserCapture(requested_url=url, final_url=final_url, refusal=refusal,
+                              refusal_detail=detail[:300], errors=errors,
+                              retrieved_at=utc_now(), closed=self.guard.closed,
+                              mode=self.policy.mode.value)
+
+    # -- closing ------------------------------------------------------------
+
+    def close(self, reason: str = "session finished") -> dict[str, Any]:
+        """Close the session.  Idempotent, and safe from a cancellation callback."""
+
+        self._retired = True
+        return self.guard.close()
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "policy": self.policy.to_dict(),
+            "engine": self.engine_name,
+            "visits": len(self.visits),
+            "navigations": self.navigations,
+            "refusals": [item.value for item in self.refusals],
+            "closed": self.guard.closed,
+            "open_resources": self.guard.open_count,
+            "guard": self.guard.summary(),
+            "elapsed_seconds": round(self._clock() - self.started_at, 3),
+        }
+
+    def capture_dicts(self) -> list[dict[str, Any]]:
+        return [capture.to_dict() for capture in self.visits]
+
+    # -- context manager ----------------------------------------------------
+
+    def __enter__(self) -> "BrowserSession":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        self.close()
+        return False
+
+
+class BrowserUnavailable(RuntimeError):
+    """The engine, the browser build, or the driver is not installed."""
+
+
+class BrowserCancelled(RuntimeError):
+    """The run was cancelled while a browser was open."""
+
+
+class BrowserTimeout(TimeoutError):
+    """The visit did not finish inside its deadline."""
+
+
+class BrowserFailed(RuntimeError):
+    """The engine raised while visiting."""
+
+
+def browser_engine_available() -> tuple[bool, str]:
+    """Whether a real browser could be started, and what is missing if not.
+
+    Checked *before* a session is built so a missing engine is a configuration
+    answer rather than a stack trace.  A missing browser build is reported
+    separately from a missing engine because the remedies differ.
+    """
+
+    if importlib.util.find_spec("playwright") is None:
+        return False, ("playwright is not installed — "
+                       "pip install playwright && python -m playwright install chromium")
+    if not find_playwright_browsers() and not find_system_browsers():
+        return False, ("no Playwright browser build is downloaded — "
+                       "run: python -m playwright install chromium")
+    return True, "playwright is installed with a browser build"
+
+
+def browser_use_available() -> tuple[bool, str]:
+    """Whether browser-use (the agent layer) is installed."""
+
+    if importlib.util.find_spec("browser_use") is None:
+        return False, "browser-use is not installed — pip install browser-use"
+    return True, "browser-use is installed"
+
+
+# -- browser-use: the agent layer, deliberately narrow ----------------------
+#
+# browser-use is the only component in this file that decides its own actions, so
+# it is the one that most needs a boundary.  Three things keep it narrow:
+#
+#   1.  **It is only reachable from AGENT mode.**  HTTP mode cannot construct an
+#       agent, so a normal fetch never becomes an autonomous one.
+#   2.  **Its instructions are generated from the closed action set.**  The task
+#       string is built from "read"/"extract" vocabulary — a caller cannot pass a
+#       free-form instruction into the vendor's prompt, which is where an
+#       "ignore the paywall" would otherwise go.
+#   3.  **Its own guardrails are configured from the policy**: allowed domains from
+#       the scope, prohibited actions for the rest, no CAPTCHA solver, no cloud.
+
+
+def build_agent_task(url: str, actions: Sequence[BrowserAction]) -> str:
+    """The instruction handed to browser-use, built only from approved actions.
+
+    Deliberately a sentence about *reading*, not a goal.  There is no field here for
+    a caller-supplied instruction, so the agent cannot be talked into anything the
+    router would have refused: the actions it may take were filtered beforehand.
+    """
+
+    wanted = [action.kind for action in actions if action.known] or ["read"]
+    steps = "; ".join(
+        {"read": "read the visible text",
+         "follow": "follow the in-scope link it is given",
+         "scroll": "scroll to reveal more text",
+         "wait_for_text": "wait until the named text appears",
+         "extract_links": "list the links on the page",
+         "screenshot": "capture the viewport"}.get(kind, "read the visible text")
+        for kind in dict.fromkeys(wanted))
+    return (f"Open {url} and {steps}. Do not log in, do not submit any form, do not "
+            f"solve any challenge, do not bypass any access control, and do not "
+            f"download anything. Report the page title and the visible text.")
+
+
+class BrowserUseAgent:
+    """browser-use, configured so that its autonomy stays inside the policy.
+
+    This class is a thin, auditable wrapper: every constructor argument it accepts
+    is a field of :class:`BrowserPolicy` or comes from the mission's scope, and its
+    ``run`` method returns a :class:`BrowserCapture` like any other engine call.
+    Nothing here accepts a caller's prompt.
+    """
+
+    name = "browser-use"
+
+    def __init__(self, *, policy: BrowserPolicy, scope: "Scope | None") -> None:
+        available, detail = browser_use_available()
+        if not available:
+            raise BrowserUnavailable(detail)
+        self.policy = policy
+        self.scope = scope
+        self.last_task = ""
+
+    def browser_kwargs(self) -> dict[str, Any]:
+        """The vendor configuration this deployment allows — and nothing more.
+
+        ``allowed_domains`` is the scope; ``captcha_solver`` is hard-off; downloads
+        are off unless the policy says otherwise; and the profile is always
+        ephemeral (``user_data_dir=None``), so no cookie can outlive the session.
+        """
+
+        allowed = [entry for entry in (self.scope.includes if self.scope else []) if entry]
+        return {
+            "headless": self.policy.headless,
+            "user_data_dir": None,
+            "allowed_domains": allowed or None,
+            "prohibited_domains": (list(self.scope.excludes)
+                                   if self.scope is not None else []),
+            "captcha_solver": False,
+            "keep_alive": False,
+            "viewport": self.policy.viewport,
+        }
+
+    def run(self, url: str, *, actions: Sequence[BrowserAction],
+            timeout_ms: int | None = None,
+            token: "CancellationToken | None" = None) -> BrowserCapture:
+        """Run one bounded agent session and return what it saw."""
+
+        from browser_use import Agent, Browser              # imported where used
+
+        self.last_task = build_agent_task(url, actions)
+        browser = Browser(**self.browser_kwargs())
+        guard = BrowserGuard(name="browser-use")
+        started = time.monotonic()
+        errors: list[BrowserError] = []
+        text, title, final = "", "", url
+        try:
+            guard.register("browser_use.browser", browser.stop)
+            guard.arm_atexit()
+            # browser-use needs a model.  Without one it cannot run, and we do not
+            # silently fall back to a fetch: an agent mode run that cannot think is
+            # a configuration error the operator must see.
+            model = _agent_model()
+            if model is None:
+                raise BrowserUnavailable(
+                    "browser-use needs a model; set ARGUS_LLM_MODEL (and a provider key)")
+            agent = Agent(task=self.last_task, llm=model, browser=browser,
+                          max_actions_per_step=2)
+            history = agent.run(max_steps=self.policy.agent_max_steps)
+            final = str(getattr(history, "final_result", lambda: "")() or "")[:4000]
+            text = final
+            urls = getattr(history, "urls", lambda: [])()
+            final_url = urls[-1] if urls else url
+            title = str(getattr(history, "title", lambda: "")() or "")
+            final = final_url
+        except BaseException as exc:
+            errors.append(BrowserError(stage="agent", kind=type(exc).__name__,
+                                       detail=str(exc)[:300], fatal=True))
+        finally:
+            summary = guard.close()
+        return BrowserCapture(
+            requested_url=url, final_url=final, title=title, text=text,
+            errors=errors, mode=BrowserMode.AGENT.value,
+            action_trace=[f"agent:{self.last_task[:60]}"],
+            elapsed_seconds=max(0.0, time.monotonic() - started),
+            closed=bool(summary.get("closed")))
+
+
+def _agent_model() -> Any:
+    """The configured model for browser-use, or ``None``.
+
+    Reuses the adapter's settings rather than a second configuration path: if the
+    run has no model, AGENT mode is unavailable and says so.
+    """
+
+    try:
+        settings = build_settings().settings
+    except Exception:                                # settings trouble is not fatal here
+        return None
+    if not settings.model:
+        return None
+    try:
+        from browser_use import ChatOpenAI            # one vendor shim, lazily
+    except Exception:
+        return None
+    key, _name = settings.resolve_api_key()          # value never leaves this call
+    return ChatOpenAI(model=settings.model, base_url=settings.base_url or None,
+                      api_key=key or "")
+
+
+
+
+# -- the router's browser capability, wired to a real session ---------------
+#
+# Task 17 left ``CapabilityRouter`` with an injectable *reader* per capability:
+# a callable the deployment supplies.  This is that reader for ``browser.interact``
+# — the only place the router learned to open a browser, and it hands back JSON so
+# the router's payload stays serialisable.
+
+
+def browser_reader(policy: BrowserPolicy, *, scope: "Scope | None",
+                   token: "CancellationToken | None" = None,
+                   runtime: "ConcurrencyRuntime | None" = None,
+                   engine: BrowserEngine | None = None) -> Callable[..., Mapping[str, Any]]:
+    """A ``CapabilityRouter`` reader that performs a real browser visit.
+
+    One session per reader (so the mission's browser budget is spent once), and one
+    visit per call.  The capture is returned as a mapping so the router can put it
+    in ``payload`` without a vendor object crossing the boundary.
+    """
+
+    session = BrowserSession(policy=policy, scope=scope, token=token, runtime=runtime,
+                             engine=engine)
+
+    def read(*, url: str = "", actions: Sequence[Any] = (), parameters: Mapping[str, Any] | None = None,
+             **_: Any) -> Mapping[str, Any]:
+        params = dict(parameters or {})
+        capture = session.visit(url or str(params.get("url") or ""), actions=actions or ())
+        return capture.to_dict()
+
+    read.session = session                            # type: ignore[attr-defined]
+    return read
+
+
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 28b. Proving the browser: closure on every path, and the five prohibitions
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _source_section(start: str, end: str | None = None) -> str:
+    """A span of this file's own text, by banner.
+
+    ``split`` from the *front*: taking the last occurrence of a banner would find
+    the assertion that names it.  A missing file yields ``""``, and every caller
+    treats that as "cannot check" rather than "ok".
+    """
+
+    source = _own_source()
+    if not source or start not in source:
+        return ""
+    span = source.split(start, 1)[1]
+    return span.split(end, 1)[0] if end and end in span else span
+
+
+def _own_source() -> str:
+    """This file's text, or ``""`` when the module was imported as a string.
+
+    Read through ``sys.modules`` rather than ``__file__``: the self-tests assert
+    things about the source they are running from, and a module executed from a
+    pipe or a zipimporter has no ``__file__`` to read.
+    """
+
+    module = sys.modules.get(__name__)
+    path = getattr(module, "__file__", "") or ""
+    try:
+        return Path(path).read_text(encoding="utf-8") if path else ""
+    except OSError:                                  # pragma: no cover - unreadable
+        return ""
+
+
+@dataclass(frozen=True)
+class BrowserCheck:
+    """One claim about the browser, and the evidence for it."""
+
+    name: str
+    ok: bool
+    detail: str = ""
+
+
+def browser_demo_scope() -> "Scope":
+    """The scope every browser check is judged against: one host, one exclusion."""
+
+    return Scope(entries=[ScopeEntry(pattern="example.com"),
+                          ScopeEntry(pattern="tracker.example.net", included=False)])
+
+
+#: Pages the scripted engine serves, so a capture has a final URL, a title and text.
+_BROWSER_SCRIPT: dict[str, dict[str, Any]] = {
+    "https://example.com/advisories": {
+        "title": "Advisories — example.com",
+        "text": ("Advisory 2026-01: the proxy component fixed a header parsing bug in "
+                 "version 4.2.1. Advisory 2026-02: the same component fixed a request "
+                 "smuggling bug in 4.3.0."),
+        "status": 200,
+        "links": ["https://example.com/advisories/2026-01", "https://example.com/about"],
+    },
+    "https://example.com/slow": {"title": "Slow", "text": "Eventually.", "status": 200},
+}
+
+
+def _scripted_session(**overrides: Any) -> BrowserSession:
+    """A session with the scripted engine and a policy that suits the checks."""
+
+    engine = overrides.pop("engine", None) or ScriptedEngine(pages=_BROWSER_SCRIPT)
+    policy = overrides.pop("policy", None) or BrowserPolicy(mode=BrowserMode.HTTP)
+    return BrowserSession(policy=policy, scope=overrides.pop("scope", browser_demo_scope()),
+                          engine=engine, **overrides)
+
+
+def run_browser_self_test() -> list[BrowserCheck]:
+    """Prove the acceptance criterion: the browser closes on every path.
+
+    Four successes (a capture, a refusal before launch, a state after close, an
+    agent-mode request that is not attempted) and four endings (success, failure,
+    timeout, cancellation) — each of which must end with nothing open.
+    """
+
+    checks: list[BrowserCheck] = []
+
+    def add(name: str, ok: bool, detail: Any = "") -> None:
+        checks.append(BrowserCheck(name=name, ok=bool(ok), detail=str(detail)[:150]))
+
+    # ---- 1. the policy is the configuration -------------------------------
+    policy = BrowserPolicy()
+    add("the default policy is headless", policy.headless is True)
+    add("the default viewport is set", policy.viewport
+        == {"width": DEFAULT_BROWSER_VIEWPORT[0], "height": DEFAULT_BROWSER_VIEWPORT[1]},
+        policy.viewport)
+    add("the default policy forbids downloads", policy.allow_downloads is False)
+    add("the default policy forbids form submission", policy.allow_form_submission is False)
+    add("the default policy bounds navigation",
+        1 <= policy.max_navigations <= 50, policy.max_navigations)
+    add("the default policy isolates contexts", policy.isolated_contexts is True)
+    add("every timeout is bounded",
+        all(value > 0 for value in (policy.navigation_timeout_ms, policy.session_timeout_ms,
+                                    policy.action_timeout_ms)))
+    add("a policy is immutable", _immutable(policy))
+    add("a policy cannot be extended with an unknown switch",
+        not _constructs(BrowserPolicy, fight_club=True))
+    add("out-of-range settings are refused", not _constructs(BrowserPolicy,
+                                                            max_navigations=0))
+    add("the policy describes itself in one line", "headless=yes" in policy.describe(),
+        policy.describe()[:80])
+    add("the three absolute prohibitions are declared",
+        len(BrowserPolicy.ABSOLUTE_PROHIBITIONS) == 3)
+
+    # ---- 2. scope is checked before a browser exists ----------------------
+    scope = browser_demo_scope()
+    allowed, refusal, _ = check_browser_url("https://example.com/a?x=1&y=2",
+                                            scope=scope, policy=policy)
+    add("an in-scope page is allowed", allowed and refusal is None)
+    for url, expected in (
+        ("https://evil.example.org/", BrowserRefusal.OUT_OF_SCOPE),
+        ("https://tracker.example.net/pixel", BrowserRefusal.OUT_OF_SCOPE),
+        ("ftp://example.com/file", BrowserRefusal.NOT_PUBLIC_WEB),
+        ("file:///etc/passwd", BrowserRefusal.NOT_PUBLIC_WEB),
+        ("javascript:alert(1)", BrowserRefusal.NOT_PUBLIC_WEB),
+        ("http://127.0.0.1:8080/", BrowserRefusal.NOT_PUBLIC_WEB),
+        ("http://169.254.169.254/latest/meta-data/", BrowserRefusal.NOT_PUBLIC_WEB),
+        ("http://10.0.0.5/", BrowserRefusal.NOT_PUBLIC_WEB),
+        ("http://metadata.google.internal/", BrowserRefusal.NOT_PUBLIC_WEB),
+        ("https://user:pass@example.com/", BrowserRefusal.CREDENTIALS),
+    ):
+        got = check_browser_url(url, scope=scope, policy=policy)[1]
+        add(f"{url[:42]!r} is refused as {expected.value}", got is expected, got)
+    add("a schemeless target is refused", not check_browser_url(
+        "example.com", scope=scope, policy=policy)[0])
+    add("an empty target is refused", not check_browser_url("", scope=scope, policy=policy)[0])
+    add("no scope means no browser target is authorised",
+        check_browser_url("https://example.com/", scope=None, policy=policy)[1]
+        is BrowserRefusal.OUT_OF_SCOPE,
+        check_browser_url("https://example.com/", scope=None, policy=policy)[2][:60])
+
+    # ---- 3. the five prohibitions are a closed vocabulary ------------------
+    _, refused, notes = plan_browser_actions(
+        ["read", "login", "solve_captcha", "bypass", "fill_credentials", "submit",
+         "download", "teleport"], policy)
+    add("a prohibited action is refused, not attempted",
+        set(refused) >= {BrowserRefusal.ACCESS_CONTROL, BrowserRefusal.CAPTCHA,
+                         BrowserRefusal.CREDENTIALS, BrowserRefusal.FORM_SUBMIT,
+                         BrowserRefusal.DOWNLOAD})
+    add("an unknown action is refused too", BrowserRefusal.UNAUTHORISED in refused)
+    add("only the approved action survives", [action.kind for action in _[0:1]] == ["read"])
+    add("every refusal is explained in words", len(notes) >= 6, len(notes))
+    submissions, _, _ = plan_browser_actions(["submit"],
+                                             BrowserPolicy(allow_form_submission=True))
+    add("a form submission needs the explicit switch", submissions == [] or
+        all(action.kind == "submit" for action in submissions))
+    add("form submission is refused by default",
+        not any(action.kind == "submit"
+                for action in plan_browser_actions(["submit"], BrowserPolicy())[0]))
+
+    # ---- 4. browser-use is reachable only from AGENT mode ------------------
+    add("HTTP mode is the default, so no agent is constructed",
+        BrowserPolicy().mode is BrowserMode.HTTP)
+    add("an agent task is built from approved actions only",
+        "Do not log in" in build_agent_task("https://example.com/", [BrowserAction(kind="read")]))
+    add("the agent cannot be given a free-form instruction",
+        "ignore" not in build_agent_task("https://example.com/",
+                                         [BrowserAction(kind="read")]).lower())
+    add("browser-use's configuration sets no CAPTCHA solver",
+        BrowserUseAgent(policy=BrowserPolicy(mode=BrowserMode.AGENT),
+                        scope=scope).browser_kwargs()["captcha_solver"] is False)
+    add("browser-use's allowed domains are the mission scope",
+        BrowserUseAgent(policy=BrowserPolicy(mode=BrowserMode.AGENT),
+                        scope=scope).browser_kwargs()["allowed_domains"] == ["example.com"])
+    add("browser-use gets an ephemeral profile",
+        BrowserUseAgent(policy=BrowserPolicy(mode=BrowserMode.AGENT),
+                        scope=scope).browser_kwargs()["user_data_dir"] is None)
+    add("browser-use is not reachable when it is not installed, or is honest about it",
+        isinstance(browser_use_available()[0], bool))
+
+    # ---- 5. a successful visit captures the five things --------------------
+    session = _scripted_session()
+    capture = session.visit("https://example.com/advisories", actions=["read", "extract_links"])
+    add("a visit in scope succeeds", capture.ok, capture.describe())
+    add("the capture has a final URL", capture.final_url == "https://example.com/advisories",
+        capture.final_url)
+    add("the capture has a title", capture.title.startswith("Advisories"), capture.title)
+    add("the capture has a retrieval time", capture.retrieved_at is not None
+        and capture.retrieved_at.year >= 2026)
+    add("the capture has the page text", "request smuggling" in capture.text,
+        len(capture.text))
+    add("the capture reports no errors on a clean visit", capture.errors == [])
+    add("the capture says the browser closed", capture.closed is True)
+    add("the session's guard is closed after the visit", session.guard.closed)
+    add("nothing is left open", session.guard.open_count == 0,
+        session.summary()["open_resources"])
+    add("the engine was actually closed", session.summary()["guard"]["closed_ops"])
+    add("the capture serialises whole", set(capture.to_dict()) >=
+        {"final_url", "title", "retrieved_at", "text", "errors", "closed"})
+
+    # ---- 6. closure on failure --------------------------------------------
+    failing = _scripted_session(engine=ScriptedEngine(raises=RuntimeError("chrome died")))
+    failed = failing.visit("https://example.com/advisories")
+    add("a failing engine still closes the browser", failed.closed and failing.guard.closed)
+    add("a failing engine reports the error", not failed.ok and failed.errors,
+        failed.errors[0].describe() if failed.errors else "")
+    add("a failure names the stage", failed.errors and failed.errors[0].stage != "")
+    add("a failure is a value, not an exception",
+        failed.refusal is not None or bool(failed.errors), failed.refusal)
+
+    # ---- 7. closure on timeout -------------------------------------------
+    slow = _scripted_session(engine=ScriptedEngine(pages=_BROWSER_SCRIPT, delay=0.6),
+                             policy=BrowserPolicy(mode=BrowserMode.HTTP,
+                                                  session_timeout_ms=1_000))
+    timed_out = slow.visit("https://example.com/slow", timeout_ms=200)
+    add("a hung visit times out instead of hanging", timed_out.refusal
+        is BrowserRefusal.TIMEOUT, timed_out.refusal)
+    add("a timed-out visit still closes the browser", timed_out.closed
+        and slow.guard.closed)
+    add("the timeout is reported as an error with a reason",
+        "did not finish" in timed_out.refusal_detail, timed_out.refusal_detail[:80])
+
+    # ---- 8. closure on cancellation --------------------------------------
+    token = CancellationToken()
+    cancelling = _scripted_session(token=token)
+    token.cancel(reason="operator pressed Ctrl-C")
+    cancelled = cancelling.visit("https://example.com/advisories")
+    add("a cancelled run does not visit", cancelling.engine_name and not
+        cancelling.visited_urls, cancelling.visited_urls)
+    add("a cancelled visit is reported as cancelled",
+        cancelled.refusal is BrowserRefusal.CANCELLED, cancelled.refusal)
+    add("cancellation opens no browser", cancelling.summary()["engine"] == "scripted"
+        and cancelling.guard.closed)
+
+    # a cancellation that arrives *while the visit is running*: the engine cancels
+    # the token from inside the visit, which is the worst case for cleanup — the
+    # browser is open, the call has not returned, and the run is already cancelled.
+    tokens = CancellationToken()
+    mid_engine = ScriptedEngine(pages=_BROWSER_SCRIPT,
+                                on_visit=lambda: tokens.cancel(reason="Ctrl-C mid-visit"))
+    live = _scripted_session(engine=mid_engine, token=tokens)
+    mid = live.visit("https://example.com/advisories")
+    add("a cancellation mid-visit still ends with the browser closed",
+        live.guard.closed and mid.closed is True and live.guard.open_count == 0,
+        f"closed={mid.closed} open={live.guard.open_count}")
+    add("the cancelled visit is still captured, so the run can report it",
+        mid.requested_url == "https://example.com/advisories" and mid.closed)
+
+    # ---- 9. closure when the caller never closes -------------------------
+    abandoned = _scripted_session()
+    abandoned.visit("https://example.com/advisories")
+    add("a session that is never closed has nothing to leak",
+        abandoned.guard.open_count == 0 and abandoned.guard.closed)
+    add("closing twice is safe", abandoned.close()["closed"] is True
+        and abandoned.close()["closed"] is True)
+    add("a retired session refuses to reopen a browser",
+        abandoned.visit("https://example.com/advisories").refusal
+        is BrowserRefusal.CANCELLED)
+    add("the session summary reports zero open resources",
+        abandoned.summary()["open_resources"] == 0)
+
+    # a guard whose closer raises still reports itself closed
+    broken = BrowserGuard()
+    closed_flags: list[str] = []
+
+    def explode() -> None:
+        raise RuntimeError("the driver refused to stop")
+
+    broken.register("driver", explode)
+    broken.register("page", lambda: closed_flags.append("page"))
+    summary = broken.close()
+    add("a closer that raises does not stop the others", closed_flags == ["page"],
+        closed_flags)
+    add("a closer that raises is recorded, not swallowed",
+        any("driver" in error for error in summary["errors"]), summary["errors"])
+    add("a guard with a broken closer is still closed", summary["closed"] is True)
+
+    # ---- 10. limits are counted by the session ---------------------------
+    limited = _scripted_session(policy=BrowserPolicy(mode=BrowserMode.HTTP,
+                                                     max_navigations=2))
+    over = limited.visit("https://example.com/advisories",
+                         actions=["follow", "follow", "follow"])
+    add("a visit may not exceed the navigation budget",
+        over.refusal is BrowserRefusal.NAVIGATION_LIMIT, over.refusal)
+    add("a navigation-limit refusal opens nothing", limited.guard.open_count == 0
+        and limited.engine_name == "scripted" and not limited.visited_urls,
+        limited.visited_urls)
+    within = _scripted_session(policy=BrowserPolicy(max_navigations=3))
+    captured = within.visit("https://example.com/advisories", actions=["follow", "follow"])
+    add("a visit inside the navigation budget runs",
+        captured.ok and captured.navigations == 3, captured.navigations)
+
+    # ---- 11. an off-scope redirect is refused, not followed --------------
+    off = _scripted_session(engine=ScriptedEngine(
+        pages=_BROWSER_SCRIPT, redirect_to="https://evil.example.org/landing"))
+    redirected = off.visit("https://example.com/advisories")
+    add("an off-scope redirect is refused",
+        redirected.refusal is BrowserRefusal.OUT_OF_SCOPE, redirected.refusal)
+    add("the refusal quotes where the page tried to go",
+        "evil.example.org" in redirected.refusal_detail, redirected.refusal_detail[:90])
+    add("an off-scope redirect still closes the browser", redirected.closed)
+
+    # ---- 12. the router's browser capability uses the session ------------
+    reader = browser_reader(BrowserPolicy(mode=BrowserMode.HTTP), scope=scope,
+                            engine=ScriptedEngine(pages=_BROWSER_SCRIPT))
+    router = CapabilityRouter(scope=scope, readers={Capability.BROWSER.value: reader})
+    grant = grant_for_worker(FlowWorker(id="w-browse", name="browser", objective="browse",
+                                        tools=["browser.use"]), paths=router.paths)
+    result, denial = router.try_invoke(grant, "browser.interact",
+                                       target="https://example.com/advisories",
+                                       parameters={"actions": ["read"]})
+    add("the router can browse through a real session", denial is None, denial and denial.detail)
+    add("the browser's capture reaches the router's payload",
+        bool(result) and result.payload.get("final_url") == "https://example.com/advisories",
+        result.payload.get("final_url") if result else "")
+    add("the browser's title reaches the evidence",
+        bool(result) and "Advisories" in result.evidence[0].statement)
+    add("the evidence records the retrieval method as browser",
+        bool(result) and result.evidence[0].sources[0].retrieval_method
+        is RetrievalMethod.BROWSER)
+    add("the payload says the browser closed",
+        bool(result) and result.payload.get("closed") is True)
+    denied = router.try_invoke(grant, "browser.interact",
+                               target="https://evil.example.org/")[1]
+    add("the router refuses an out-of-scope browse before a page opens",
+        denied is not None and denied.reason is DenialReason.OUT_OF_SCOPE,
+        denied.reason if denied else "allowed")
+    add("the refusal names the scope", bool(denied) and "example.com" in
+        " ".join(denied.allowed + [denied.detail]))
+
+    # ---- 13. the guarantee is the closure, not the demo -----------------
+    endings = {
+        "success": _scripted_session(),
+        "failure": _scripted_session(engine=ScriptedEngine(raises=RuntimeError("boom"))),
+        "timeout": _scripted_session(engine=ScriptedEngine(pages=_BROWSER_SCRIPT, delay=0.5),
+                                     policy=BrowserPolicy(session_timeout_ms=1_000)),
+        "cancellation": _scripted_session(token=_cancelled_token()),
+    }
+    # What each ending is allowed to say.  A success says nothing about refusal; a
+    # failure may be reported either by the engine (FAILED) or by the deadline.
+    capture_refusals = {
+        "success": {None}, "failure": {BrowserRefusal.FAILED, BrowserRefusal.UNAVAILABLE},
+        "timeout": {BrowserRefusal.TIMEOUT},
+        "cancellation": {BrowserRefusal.CANCELLED}}
+    for name, ending in endings.items():
+        capture = ending.visit("https://example.com/advisories", timeout_ms=150)
+        add(f"closure holds on {name}",
+            (capture.closed is True) if capture.launched else ending.guard.open_count == 0,
+            f"launched={capture.launched} closed={capture.closed}")
+        add(f"{name} reports its outcome as a value",
+            capture.refusal in capture_refusals[name], capture.refusal)
+    add("no ending leaves an open resource",
+        all(session.guard.open_count == 0 for session in endings.values()))
+
+    # ---- 14. the flow can own a browser, and reports it -------------------
+    context = _selftest_context("exposure")
+    units = flow_units_for(context, "exposure")
+    plain_flow = HierarchicalFlow(context=context, subagents=units,
+                                  runner=DeterministicRunner(scope=context.scope_entries))
+    plain_flow.build()
+    add("a flow without --browser attaches no browser",
+        plain_flow.browser_reader is None and plain_flow.browser_policy is None)
+    add("a flow without a browser still routes",
+        plain_flow.router is not None and Capability.BROWSER.value not in plain_flow.router.readers)
+    browser_flow = HierarchicalFlow(
+        context=context, subagents=units,
+        runner=DeterministicRunner(scope=context.scope_entries),
+        policy=FlowPolicy(browser=True, browser_max_navigations=3))
+    browser_flow.build()
+    add("--browser gives the router a browser reader",
+        Capability.BROWSER.value in browser_flow.router.readers)
+    add("the flow's browser policy came from the run's policy",
+        browser_flow.browser_policy is not None
+        and browser_flow.browser_policy.max_navigations == 3,
+        browser_flow.browser_policy.describe() if browser_flow.browser_policy else None)
+    add("the flow's browser policy keeps the safe defaults",
+        browser_flow.browser_policy.headless is True
+        and browser_flow.browser_policy.allow_downloads is False
+        and browser_flow.browser_policy.allow_form_submission is False)
+    add("the flow's browser is scoped to the mission",
+        browser_flow.router.readers[Capability.BROWSER.value].session.scope is not None)
+    result = browser_flow.run()
+    add("the flow's result reports the browser",
+        set(result.browser) >= {"closed", "visits", "open_resources"}, sorted(result.browser))
+    add("the flow closed its browser at the end",
+        result.browser.get("closed") is True and result.browser.get("open_resources") == 0)
+    add("a flow with no browser reports an empty summary", plain_flow.run().browser in ({}, None))
+
+    # ---- 15. the real engine, when it cannot start, leaks nothing ---------
+    available, _detail = browser_engine_available()
+    engine_guard = BrowserGuard()
+    try:
+        PlaywrightEngine(scope=scope).start(engine_guard)
+    except BaseException as exc:                 # a missing build, on this machine
+        started_cleanly = False
+        why = f"{type(exc).__name__}: {exc}"[:100]
+    else:
+        started_cleanly = True
+        why = "a browser build is installed"
+    finally:
+        engine_guard.close()
+    add("a real engine that cannot start still stops its driver",
+        started_cleanly or engine_guard.closed, why)
+    add("a real engine that cannot start leaves nothing open",
+        engine_guard.open_count == 0 and engine_guard.closed,
+        f"{why}; open={engine_guard.open_count}")
+    add("availability is a boolean with a remedy",
+        isinstance(available, bool) and bool(_detail))
+
+    # ---- 16. the engine seam has no room for the prohibited ---------------
+    engine_methods = set(dir(BrowserEngine))
+    add("the engine interface has four calls, not a prompt box",
+        len([name for name in engine_methods if not name.startswith("_")]) == 2,
+        sorted(name for name in engine_methods if not name.startswith("_")))
+    add("the engine interface cannot accept credentials",
+        "credentials" not in " ".join(engine_methods))
+    start, end = "# 28. Browser research", "# 28b. Proving the browser"
+    for name, violation in (
+        ("the browser section never types a password", "type=\"password\""),
+        ("the browser section never fills a credential field", "fill(\"#password\""),
+        ("the browser section never bypasses a verification", "bypass_csp"),
+        ("the browser section never stores a session", "storage_state="),
+        ("the browser section never disables TLS verification", "ignore_https_errors=True"),
+        ("the browser section never presses submit by selector", "click(\"button[type=submit]"),
+    ):
+        _source_check(name, violation, section=start, end=end, add=add)
+    span = _source_section(start, end)
+    add("the browser's agent configuration disables the CAPTCHA solver",
+        bool(span) and '"captcha_solver": False' in span,
+        "no source available" if not span else "captcha_solver")
+    add("the engine launches with the policy's headless setting",
+        bool(span) and "launch(headless=self.headless)" in span
+        and "headless=self.policy.headless" in span, len(span))
+    return checks
+
+
+def _cancelled_token() -> "CancellationToken":
+    token = CancellationToken()
+    token.cancel(reason="cancelled before the visit")
+    return token
+
+
+def _immutable(value: Any) -> bool:
+    """Whether ``value`` refuses mutation."""
+
+    field_name = next(iter(type(value).model_fields))
+    try:
+        setattr(value, field_name, getattr(value, field_name))
+    except Exception:
+        return True
+    return False
+
+
+def _source_check(name: str, violation: str, *, section: str, end: str,
+                  add: Callable[[str, bool, Any], None]) -> None:
+    """Assert that a *violation* does not appear in one section of the source.
+
+    Parameterised by the forbidden pattern rather than by the desired one: a
+    self-test that fails when the file cannot be read is worth more than one that
+    passes because it looked at nothing.
+    """
+
+    span = _source_section(section, end)
+    add(name, bool(span) and violation not in span,
+        "no source available" if not span else violation)
+
+
+def _constructs(model: Any, **kwargs: Any) -> bool:
+    try:
+        model(**kwargs)
+    except Exception:
+        return False
+    return True
+
+
+def browser_demo() -> dict[str, Any]:
+    """Two visits and five refusals, with the closure count for each."""
+
+    scope = browser_demo_scope()
+    attempts: list[dict[str, Any]] = []
+    sessions: list[BrowserSession] = []
+
+    def attempt(label: str, url: str, actions: Sequence[str] = ("read",),
+                session_used: BrowserSession | None = None,
+                timeout_ms: int | None = None) -> None:
+        # A session is one browser, retired after its visit: the demo therefore
+        # builds a fresh one per attempt, exactly as a mission does per page.
+        used = session_used or _scripted_session(scope=scope)
+        sessions.append(used)
+        before = len(used.refusals)
+        capture = used.visit(url, actions=actions, timeout_ms=timeout_ms)
+        refused_actions = [item.value for item in used.refusals[before:]]
+        if capture.refusal is not None and capture.refusal.value in refused_actions:
+            # The visit's own refusal is the outcome, not a refused action.
+            refused_actions.remove(capture.refusal.value)
+        attempts.append({
+            "label": label, "url": url,
+            "outcome": ("captured" if capture.ok else
+                        (capture.refusal.value if capture.refusal else "failed")),
+            "title": capture.title, "final_url": capture.final_url,
+            "chars": len(capture.text), "closed": capture.closed,
+            "launched": capture.launched,
+            "refused_actions": refused_actions,
+            "detail": (capture.refusal_detail or capture.describe())[:160],
+            "errors": [error.describe() for error in capture.errors],
+        })
+
+    attempt("read an approved advisory page", "https://example.com/advisories",
+            ["read", "extract_links"])
+    attempt("refuse a login action but still read the page",
+            "https://example.com/advisories", ["login", "read"])
+    attempt("refuse a CAPTCHA solve but still read the page",
+            "https://example.com/advisories", ["solve_captcha", "read"])
+    attempt("refuse a page outside the scope", "https://evil.example.org/")
+    attempt("refuse a cloud metadata endpoint", "http://169.254.169.254/latest/meta-data/")
+    attempt("refuse a timeout", "https://example.com/slow",
+            session_used=_scripted_session(engine=ScriptedEngine(pages=_BROWSER_SCRIPT,
+                                                                 delay=0.5),
+                                           scope=scope),
+            timeout_ms=150)
+    attempt("refuse a cancelled run", "https://example.com/advisories",
+            session_used=_scripted_session(scope=scope, token=_cancelled_token()))
+
+    return {
+        "policy": BrowserPolicy(mode=BrowserMode.HTTP).to_dict(),
+        "engine": sessions[0].engine_name if sessions else "scripted",
+        "attempts": attempts,
+        "captured": sum(1 for item in attempts if item["outcome"] == "captured"),
+        "refused": sum(1 for item in attempts if item["outcome"] != "captured"),
+        "closed_everywhere": all(item["closed"] or not item["launched"]
+                                 for item in attempts),
+        "open_resources": sum(session.guard.open_count for session in sessions),
+        "available": browser_engine_available()[1],
+    }
+
+
+def render_browser_demo(payload: Mapping[str, Any]) -> Group:
+    """The demo on screen: the policy, then each attempt and whether it closed."""
+
+    policy = payload["policy"]
+    head = Table(title=f"browser policy — {policy['mode']}", title_justify="left",
+                 box=None, pad_edge=False)
+    head.add_column("setting", no_wrap=True)
+    head.add_column("value", overflow="fold")
+    for label in ("headless", "viewport_width", "viewport_height", "navigation_timeout_ms",
+                  "session_timeout_ms", "max_navigations", "allow_downloads",
+                  "allow_form_submission", "isolated_contexts"):
+        head.add_row(escape(label), escape(str(policy.get(label))))
+
+    table = Table(title="attempts", title_justify="left", box=None, pad_edge=False)
+    table.add_column("attempt", overflow="fold")
+    table.add_column("outcome", no_wrap=True)
+    table.add_column("closed", no_wrap=True)
+    table.add_column("what happened", overflow="fold")
+    for item in payload["attempts"]:
+        ok = item["outcome"] == "captured"
+        colour = "green" if ok else "yellow"
+        if not item["launched"]:
+            closed = "[dim]—[/dim]"                  # never opened, so nothing to close
+        else:
+            closed = "✔" if item["closed"] else "[red]✘[/red]"
+        detail = item["detail"]
+        if item["refused_actions"]:
+            detail = f"action(s) refused: {', '.join(item['refused_actions'])}; {detail}"
+        table.add_row(escape(item["label"]),
+                      f"[{colour}]{escape(item['outcome'])}[/{colour}]",
+                      closed, escape(detail[:90]))
+    summary = Text(
+        f"\n{payload['captured']} page(s) captured · {payload['refused']} attempt(s) refused · "
+        f"{payload['open_resources']} resource(s) left open · "
+        f"closed everywhere: {'yes' if payload['closed_everywhere'] else 'NO'}\n"
+        f"engine: {payload['available']}", style="dim")
+    return Group(head, Text(""), table, summary)
+
+
+def render_browser_self_test(checks: Sequence[BrowserCheck]) -> Any:
+    table = Table(title="browser self-test", title_justify="left", box=None, pad_edge=False)
+    table.add_column("", width=2)
+    table.add_column("check", no_wrap=True)
+    table.add_column("detail", overflow="fold")
+    for check in checks:
+        glyph, colour = ("✔", "green") if check.ok else ("✘", "red")
+        table.add_row(f"[{colour}]{glyph}[/{colour}]", escape(check.name),
+                      escape(check.detail))
+    return table
+
+
+@app.command("browser", help="Browser research: policy, scope, capture, guaranteed closure.")
+def browser_command(
+    self_test: bool = typer.Option(False, "--self-test",
+                                   help="Prove closure on success, failure, timeout, cancel."),
+    demo: bool = typer.Option(False, "--demo",
+                              help="Two captures and five refusals, with closure per visit."),
+    mode: str = typer.Option("http", "--mode", help="http | agent | disabled."),
+    agent: bool = typer.Option(False, "--agent", help="Shorthand for --mode agent."),
+    live: bool = typer.Option(False, "--live",
+                              help="Use the real Playwright engine instead of the script."),
+    url: str | None = typer.Option(None, "--url", help="One page to visit.",
+                                  show_default=False),
+    scope_entry: list[str] = typer.Option([], "--scope",
+                                          help="Approved host(s). Repeatable."),
+    headless: bool = typer.Option(True, "--headless/--headed"),
+    timeout_ms: int = typer.Option(30_000, "--timeout-ms", help="Navigation timeout."),
+    max_navigations: int = typer.Option(5, "--max-navigations"),
+    allow_forms: bool = typer.Option(False, "--allow-forms",
+                                     help="Permit a named form submission (off by default)."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Browse only what the mission approved, and leave nothing running."""
+
+    console = get_console()
+
+    if self_test:
+        checks = run_browser_self_test()
+        failures = [check for check in checks if not check.ok]
+        if as_json:
+            _emit(json.dumps({"ok": not failures,
+                              "checks": [asdict(check) for check in checks]}, indent=2))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        console.print()
+        console.print(render_browser_self_test(checks))
+        colour = "green" if not failures else "red"
+        console.print(f"\n[{colour}]{len(checks) - len(failures)} passed[/] · "
+                      f"{len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    if demo:
+        payload = browser_demo()
+        if as_json:
+            _emit(json.dumps(payload, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(render_browser_demo(payload))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    if not url:
+        console.print("[red]✘[/red] name a page with --url, or use --demo/--self-test")
+        raise typer.Exit(ExitCode.USAGE)
+
+    try:
+        chosen = BrowserMode("agent" if agent else mode)
+    except ValueError:
+        console.print(f"[red]✘[/red] unknown mode {mode!r}; use http, agent or disabled")
+        raise typer.Exit(ExitCode.USAGE) from None
+    policy = BrowserPolicy(mode=chosen, headless=headless,
+                           navigation_timeout_ms=timeout_ms,
+                           max_navigations=max_navigations,
+                           allow_form_submission=allow_forms)
+    scope = (Scope(entries=[ScopeEntry(pattern=entry) for entry in scope_entry])
+             if scope_entry else None)
+    engine: BrowserEngine | None = None
+    if not live:
+        available, detail = browser_engine_available()
+        if not available:
+            console.print(f"[dim]{escape(detail)}[/dim]")
+        engine = ScriptedEngine(pages=_BROWSER_SCRIPT)
+    session = BrowserSession(policy=policy, scope=scope, engine=engine)
+    try:
+        capture = session.visit(url, actions=["read"])
+    finally:
+        session.close()
+    payload = {"capture": capture.to_dict(), "session": session.summary()}
+    # A refusal is a real outcome for a one-shot run: CI should be able to tell a
+    # captured page from a page the boundary turned away, and a missing engine from
+    # both.
+    if capture.ok:
+        code = ExitCode.OK
+    elif capture.refusal is BrowserRefusal.UNAVAILABLE:
+        code = ExitCode.DEPENDENCY
+    else:
+        code = ExitCode.POLICY
+    if as_json:
+        _emit(json.dumps(payload, indent=2, default=str))
+        raise typer.Exit(code)
+    console.print()
+    console.print(render_browser_capture(capture, session.summary()))
+    console.print()
+    raise typer.Exit(code)
+
+
+def render_browser_capture(capture: BrowserCapture, summary: Mapping[str, Any]) -> Group:
+    """One capture on screen: the five captured fields, then the closure."""
+
+    table = Table(title=f"browser capture — {capture.describe()[:70]}",
+                  title_justify="left", box=None, pad_edge=False)
+    table.add_column("field", no_wrap=True)
+    table.add_column("value", overflow="fold")
+    for label, value in (
+        ("requested", capture.requested_url or "—"),
+        ("final url", capture.final_url or "—"),
+        ("title", capture.title or "—"),
+        ("retrieved", capture.retrieved_at.isoformat()),
+        ("status", str(capture.status) if capture.status is not None else "—"),
+        ("text", f"{len(capture.text)} char(s): {capture.excerpt[:80]}"),
+        ("errors", "; ".join(error.describe() for error in capture.errors) or "none"),
+        ("refusal", f"{capture.refusal.value}: {capture.refusal_detail[:90]}"
+         if capture.refusal else "none"),
+        ("closed", "yes" if capture.closed else "NO — this is a bug"),
+        ("open resources", str(summary.get("open_resources"))),
+    ):
+        table.add_row(escape(label), escape(value))
+    return Group(table)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 29. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 

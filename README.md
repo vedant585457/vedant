@@ -18,6 +18,7 @@ python vedant_osint.py flow --self-test       # LangGraph execution flow
 python vedant_osint.py sched --self-test      # bounded queues, deadlines, licences
 python vedant_osint.py resume --self-test     # checkpointing and resumable missions
 python vedant_osint.py router --self-test     # the controlled capability router
+python vedant_osint.py browser --self-test    # browser research, guaranteed closure
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -507,6 +508,48 @@ python vedant_osint.py router --demo --json  # grants, attempts, dispatch
   concurrency slot: a Worker with nothing it may do is reported as blocked
   instead of consuming capacity a working Worker needs.
 
+## Browser research
+
+The ninth capability has a real engine behind it: Playwright for a fetch,
+browser-use when the run asks for an agent, both configured from one policy and
+both closed by the same guard.
+
+```bash
+python vedant_osint.py browser --self-test                                  # 113 closure checks
+python vedant_osint.py browser --demo                                       # 3 captures, 4 refusals
+python vedant_osint.py browser --url https://example.com/ --scope example.com
+python vedant_osint.py browser --url https://example.com/ --scope example.com --live
+python vedant_osint.py flow --demo exposure --browser                        # through the router
+```
+
+- **Scope is checked before a browser exists.** A URL outside the mission's
+  `Scope` is refused with no process started, no profile written and no request
+  made. A page that *redirects* off-scope is refused rather than followed, so a
+  redirect cannot widen the mission, and requests are filtered at the browser
+  too — an off-scope document is aborted before it renders.
+- **Not-public-web is not browsable.** Loopback, RFC 1918, link-local, `.local`
+  and the cloud metadata names are refused *statically*, without DNS, so the
+  browser cannot become a pivot into an internal network.
+- **Each visit gets its own context.** Cookie-less, ephemeral and closed in a
+  `finally`; there is no persistent profile, so nothing survives from one visit
+  into the next or from one run into the next.
+- **Five prohibitions, as values not prose.** Credential use, access-control
+  bypass, CAPTCHA solving, unauthorised automation and form submission each have
+  a `BrowserRefusal`; an action that names one is refused with a reason while
+  the rest of the visit still runs — the page is read, the login is not.
+- **Headless, bounded, and configured from one object.** `BrowserPolicy` carries
+  headless mode, navigation and action timeouts, the viewport, the download
+  policy, the navigation ceiling and the text cap; `browser --demo` prints it.
+- **Closure is the acceptance criterion, so it is not a `finally: pass`.** A
+  session owns one browser for one visit and retires itself when the visit ends
+  — on success, on an engine exception, on a deadline, and on a cancellation that
+  arrives *while* the visit is running. The capture reports whether a browser was
+  launched and whether it was closed, `flow --browser` closes again on its own
+  exit path, and the demo prints `0 resource(s) left open`.
+- **The capture is evidence.** Final URL, title, retrieval time, the relevant
+  text and the errors all reach the router's evidence, so "the page did not load"
+  becomes a reported finding instead of an empty result.
+
 ## Status
 
 | Phase | Scope | State |
@@ -514,7 +557,7 @@ python vedant_osint.py router --demo --json  # grants, attempts, dispatch
 | 1 | Foundation — CLI skeleton, config probing, version reporting | ✅ done |
 | 2 | Contracts — settings, `doctor`, preflight, models, state, renderer, lifecycle, resilience, model adapter | ✅ done |
 | 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control) |
-| 4 | Browser — browser-use / Playwright sessions and capture | ⬜ |
+| 4 | Browser — browser-use / Playwright sessions and capture | 🟡 started (policy, scope, capture, guarded closure, agent mode) |
 | 5 | Collection — passive OSINT sources, artefact hashing | ⬜ |
 | 6 | Synthesis — cross-source correlation and reporting | ⬜ |
 | 7 | Operations — resume, budgets, audit trail, hardening | 🟡 started (checkpoints, resumable missions, capability router, budgets) |
