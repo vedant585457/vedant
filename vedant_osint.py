@@ -54624,17 +54624,23 @@ def _stopping_record(result: "FlowResult", report: MasterReport) -> StoppingReco
     reason = (decision.basis if decision is not None and decision.basis
               else result.stop_reason
               or (saturations.stop_reason if saturations is not None else ""))
-    if not reason:
-        reason = ("the mission ran every unit it planned and the master closed it without "
-                  "recording a bound, which the trace supports and this line states")
+    if not reason and result.trace:
+        reason = ("the run completed and recorded no stopping bound, so this dossier reports "
+                  "the absence rather than inventing one")
+    elif not reason:
+        reason = ("the stopping record was not supplied with this dossier: the mission's "
+                  "trace and decisions are not part of the file it was built from")
     if result.stopped:
         statement = (f"the mission stopped before finishing: {reason[:200]}. Every section "
                      f"above reports what it had collected at that point, and nothing is "
                      f"presented as if the mission had completed.")
-    else:
+    elif decision is not None:
         statement = (f"the mission finished: {reason[:200]}. The bound that ended it is on "
                      f"the record, so a reader can tell a finished mission from a stopped "
                      f"one.")
+    else:
+        statement = (f"the mission finished: {reason[:200]}. No stopping decision was part of "
+                     f"this file, so the reason above is the whole of what the record says.")
     return StoppingRecord(
         stopped=result.stopped, condition=condition, reason=reason[:400], kind=kind,
         reviews=len(result.master_reviews),
@@ -57153,7 +57159,17 @@ def _flow_result_from_payload(payload: Mapping[str, Any]) -> FlowResult:
         checkpoint=str(payload.get("checkpoint") or ""),
         retasks=[RetaskedWorker.model_validate(item)
                  for item in payload.get("retasks") or []
-                 if _written_like_model(item, RetaskedWorker)])
+                 if _written_like_model(item, RetaskedWorker)],
+        # Present in a checkpointed run's own file and absent from `flow --json`; used when
+        # they are there, so the stopping record is read rather than inferred.
+        master_reviews=[MasterReview.model_validate(item)
+                        for item in payload.get("master_reviews") or []
+                        if _written_like_model(item, MasterReview)],
+        master_decisions=[MasterDecision.model_validate(item)
+                          for item in payload.get("master_decisions") or []
+                          if _written_like_model(item, MasterDecision)],
+        loops=(LoopLedger.model_validate(payload["loops"])
+               if isinstance(payload.get("loops"), dict) else None))
 
 
 def _written_like_model(payload: Any, model: type[BaseModel]) -> bool:
