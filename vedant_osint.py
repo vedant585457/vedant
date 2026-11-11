@@ -423,6 +423,14 @@ by side).  There is no node named after a specialist role and no roster constant
   a mission whose rounds stop adding claims stops with the series it judged.  No
   instruction this build accepts is unbounded: "continue until…" is refused at the
   door, because a loop detector cannot save an instruction with no end condition.
+* **The document cannot outrun its evidence.**  The finished report is assembled from
+  the reviewed record in ten sections — executive summary, scope and methods, key
+  findings, corroborated indicators, competing hypotheses, contradictions, confidence,
+  gaps, limitations and lawful next steps.  Every finding cites the evidence ids that
+  carry it, confidence is *derived* from independent origins and capped by the claim's
+  epistemic kind, contradictions are preserved rather than settled, and no sentence may
+  declare guilt or attribute identity with certainty.  A report that cannot meet its own
+  acceptance clause is refused rather than printed.
 
 ::
 
@@ -924,6 +932,8 @@ round.
     python vedant_osint.py review-master --next mission.json --objective "..."
     python vedant_osint.py loops --self-test             # 52 loop-detection checks
     python vedant_osint.py loops --demo                  # correct, block, stop
+    python vedant_osint.py synthesis --self-test         # 50 calibration checks
+    python vedant_osint.py synthesis --demo              # one claim, three evidence bases
 
 Structured model adapter
 ------------------------
@@ -1131,7 +1141,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 28
+VERSION_MINOR: int = 29
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -22487,6 +22497,11 @@ class MasterSynthesis(StrictModel):
     confidence_basis: str | None = None
     uncertainty_statement: str = Field(min_length=15)
     aggregate_basis: JoinBarrier | None = None
+    #: §39: the finished report — ten sections, every finding cited, every level
+    #: calibrated.  Attached to the synthesis rather than replacing it because the
+    #: synthesis is what a runner returned and the report is what the mission *says*:
+    #: they are different claims, and a reader must be able to see both.
+    report: "MasterReport | None" = None
 
     @property
     def sourced_claims(self) -> list[ModelClaim]:
@@ -25403,6 +25418,88 @@ class HierarchicalFlow:
                             f"and re-aggregated")
         return admitted
 
+    # -- 6b. §39: the hypotheses and next steps the report carries ----------------
+
+    def _synthesis_hypotheses(self, reports: Sequence[SubagentOutcome],
+                              synthesis: MasterSynthesis) -> list[HypothesisRow]:
+        """The mission's questions, as hypotheses with a status and a test.
+
+        Every question the mission set itself becomes a row, whether or not it was
+        answered: a question nobody answered is an ``untested`` hypothesis, and listing
+        it is how the report admits that instead of quietly shrinking its own scope.  The
+        status is read from the evidence — a question whose words appear in a reviewed
+        statement is ``supported``, one contradicted by a stated conflict is ``open``,
+        everything else is ``untested`` — never from a writer's preference.
+        """
+
+        statements = [(item.statement, item.id) for report in reports for item in report.evidence]
+        conflicts = [conflict for report in reports for conflict in report.disagreements]
+        rows: list[HypothesisRow] = []
+        for index, question in enumerate(self.context.mission_questions[:8], start=1):
+            words = _topic_words(question)
+            supporting = [item_id for statement, item_id in statements
+                          if words and len(words & _topic_words(statement)) >= 2]
+            disputed = any(words and len(words & _topic_words(conflict.topic)) >= 2
+                           for conflict in conflicts)
+            status = "open" if disputed else ("supported" if supporting else "untested")
+            try:
+                rows.append(HypothesisRow(
+                    statement=question,
+                    status=status,
+                    evidence_ids=supporting[:4] if status != "untested" else [],
+                    competes_with=("the benign explanation: the same observations are "
+                                   "consistent with configuration drift or a shared "
+                                   "provider, and no evidence here excludes it"),
+                    test=(f"a first-party record that directly addresses question {index}, "
+                          f"dated and independently reproducible: {question[:90]}")))
+            except SynthesisConflict:
+                continue
+        if not rows:
+            rows.append(HypothesisRow(
+                statement=("the mission's objective is answered by the evidence it "
+                           "collected, and no benign alternative remains"),
+                status="untested", evidence_ids=[],
+                test=("state a falsifiable question for the mission: a report with no "
+                      "hypothesis has not tested one")))
+        return rows
+
+    def _synthesis_next_steps(self, reports: Sequence[SubagentOutcome],
+                              synthesis: MasterSynthesis) -> list[NextStep]:
+        """Lawful, passive steps that address the gaps the mission actually has.
+
+        Derived from the record: one step per gap, naming the gap it addresses and why it
+        is inside the mission's authorisation.  Nothing here touches a host, sends
+        traffic, or contacts a person — this build plans passive collection, and a
+        recommendation is a plan.
+        """
+
+        scope = ", ".join(self.context.scope_entries[:4]) or "the authorised scope"
+        steps: list[NextStep] = []
+        for number, gap in enumerate([*synthesis.gaps,
+                                      *[item for report in reports for item in report.gaps]],
+                                     start=1):
+            try:
+                steps.append(NextStep(
+                    action=(f"collect one dated, first-party record that closes: "
+                            f"{(gap.detail or 'the stated gap')[:140]}"),
+                    addresses=f"gap-{number}",
+                    basis=(f"passive collection from {scope}, which the mission is already "
+                           f"authorised for; no new scope is required"),
+                    value="high" if number <= 2 else "medium"))
+            except SynthesisConflict:
+                continue
+            if len(steps) >= 5:
+                break
+        if not steps:
+            steps.append(NextStep(
+                action=("re-run the same passive checks after the target publishes its next "
+                        "advisory, so a change in the record is distinguishable from a "
+                        "change in the collection"),
+                addresses="gap-1",
+                basis=f"the same scope and method the mission already used ({scope})",
+                value="low"))
+        return steps
+
     def _node_master_synthesize(self, state: Mapping[str, Any]) -> dict[str, Any]:
         """The final join: synthesise only once every Subagent has reported."""
 
@@ -25416,9 +25513,31 @@ class HierarchicalFlow:
                    for subagent in self.subagents]
         synthesis = self.runner.synthesize(self.subagents, ordered, self.context)
         synthesis = synthesis.model_copy(update={"aggregate_basis": barrier})
+        # §39: the finished document, assembled from the reviewed record rather than
+        # written by the runner.  The runner's synthesis is its *opinion* of the record;
+        # the report is what the record can carry, and the difference is the point: every
+        # finding in it cites evidence ids that exist, confidence is derived from origins
+        # and capped by epistemic kind, and contradictions are preserved.  Built here,
+        # after the join, because a report assembled before it would be a report about a
+        # mission that had not finished.
+        report = synthesise_report(
+            ordered, context=self.context, mission_id=self.mission_id,
+            hypotheses=self._synthesis_hypotheses(ordered, synthesis),
+            next_steps=self._synthesis_next_steps(ordered, synthesis),
+            limitations=list(synthesis.limitations),
+            withheld=[f"line of inquiry blocked: {line.reason[:120]}"
+                      for line in self._loops.blocked],
+            barrier=barrier, review=self._master_reviews[-1] if self._master_reviews else None,
+            # The question the mission asked is its own first stated question; passed
+            # separately from the objective because a criterion is not a question, and a
+            # report that presented one as the other would be answering something else.
+            question=(self.context.mission_questions[0]
+                      if self.context.mission_questions else ""))
+        synthesis = synthesis.model_copy(update={"report": report})
         self._record(FlowStage.MASTER_SYNTHESIZE,
                      detail=f"{barrier.describe()}; {len(synthesis.sourced_claims)} sourced "
-                            f"claim(s), {len(synthesis.gaps)} gap(s)")
+                            f"claim(s), {len(synthesis.gaps)} gap(s); report: "
+                            f"{report.summary_line()[:120]}")
         if self.resume is not None:
             self.resume.synthesis(synthesis)
         return {"synthesis": json.loads(model_to_json(synthesis))}
@@ -25463,7 +25582,8 @@ class HierarchicalFlow:
             self.resume.stage(FlowStage.MASTER_SYNTHESIZE.value,
                               note=("synthesised" if final.get("synthesis")
                                     else "stopped before synthesis"))
-        reports = [SubagentOutcome.model_validate(item) for item in final.get("reports") or []]
+        reports = _latest_reports(
+            [SubagentOutcome.model_validate(item) for item in final.get("reports") or []])
         ordered = [next((report for report in reports if report.subagent_id == subagent.id), None)
                    for subagent in self.subagents]
         kept = [report for report in ordered if report is not None]
@@ -49054,10 +49174,14 @@ def run_aggregate_self_test() -> list[AggregateCheck]:
     add("a ready report met its criteria", all(
         report.readiness.ready for report in result.reports))
 
+    # ``allow_runtime_workers`` binds the *Subagent's* own §36 expansion.  The Master's
+    # §37 follow-up is a different budget on purpose, so it is switched off here too:
+    # this check is about one switch, not about a mission with no expansion at all.
     bounded = HierarchicalFlow(
         context=context, subagents=flow_units_for(context, "exposure"),
         runner=_CountingRunner(scope=context.scope_entries),
-        policy=FlowPolicy(max_review_rounds=2, allow_runtime_workers=False)).run()
+        policy=FlowPolicy(max_review_rounds=2, allow_runtime_workers=False,
+                          allow_follow_ups=False)).run()
     add("with expansion off no runtime Worker is created",
         not any(report.runtime_workers for report in bounded.reports),
         [len(report.runtime_workers) for report in bounded.reports])
@@ -49067,15 +49191,22 @@ def run_aggregate_self_test() -> list[AggregateCheck]:
         all(report.aggregate_basis and report.aggregate_basis.satisfied
             for report in bounded.reports))
 
+    # §36's cap is the Subagent's own ceiling; §37's follow-up Workers are counted
+    # against the Master's separate budget and are therefore excluded here on purpose.
+    # Anything the Subagent itself planned beyond one is a breach of the cap.
     ceiling = HierarchicalFlow(
         context=context, subagents=flow_units_for(context, "exposure"),
         runner=_CountingRunner(scope=context.scope_entries),
         policy=FlowPolicy(max_review_rounds=2,
                           max_runtime_workers_per_subagent=1)).run()
+    # A follow-up Worker is named ``follow-up-<id>`` by ``_follow_up_plan``; a Worker the
+    # Subagent planned for its own gap is named ``gap-<id>`` by ``plan_runtime_worker``.
+    self_planned = lambda report: [row for row in report.runtime_workers  # noqa: E731
+                                   if row.spawned
+                                   and not row.name.startswith("follow-up-")]
     add("the per-Subagent ceiling binds", all(
-        len([row for row in report.runtime_workers if row.spawned]) <= 1
-        for report in ceiling.reports),
-        [len(report.runtime_workers) for report in ceiling.reports])
+        len(self_planned(report)) <= 1 for report in ceiling.reports),
+        [[row.name for row in self_planned(report)] for report in ceiling.reports])
     add("a mission at its ceiling still returns a report",
         bool(ceiling.reports) and ceiling.synthesis is not None)
 
@@ -52248,6 +52379,1441 @@ class LoopLedger(StrictModel):
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# 39. Evidence-based Master synthesis: a report that cannot outrun its evidence
+# --------------------------------------------------------------------------
+#
+# The mission produces one document, and the one thing it must not do is conclude more
+# than it can show.  §34 judged every Worker result, §35 re-tasked what failed, §36
+# reconciled each Subagent, §37 decided whether to keep working and §38 detected when
+# working had stopped helping.  This section turns the finished record into the answer:
+# an executive summary, scope and methods, key findings, corroborated indicators,
+# competing hypotheses, contradictions, confidence levels, evidence gaps, limitations
+# and lawful next steps.
+#
+# The design problem is not formatting.  It is that a synthesis is *authored* — by a
+# model, in the ordinary case — and an authored conclusion can say anything.  So the
+# document is assembled from typed parts (:class:`SynthesisSection`, each one of them),
+# and the assembly is what enforces the acceptance clause:
+#
+# *   **Every key finding links to evidence ids.**  A :class:`KeyFinding` cannot be
+#     constructed without them, and every id must exist in the mission's own evidence —
+#     a finding that cites an id nobody collected is refused at construction, not
+#     flagged later.
+# *   **No conclusion exceeds its evidence.**  Confidence is *derived*, twice over: from
+#     independent origins (the same rule the research audit uses, so two sections cannot
+#     disagree about what "corroborated" means) and from the epistemic kind of the item
+#     (an allegation is capped at low and an inference at medium, whatever a model says).
+#     A stated confidence above the derived ceiling is refused.
+# *   **No declarations of guilt, no certain identity attribution.**  The scope policy
+#     already pauses objectives that assume guilt; the *output* needs the same bar, so
+#     :func:`check_attribution` refuses a verdict and :func:`check_identity_claim` refuses
+#     a certain identity claim, and both run on every finding at construction.
+#
+# The report also says what it does not know: gaps are §14 unknowns carried forward, the
+# contradictions are preserved rather than settled (§36's rule, a level up), and the
+# hypotheses section is allowed — indeed required — to keep more than one explanation
+# alive when the evidence does not choose between them.
+
+
+class SynthesisConflict(Exception):
+    """Raised when a synthesis would say more than the evidence supports."""
+
+
+class ConfidenceBand(str, Enum):
+    """The three levels of confidence a finished report may state, and what earns each.
+
+    Deliberately the same three bands the mission's :class:`Confidence` enum uses, named
+    here so the *rule* that assigns a band is a thing a reader can inspect: one
+    independent origin is ``SINGLE_SOURCE``, two are ``CORROBORATED``, and three or more
+    agreeing origins on a material claim are ``WELL_CORROBORATED``.  A band starts at
+    ``SINGLE_SOURCE`` because any statement in the report rests on at least one citation —
+    a statement that rests on none is not a finding.
+    """
+
+    SINGLE_SOURCE = "single-source"
+    CORROBORATED = "corroborated"
+    WELL_CORROBORATED = "well-corroborated"
+
+    @property
+    def confidence(self) -> Confidence:
+        """The coarse confidence this band reports as."""
+
+        return {ConfidenceBand.SINGLE_SOURCE: Confidence.LOW,
+                ConfidenceBand.CORROBORATED: Confidence.MEDIUM,
+                ConfidenceBand.WELL_CORROBORATED: Confidence.HIGH}[self]
+
+    @property
+    def rank(self) -> int:
+        return {ConfidenceBand.SINGLE_SOURCE: 1, ConfidenceBand.CORROBORATED: 2,
+                ConfidenceBand.WELL_CORROBORATED: 3}[self]
+
+    @classmethod
+    def of(cls, confidence: Confidence) -> "ConfidenceBand":
+        return {Confidence.LOW: cls.SINGLE_SOURCE, Confidence.MEDIUM: cls.CORROBORATED,
+                Confidence.HIGH: cls.WELL_CORROBORATED,
+                Confidence.UNKNOWN: cls.SINGLE_SOURCE}[confidence]
+
+
+#: What an allegation may be reported as, whatever its sources say.  A third party's
+#: claim is not corroborated by a third party repeating it: the *claim* is well
+#: attested, the conduct is not established, and the band has to say the second thing.
+ALLEGATION_CEILING: ConfidenceBand = ConfidenceBand.CORROBORATED
+
+#: What an inference may be reported as.  Reasoning over good evidence is still
+#: reasoning: three origins can establish a fact, and can only make a conclusion likely.
+INFERENCE_CEILING: ConfidenceBand = ConfidenceBand.CORROBORATED
+
+#: The bands each epistemic kind is allowed to reach.  A lookup rather than a chain of
+#: ``if``s so the caps are data, and a reader can see all three at once.
+_KIND_CEILING: dict[EvidenceKind, ConfidenceBand] = {
+    EvidenceKind.OBSERVATION: ConfidenceBand.WELL_CORROBORATED,
+    EvidenceKind.INFERENCE: INFERENCE_CEILING,
+    EvidenceKind.ALLEGATION: ALLEGATION_CEILING,
+}
+
+
+#: Words that assert conduct rather than describe indicia.  Checked anywhere a synthesis
+#: states something about a person: a report may say what a log shows and what it would
+#: take to establish who did it, and it may not say who did it.
+_ATTRIBUTION_WORDS: tuple[str, ...] = (
+    "guilty", "culprit", "perpetrator", "attacker", "the hacker", "fraudster",
+    "scammer", "stalker", "leaker", "insider threat", "the thief", "the spy",
+    "committed the crime", "carried out the attack", "responsible for the attack",
+    "did it", "who did this", "is to blame", "malicious actor named",
+)
+
+#: Phrases that turn an identity claim into a certainty.  Kept apart from
+#: :data:`_HEDGE_WORDS`: those assert certainty about anything, these assert *who*.
+_ATTRIBUTION_CERTAINTY: tuple[str, ...] = (
+    "is the person who", "was the person who", "is the individual who",
+    "must be the same person", "is identical to the suspect", "is the attacker",
+    "is the culprit", "definitely the same person", "positively identified as",
+    "is certainly the", "we identify", "we have identified",
+)
+
+#: How an identity statement may be phrased: as a hypothesis with a stated basis and a
+#: named thing that would confirm or refute it.  A sentence is acceptable when it carries
+#: at least one of these, because then it is asking a question rather than answering one.
+_ATTRIBUTION_QUALIFIERS: tuple[str, ...] = (
+    "hypothesis", "competing", "would", "if ", "cannot be established", "not established",
+    "does not establish", "insufficient", "indicative", "consistent with", "one of several",
+    "remains", "unresolved", "could", "may", "might", "alleged", "reported", "according to",
+    "no evidence", "would require", "to establish", "testing", "alternative",
+)
+
+
+def _synthesis_sentences(text: str) -> list[str]:
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+|\n+", text or "")
+            if part.strip()]
+
+
+def check_attribution(text: str) -> str:
+    """Refuse a declaration of guilt.  Returns the text, or raises.
+
+    Deliberately blunt: this is the one class of sentence a finished report must never
+    contain, so the check runs on every finding and every section, and a match is a
+    construction error rather than a warning a caller might not read.
+
+    Returned unchanged rather than normalised: rewriting a claim to remove the word
+    "attacker" would leave a sentence nobody wrote, and a report's sentences must be the
+    ones the mission stands behind.
+    """
+
+    lowered = (text or "").lower()
+    for word in _ATTRIBUTION_WORDS:
+        if re.search(rf"\b{re.escape(word)}\b", lowered):
+            raise SynthesisConflict(
+                f"a synthesis may not declare guilt ({word!r}); describe the indicia and "
+                f"the standard of proof instead — see check_identity_claim")
+    return text
+
+
+def check_identity_claim(text: str) -> str:
+    """Refuse a *certain* identity attribution, and allow an explicitly uncertain one.
+
+    The distinction is the whole point of the section: "the person who administers the
+    domain is probably X" is a hypothesis the report can state with its basis, while "X
+    is the person who did this" is a verdict the mission is not entitled to reach.  A
+    sentence carrying one of :data:`_ATTRIBUTION_CERTAINTY` and *no* qualifier from
+    :data:`_ATTRIBUTION_QUALIFIERS` is refused; the same sentence with "no evidence
+    establishes" in front of it is not.
+    """
+
+    for sentence in _synthesis_sentences(text):
+        lowered = sentence.lower()
+        if not any(token in lowered for token in _ATTRIBUTION_CERTAINTY):
+            continue
+        if any(token in lowered for token in _ATTRIBUTION_QUALIFIERS):
+            continue
+        raise SynthesisConflict(
+            "a synthesis may not attribute identity with certainty: state it as a "
+            "hypothesis with its basis, and name what would confirm or refute it")
+    return text
+
+
+def claim_signature(statement: str) -> str:
+    """A claim's identity: normalised text, with numbers read in any order.
+
+    Two rows that say the same thing in a different order are one claim, which is what
+    both the duplicate-detection and the contradiction check need.  Numbers are included
+    because "firmware 7.2" and "firmware 7.4" are different claims, not the same one
+    re-worded — the mistake a token-set similarity is prone to.
+    """
+
+    return " ".join(sorted(_claim_key(statement).split()))
+
+
+class EvidenceView(StrictModel):
+    """One item of mission evidence, as the synthesis reads it.
+
+    A snapshot rather than the :class:`EvidenceItem` itself: the synthesis is a document
+    assembled *after* the run, and it must not be able to mutate the record it is
+    reporting on.  The ids, statements and origins are everything the writers need, and
+    nothing else is copied — a copy of the whole item would invite a writer to read a
+    field the synthesis is not supposed to reason from.
+    """
+
+    id: str = Field(min_length=1)
+    statement: str = Field(min_length=1)
+    kind: EvidenceKind = EvidenceKind.OBSERVATION
+    confidence: Confidence = Confidence.UNKNOWN
+    #: One id per independent origin, as §31 counts them.
+    origins: list[str] = Field(default_factory=list)
+    #: The Subagent that collected it, so a finding can name where it came from.
+    collected_by: str = ""
+    supports: list[str] = Field(default_factory=list)
+    contradicts: list[str] = Field(default_factory=list)
+    #: The sources behind it, for a citation a reader can follow.
+    citations: list[str] = Field(default_factory=list)
+
+    @property
+    def independent_origins(self) -> int:
+        return len(set(self.origins))
+
+    @property
+    def signature(self) -> str:
+        return claim_signature(self.statement)
+
+    def band(self) -> ConfidenceBand:
+        """The band this item's *sources* earn, before its epistemic kind caps it."""
+
+        count = self.independent_origins
+        if count >= 3:
+            return ConfidenceBand.WELL_CORROBORATED
+        if count == 2:
+            return ConfidenceBand.CORROBORATED
+        return ConfidenceBand.SINGLE_SOURCE
+
+    def ceiling(self) -> ConfidenceBand:
+        """The band this *row* supports: its own sources, capped by its kind.
+
+        The row's reading, not the claim's: two Workers may have corroborated one claim
+        between them without either row carrying both sources, and
+        :func:`_finding_for` combines the rows before it assigns a band.  This is the
+        floor a row can never exceed on its own.
+        """
+
+        cap = _KIND_CEILING[self.kind]
+        earned = self.band()
+        return earned if earned.rank <= cap.rank else cap
+
+
+class EvidenceIndex(StrictModel):
+    """Every item the mission holds, addressable by id — the synthesis's only input.
+
+    One object, built once, because three problems need the same answer: which ids are
+    real (a finding citing an invented id), which statements are the same claim (a
+    duplicate counted as corroboration), and which statements conflict (a contradiction
+    the report must carry rather than resolve).  Building it per section would let two
+    sections disagree about what the mission knows.
+    """
+
+    items: list[EvidenceView] = Field(default_factory=list)
+    #: The ids this deployment refused or never received, so a citation is checked
+    #: against the mission rather than against the assembled document.
+    excluded: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def of(cls, evidence: Sequence["EvidenceItem"], *,
+           excluded: Sequence[str] = ()) -> "EvidenceIndex":
+        return cls(items=[_evidence_view(item) for item in evidence],
+                   excluded=[str(item) for item in excluded])
+
+    def __contains__(self, item_id: object) -> bool:
+        return any(item.id == item_id for item in self.items)
+
+    @property
+    def by_id(self) -> dict[str, EvidenceView]:
+        return {item.id: item for item in self.items}
+
+    @property
+    def ids(self) -> list[str]:
+        return [item.id for item in self.items]
+
+    def get(self, item_id: str) -> EvidenceView:
+        found = self.by_id.get(item_id)
+        if found is None:
+            raise SynthesisConflict(
+                f"evidence {item_id!r} is not in this mission: a synthesis may cite only "
+                f"what was collected")
+        return found
+
+    def statement_ids(self, statement: str) -> list[str]:
+        """Every id that makes the same claim as ``statement``, in collection order."""
+
+        signature = claim_signature(statement)
+        return [item.id for item in self.items if item.signature == signature]
+
+    def distinct_ids(self, statement: str) -> list[str]:
+        """Ids for the claim, one per independent origin.
+
+        The distinction matters for a report: two items from one host are corroboration the
+        *statement* has and a *second witness* it does not, and a citations list that showed
+        both would read as two sources.
+        """
+
+        seen: set[str] = set()
+        kept: list[str] = []
+        for item_id in self.statement_ids(statement):
+            origins = set(self.get(item_id).origins)
+            if origins and not origins <= seen:
+                kept.append(item_id)
+            seen |= origins
+        return kept or self.statement_ids(statement)[:1]
+
+    def count_statement(self, statement: str) -> int:
+        """How many independent origins state this claim — the corroboration count.
+
+        Two rows from one source are one origin and count once: the number is used to
+        decide whether a claim is corroborated, and a duplicate is not a second witness.
+        """
+
+        ids = self.statement_ids(statement)
+        return len({origin for item_id in ids
+                    for origin in self.get(item_id).origins}) or (1 if ids else 0)
+
+
+class KeyFinding(StrictModel):
+    """One finding of the finished report, with the evidence that carries it.
+
+    Four fields are required and none is a sentence the mission cannot check: what is
+    claimed, what it rests on, how confident the mission is *and why*, and what would
+    change the answer.  ``confidence`` is validated against the derived ceiling, so the
+    one thing a writer cannot do is promote a single-source row to high confidence.
+    """
+
+    id: str = ""
+    #: The claim, in neutral language: what is observed or inferred, never who is guilty.
+    statement: str = Field(min_length=12)
+    #: The evidence ids that carry it.  At least one, all real — checked by the assembler.
+    evidence_ids: list[str] = Field(min_length=1)
+    kind: EvidenceKind = EvidenceKind.OBSERVATION
+    band: ConfidenceBand = ConfidenceBand.SINGLE_SOURCE
+    confidence: Confidence = Confidence.LOW
+    #: Why this confidence and not another, in a sentence that names the count.
+    confidence_basis: str = Field(min_length=12)
+    #: How many independent origins back it, as measured rather than declared.
+    origins: int = Field(default=1, ge=1)
+    #: What would raise or lower this: a second origin, a dated advisory, a refutation.
+    falsifier: str = Field(min_length=8)
+    #: ``""`` for a finding the mission states, or the section it belongs to.
+    subject: str = ""
+
+    @field_validator("evidence_ids", mode="before")
+    @classmethod
+    def _cited(cls, value: Any) -> Any:
+        # The acceptance clause's first half, refused at the door.  Checked here rather
+        # than in the model's own constraint so the reason names the rule a reader cares
+        # about ("a finding must cite what carries it") instead of a list length.
+        if isinstance(value, (list, tuple)) and not [item for item in value if str(item).strip()]:
+            raise SynthesisConflict(
+                "a finding must cite the evidence that carries it: an uncited finding is "
+                "an opinion with a heading")
+        return value
+
+    @model_validator(mode="after")
+    def _calibrated(self) -> "KeyFinding":
+        check_attribution(self.statement)
+        check_identity_claim(self.statement)
+        ceiling = _KIND_CEILING[self.kind]
+        if self.band.rank > ceiling.rank:
+            raise SynthesisConflict(
+                f"an {self.kind.value} may not be reported as {self.band.value}: its "
+                f"ceiling is {ceiling.value}")
+        if self.confidence is not self.band.confidence:
+            raise SynthesisConflict(
+                f"confidence {self.confidence.value} does not match band "
+                f"{self.band.value}: the level is derived from the evidence, not chosen")
+        if not self.id:
+            self.id = content_id("kf", claim_signature(self.statement), length=10)
+        return self
+
+    @property
+    def cited(self) -> bool:
+        return bool(self.evidence_ids)
+
+    def describe(self) -> str:
+        return (f"{self.statement[:150]} [{self.band.value}, {self.origins} origin(s); "
+                f"{', '.join(self.evidence_ids[:4])}]")
+
+
+class IndicatorRow(StrictModel):
+    """One corroborated indicator: the thing observed, where, and from how many origins.
+
+    An indicator is not a conclusion.  "The login came from an address the domain does
+    not publish" is an indicator; "the contractor breached the account" is not, and the
+    section that lists the first may not contain the second.
+    """
+
+    statement: str = Field(min_length=8)
+    evidence_ids: list[str] = Field(min_length=1)
+    #: One label per independent origin, so two rows from one site cannot look like two
+    #: witnesses.
+    origins: list[str] = Field(min_length=1)
+    band: ConfidenceBand = ConfidenceBand.SINGLE_SOURCE
+    #: What the indicator would mean if the competing explanation is excluded.
+    significance: str = Field(min_length=10)
+
+    @model_validator(mode="after")
+    def _corroborated(self) -> "IndicatorRow":
+        check_attribution(self.statement)
+        if self.band.rank < ConfidenceBand.CORROBORATED.rank:
+            raise SynthesisConflict(
+                "an indicator listed as corroborated needs two independent origins; a "
+                "single-source observation belongs in the findings, with its band stated")
+        if len(set(self.origins)) < 2:
+            raise SynthesisConflict(
+                "two rows on one origin are one witness: name the second origin or state "
+                "the indicator as single-source")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"statement": self.statement, "evidence_ids": list(self.evidence_ids),
+                "origins": list(self.origins), "band": self.band.value,
+                "significance": self.significance}
+
+
+class HypothesisRow(StrictModel):
+    """One explanation the mission considered, and what the evidence did to it.
+
+    ``status`` is the mission's answer to "is this still possible?": ``supported`` means
+    evidence favours it, ``refuted`` means evidence rules it out, ``open`` means the
+    mission could not choose, and ``untested`` is an admission — kept, because a report
+    that lists only the hypotheses it got to is a report that hides its own gaps.
+    """
+
+    statement: str = Field(min_length=12)
+    status: str = Field(default="open",
+                        pattern="^(supported|refuted|open|untested)$")
+    #: Evidence that bears on it, in either direction.  May be empty only when untested.
+    evidence_ids: list[str] = Field(default_factory=list)
+    #: The competing explanation this one is being weighed against, when there is one.
+    competes_with: str = ""
+    #: What would settle it — always required: a hypothesis nobody can test is a belief.
+    test: str = Field(min_length=12)
+
+    @model_validator(mode="after")
+    def _testable(self) -> "HypothesisRow":
+        check_attribution(self.statement)
+        check_identity_claim(self.statement)
+        if self.status != "untested" and not self.evidence_ids:
+            raise SynthesisConflict(
+                f"a {self.status} hypothesis must name the evidence that supports or "
+                f"refutes it, or be reported as untested")
+        if self.status == "untested" and self.evidence_ids:
+            raise SynthesisConflict(
+                "a hypothesis with evidence bearing on it is not untested: state what the "
+                "evidence did to it")
+        return self
+
+    @property
+    def alive(self) -> bool:
+        return self.status in {"supported", "open", "untested"}
+
+
+class ConflictRecord(StrictModel):
+    """A contradiction the report carries rather than settles.
+
+    §36 found these between Workers and §37 found them between reports; this is the same
+    fact at the document level.  The rule is unchanged one level up: a synthesis that
+    picked a side without new evidence would delete a finding, so it states both sides,
+    their evidence, and what would decide it.
+    """
+
+    topic: str = Field(min_length=6)
+    left_statement: str = Field(min_length=8)
+    right_statement: str = Field(min_length=8)
+    left_evidence: list[str] = Field(default_factory=list)
+    right_evidence: list[str] = Field(default_factory=list)
+    #: Why they cannot both be right — the rule that found the conflict.
+    basis: str = Field(min_length=10)
+    #: What would settle it.  Required: a conflict nobody can resolve is a standing gap.
+    resolution: str = Field(min_length=12)
+    resolved: bool = False
+
+    @model_validator(mode="after")
+    def _both_sides(self) -> "ConflictRecord":
+        if not self.left_evidence and not self.right_evidence:
+            raise SynthesisConflict(
+                "a contradiction must cite the evidence on at least one side, or it is "
+                "an impression")
+        return self
+
+    def describe(self) -> str:
+        return (f"{self.topic}: {self.left_statement[:70]!r} vs "
+                f"{self.right_statement[:70]!r} — {self.resolution[:90]}")
+
+
+class GapRecord(StrictModel):
+    """What the mission does not know, and why — a §14 unknown with its consequence.
+
+    The consequence is the part a reader needs and a bare unknown does not carry: "the
+    advisory for the affected version was not published" is a gap; "so the fixed version
+    cannot be ranked" is why it matters, and it is required.
+    """
+
+    detail: str = Field(min_length=10)
+    reason: UnknownReason = UnknownReason.UNKNOWN
+    #: Which part of the mission could not establish it.
+    determined_by: str = ""
+    #: What the report therefore cannot say.
+    consequence: str = Field(min_length=10)
+    #: What would close it.
+    would_close: str = ""
+
+    def describe(self) -> str:
+        tail = f"; would close with {self.would_close[:110]}" if self.would_close else ""
+        return (f"{self.reason.value}: {self.detail[:150]} — consequence: "
+                f"{self.consequence[:110]}{tail}")
+
+    @classmethod
+    def of(cls, unknown: UnknownValue, *, consequence: str,
+           would_close: str = "") -> "GapRecord":
+        return cls(detail=(unknown.detail or "an unknown with no detail")[:400],
+                   reason=unknown.reason, determined_by=unknown.determined_by or "",
+                   consequence=consequence, would_close=would_close)
+
+
+class NextStep(StrictModel):
+    """One recommended next step, lawful by construction and ordered by what it settles.
+
+    Four hard requirements, and each one is a way a "next steps" list goes wrong: it may
+    not widen scope (``within_scope``), may not touch a system the mission is not
+    authorised for (``authorised``), must say which gap or hypothesis it addresses
+    (``addresses``), and must be something a person could actually do on Monday
+    (``action``).  A step that cannot name what it settles is a wish.
+    """
+
+    action: str = Field(min_length=15)
+    #: The gap or hypothesis id it addresses.
+    addresses: str = Field(min_length=4)
+    #: Why it is within the mission's authorisation, in the operator's own terms.
+    basis: str = Field(min_length=12)
+    within_scope: bool = True
+    authorised: bool = True
+    passive: bool = True
+    #: ``high``, ``medium`` or ``low`` — what it would settle, not how easy it is.
+    value: str = Field(default="medium", pattern="^(high|medium|low)$")
+
+    @model_validator(mode="after")
+    def _lawful(self) -> "NextStep":
+        check_attribution(self.action)
+        if not self.within_scope or not self.authorised:
+            raise SynthesisConflict(
+                "a recommended step must stay inside the mission's scope and authorisation; "
+                "a step that widens either is a new mission, not a next step")
+        if not self.passive:
+            raise SynthesisConflict(
+                "this build recommends passive collection only: an active step (touching a "
+                "host, sending traffic, contacting a person) is outside what it will plan")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"action": self.action, "addresses": self.addresses, "basis": self.basis,
+                "within_scope": self.within_scope, "authorised": self.authorised,
+                "passive": self.passive, "value": self.value}
+
+
+class SynthesisSection(StrictModel):
+    """One required part of the report: its prose, and the evidence behind it.
+
+    Every section carries ``evidence_ids``, even the ones that are mostly narrative
+    ("scope and methods" cites the reports it covers).  That uniformity is what makes the
+    completeness check a loop rather than a list of special cases, and what lets a reader
+    ask "what is *this paragraph* based on?" of any paragraph in the document.
+    """
+
+    kind: str = Field(pattern="^(executive-summary|scope-and-methods|key-findings|"
+                              "indicators|hypotheses|contradictions|confidence|gaps|"
+                              "limitations|next-steps)$")
+    title: str = Field(min_length=3)
+    #: The prose.  May be empty for a section whose content is entirely structured
+    #: (key findings, indicators, contradictions), which is why it is not ``min_length=1``.
+    body: str = ""
+    evidence_ids: list[str] = Field(default_factory=list)
+    #: Ids of the structured items the section carries, so a reader can navigate.
+    item_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _safe(self) -> "SynthesisSection":
+        check_attribution(f"{self.title}\n{self.body}")
+        check_identity_claim(self.body)
+        return self
+
+    @property
+    def filled(self) -> bool:
+        """Whether the section actually says something.
+
+        A heading with no prose and no items is the failure mode this property exists to
+        catch: it looks like a section in a table of contents and reads as "nothing to
+        report", which is a different claim from "nothing was found".
+        """
+
+        return bool(self.body.strip()) or bool(self.item_ids)
+
+
+#: The ten sections the task names, in the order a reader needs them.  A report missing
+#: any one of them is refused: not because ten is a magic number, but because each answers
+#: a question a reader will ask, and a report that cannot answer one of them is a report
+#: that has not been finished.
+REQUIRED_SECTIONS: tuple[tuple[str, str], ...] = (
+    ("executive-summary", "Executive summary"),
+    ("scope-and-methods", "Scope and methods"),
+    ("key-findings", "Key findings"),
+    ("indicators", "Corroborated indicators"),
+    ("hypotheses", "Competing hypotheses"),
+    ("contradictions", "Contradictions"),
+    ("confidence", "Confidence levels"),
+    ("gaps", "Evidence gaps"),
+    ("limitations", "Limitations"),
+    ("next-steps", "Recommended next steps"),
+)
+
+
+class MasterReport(StrictModel):
+    """The finished document: ten sections, every finding cited, every level calibrated.
+
+    This is what the mission produces when it is allowed to speak, and it is the object
+    the acceptance clause is a property of.  Nothing here is a free-text field a model
+    can fill with a conclusion: the findings are :class:`KeyFinding` (cited and
+    calibrated), the indicators are corroboration-checked, the hypotheses are testable,
+    and the sections are all present.
+
+    ``verdict`` is deliberately absent.  There is no field for "who is responsible",
+    because a document with such a field acquires an answer to it.
+    """
+
+    mission_id: str = ""
+    objective: str = Field(min_length=10)
+    #: The question the mission set out to answer, restated when the mission changed it.
+    question: str = ""
+    generated_at: datetime = Field(default_factory=utc_now)
+    sections: list[SynthesisSection] = Field(default_factory=list)
+    findings: list[KeyFinding] = Field(default_factory=list)
+    indicators: list[IndicatorRow] = Field(default_factory=list)
+    hypotheses: list[HypothesisRow] = Field(default_factory=list)
+    conflicts: list[ConflictRecord] = Field(default_factory=list)
+    gaps: list[GapRecord] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    next_steps: list[NextStep] = Field(default_factory=list)
+    #: The mission's overall confidence: the weakest link among the findings that carry
+    #: its answer, never an average — an average would let three strong claims hide one
+    #: weak one, which is exactly the arithmetic a report must not do.
+    confidence: Confidence = Confidence.UNKNOWN
+    confidence_basis: str = ""
+    #: What no evidence in this mission could have shown, stated by the mission itself.
+    uncertainty_statement: str = Field(min_length=15)
+    #: Every evidence id the document cites, so a reader can check the set at once.
+    cited_ids: list[str] = Field(default_factory=list)
+    #: One id per independent origin across the whole document, for the confidence basis.
+    origins: list[str] = Field(default_factory=list)
+    #: The join this synthesis waited on (§36's barrier, at the mission level).
+    aggregate_basis: JoinBarrier | None = None
+    #: What the mission did not synthesise and why (blocked lines, refusals).
+    withheld: list[str] = Field(default_factory=list)
+
+    @field_validator("generated_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> datetime:
+        return normalise_datetime(value)
+
+    @property
+    def section(self) -> dict[str, SynthesisSection]:
+        return {item.kind: item for item in self.sections}
+
+    def section_of(self, kind: str) -> SynthesisSection:
+        found = self.section.get(kind)
+        if found is None:
+            raise KeyError(f"the report has no {kind!r} section")
+        return found
+
+    @property
+    def corroborated(self) -> list[KeyFinding]:
+        return [finding for finding in self.findings
+                if finding.band.rank >= ConfidenceBand.CORROBORATED.rank]
+
+    @property
+    def single_source(self) -> list[KeyFinding]:
+        return [finding for finding in self.findings
+                if finding.band is ConfidenceBand.SINGLE_SOURCE]
+
+    @property
+    def open_hypotheses(self) -> list[HypothesisRow]:
+        return [item for item in self.hypotheses if item.alive]
+
+    def summary_line(self) -> str:
+        return (f"{len(self.findings)} finding(s) from {len(self.cited_ids)} citation(s); "
+                f"{len(self.corroborated)} corroborated, {len(self.single_source)} "
+                f"single-source; {len(self.gaps)} gap(s), {len(self.conflicts)} "
+                f"contradiction(s); confidence {self.confidence.value}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"mission_id": self.mission_id, "objective": self.objective,
+                "question": self.question,
+                "generated_at": self.generated_at.isoformat(),
+                "sections": [{"kind": item.kind, "title": item.title,
+                              "body": item.body,
+                              "evidence_ids": list(item.evidence_ids),
+                              "item_ids": list(item.item_ids)} for item in self.sections],
+                "findings": [{"id": finding.id, "statement": finding.statement,
+                              "evidence_ids": list(finding.evidence_ids),
+                              "kind": finding.kind.value, "band": finding.band.value,
+                              "confidence": finding.confidence.value,
+                              "confidence_basis": finding.confidence_basis,
+                              "origins": finding.origins,
+                              "falsifier": finding.falsifier}
+                             for finding in self.findings],
+                "indicators": [item.to_dict() for item in self.indicators],
+                "hypotheses": [{"statement": item.statement, "status": item.status,
+                                "evidence_ids": list(item.evidence_ids),
+                                "competes_with": item.competes_with, "test": item.test}
+                               for item in self.hypotheses],
+                "conflicts": [{"topic": item.topic,
+                               "left": item.left_statement, "right": item.right_statement,
+                               "left_evidence": list(item.left_evidence),
+                               "right_evidence": list(item.right_evidence),
+                               "basis": item.basis, "resolution": item.resolution,
+                               "resolved": item.resolved} for item in self.conflicts],
+                "gaps": [{"detail": item.detail, "reason": item.reason.value,
+                          "consequence": item.consequence,
+                          "would_close": item.would_close} for item in self.gaps],
+                "limitations": list(self.limitations),
+                "next_steps": [item.to_dict() for item in self.next_steps],
+                "confidence": self.confidence.value,
+                "confidence_basis": self.confidence_basis,
+                "uncertainty_statement": self.uncertainty_statement,
+                "cited_ids": list(self.cited_ids), "origins": list(self.origins),
+                "withheld": list(self.withheld),
+                # The acceptance clause, as the report's own claim about itself — checkable
+                # against the fields above rather than taken on trust.
+                "acceptance": self.acceptance(),
+                "summary_line": self.summary_line()}
+
+    def acceptance(self) -> dict[str, Any]:
+        """The acceptance clause, evaluated on this document rather than asserted."""
+
+        uncited = [finding.id for finding in self.findings if not finding.cited]
+        over = [finding.id for finding in self.findings
+                if finding.band.rank > _KIND_CEILING[finding.kind].rank]
+        return {"every_finding_cited": not uncited,
+                "uncited": uncited,
+                "no_conclusion_exceeds_its_evidence": not over,
+                "overconfident": over,
+                "all_sections_present": len({item.kind for item in self.sections})
+                == len(REQUIRED_SECTIONS),
+                "no_attribution": not any(
+                    _declares(finding.statement) for finding in self.findings),
+                "cited": len(self.cited_ids)}
+
+
+def _declares(text: str) -> bool:
+    """Whether a sentence declares guilt — the predicate the acceptance check uses."""
+
+    try:
+        check_attribution(text)
+    except SynthesisConflict:
+        return True
+    return False
+
+
+# --------------------------------------------------------------------------
+# 39.1 Reading the record
+# --------------------------------------------------------------------------
+
+
+def _evidence_view(item: "EvidenceItem") -> EvidenceView:
+    """One collected item, as the synthesis reads it.
+
+    Origins are counted the way §31 counts them — the registrable domain of each source,
+    with an archive credited to the page it archived — so "corroborated" means the same
+    thing in the research audit and in the finished report.  A second definition of
+    "independent" would let the two sections disagree about the same evidence.
+    """
+
+    origins: list[str] = []
+    citations: list[str] = []
+    for source in item.sources:
+        host = ""
+        if source.url:
+            match = re.match(r"^[a-z]+://([^/?#]+)", source.url.lower())
+            host = _registrable_domain(match.group(1)) if match else ""
+        origins.append(host or (source.publisher or source.title or item.id).lower())
+        citations.append(source.url or source.artifact_path or (source.title or item.id))
+    if not origins:
+        origins = [f"unattributed:{item.id}"]
+    return EvidenceView(
+        id=item.id, statement=item.statement, kind=item.kind,
+        confidence=item.confidence, origins=sorted(set(origins)),
+        collected_by=item.collected_by or "", supports=list(item.supports),
+        contradicts=list(item.contradicts), citations=citations[:6])
+
+
+def _report_evidence(reports: Sequence["SubagentOutcome"]) -> list["EvidenceItem"]:
+    """Every evidence item the mission still stands behind, one id per claim.
+
+    Reviewed work only (§34's rule: an aggregate carries what its reviews forwarded), and
+    de-duplicated by id rather than by statement — the contradiction check needs both
+    copies of a claim that disagree, and a set of statements would have already merged
+    them.
+    """
+
+    seen: set[str] = set()
+    items: list["EvidenceItem"] = []
+    for report in reports:
+        for item in report.evidence:
+            if item.id in seen:
+                continue
+            seen.add(item.id)
+            items.append(item)
+    return items
+
+
+#: How much subject overlap two statements need before opposite polarity makes them a
+#: contradiction: the *smaller* statement's subject must be substantially contained in the
+#: larger one (see :func:`_subject_overlap`).  Equality is too strict — the commonest real
+#: conflict negates one clause of a longer sentence — and a share of the union is too
+#: lenient in the other direction, because one long sentence would dilute every conflict
+#: it is part of.  Named so the number is inspectable and a reader can disagree with it.
+CONTRADICTION_OVERLAP: float = 0.6
+
+
+#: Subject words are folded the same way the duplicate lens folds claims, so "runs" and
+#: "ran" are one word here: a negation is the only difference two conflicting statements
+#: should have, and a tense change is not a different subject.
+_FOLD_SUBJECT: bool = True
+
+
+def _folded_subject(statement: str) -> set[str]:
+    """The subject words of a statement, verb forms folded and negations removed."""
+
+    words = {_claim_stem(word) for word in _claim_key(statement).split()}
+    return {word for word in words if word not in _NEGATIONS}
+
+
+def _subject_overlap(left: set[str], right: set[str]) -> float:
+    """How much of the *smaller* subject two statements share, in ``[0, 1]``.
+
+    Containment rather than a share of the union: "the edge gateway runs 7.2 and the
+    advisory names its session handling" against "the edge gateway never ran 7.2" is a
+    contradiction over firmware, and the longer sentence's extra clause should not dilute
+    it below a threshold.  The measure is deliberately asymmetric so the answer does not
+    depend on which statement is compared first.
+    """
+
+    if not left or not right:
+        return 0.0
+    return len(left & right) / min(len(left), len(right))
+
+
+def _is_negated(statement: str) -> bool:
+    """Whether a statement carries a negation word — the polarity half of a conflict."""
+
+    return any(word in _claim_key(statement).split() for word in _NEGATIONS)
+
+
+def _contradiction_pairs(index: EvidenceIndex) -> list[ConflictRecord]:
+    """Claims that cannot both be right, found from the index rather than from prose.
+
+    §36's rule, at the document level: two statements with the same subject and opposite
+    polarity.  Deliberately conservative — a shared subject with a *different* claim is
+    two findings, not a contradiction — because a report that cried contradiction over
+    every disagreement would drown the ones that matter.
+    """
+
+    records: list[ConflictRecord] = []
+    seen: set[tuple[str, str]] = set()
+    items = index.items
+    for left in items:
+        left_subject = _folded_subject(left.statement)
+        left_negative = _is_negated(left.statement)
+        for right in items:
+            if left.id == right.id or left.signature == right.signature:
+                continue
+            key = tuple(sorted((left.id, right.id)))
+            if key in seen:
+                continue
+            right_subject = _folded_subject(right.statement)
+            # Overlap, not equality: the commonest real conflict is one clause of a
+            # longer sentence negated ("runs 7.2 …" vs "never ran 7.2 …"), and an exact
+            # subject comparison would miss it because the rest of the sentence differs.
+            if _subject_overlap(left_subject, right_subject) < CONTRADICTION_OVERLAP:
+                continue
+            if left_negative == _is_negated(right.statement):
+                continue
+            seen.add(key)
+            records.append(ConflictRecord(
+                topic=" ".join(sorted(left_subject))[:120] or "an unresolved subject",
+                left_statement=left.statement, right_statement=right.statement,
+                left_evidence=[left.id], right_evidence=[right.id],
+                basis=("the two statements share their subject words and one of them is "
+                       "negated, so the two cannot both be true"),
+                resolution=("collect a dated first-party record of the subject; a second "
+                            "independent origin agreeing with one side would settle it")))
+            if len(records) >= 12:
+                return records
+    return records
+
+
+def _band_for_origins(count: int, kind: EvidenceKind) -> ConfidenceBand:
+    """The band ``count`` independent origins earn, capped by the claim's epistemic kind."""
+
+    earned = (ConfidenceBand.WELL_CORROBORATED if count >= 3
+              else ConfidenceBand.CORROBORATED if count == 2
+              else ConfidenceBand.SINGLE_SOURCE)
+    cap = _KIND_CEILING[kind]
+    return earned if earned.rank <= cap.rank else cap
+
+
+def _claim_origins(index: EvidenceIndex) -> dict[str, list[str]]:
+    """Every origin that states each claim — the number a finding's band rests on.
+
+    Corroboration is a property of the *claim*, not of one row: two Workers retrieving the
+    same fact from two sites have corroborated it between them, though neither row lists
+    two sources.  Counting per row would report that claim as single-source and understate
+    the mission, which is its own kind of inaccuracy.
+    """
+
+    origins: dict[str, set[str]] = {}
+    for item in index.items:
+        origins.setdefault(item.signature, set()).update(item.origins)
+    return {signature: sorted(values) for signature, values in origins.items()}
+
+
+def _findings_from(index: EvidenceIndex) -> list[KeyFinding]:
+    """One finding per distinct claim, citing every id and origin that carries it.
+
+    Deduplicated by claim rather than listed per row: two Workers that retrieved the same
+    fact are one finding with two citations, and printing it twice would let a reader count
+    it as two — which is the arithmetic the whole section is about not doing.
+    """
+
+    claim_origins = _claim_origins(index)
+    grouped: dict[str, list[EvidenceView]] = {}
+    for item in index.items:
+        grouped.setdefault(item.signature, []).append(item)
+    findings: list[KeyFinding] = []
+    for signature, items in grouped.items():
+        origins = claim_origins.get(signature, [])
+        cited = index.distinct_ids(items[0].statement)
+        finding = _finding_for(items[0], origins=origins)
+        findings.append(finding.model_copy(update={"evidence_ids": cited}))
+    return findings
+
+
+def _finding_for(item: EvidenceView, *, origins: Sequence[str] = (),
+                 falsifier: str = "") -> KeyFinding:
+    """A key finding derived from one item — never written freehand.
+
+    This is what keeps the acceptance clause true by construction: the statement, the
+    citations and the band all come from the same record, so there is no step at which a
+    writer can state something the evidence does not carry.  The falsifier is the one
+    input a caller supplies, and it is required to be a *test*, not a disclaimer.
+    """
+
+    counted = sorted(set(origins) or set(item.origins))
+    band = _band_for_origins(len(counted), item.kind)
+    capped = band.rank < _band_for_origins(len(counted), EvidenceKind.OBSERVATION).rank
+    return KeyFinding(
+        statement=item.statement, evidence_ids=[item.id], kind=item.kind,
+        band=band, confidence=band.confidence,
+        confidence_basis=(
+            f"{len(counted)} independent origin(s) state this claim"
+            + (f"; a {item.kind.value} is capped at {band.value} whatever they show"
+               if capped else f"; band {band.value}")),
+        origins=max(1, len(counted)),
+        falsifier=falsifier or ("a first-party record contradicting it, or a second "
+                                "independent origin failing to reproduce it"))
+
+
+def _confidence_of(findings: Sequence[KeyFinding]) -> tuple[Confidence, str]:
+    """The report's confidence: the weakest finding that carries the answer.
+
+    Not an average, and not the best finding.  A mission's answer is only as strong as
+    the weakest link it needs, and a document that reported the strongest would be
+    overstating exactly where it matters most.
+    """
+
+    if not findings:
+        return (Confidence.UNKNOWN,
+                "no finding survived review, so the report states no confidence")
+    weakest = min(findings, key=lambda finding: finding.band.rank)
+    return (weakest.confidence,
+            f"the weakest of {len(findings)} finding(s) sets the level: "
+            f"{weakest.band.value} ({weakest.origins} origin(s)), because the answer "
+            f"cannot be stronger than the claim it depends on")
+
+
+# --------------------------------------------------------------------------
+# 39.2 Assembling the ten sections
+# --------------------------------------------------------------------------
+
+
+def _section(kind: str, title: str, *, body: str = "",
+             evidence: Sequence[str] = (), items: Sequence[str] = ()) -> SynthesisSection:
+    return SynthesisSection(kind=kind, title=title, body=body,
+                            evidence_ids=list(dict.fromkeys(evidence)),
+                            item_ids=list(dict.fromkeys(items)))
+
+
+def _scope_section(objective: str, question: str, index: EvidenceIndex,
+                   reports: Sequence["SubagentOutcome"], *, limit: int = 1200) -> SynthesisSection:
+    """What was asked, what was looked at, and how — in the mission's own terms.
+
+    ``methods`` names the machinery rather than the operators: a reader of a finished
+    report should be able to see that the evidence passed review and reconciliation
+    before it reached this document, which is a fact about how much the document is worth.
+    """
+
+    lines = [f"Objective: {objective}"]
+    if question and question != objective:
+        lines.append(f"The question this mission set out to answer: {question}")
+    if reports:
+        lines.append("Sources reviewed: " + "; ".join(
+            f"{report.role} ({len(report.evidence)} item(s))" for report in reports[:8]))
+    lines.append(
+        "Methods: every Worker result was judged on seven quality dimensions (§34) before "
+        "it could be forwarded, retried attempts were re-tasked with a specific correction "
+        "(§35), each Subagent reconciled duplicates and preserved disagreements (§36), the "
+        "Master reviewed the report set with five lenses and a bounded loop (§37, §38), and "
+        "this synthesis cites only evidence that survived all four.")
+    lines.append(
+        f"Evidence base: {len(index.items)} reviewed item(s) from "
+        f"{len({origin for item in index.items for origin in item.origins})} independent "
+        f"origin(s).")
+    return _section("scope-and-methods", "Scope and methods",
+                    body="\n".join(lines)[:limit + 400],
+                    evidence=[item.id for item in index.items])
+
+
+def _findings_section(findings: Sequence[KeyFinding]) -> SynthesisSection:
+    return _section("key-findings", "Key findings",
+                    body=("Each finding below is a reviewed evidence item, restated "
+                          "without embellishment. Confidence is derived from the number of "
+                          "independent origins behind it and capped by its epistemic kind."
+                          if findings else
+                          "No item survived review, so the mission reports no key finding. "
+                          "That is a result, not an omission: the gaps section says what "
+                          "could not be established."),
+                    evidence=[item for finding in findings for item in finding.evidence_ids],
+                    items=[finding.id for finding in findings])
+
+
+def _indicators_section(index: EvidenceIndex,
+                        rows: Sequence[IndicatorRow]) -> SynthesisSection:
+    """The corroborated indicators: claims two independent origins agree on.
+
+    Built from the index, not from a writer's list, so "corroborated" is a count rather
+    than a judgement.  A claim with one origin is deliberately absent: it belongs in the
+    findings with its band stated, and promoting it here would be the report's first
+    overstatement.
+    """
+
+    rows = list(rows)
+    return _section("indicators", "Corroborated indicators",
+                    body=(f"{len(rows)} claim(s) are stated independently by two or more "
+                          f"origins. An indicator is not a conclusion: it narrows which "
+                          f"hypotheses remain possible." if rows else
+                          "No claim was corroborated by a second independent origin, so the "
+                          "mission reports none. Every finding above is single-source and "
+                          "says so."),
+                    evidence=[item for row in rows for item in row.evidence_ids],
+                    items=[claim_signature(row.statement)[:40] for row in rows])
+
+
+def _hypotheses_section(hypotheses: Sequence[HypothesisRow]) -> SynthesisSection:
+    alive = [item for item in hypotheses if item.alive]
+    body = (f"{len(hypotheses)} explanation(s) were tested; {len(alive)} remain possible. "
+            f"A hypothesis the mission could not test is listed as untested rather than "
+            f"omitted." if hypotheses else
+            "The mission recorded no competing hypothesis, which is itself a limitation: a "
+            "report with one explanation has not tested it.")
+    return _section("hypotheses", "Competing hypotheses", body=body,
+                    evidence=[item for row in hypotheses for item in row.evidence_ids],
+                    items=[row.statement[:48] for row in hypotheses])
+
+
+def _conflicts_section(conflicts: Sequence[ConflictRecord]) -> SynthesisSection:
+    unresolved = [item for item in conflicts if not item.resolved]
+    body = (f"{len(conflicts)} contradiction(s), {len(unresolved)} unresolved. Both sides "
+            f"are stated with their evidence: the mission does not pick a side without "
+            f"new evidence." if conflicts else
+            "No two reviewed items make the same claim with opposite polarity, so the "
+            "mission records no contradiction. Silence here is a finding: nothing the "
+            "mission collected conflicts with anything else it collected.")
+    return _section("contradictions", "Contradictions", body=body,
+                    evidence=[item for record in conflicts
+                              for item in record.left_evidence + record.right_evidence],
+                    items=[record.topic[:48] for record in conflicts])
+
+
+def _confidence_section(findings: Sequence[KeyFinding], confidence: Confidence,
+                        basis: str) -> SynthesisSection:
+    counts = {band: sum(1 for finding in findings if finding.band is band)
+              for band in ConfidenceBand}
+    body = "\n".join([
+        f"Mission confidence: {confidence.value}.",
+        f"Basis: {basis}",
+        "Bands: " + ", ".join(f"{band.value} {count}" for band, count in counts.items()),
+        ("Band rules: one independent origin is single-source; two are corroborated; three "
+         "or more are well-corroborated. An allegation is capped at corroborated — a third "
+         "party repeating a claim does not establish it — and an inference is capped at "
+         "corroborated, because reasoning over good evidence is still reasoning."),
+    ])
+    return _section("confidence", "Confidence levels", body=body,
+                    evidence=[item for finding in findings for item in finding.evidence_ids])
+
+
+def _gaps_section(gaps: Sequence[GapRecord]) -> SynthesisSection:
+    body = (f"{len(gaps)} gap(s). Each states what the mission could not establish, why, "
+            f"and what it therefore cannot say." if gaps else
+            "The mission closed every gap it opened. That is a claim about the questions "
+            "it asked, not about the target: questions it did not think to ask are not in "
+            "this list.")
+    return _section("gaps", "Evidence gaps", body=body,
+                    items=[gap.detail[:48] for gap in gaps])
+
+
+def _limitations_section(limitations: Sequence[str], withheld: Sequence[str]) -> SynthesisSection:
+    lines = list(limitations)
+    if withheld:
+        lines.extend(withheld)
+    body = ("\n".join(f"— {line}" for line in lines) if lines else
+            "The mission recorded no limitation. A report with none usually means the "
+            "record was not examined for them, which is itself worth stating.")
+    return _section("limitations", "Limitations", body=body)
+
+
+def _next_steps_section(steps: Sequence[NextStep]) -> SynthesisSection:
+    body = (f"{len(steps)} step(s), each naming what it settles and why it is lawful. "
+            f"None requires touching a system or contacting a person."
+            if steps else
+            "No further passive step would change this answer. Anything beyond it would be "
+            "a different mission with its own authorisation.")
+    return _section("next-steps", "Recommended next steps", body=body,
+                    items=[step.addresses for step in steps])
+
+
+def _executive_summary(report: MasterReport) -> str:
+    """The summary, written from the finished parts rather than before them.
+
+    Composed last, deliberately.  A summary written first becomes the plan the rest of
+    the document is made to agree with; one written last can only restate what the
+    sections already established.
+    """
+
+    strongest = report.corroborated[0] if report.corroborated else None
+    lines = [
+        f"{len(report.findings)} reviewed finding(s) bear on: {report.objective[:160]}",
+        (f"The strongest of them, corroborated by independent origins, is: "
+         f"{strongest.statement[:200]}" if strongest else
+         "None of them is corroborated by a second independent origin, so every finding "
+         "below carries the band it earned."),
+        (f"{len(report.open_hypotheses)} explanation(s) remain possible"
+         + (f"; {len(report.conflicts)} contradiction(s) are stated rather than settled"
+            if report.conflicts else "")
+         + f". Confidence: {report.confidence.value}."),
+    ]
+    if report.gaps:
+        lines.append(f"What the mission could not establish: {report.gaps[0].consequence[:160]}")
+    return " ".join(line.rstrip(".") + "." for line in lines if line)
+
+
+def synthesise_report(reports: Sequence["SubagentOutcome"], *, context: "MasterContext",
+                      mission_id: str = "",
+                      hypotheses: Sequence[HypothesisRow] = (),
+                      next_steps: Sequence[NextStep] = (),
+                      limitations: Sequence[str] = (),
+                      withheld: Sequence[str] = (),
+                      barrier: JoinBarrier | None = None,
+                      review: "MasterReview | None" = None,
+                      question: str = "") -> MasterReport:
+    """Assemble the finished document from the reviewed record.
+
+    The order is the argument.  Evidence is indexed first (so every later step cites real
+    ids), contradictions are found from the index (so the report cannot quietly drop one),
+    findings are derived from items (so no finding can say more than its item), indicators
+    are counted (so "corroborated" is arithmetic), and the sections are assembled from
+    those parts.  The executive summary is written last, from the assembled sections.
+
+    A mission that reviewed nothing still gets a report: it says it found nothing, lists
+    the gap, and states why — which is a different document from no document, and the one
+    a reader needs.
+    """
+
+    index = EvidenceIndex.of(_report_evidence(reports),
+                             excluded=[gap.detail or "" for report in reports
+                                       for gap in report.gaps if gap.detail][:40])
+    conflicts = _contradiction_pairs(index)
+    findings = _findings_from(index)
+    # A finding whose statement makes a claim the mission cannot attribute is kept out of
+    # the document entirely: an item that names who is guilty is not a finding, and
+    # restating it as one would launder the problem through the synthesis.
+    findings = [finding for finding in findings
+                if not _declares(finding.statement)]
+    confidence, basis = _confidence_of(findings)
+
+    gap_records = [
+        GapRecord.of(gap, consequence=(
+            "the report cannot state anything this gap would have established"),
+            would_close="collect one sourced record that answers it")
+        for report in reports for gap in report.gaps]
+    if not findings:
+        gap_records.append(GapRecord(
+            detail="no reviewed evidence item was available to synthesise",
+            reason=UnknownReason.UNAVAILABLE, determined_by="master-synthesize",
+            consequence="the report states no finding about the target",
+            would_close="a completed collection phase with at least one reviewed item"))
+
+    indicators = _indicator_rows(index)
+    report = MasterReport(
+        mission_id=mission_id, objective=context.objective, question=question,
+        sections=[], findings=findings,
+        indicators=indicators, hypotheses=list(hypotheses), conflicts=conflicts,
+        gaps=gap_records, limitations=list(limitations), next_steps=list(next_steps),
+        confidence=confidence, confidence_basis=basis,
+        uncertainty_statement=(
+            "This report states only what reviewed evidence supports: every key finding "
+            "cites the evidence ids behind it, confidence is derived from independent "
+            "origins and capped by epistemic kind, contradictions are preserved rather "
+            "than settled, and no attribution of conduct or identity is made. Nothing "
+            "outside the gaps and limitations sections should be read as established."),
+        aggregate_basis=barrier, withheld=list(withheld))
+
+    indicator_section = _indicators_section(index, indicators)
+
+    report.sections = [
+        _section("executive-summary", "Executive summary", body="",
+                 evidence=[item for finding in findings for item in finding.evidence_ids]),
+        _scope_section(context.objective, question, index, reports),
+        _findings_section(findings),
+        indicator_section,
+        _hypotheses_section(report.hypotheses),
+        _conflicts_section(conflicts),
+        _confidence_section(findings, confidence, basis),
+        _gaps_section(gap_records),
+        _limitations_section(limitations, withheld),
+        _next_steps_section(report.next_steps),
+    ]
+    # The summary is a *section* like the others, so the completeness check and the
+    # citation check treat it the same way — and so a reader can ask what it rests on.
+    summary_section = report.section_of("executive-summary")
+    summary_section.body = _executive_summary(report)
+    summary_section.evidence_ids = list(dict.fromkeys(
+        [item for finding in findings for item in finding.evidence_ids]))
+    report.cited_ids = sorted({item for section in report.sections
+                               for item in section.evidence_ids})
+    report.origins = sorted({origin for item_id in report.cited_ids
+                             for origin in index.get(item_id).origins})
+    if review is not None:
+        report.withheld = list(dict.fromkeys(
+            [*report.withheld,
+             *[f"no report from: {gap.target[:80]}" for gap in review.coverage]]))
+    _assert_complete(report, index)
+    return report
+
+
+def _indicator_rows(index: EvidenceIndex) -> list[IndicatorRow]:
+    """The corroborated rows, computed once and reused by the section and the report."""
+
+    groups: dict[str, list[EvidenceView]] = {}
+    for item in index.items:
+        groups.setdefault(item.signature, []).append(item)
+    rows: list[IndicatorRow] = []
+    for items in groups.values():
+        # The origins are shared out *between* rows, so two copies of a claim from two
+        # hosts are one indicator with two witnesses and two citations — not two hosts
+        # claiming the same thing twice in the same table.
+        origins: list[str] = []
+        cited: list[str] = []
+        for item in items:
+            new = [origin for origin in item.origins if origin not in origins]
+            if new:
+                cited.append(item.id)
+                origins.extend(new)
+        if len(origins) < 2:
+            continue
+        band = (ConfidenceBand.WELL_CORROBORATED if len(origins) >= 3
+                else ConfidenceBand.CORROBORATED)
+        try:
+            rows.append(IndicatorRow(
+                statement=items[0].statement[:300], evidence_ids=cited,
+                origins=origins, band=band,
+                significance=("two or more independent origins state this independently, "
+                              "so it is an indicator rather than a single observation")))
+        except SynthesisConflict:
+            continue
+    return rows
+
+
+def _assert_complete(report: MasterReport, index: EvidenceIndex) -> None:
+    """Refuse an incomplete document.  The last gate before a report can be published.
+
+    Five properties, each the negation of a specific failure: a missing section, a section
+    with no content, a finding citing an id the mission does not hold, a conclusion above
+    its evidence, and a finding that declares guilt.  Each raises with the thing that
+    failed, because a report that is 90% right is not a report.
+    """
+
+    present = {section.kind for section in report.sections}
+    missing = [kind for kind, _title in REQUIRED_SECTIONS if kind not in present]
+    if missing:
+        raise SynthesisConflict(f"the report is missing section(s): {', '.join(missing)}")
+    empty = [section.kind for section in report.sections if not section.filled]
+    if empty:
+        raise SynthesisConflict(
+            f"section(s) present but empty: {', '.join(empty)} — a heading with nothing "
+            f"under it reads as 'nothing to report'")
+    unknown = [item for finding in report.findings for item in finding.evidence_ids
+               if item not in index]
+    if unknown:
+        raise SynthesisConflict(
+            f"finding(s) cite evidence this mission never collected: {', '.join(unknown[:5])}")
+    over = [finding.id for finding in report.findings
+            if finding.band.rank > _KIND_CEILING[finding.kind].rank]
+    if over:
+        raise SynthesisConflict(
+            f"finding(s) claim more confidence than their kind allows: {', '.join(over)}")
+    declarations = [finding.id for finding in report.findings
+                    if _declares(finding.statement)]
+    if declarations:
+        raise SynthesisConflict(
+            f"finding(s) declare guilt: {', '.join(declarations)} — a synthesis reports "
+            f"indicia and the standard of proof, not a verdict")
+
+
+# --------------------------------------------------------------------------
+# 39.3 Rendering: the document as a reader sees it
+# --------------------------------------------------------------------------
+
+
+def render_master_report(report: MasterReport, *, width: int = 96) -> Group:
+    """The report, printed.  Sections in the order a reader needs them.
+
+    Citations are shown as ids, not as prose: a reader who wants the source follows the id
+    into the record, and a citation that was only a title could not be checked at all.
+    """
+
+    blocks: list[Any] = []
+    head = Table.grid(padding=(0, 1))
+    head.add_column(style="dim", no_wrap=True)
+    head.add_column(overflow="fold")
+    head.add_row("objective", escape(report.objective[:220]))
+    if report.question and report.question != report.objective:
+        head.add_row("question", escape(report.question[:220]))
+    head.add_row("confidence", escape(f"{report.confidence.value} — "
+                                      f"{_first_sentence(report.confidence_basis)}"))
+    head.add_row("evidence", escape(f"{len(report.cited_ids)} citation(s) from "
+                                    f"{len(report.origins)} independent origin(s)"))
+    blocks.append(Text("Master synthesis", style="bold"))
+    blocks.append(head)
+
+    summary = report.section.get("executive-summary")
+    if summary is not None and summary.body:
+        blocks.append(Text(""))
+        blocks.append(Panel(Text(escape(summary.body), overflow="fold"),
+                            title="Executive summary", title_align="left",
+                            border_style="dim", padding=(0, 1), expand=False))
+
+    for kind, title in REQUIRED_SECTIONS[1:]:
+        section = report.section.get(kind)
+        if section is None:
+            continue
+        blocks.append(Text(""))
+        blocks.append(Text(title, style="bold"))
+        if section.body:
+            blocks.append(Text(escape(section.body), overflow="fold"))
+
+    if report.findings:
+        table = Table(box=None, pad_edge=False, expand=False)
+        table.add_column("finding", overflow="fold", max_width=58)
+        table.add_column("band", no_wrap=True)
+        table.add_column("evidence", overflow="fold", max_width=30)
+        for finding in report.findings:
+            table.add_row(escape(finding.statement[:200]),
+                          escape(f"{finding.band.value} ({finding.origins})"),
+                          escape(", ".join(finding.evidence_ids[:3])))
+        blocks.append(table)
+
+    if report.indicators:
+        table = Table(title="corroborated indicators", title_justify="left", box=None,
+                      pad_edge=False, expand=False)
+        table.add_column("indicator", overflow="fold", max_width=52)
+        table.add_column("origins", overflow="fold", max_width=32)
+        for row in report.indicators:
+            table.add_row(escape(row.statement[:160]),
+                          escape(", ".join(row.origins[:4])))
+        blocks.append(table)
+
+    if report.hypotheses:
+        table = Table(title="competing hypotheses", title_justify="left", box=None,
+                      pad_edge=False, expand=False)
+        table.add_column("hypothesis", overflow="fold", max_width=48)
+        table.add_column("status", no_wrap=True)
+        table.add_column("would settle it", overflow="fold", max_width=40)
+        for row in report.hypotheses:
+            table.add_row(escape(row.statement[:150]), escape(row.status),
+                          escape(row.test[:120]))
+        blocks.append(table)
+
+    if report.conflicts:
+        table = Table(title="contradictions, stated not settled", title_justify="left",
+                      box=None, pad_edge=False, expand=False)
+        table.add_column("topic", overflow="fold", max_width=24)
+        table.add_column("both sides", overflow="fold", max_width=64)
+        for record in report.conflicts:
+            table.add_row(escape(record.topic[:70]),
+                          escape(f"{record.left_statement[:90]} ↔ "
+                                 f"{record.right_statement[:90]}"))
+        blocks.append(table)
+
+    if report.gaps:
+        table = Table(title="evidence gaps", title_justify="left", box=None,
+                      pad_edge=False, expand=False)
+        table.add_column("gap", overflow="fold", max_width=52)
+        table.add_column("so the report cannot say", overflow="fold", max_width=44)
+        for gap in report.gaps:
+            table.add_row(escape(gap.detail[:150]), escape(gap.consequence[:140]))
+        blocks.append(table)
+
+    if report.next_steps:
+        table = Table(title="recommended next steps (passive, in scope)", title_justify="left",
+                      box=None, pad_edge=False, expand=False)
+        table.add_column("step", overflow="fold", max_width=58)
+        table.add_column("settles", no_wrap=True)
+        table.add_column("value", no_wrap=True)
+        for step in report.next_steps:
+            table.add_row(escape(step.action[:180]), escape(step.addresses[:24]),
+                          escape(step.value))
+        blocks.append(table)
+
+    blocks.append(Text(""))
+    blocks.append(Text(escape(f"calibration: {report.summary_line()}"), style="dim"))
+    blocks.append(Text(escape("no attribution of conduct or identity is made; every "
+                              "finding cites the evidence it rests on"), style="dim"))
+    return Group(*blocks)
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 38. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -52773,7 +54339,544 @@ def workers_of(units: Sequence[FlowSubagent]) -> list[str]:
 
     return [worker.id for subagent in units for worker in subagent.workers]
 
+# --------------------------------------------------------------------------
+# 39.4 The demo and its checks: the document, and the sentences it refuses
+# --------------------------------------------------------------------------
+
+class SynthesisCheck(StrictModel):
+    """One assertion in the §39 self-test."""
+
+    name: str = Field(min_length=1)
+    ok: bool
+    detail: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "ok": self.ok, "detail": self.detail}
+
+
+def _synthesis_report(role: str, statements: Sequence[str], *, hosts: Sequence[str] = (),
+                      kind: EvidenceKind = EvidenceKind.OBSERVATION,
+                      worker: str = "wrk-syn", gap: str = "",
+                      disagreement: "Disagreement | None" = None) -> "SubagentOutcome":
+    """A reviewed Subagent report whose items carry *real* source hosts.
+
+    The hosts matter: corroboration is counted by origin, so a fixture with no URLs could
+    not tell a single-source finding from a corroborated one, and every check about bands
+    would be proving something about the fixture instead of about the rule.
+    """
+
+    evidence: list[EvidenceItem] = []
+    for number, statement in enumerate(statements):
+        host = hosts[number % len(hosts)] if hosts else f"{role}.test"
+        evidence.append(EvidenceItem(
+            id=content_id("ev", role, statement, number, length=10), kind=kind,
+            statement=statement,
+            sources=[SourceReference(
+                kind=SourceKind.PUBLIC_WEB, url=f"https://{host}/record/{number}",
+                title=f"{role} record", retrieved_at=datetime(2026, 5, 4, 10, 0,
+                                                             tzinfo=timezone.utc),
+                retrieval_method=RetrievalMethod.HTTP, http_status=200)],
+            confidence=Confidence.LOW,
+            confidence_basis="one retrieval of a published record",
+            # An allegation is a third party's claim, and the record has to say whose: the
+            # synthesis may report it, and may not upgrade it to an observation.
+            allegation_made_by="a public forum post" if kind is EvidenceKind.ALLEGATION else None,
+            collected_by=worker))
+    outcome = WorkerOutcome(
+        worker_id=worker, subagent_id=content_id("sa", role, length=12),
+        status=EntityStatus.SUCCEEDED, attempt=1,
+        summary=f"{worker}: {len(evidence)} observation(s) collected",
+        evidence_ids=[item.id for item in evidence])
+    return SubagentOutcome(
+        subagent_id=content_id("sa", role, length=12), role=role, objective=role,
+        status=EntityStatus.SUCCEEDED, outcomes=[outcome], evidence=evidence,
+        aggregate_basis=check_join(f"subagent-aggregate:{role}", [worker], [worker]),
+        gaps=[UnknownValue(reason=UnknownReason.NOT_PUBLISHED, determined_by=role,
+                           detail=gap)] if gap else [],
+        disagreements=[disagreement] if disagreement is not None else [])
+
+
+def synthesis_cases() -> dict[str, Any]:
+    """Three report sets: one corroborated, one conflicting, one single-source.
+
+    They differ only in *origins*, so the checks can hold the statements fixed and vary
+    what the mission knows: a rule that assigned the same band to all three would be
+    visible as a failure rather than as a coincidence.
+    """
+
+    shared = "the edge gateway runs firmware 7.2 and the advisory names its session handling"
+    second = "the edge gateway failed its last configuration review on 2026-03-02"
+    negated = "the edge gateway never ran firmware 7.2"
+    corroborated = [
+        _synthesis_report("advisories", [shared], hosts=["advisory.test", "mirror.test"],
+                          worker="wrk-adv"),
+        _synthesis_report("records", [shared, second],
+                          hosts=["mirror.test", "registry.test"], worker="wrk-rec")]
+    conflicting = [
+        _synthesis_report("advisories", [shared], hosts=["advisory.test", "mirror.test"],
+                          worker="wrk-adv"),
+        _synthesis_report("records", [negated], hosts=["registry.test"], worker="wrk-rec")]
+    single = [_synthesis_report("advisories", [shared], hosts=["advisory.test"],
+                                worker="wrk-adv")]
+    third = "the archive holds four snapshots of the same page (2026-01-04 to 2026-04-11)"
+    third_party = [_synthesis_report("forums", [shared], hosts=["forum.test"],
+                                     kind=EvidenceKind.ALLEGATION, worker="wrk-frm")]
+    return {"corroborated": corroborated, "conflicting": conflicting,
+            "single": single, "allegation": third_party,
+            "shared": shared, "second": second, "negated": negated, "third": third}
+
+
+def _synthesis_context() -> "MasterContext":
+    """The mission the synthesis fixtures belong to: one question, one criterion."""
+
+    return MasterContext(
+        objective="map the publicly documented exposure of example.com and rank the "
+                  "advisory-backed risks",
+        scope_entries=["example.com"],
+        available_tools=["http.fetch", "advisory.read"],
+        completion_criteria=["every finding cites a published advisory"],
+        mission_questions=["the published advisories name the affected component"])
+
+
+def synthesis_demo() -> dict[str, Any]:
+    """Assemble the document three ways and show what each one refuses."""
+
+    cases = synthesis_cases()
+    context = _synthesis_context()
+    corroborated = synthesise_report(cases["corroborated"], context=context,
+                                     mission_id="msn-demo-corrob")
+    conflicting = synthesise_report(cases["conflicting"], context=context,
+                                    mission_id="msn-demo-conflict")
+    single = synthesise_report(cases["single"], context=context, mission_id="msn-demo-single")
+
+    refusals: list[dict[str, str]] = []
+
+    def attempt(name: str, fn: Callable[[], Any]) -> None:
+        # Both refusal kinds count: a pydantic constraint (a finding with no citation) and
+        # a synthesis rule (a conclusion above its evidence) are the same answer to the
+        # caller — the document cannot say this — so the demo reports the reason, not the
+        # exception class.  An exception of any *other* kind would be a bug, and the
+        # self-test asserts that none is raised.
+        try:
+            fn()
+        except (SynthesisConflict, ValueError) as exc:
+            refusals.append({"probe": name, "refused": _first_sentence(str(exc))[:220]})
+        else:
+            refusals.append({"probe": name, "refused": "NOT REFUSED"})
+
+    attempt("a finding that cites nothing", lambda: KeyFinding(
+        statement="the gateway is exposed to the advisory", evidence_ids=[],
+        band=ConfidenceBand.SINGLE_SOURCE, confidence=Confidence.LOW,
+        confidence_basis="one retrieval", origins=1, falsifier="a patched build"))
+    attempt("a single-source finding promoted to high", lambda: KeyFinding(
+        statement="the gateway is exposed to the advisory", evidence_ids=["ev-1"],
+        band=ConfidenceBand.SINGLE_SOURCE, confidence=Confidence.HIGH,
+        confidence_basis="one retrieval", origins=1, falsifier="a patched build"))
+    attempt("an allegation reported as well-corroborated", lambda: KeyFinding(
+        statement="a forum states the gateway is exposed to the advisory",
+        evidence_ids=["ev-1"], kind=EvidenceKind.ALLEGATION,
+        band=ConfidenceBand.WELL_CORROBORATED, confidence=Confidence.HIGH,
+        confidence_basis="three posts repeat it", origins=3, falsifier="the forum retracts"))
+    attempt("a declaration of guilt", lambda: KeyFinding(
+        statement="the contractor is guilty of exposing the gateway",
+        evidence_ids=["ev-1"], band=ConfidenceBand.SINGLE_SOURCE,
+        confidence=Confidence.LOW, confidence_basis="one retrieval", origins=1,
+        falsifier="a patched build"))
+    attempt("a certainty about identity", lambda: HypothesisRow(
+        statement="the administrator is the person who changed the configuration",
+        status="untested", test="compare the audit log against the change window"))
+    attempt("a next step that widens the scope", lambda: NextStep(
+        action="scan the neighbouring netblock for the same firmware",
+        addresses="gap-1", basis="the same operator", within_scope=False))
+    attempt("a next step that is not passive", lambda: NextStep(
+        action="log in to the gateway and read its configuration",
+        addresses="gap-1", basis="the operator owns it", passive=False))
+
+    signals = {
+        "every finding cites evidence ids": all(
+            finding.cited for finding in corroborated.findings),
+        "no conclusion exceeds its evidence": corroborated.acceptance()[
+            "no_conclusion_exceeds_its_evidence"],
+        "two origins corroborate a claim": bool(corroborated.indicators),
+        "a contradiction is preserved, not settled": bool(conflicting.conflicts),
+        "a single-source mission reports low confidence":
+            single.confidence is Confidence.LOW,
+        "the acceptance clause holds for the assembled report":
+            all(corroborated.acceptance()[key] for key in
+                ("every_finding_cited", "no_conclusion_exceeds_its_evidence",
+                 "all_sections_present", "no_attribution")),
+        "every refusal is a sentence a reader can act on": all(
+            refusal["refused"] != "NOT REFUSED" for refusal in refusals),
+        "no finding declares guilt": all(
+            "guilty" not in finding.statement.lower()
+            for report in (corroborated, conflicting, single)
+            for finding in report.findings),
+        "ten sections, all filled": len(corroborated.sections) == len(REQUIRED_SECTIONS)
+            and all(section.filled for section in corroborated.sections),
+    }
+    return {
+        "objective": context.objective,
+        "reports": {"corroborated": corroborated.to_dict(),
+                    "conflicting": conflicting.to_dict(),
+                    "single": single.to_dict()},
+        "bands": {name: {band.value: sum(1 for finding in report.findings
+                                         if finding.band is band)
+                         for band in ConfidenceBand}
+                  for name, report in (("corroborated", corroborated),
+                                       ("conflicting", conflicting),
+                                       ("single", single))},
+        "conflicts": [record.describe() for record in conflicting.conflicts],
+        "indicators": [row.statement for row in corroborated.indicators],
+        "refusals": refusals,
+        "signals": signals,
+        "acceptance": {"all_signals": all(signals.values()), "signals": signals},
+    }
+
+
+def render_synthesis_demo(payload: Mapping[str, Any]) -> Group:
+    """The demo, as a reader sees it: what the document says, and what it refuses to."""
+
+    bands = Table(title="the same claim, three evidence bases", title_justify="left",
+                  box=None, pad_edge=False, expand=False)
+    bands.add_column("report", no_wrap=True)
+    for band in ConfidenceBand:
+        bands.add_column(band.value, no_wrap=True)
+    for name, counts in payload["bands"].items():
+        bands.add_row(escape(name), *[str(counts[band.value]) for band in ConfidenceBand])
+
+    refusals = Table(title="sentences the synthesis refuses", title_justify="left",
+                     box=None, pad_edge=False, expand=False)
+    refusals.add_column("probe", overflow="fold", max_width=34)
+    refusals.add_column("refused because", overflow="fold", max_width=64)
+    for entry in payload["refusals"]:
+        refusals.add_row(escape(entry["probe"]), escape(entry["refused"]))
+
+    signals = Table(title="acceptance", title_justify="left", box=None, pad_edge=False,
+                    expand=False)
+    signals.add_column("check", overflow="fold")
+    signals.add_column("ok", no_wrap=True)
+    for name, ok in payload["signals"].items():
+        signals.add_row(escape(name), "[green]✔[/green]" if ok else "[red]✘[/red]")
+
+    tail = Text("a finding cites what carries it, confidence is counted rather than "
+                "claimed, and no sentence names who is guilty", style="dim")
+    return Group(bands, Text(""), refusals, Text(""), signals, Text(""), tail)
+
+
+def run_synthesis_self_test() -> list[SynthesisCheck]:
+    """Prove §39's acceptance clause: every finding cited, no conclusion above its evidence.
+
+    Five groups, because five different things must hold: the bands are derived rather
+    than declared, the refusals are real, the document is complete, the record is
+    preserved (contradictions, gaps, hypotheses), and the graph attaches the document to
+    the mission it synthesised.
+    """
+
+    checks: list[SynthesisCheck] = []
+
+    def add(name: str, ok: Any, detail: Any = "") -> None:
+        checks.append(SynthesisCheck(name=name, ok=bool(ok), detail=str(detail)[:150]))
+
+    def raises(fn: Callable[[], Any], exc: type[BaseException]) -> bool:
+        try:
+            fn()
+        except exc:
+            return True
+        except Exception:                     # noqa: BLE001 - the wrong error is a failure
+            return False
+        return False
+
+    cases = synthesis_cases()
+    context = _synthesis_context()
+    shared = cases["shared"]
+
+    # -- 1. the index: ids, origins and sameness ------------------------------
+    index = EvidenceIndex.of([item for report in cases["corroborated"]
+                              for item in report.evidence])
+    add("the index holds every reviewed item", len(index.items) == 3, len(index.items))
+    add("two hosts are two origins",
+        len({origin for item in index.items for origin in item.origins}) == 3,
+        [item.origins for item in index.items])
+    add("a duplicate statement is one claim", len(index.statement_ids(shared)) == 2,
+        len(index.statement_ids(shared)))
+    add("a claim with two origins is corroborated", index.count_statement(shared) == 2,
+        index.count_statement(shared))
+    add("an id the mission never collected is refused",
+        raises(lambda: index.get("ev-does-not-exist"), SynthesisConflict))
+
+    # -- 2. the bands: derived, capped, and never chosen ----------------------
+    one = EvidenceIndex.of(cases["single"][0].evidence)
+    add("one origin is single-source",
+        one.items[0].ceiling() is ConfidenceBand.SINGLE_SOURCE)
+    corroborated_index = EvidenceIndex.of(
+        [item for report in cases["corroborated"] for item in report.evidence])
+    claim_origins = _claim_origins(corroborated_index)
+    corroborated_findings = [_finding_for(item, origins=claim_origins.get(item.signature, ()))
+                             for item in corroborated_index.items]
+    add("two origins corroborate the claim they share",
+        any(finding.band.rank >= ConfidenceBand.CORROBORATED.rank
+            for finding in corroborated_findings),
+        [(finding.statement[:30], finding.band.value) for finding in corroborated_findings])
+    allegation = EvidenceIndex.of(cases["allegation"][0].evidence)
+    add("an allegation is capped at corroborated",
+        allegation.items[0].ceiling().rank <= ConfidenceBand.CORROBORATED.rank,
+        allegation.items[0].ceiling().value)
+    add("the band's confidence is the coarse confidence",
+        ConfidenceBand.SINGLE_SOURCE.confidence is Confidence.LOW
+        and ConfidenceBand.CORROBORATED.confidence is Confidence.MEDIUM
+        and ConfidenceBand.WELL_CORROBORATED.confidence is Confidence.HIGH)
+    add("a finding cannot state a confidence above its band", raises(lambda: KeyFinding(
+        statement="the gateway runs firmware 7.2", evidence_ids=["ev-1"],
+        band=ConfidenceBand.SINGLE_SOURCE, confidence=Confidence.HIGH,
+        confidence_basis="one retrieval", origins=1, falsifier="a patched build"),
+        SynthesisConflict))
+    add("an allegation cannot be reported as well-corroborated", raises(lambda: KeyFinding(
+        statement="a forum states the gateway runs firmware 7.2", evidence_ids=["ev-1"],
+        kind=EvidenceKind.ALLEGATION, band=ConfidenceBand.WELL_CORROBORATED,
+        confidence=Confidence.HIGH, confidence_basis="repeated on one forum", origins=3,
+        falsifier="the forum retracts"), SynthesisConflict))
+    add("an inference cannot be reported as well-corroborated", raises(lambda: KeyFinding(
+        statement="the gateway was probably patched after the advisory",
+        evidence_ids=["ev-1"], kind=EvidenceKind.INFERENCE,
+        band=ConfidenceBand.WELL_CORROBORATED, confidence=Confidence.HIGH,
+        confidence_basis="three origins agree", origins=3, falsifier="the build date"),
+        SynthesisConflict))
+
+    # -- 3. the refusals: the sentences a report may not contain --------------
+    add("a finding must cite at least one id", raises(lambda: KeyFinding(
+        statement="the gateway is exposed to the advisory", evidence_ids=[],
+        band=ConfidenceBand.SINGLE_SOURCE, confidence=Confidence.LOW,
+        confidence_basis="one retrieval", origins=1, falsifier="a patched build"),
+        SynthesisConflict))
+    add("an uncited finding is refused with a reason a reader can act on", raises(
+        lambda: KeyFinding(statement="the gateway is exposed to the advisory",
+                           evidence_ids=["  "], band=ConfidenceBand.SINGLE_SOURCE,
+                           confidence=Confidence.LOW, confidence_basis="one retrieval",
+                           origins=1, falsifier="a patched build"),
+        SynthesisConflict))
+    add("a declaration of guilt is refused", raises(lambda: check_attribution(
+        "the contractor is guilty"), SynthesisConflict))
+    add("naming an attacker is refused", raises(lambda: check_attribution(
+        "the attacker used the advisory"), SynthesisConflict))
+    add("describing indicia is allowed", not raises(lambda: check_attribution(
+        "the login came from an address the domain does not publish"), SynthesisConflict))
+    add("a certain identity claim is refused", raises(lambda: check_identity_claim(
+        "the administrator is the person who changed the configuration"),
+        SynthesisConflict))
+    add("an identity hypothesis with a basis is allowed", not raises(
+        lambda: check_identity_claim(
+            "one hypothesis is that the administrator changed the configuration; "
+            "no evidence establishes it and the audit log would decide"),
+        SynthesisConflict))
+    add("a next step that widens scope is refused", raises(lambda: NextStep(
+        action="scan the neighbouring netblock", addresses="gap-1",
+        basis="the same operator", within_scope=False), SynthesisConflict))
+    add("a next step that is not passive is refused", raises(lambda: NextStep(
+        action="log in to the gateway and read the configuration", addresses="gap-1",
+        basis="the operator owns it", passive=False), SynthesisConflict))
+    add("a lawful next step is accepted", not raises(lambda: NextStep(
+        action="read the advisory archive for the affected version", addresses="gap-1",
+        basis="passive collection from example.com"), SynthesisConflict))
+
+    # -- 4. the document ------------------------------------------------------
+    report = synthesise_report(cases["corroborated"], context=context)
+    add("the report has all ten sections",
+        [section.kind for section in report.sections]
+        == [kind for kind, _title in REQUIRED_SECTIONS],
+        [section.kind for section in report.sections])
+    add("every section says something", all(section.filled for section in report.sections),
+        [section.kind for section in report.sections if not section.filled])
+    add("every finding cites evidence", all(finding.cited for finding in report.findings))
+    add("every citation is in the mission's evidence",
+        all(item_id in {item.id for item in index.items}
+            for item_id in report.cited_ids), report.cited_ids)
+    add("the acceptance clause is evaluated, not asserted",
+        report.acceptance()["every_finding_cited"]
+        and report.acceptance()["no_conclusion_exceeds_its_evidence"]
+        and report.acceptance()["all_sections_present"]
+        and report.acceptance()["no_attribution"], report.acceptance())
+    add("one claim is one finding, however many rows carry it",
+        len(report.findings) == len({item.signature for item in
+                                     EvidenceIndex.of([i for r in cases["corroborated"]
+                                                       for i in r.evidence]).items}),
+        len(report.findings))
+    add("a corroborated finding cites both of its rows",
+        all(len(finding.evidence_ids) >= 2 for finding in report.findings
+            if finding.band.rank >= ConfidenceBand.CORROBORATED.rank),
+        [(f.statement[:20], f.evidence_ids) for f in report.findings])
+    add("a corroborated claim appears as an indicator", bool(report.indicators),
+        [row.statement[:40] for row in report.indicators])
+    add("the confidence is the weakest finding, not the strongest",
+        report.confidence is Confidence.LOW
+        and any(finding.confidence is Confidence.MEDIUM for finding in report.findings),
+        [(finding.band.value) for finding in report.findings])
+
+    conflicting = synthesise_report(cases["conflicting"], context=context)
+    add("a contradiction is preserved rather than settled", bool(conflicting.conflicts),
+        [record.describe()[:80] for record in conflicting.conflicts])
+    add("a contradiction names what would settle it",
+        all(len(record.resolution) > 10 for record in conflicting.conflicts))
+    add("a contradiction cites both sides",
+        all(record.left_evidence and record.right_evidence
+            for record in conflicting.conflicts))
+
+    single = synthesise_report(cases["single"], context=context)
+    add("a single-source mission is single-source", single.confidence is Confidence.LOW)
+    add("a single-source mission claims no indicator", not single.indicators)
+    add("a gap becomes a gap record with its consequence",
+        all(gap.consequence for gap in single.gaps))
+    add("the summary is written from the sections", "finding(s)" in
+        (single.section_of("executive-summary").body or ""))
+
+    partial = synthesise_report([], context=context)
+    add("a mission with no evidence still reports", bool(partial.sections))
+    add("a mission with no evidence states the gap", bool(partial.gaps))
+    add("a mission with no evidence claims no finding", not partial.findings)
+    add("a mission with no evidence states no confidence",
+        partial.confidence is Confidence.UNKNOWN, partial.confidence.value)
+
+    # -- 5. the graph uses it -------------------------------------------------
+    ctx = _selftest_context("exposure")
+    units = flow_units_for(ctx, "exposure")
+    flow = HierarchicalFlow(context=ctx, subagents=units,
+                            runner=_CountingRunner(scope=ctx.scope_entries),
+                            policy=FlowPolicy(allow_runtime_workers=False,
+                                              max_replan_rounds=0))
+    result = flow.run()
+    attachment = result.synthesis.report if result.synthesis else None
+    add("the flow attaches the report to its synthesis", attachment is not None)
+    add("the attached report is complete",
+        attachment is not None and all(section.filled for section in attachment.sections))
+    add("the attached report cites only the mission's evidence",
+        attachment is not None and all(
+            item_id in {item.id for report in result.reports for item in report.evidence}
+            for item_id in attachment.cited_ids),
+        attachment.cited_ids if attachment else "")
+    add("the report names the hypotheses the mission had", bool(
+        attachment and attachment.hypotheses))
+    add("the report recommends only lawful steps", bool(
+        attachment and attachment.next_steps and all(
+            step.passive and step.within_scope and step.authorised
+            for step in attachment.next_steps)))
+    add("the reported mission serialises the document",
+        "report" in json.loads(json.dumps(result.to_dict(), default=str))["synthesis"])
+
+    # a mission whose loops blocked a line reports it as withheld, not as silence
+    looping_units = _looping_units(ctx, attempts=3)
+    stubborn = HierarchicalFlow(
+        context=ctx, subagents=looping_units,
+        runner=_CountingRunner(scope=ctx.scope_entries, repeat_queries=True,
+                               always_retry=workers_of(looping_units)),
+        policy=FlowPolicy(allow_runtime_workers=False, max_review_rounds=3,
+                          max_replan_rounds=0))
+    stubborn_result = stubborn.run()
+    stubborn_report = stubborn_result.synthesis.report if stubborn_result.synthesis else None
+    add("a blocked line is withheld in the report",
+        stubborn_report is not None and any(
+            "blocked" in line for line in stubborn_report.withheld),
+        stubborn_report.withheld[:2] if stubborn_report else None)
+    add("a blocked mission still produces a complete report",
+        stubborn_report is not None
+        and all(section.filled for section in stubborn_report.sections))
+    return checks
+@app.command("synthesis",
+             help="Evidence-based Master synthesis: ten sections, every finding cited.")
+def synthesis_command(
+    self_test: bool = typer.Option(False, "--self-test",
+                                   help="Prove the report's calibration and completeness."),
+    demo: bool = typer.Option(False, "--demo",
+                              help="The same claim over three evidence bases, and what is refused."),
+    reports: str | None = typer.Option(
+        None, "--reports",
+        help="Synthesise a mission's reviewed reports from JSON ('-' for stdin)."),
+    objective: str = typer.Option(
+        "", "--objective", "-o",
+        help="The mission objective the report answers (overrides the file's)."),
+    question: str = typer.Option("", "--question", help="The question the mission set itself."),
+    limitations: str = typer.Option(
+        "", "--limitation", help="A limitation to carry into the report (repeatable)."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Assemble the mission's document, or prove that it cannot overstate it.
+
+    Exit codes: ``OK`` when the report is complete and every finding is calibrated,
+    ``POLICY`` when a report was produced but does not meet its own acceptance clause —
+    which is a defect in the evidence or in a citation, not a mission failure, and is
+    reported rather than swallowed.
+    """
+
+    console = get_console()
+
+    if self_test:
+        checks = run_synthesis_self_test()
+        failures = [check for check in checks if not check.ok]
+        if as_json:
+            _emit(json.dumps({"checks": [check.to_dict() for check in checks],
+                              "passed": len(checks) - len(failures),
+                              "failed": len(failures)}, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        table = Table(box=None, pad_edge=False)
+        table.add_column("check", overflow="fold")
+        table.add_column("detail", overflow="fold")
+        for check in checks:
+            glyph, colour = ("✔", "green") if check.ok else ("✘", "red")
+            table.add_row(f"{glyph} {escape(check.name)}", escape(check.detail))
+        console.print(table)
+        colour = "green" if not failures else "red"
+        console.print(f"\n[{colour}]{len(checks) - len(failures)} passed[/] · "
+                      f"{len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    if demo:
+        payload = synthesis_demo()
+        if as_json:
+            _emit(json.dumps(payload, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(render_synthesis_demo(payload))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    if reports:
+        try:
+            raw = (sys.stdin.read() if reports == "-"
+                   else Path(reports).expanduser().read_text(encoding="utf-8"))
+            payload = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            console.print(f"[red]✘[/red] not a mission report set: "
+                          f"{escape(_first_sentence(str(exc))[:200])}")
+            raise typer.Exit(ExitCode.USAGE) from exc
+        try:
+            reviewed = [SubagentOutcome.model_validate(item)
+                        for item in payload.get("reports") or []]
+            mission = (objective or str(payload.get("objective") or ""))
+            asked = question or str((payload.get("questions") or [""])[0] or "")
+            scope = [str(item) for item in payload.get("scope") or []]
+        except (KeyError, ValueError) as exc:
+            console.print(f"[red]✘[/red] not a mission report set: "
+                          f"{escape(_first_sentence(str(exc))[:200])}")
+            raise typer.Exit(ExitCode.USAGE) from exc
+        if not mission:
+            console.print("[red]✘[/red] the report needs an objective: pass --objective")
+            raise typer.Exit(ExitCode.USAGE)
+        context = MasterContext(objective=mission, scope_entries=scope,
+                                mission_questions=[asked] if asked else [])
+        notes = [item for item in limitations.split("|") if item.strip()]
+        report = synthesise_report(reviewed, context=context, question=asked,
+                                   limitations=notes)
+        acceptance = report.acceptance()
+        ok = all(value for key, value in acceptance.items() if isinstance(value, bool))
+        if as_json:
+            _emit(json.dumps(report.to_dict(), indent=2, default=str))
+            raise typer.Exit(ExitCode.OK if ok else ExitCode.POLICY)
+        console.print()
+        console.print(render_master_report(report))
+        console.print()
+        raise typer.Exit(ExitCode.OK if ok else ExitCode.POLICY)
+
+    console.print("[red]✘[/red] choose --demo, --self-test or --reports FILE")
+    raise typer.Exit(ExitCode.USAGE)
+
 
 if __name__ == "__main__":
     process_entry()
-

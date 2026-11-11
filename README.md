@@ -29,6 +29,7 @@ python vedant_osint.py retask --self-test    # a revise becomes a specific assig
 python vedant_osint.py aggregate --self-test # reviewed work only, and never early
 python vedant_osint.py review-master --self-test # five lenses, five ways to stop
 python vedant_osint.py loops --self-test      # repeated work, blocked lines, saturation
+python vedant_osint.py synthesis --self-test  # a report that cannot outrun its evidence
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -967,13 +968,54 @@ python vedant_osint.py loops --demo                     # correct, block, stop
 python vedant_osint.py loops --reports mission.json --evidence 4,0,0
 ```
 
+## Evidence-based Master synthesis
+
+The mission produces one document, and the thing it must not do is conclude more than it
+can show. The report is assembled from the reviewed record — not written freehand — in ten
+sections: executive summary, scope and methods, key findings, corroborated indicators,
+competing hypotheses, contradictions, confidence levels, evidence gaps, limitations and
+recommended lawful next steps.
+
+- **Every key finding links to evidence IDs.** A `KeyFinding` cannot be constructed without
+  them, and every id must exist in the mission's own evidence; an id nobody collected is
+  refused at assembly. Findings are deduplicated by claim, so two Workers that retrieved the
+  same fact are one finding with two citations rather than two findings.
+- **No conclusion exceeds its supporting evidence.** Confidence is derived twice: from the
+  number of independent origins (one → single-source, two → corroborated, three or more →
+  well-corroborated, counted the way the research audit counts them) and then capped by the
+  claim's epistemic kind — an allegation can never be more than corroborated, because a
+  third party repeating a claim does not establish it, and an inference is capped at
+  corroborated, because reasoning over good evidence is still reasoning. A stated level
+  above the derived band is refused. The report's overall confidence is the *weakest*
+  finding that carries the answer, never an average and never the strongest.
+- **Contradictions are preserved, not settled.** Two statements whose subjects overlap and
+  whose polarity differs are recorded with both sides, the rule that found the conflict, and
+  what would resolve it. Picking a side without new evidence would delete a finding.
+- **No declarations of guilt, no certain identity attribution.** "Guilty", "the attacker",
+  "is the person who" are refused wherever a report states anything; an identity claim
+  survives only as a hypothesis with its basis and the test that would decide it. There is
+  no field for a verdict, because a document with such a field acquires an answer to it.
+- **What the mission could not establish is a section, not silence.** Gaps carry the
+  reason, the consequence (*what the report therefore cannot say*) and what would close
+  them; hypotheses the mission could not test are listed as untested; blocked lines from
+  loop detection arrive as withheld lines.
+- **Recommended next steps are lawful by construction.** Each names the gap it addresses,
+  asserts it stays inside the mission's scope and authorisation, and must be passive — this
+  build plans passive collection, and a recommendation is a plan.
+
+```
+python vedant_osint.py synthesis --self-test              # 50 calibration checks
+python vedant_osint.py synthesis --demo                   # one claim, three evidence bases
+python vedant_osint.py synthesis --reports mission.json   # assemble the document
+```
+
 ## Status
 
 | Phase | Scope | State |
 |-------|-------|-------|
 | 1 | Foundation — CLI skeleton, config probing, version reporting | ✅ done |
 | 2 | Contracts — settings, `doctor`, preflight, models, state, renderer, lifecycle, resilience, model adapter | ✅ done |
-| 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control, Worker outcome contract, Subagent quality review, targeted Worker retasking, Subagent aggregation with bounded runtime Workers, Master review with bounded replanning, loop detection with strategy change, blocked lines and saturation stops) |
+| 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control, Worker outcome contract, Subagent quality review, targeted Worker retasking, Subagent aggregation with bounded runtime Workers, Master review with bounded replanning, loop detection with strategy change, blocked lines and saturation stops, evidence-based Master synthesis with cited findings and calibrated confidence) |
 | 4 | Browser — browser-use / Playwright sessions and capture | 🟡 started (policy, scope, capture, guarded closure, agent mode) |
 | 5 | Collection — passive OSINT sources, artefact hashing | 🟡 started (source-aware web research; safe document/page extraction with injection defence; read-only artifact manifests, hashing and access ledger) |
 | 6 | Synthesis — cross-source correlation and reporting | 🟡 started (deterministic timelines, explained indicator correlation, content de-duplication) |
