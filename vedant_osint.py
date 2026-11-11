@@ -376,7 +376,7 @@ The hierarchy is executed by a LangGraph workflow, not by loops in this file.
 mission:
 
 * **Master** — ``master-plan`` → one ``Send`` per Subagent → ``master-review`` →
-  ``master-synthesize``.
+  (``master-replan`` → one ``Send`` per follow-up) → ``master-synthesize``.
 * **Subagent** (one child graph per Subagent, compiled once) — ``subagent`` →
   one ``Send`` per Worker → ``subagent-aggregate``.
 * **Worker** (one child graph per Worker, compiled once) — ``worker-task`` →
@@ -408,6 +408,14 @@ by side).  There is no node named after a specialist role and no roster constant
   budget; when they run out the verdict stands, the gap names the Worker and the
   gate, and a mission whose Subagents produced nothing stops with
   ``stopped``/``stop_reason`` instead of synthesising an empty answer.
+* **The Master reviews, and may replan once — within limits.**  After the join the
+  Master applies five lenses to every report (relevance, sufficiency,
+  contradictions, duplication, coverage), and either finishes, stops, or opens one
+  bounded follow-up round: a Worker for a Subagent that already exists, or a
+  Subagent that does not, both through the same gates.  The loop is bounded by a
+  round cap, a review budget, the spawn licence, the deadline and saturation —
+  and every bound that had a say is on the record, so no mission can loop
+  indefinitely and every mission reaches a final or partial report.
 
 ::
 
@@ -874,6 +882,40 @@ forwarded.
     python vedant_osint.py aggregate --demo             # merge, disagreement, stop
     python vedant_osint.py aggregate --next team.json   # aggregate reviewed results
 
+Master review and bounded replanning
+------------------------------------
+A Subagent judges its own team; the Master judges the mission.  After the join it
+applies five lenses to every report — **relevance** (is it about this mission?),
+**sufficiency** (can it carry its claims?), **contradictions** (does it disagree with
+another report, visibly?), **duplication** (does it repeat one?) and **coverage** (what
+does nobody cover?) — and then either finishes, stops, or opens one bounded follow-up
+round.
+
+*   **Two routes, both through the gates.**  A follow-up goes to a Subagent that already
+    exists (it plans one more runtime Worker, spending its own licence and the Master's
+    follow-up budget) or to one that does not (the Master spends a licence seat and the
+    draft passes the *same* specification validation as the original plan).  There is no
+    third route and no privileged one.
+*   **The loop cannot run for ever.**  Five independent bounds: the round cap
+    (``max_replan_rounds``), the review budget (``max_master_reviews``), the spawn
+    licence that cannot be topped up, the mission deadline, and saturation — a round
+    that added no new *claim*, not merely no new rows.  Every bound that had a say is
+    listed on the decision, so "why did it stop here?" has one answer per bound.
+*   **A bounded stop is not a failure.**  ``final`` means the mission met its own stated
+    criteria; ``stop`` names which bound ended it (``budget``, ``deadline``, ``blocked``,
+    ``saturation``).  A mission that finished never reports itself as cut short, and a
+    mission that was cut short never claims to be finished — the outcome is the same
+    either way: a report, with its limitations attached.
+*   **Reviewing is deterministic and offline.**  The lenses read the record (statements,
+    evidence, joins, disagreements, criteria checks) and never ask a model to grade a
+    model: a reviewer that can be argued into a pass is not a control.
+
+::
+
+    python vedant_osint.py review-master --self-test     # 70 bounded-loop checks
+    python vedant_osint.py review-master --demo          # five lenses, four endings
+    python vedant_osint.py review-master --next mission.json --objective "..."
+
 Structured model adapter
 ------------------------
 One model-calling interface sits between orchestration and every provider, so
@@ -1080,7 +1122,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 26
+VERSION_MINOR: int = 27
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -14680,6 +14722,17 @@ class MasterContext(StrictModel):
     #: Facts the operator supplied up front, as opposed statements only.
     operator_notes: list[str] = Field(default_factory=list)
     prior_findings: list[str] = Field(default_factory=list)
+    #: What would make this mission finished, in the mission's own terms.  The Master
+    #: reviews against these (§37) rather than against an opinion about them, so they
+    #: travel with the context the same way the scope and the limits do.  A mission
+    #: that states none is reviewed, decides, and simply never reaches ``final``: it
+    #: stopped on a bound, which is the honest description of a mission with no stated
+    #: end.
+    completion_criteria: list[str] = Field(default_factory=list)
+    #: The questions the mission has to answer — its working hypotheses.  The coverage
+    #: lens asks whether any report actually answered them, which is only answerable
+    #: if the questions are data rather than prose in an objective sentence.
+    mission_questions: list[str] = Field(default_factory=list)
 
     def scope_object(self) -> Scope:
         entries = [ScopeEntry(pattern=p) for p in self.scope_entries]
@@ -15359,6 +15412,10 @@ _SELFTEST_OBJECTIVES: dict[str, dict[str, Any]] = {
 
 def _selftest_context(name: str) -> MasterContext:
     spec = _SELFTEST_OBJECTIVES[name]
+    # The scripted team already states what would finish its mission, so the context
+    # carries the same criteria and questions rather than a second copy written here
+    # (§37 reviews the mission against its own terms, and two copies could disagree).
+    design = _team_payload(name)
     return MasterContext(
         objective=spec["objective"],
         scope_entries=spec["scope_entries"],
@@ -15366,6 +15423,8 @@ def _selftest_context(name: str) -> MasterContext:
         mode=MissionMode(spec["mode"]),
         max_subagents=4,
         max_total_workers=8,
+        completion_criteria=list(design.get("completion_criteria") or []),
+        mission_questions=list(design.get("hypotheses") or []),
     )
 
 
@@ -21453,9 +21512,13 @@ def run_resource_self_test() -> list[ConcurrencyCheck]:
         not report_all.clipped and len(kept_all) == len(team), report_all.summary())
 
     # clipping inside the real graph
+    # §37 off: this check is about the *clip*, and a follow-up round adds a Worker the
+    # clip never saw.  Turning the loop off keeps the measurement about what it says.
     flow = HierarchicalFlow(context=context, subagents=team,
                             runtime=ConcurrencyRuntime(tight),
-                            runner=_MeasuringRunner(scope=context.scope_entries))
+                            runner=_MeasuringRunner(scope=context.scope_entries),
+                            policy=FlowPolicy(allow_follow_ups=False,
+                                              max_replan_rounds=0))
     result = flow.run()
     add("a clipped flow still runs to a synthesis", result.synthesis is not None)
     add("the clip travels with the result", result.clip is not None and result.clip.clipped)
@@ -21612,6 +21675,10 @@ class FlowStage(str, Enum):
     REVIEW = "worker-review"
     SUBAGENT_AGGREGATE = "subagent-aggregate"
     MASTER_REVIEW = "master-review"
+    #: §37: the Master's bounded follow-up round.  A stage, not a node per role, for
+    #: the same reason every other node is: the structure stays fixed while the work
+    #: it fans out to is data.
+    MASTER_REPLAN = "master-replan"
     MASTER_SYNTHESIZE = "master-synthesize"
 
 
@@ -21637,6 +21704,7 @@ FLOW_STAGE_ORDER: tuple[FlowStage, ...] = (
     FlowStage.REVIEW,
     FlowStage.SUBAGENT_AGGREGATE,
     FlowStage.MASTER_REVIEW,
+    FlowStage.MASTER_REPLAN,
     FlowStage.MASTER_SYNTHESIZE,
 )
 
@@ -21663,6 +21731,25 @@ class FlowPolicy(StrictModel):
     #: How many extra Workers one Subagent may create across its whole run.  The
     #: SpawnLedger licence is a second, lower ceiling; both bind.
     max_runtime_workers_per_subagent: int = Field(default=2, ge=0, le=8)
+    #: How many follow-up Workers the *Master* may direct at one existing Subagent
+    #: (§37).  Deliberately a second, separate number: a Subagent answering its own
+    #: §36 gaps and a Master answering a review are different judgements by different
+    #: agents, and folding them into one budget would let either spend the other's.
+    #: ``0`` means the Master may only ever create a Subagent, never re-task one.
+    max_follow_up_workers_per_subagent: int = Field(default=1, ge=0, le=4)
+    #: May the Master answer a review with a bounded follow-up round (§37)?  Off
+    #: makes every mission exactly as wide as its plan; on lets one round of extra
+    #: work happen, still bounded by the two budgets below.
+    allow_follow_ups: bool = True
+    #: How many review → assign → re-run rounds a mission may open.  ``0`` reviews
+    #: once and never continues, which is the "review without replanning" mode.
+    #: The cap is a policy number rather than the graph's recursion limit, so the
+    #: bound on the loop is one a reader can point at in the result.
+    max_replan_rounds: int = Field(default=1, ge=0, le=3)
+    #: How many times the Master may review in one mission.  Deliberately separate
+    #: from the round cap: a review is the `final`/`stop` decision as well as the
+    #: `continue` one, so the last round always gets a review even at round cap.
+    max_master_reviews: int = Field(default=3, ge=1, le=6)
     #: Simulated per-stage latency used by the demo so parallelism is observable.
     stage_delay_seconds: float = Field(default=0.0, ge=0.0, le=5.0)
     #: How long a unit waits for a dependency before its gate fails it.  Bounded
@@ -22426,6 +22513,13 @@ class FlowResult(StrictModel):
     reviews: "ReviewLedger | None" = None
     #: Every retask this run issued (§35): a retried attempt's assignment.
     retasks: list["RetaskedWorker"] = Field(default_factory=list)
+    #: §37: every review the Master made, and every decision that followed it.  The
+    #: last of each is the mission's answer to "did I finish?"; the list is the
+    #: evidence that the loop was bounded rather than merely well-behaved.
+    master_reviews: list["MasterReview"] = Field(default_factory=list)
+    master_decisions: list["MasterDecision"] = Field(default_factory=list)
+    #: The follow-up work the mission opened, and what became of it.
+    follow_ups: list["FollowUpAssignment"] = Field(default_factory=list)
 
     @property
     def review_summary(self) -> dict[str, Any]:
@@ -22455,6 +22549,48 @@ class FlowResult(StrictModel):
                 "carried_evidence": sum(len(retask.prior_evidence) for retask in retasks),
                 "repeated_prompts": repeats,
                 "prompt_chars": [len(retask.prompt) for retask in retasks]}
+
+    @property
+    def review(self) -> "MasterReview | None":
+        """The Master's last review — what it concluded about the finished mission."""
+
+        return self.master_reviews[-1] if self.master_reviews else None
+
+    @property
+    def decision(self) -> "MasterDecision | None":
+        """The Master's last decision — how the mission came to stop where it did."""
+
+        return self.master_decisions[-1] if self.master_decisions else None
+
+    @property
+    def stop_condition(self) -> "StopCondition":
+        """Why this mission stopped asking for more work (§37).
+
+        ``NONE`` when the Master never reviewed — a mission that died at the join has
+        no stop condition because it never reached the question.
+        """
+
+        decision = self.decision
+        return decision.condition if decision is not None else StopCondition.NONE
+
+    @property
+    def review_summary_of_mission(self) -> dict[str, Any]:
+        """The review's counts, as the CLI and the demos read them."""
+
+        review = self.review
+        if review is None:
+            return {}
+        return {"rounds": len(self.master_reviews),
+                "reports": len(review.observations),
+                **review.by_satisfaction(),
+                "actionable": len(review.actionable),
+                "coverage_gaps": len(review.coverage),
+                "criteria_met": len(review.criteria_met),
+                "criteria_unmet": len(review.criteria_unmet),
+                "stop": self.stop_condition.value,
+                "follow_ups": len(self.follow_ups),
+                "new_subagents": sum(1 for item in self.follow_ups
+                                     if item.route == "new")}
 
     @property
     def total_workers(self) -> int:
@@ -22496,6 +22632,11 @@ class FlowResult(StrictModel):
             "review_summary": self.review_summary,
             "retasks": [retask.to_dict() for retask in self.retasks],
             "retask_summary": self.retask_summary,
+            "master_reviews": [review.to_dict() for review in self.master_reviews],
+            "master_decisions": [item.to_dict() for item in self.master_decisions],
+            "follow_ups": [item.to_dict() for item in self.follow_ups],
+            "mission_review": self.review_summary_of_mission,
+            "stop_condition": self.stop_condition.value,
             "seconds": round(self.seconds, 3),
             "stage_order": self.stage_order(),
             "trace": self.trace,
@@ -22557,13 +22698,56 @@ class _MasterState(TypedDict, total=False):
     synthesis: dict[str, Any]
     stopped: bool
     stop_reason: str
+    #: §37: every review and every decision, accumulated so the result can show the
+    #: loop rather than only its last iteration.
+    reviews: Annotated[list[dict[str, Any]], operator.add]
+    decisions: Annotated[list[dict[str, Any]], operator.add]
+    rounds: Annotated[list[dict[str, Any]], operator.add]
+    #: The round the Master is on, and how many reviews it has spent.  Both are
+    #: written by the review node, never incremented by a router.
+    round: int
+    reviewed: int
+    #: What a continue decision will run next: the assignments (for the record) and
+    #: the per-Subagent work, keyed by Subagent id, the fan-out reads.
+    follow_ups: Annotated[list[dict[str, Any]], operator.add]
+    replan: list[dict[str, Any]]
+    #: What the replan node created this round: the assignments' materialisations.
+    admitted: list[dict[str, Any]]
+    replan_seconds: float
+    refusals: Annotated[list[str], operator.add]
+    #: §37: a revisit is a branch that re-enters an existing Subagent's aggregate with
+    #: one more runtime Worker, instead of starting a new unit from the plan.
+    revisit: bool
+    worker: dict[str, Any]
+
+
+def _latest_reports(reports: Sequence["SubagentOutcome"]) -> list["SubagentOutcome"]:
+    """One report per Subagent: the most recent one, in the order they first arrived.
+
+    A §37 follow-up round re-aggregates a Subagent that has already reported, and both
+    aggregates travel through the same join.  Keeping the later one is the only reading
+    that means anything: the mission has one current answer per Subagent, the earlier
+    one is history (and stays in the trace, where it is a fact about what happened
+    rather than a competing report).
+    """
+
+    order: list[str] = []
+    latest: dict[str, SubagentOutcome] = {}
+    for report in reports:
+        if report.subagent_id not in latest:
+            order.append(report.subagent_id)
+        latest[report.subagent_id] = report
+    return [latest[subagent_id] for subagent_id in order]
 
 
 def _master_state(mission_id: str, objective: str) -> dict[str, Any]:
     """The initial state of the Master graph, with every reducer key present."""
 
     return {"mission_id": mission_id, "objective": objective, "subagent": "", "wave": 0,
-            "waves": [], "reports": [], "stopped": False, "stop_reason": ""}
+            "waves": [], "reports": [], "stopped": False, "stop_reason": "",
+            "reviews": [], "decisions": [], "rounds": [], "round": 1, "reviewed": 0,
+            "follow_ups": [], "replan": [], "admitted": [], "replan_seconds": 0.0,
+            "refusals": [], "revisit": False, "worker": {}}
 
 
 def _runtime_worker_in(state: Mapping[str, Any], subagent: "FlowSubagent") -> "FlowWorker | None":
@@ -22756,6 +22940,35 @@ class HierarchicalFlow:
         #: every one it created — the report carries these, and the cap counts them.
         self._runtime_spawned: dict[str, int] = {}
         self._runtime_records: dict[str, list[RuntimeSpawnRecord]] = {}
+        #: §37: every review the Master made, and the round it was on when it made it.
+        #: The reviews are the record; the result's rounds are assembled from them in
+        #: :meth:`master_rounds`, so the loop's history cannot be rewritten after it ran.
+        self._master_reviews: list[MasterReview] = []
+        self._master_decisions: list[MasterDecision] = []
+        #: Evidence count before each round's follow-up work and after it, so the
+        #: saturation question is answerable from the record rather than re-derived.
+        self._round_evidence: list[tuple[int, int]] = []
+        self._review_round = 1
+        self._reviews_used = 0
+        #: The normalised claims the previous round saw, for the saturation test.
+        #: ``None`` before the first review, which is how the first round is exempt.
+        self._last_claims: set[str] | None = None
+        #: Follow-up assignments this mission opened, in the order it opened them.
+        self._follow_ups: list[FollowUpAssignment] = []
+        #: What each follow-up round created, so the result can name it.
+        self._follow_up_rounds: list[dict[str, Any]] = []
+        #: Follow-up Workers the Master directed at each Subagent, counted against
+        #: ``max_follow_up_workers_per_subagent`` rather than the Subagent's own seats.
+        self._follow_up_workers: dict[str, int] = {}
+        #: Every reason a follow-up round could not create something it planned.
+        self._replan_refusals: list[str] = []
+        #: Units whose Master licence seat was already spent by the replan node, so the
+        #: branch node does not spend a second one for the same Subagent.
+        self._licensed: set[str] = set()
+        #: The most recent aggregate per Subagent.  A follow-up round re-aggregates a
+        #: Subagent, and the new report *replaces* the earlier one rather than standing
+        #: beside it: the mission has one current answer per Subagent.
+        self._latest: dict[str, SubagentOutcome] = {}
 
     def _limits_for_run(self) -> ResourceLimits:
         """The mission's limits, derived from the policy when none were given."""
@@ -22826,8 +23039,8 @@ class HierarchicalFlow:
         """
 
         if self._top_graph is None:
-            return sorted(["master-plan", "master-review", "master-synthesize",
-                           "master-subagent"])
+            return sorted(["master-plan", "master-replan", "master-review",
+                           "master-synthesize", "master-subagent"])
         return sorted(str(node) for node in self._top_graph.get_graph().nodes
                       if not str(node).startswith("__"))
 
@@ -22986,16 +23199,31 @@ class HierarchicalFlow:
         master.add_node(FlowStage.PLAN.value, self._node_master_plan)
         master.add_node("master-subagent", self._node_master_subagent)
         master.add_node(FlowStage.MASTER_REVIEW.value, self._node_master_review)
+        master.add_node(FlowStage.MASTER_REPLAN.value, self._node_master_replan)
         master.add_node(FlowStage.MASTER_SYNTHESIZE.value, self._node_master_synthesize)
         master.add_edge(START, FlowStage.PLAN.value)
         master.add_conditional_edges(FlowStage.PLAN.value, self._subagent_sends,
                                      ["master-subagent"])
-        # The join: every Subagent branch arrives here, so this node runs once.
+        # The join: every Subagent branch arrives here, so this node runs once per
+        # round.  The branch node is also the join for §37: a follow-up branch lands
+        # here too, so the next review sees the work it asked for.
         master.add_edge("master-subagent", FlowStage.MASTER_REVIEW.value)
-        # A mission with a blocking failure stops here: it produces no aggregate
-        # at all rather than a synthesis built on work that never arrived.
-        master.add_conditional_edges(FlowStage.MASTER_REVIEW.value, self._after_master_review,
-                                     [FlowStage.MASTER_SYNTHESIZE.value, END])
+        # §37: review → (synthesise | replan); replan → another round of branches.
+        # The loop is bounded by FlowPolicy (rounds, reviews, licences, deadline) and
+        # by saturation, all of which the decision already read — the router below only
+        # reads the decision it was handed, exactly as §36's router reads its record.
+        master.add_conditional_edges(FlowStage.MASTER_REVIEW.value,
+                                     self._after_master_review,
+                                     [FlowStage.MASTER_SYNTHESIZE.value,
+                                      FlowStage.MASTER_REPLAN.value, END])
+        master.add_conditional_edges(FlowStage.MASTER_REPLAN.value,
+                                     self._after_master_replan,
+                                     ["master-subagent", FlowStage.MASTER_REVIEW.value,
+                                      FlowStage.MASTER_SYNTHESIZE.value])
+        # A follow-up branch lands back on the review, so the next round reviews the
+        # work it asked for.  The review is therefore the loop's only entry point, and
+        # the only place the next round can be refused.
+
         master.add_edge(FlowStage.MASTER_SYNTHESIZE.value, END)
         self._top_graph = master.compile()
 
@@ -23153,6 +23381,12 @@ class HierarchicalFlow:
 
         subagent = self._by_id[str(state.get("subagent"))]
         wave = int(state.get("wave") or 0)
+        if state.get("revisit"):
+            # §37: an existing Subagent re-enters its own graph with one more Worker.
+            # It takes the same gate and the same slot as a planned unit — a follow-up
+            # is not a way around the scheduler — and returns its aggregate to the same
+            # join, so the next review sees a report for this Subagent exactly once.
+            return self._admit_revisit(subagent, state)
         gate = self._wait_for(subagent.id, subagent.depends_on, parent="master",
                               stage=FlowStage.SUBAGENT)
         if gate is not FlowGate.NONE:
@@ -23160,8 +23394,10 @@ class HierarchicalFlow:
             self._settled["master"].add(subagent.id)
             return {"reports": [json.loads(model_to_json(report))]}
 
-        # A Subagent may only exist because the Master's licence allows it.
-        if not self.from_specs:
+        # A Subagent may only exist because the Master's licence allows it.  A unit the
+        # replan node created already spent that seat, so re-spending it here would
+        # charge the mission twice for one Subagent.
+        if not self.from_specs and subagent.id not in self._licensed:
             try:
                 self.runtime.spawns.spawn("master", subagent.id, SpawnTier.SUBAGENT)
             except SpawnRefused as exc:
@@ -23279,7 +23515,12 @@ class HierarchicalFlow:
                             f"({len(outcome.evidence_ids)} evidence id(s))")
         return outcome, verdict
 
-    def _admit_subagent(self, subagent: FlowSubagent, wave: int = 0) -> dict[str, Any]:
+    def _admit_subagent(self, subagent: FlowSubagent, wave: int = 0, *,
+                        runtime: Sequence[Mapping[str, Any]] = (),
+                        round_no: int = 1,
+                        outcomes: Sequence[Mapping[str, Any]] = (),
+                        worker_payloads: Sequence[Mapping[str, Any]] = (),
+                        spawned: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any]:
         """Run one Subagent's graph while holding a Subagent slot.
 
         A Subagent whose aggregate is already on record does not compile-run at
@@ -23309,7 +23550,17 @@ class HierarchicalFlow:
             # the workers that settle it run on other threads and their parent is
             # this Subagent.
             self._settled[subagent.id] = set()
-            payload = {**_subagent_state(), "subagent": subagent.id, "wave": wave}
+            payload = {**_subagent_state(), "subagent": subagent.id, "wave": wave,
+                       # §37: a revisit carries the round it belongs to and the plan it
+                       # runs, so the Subagent's own plan node takes its runtime path.
+                       "runtime": [dict(item) for item in runtime],
+                       "runtime_workers": [dict(item) for item in worker_payloads],
+                       "outcomes": [dict(item) for item in outcomes],
+                       # §36's per-Subagent cap counts every runtime Worker the Subagent
+                       # has ever created, so a revisit has to carry the record forward:
+                       # a follow-up must not look like the first extra Worker.
+                       "spawned": [dict(item) for item in spawned],
+                       "round": max(round_no, 2) if runtime else round_no}
             result = self._subagent_graph.invoke(payload)
         report = result.get("report")
         if report is None:                    # pragma: no cover - the graph always aggregates
@@ -23317,6 +23568,7 @@ class HierarchicalFlow:
                 stage=f"subagent:{subagent.role}",
                 expected=[worker.id for worker in subagent.workers], received=[],
                 missing=[worker.id for worker in subagent.workers]))
+        self._latest[subagent.id] = SubagentOutcome.model_validate(report)
         return {"reports": [dict(report)]}
 
     def _gated_report(self, subagent: FlowSubagent, gate: FlowGate) -> SubagentOutcome:
@@ -23364,10 +23616,16 @@ class HierarchicalFlow:
         runtime = [RuntimePlan.model_validate(item) for item in state.get("runtime") or []]
         if runtime:
             # A second round: the set of Workers for *this* round is exactly the ones
-            # the aggregate planned, so the fan-out below creates only those.
+            # the aggregate planned, so the fan-out below creates only those.  §37 hands
+            # a revisit its Worker already materialised — the replan node created it and
+            # spent the licence against it — so that Worker is used as it stands rather
+            # than rebuilt: two builds of one plan would be two ids and one seat.
             planned = list(runtime)
-            workers = [runtime_worker_from_plan(plan, index=round_no, subagent=subagent)
-                       for plan in planned]
+            materialised = [FlowWorker.model_validate(item)
+                            for item in state.get("runtime_workers") or []]
+            workers = materialised or [
+                runtime_worker_from_plan(plan, index=round_no, subagent=subagent)
+                for plan in planned]
             self._record(FlowStage.SUBAGENT, unit=subagent.id, parent="master",
                          wave=0, detail=f"round {round_no}: {len(workers)} runtime "
                                         f"worker(s) for unmet criteria")
@@ -23599,6 +23857,57 @@ class HierarchicalFlow:
         """Every Worker result this run reviewed, with its verdict."""
 
         return review_ledger(self._reviews)
+
+    def master_reviews(self) -> list[MasterReview]:
+        """Every review the Master made, in the order it made them (§37)."""
+
+        return list(self._master_reviews)
+
+    def master_decisions(self) -> list[MasterDecision]:
+        """Every decision that followed a review, in order (§37).
+
+        Stored beside the reviews rather than recomputed: a decision that was made
+        under a budget the run has since spent would not recompute to the same answer,
+        and the mission's own record of *why it stopped* must not change after it
+        stopped.
+        """
+
+        return list(self._master_decisions)
+
+    def follow_ups(self) -> list[FollowUpAssignment]:
+        """Every follow-up assignment this mission opened (§37)."""
+
+        return list(self._follow_ups)
+
+    def master_rounds(self) -> list[ReplanRound]:
+        """The loop as it happened: one record per review, with its evidence counts.
+
+        A round is assembled from the artefacts that already exist — the review, the
+        decision, and the report set at the time — so the history cannot be rewritten
+        after the run.  ``added`` is what makes saturation checkable by a reader: a
+        round that added nothing is visible as a zero, not as an assertion.
+        """
+
+        rounds: list[ReplanRound] = []
+        for index, review in enumerate(self._master_reviews):
+            if index >= len(self._master_decisions):   # pragma: no cover - one each
+                continue
+            decision = self._master_decisions[index]
+            before, after = (self._round_evidence[index]
+                             if index < len(self._round_evidence) else (0, 0))
+            # What the round *made*, from the replan record — not what it planned.  An
+            # assignment the licence or the specification gates refused created nothing,
+            # and a record that counted it would claim work the mission never did.
+            # A decision made at review N opens round N+1, and the replan node records
+            # what it made under that round number — so the pairing is N → N+1.
+            made = next((item for item in self._follow_up_rounds
+                         if item["round"] == review.round + 1), {})
+            rounds.append(ReplanRound(
+                round=review.round, review=review, decision=decision,
+                evidence_before=before, evidence_after=after,
+                created=[str(value) for value in made.get("created") or []],
+                revisited=[str(value) for value in made.get("revisited") or []]))
+        return rounds
 
     def retasks(self) -> list[RetaskedWorker]:
         """Every retask this run issued, in the order it was issued (§35)."""
@@ -24293,15 +24602,27 @@ class HierarchicalFlow:
     # -- 6. the Master's join and the final synthesis -------------------------
 
     def _node_master_review(self, state: Mapping[str, Any]) -> dict[str, Any]:
-        """Check the mission's join, then decide whether to synthesise at all."""
+        """Check the mission's join, review every report, and decide what happens next.
 
-        reports = [SubagentOutcome.model_validate(item) for item in state.get("reports") or []]
+        One node does both because they are one judgement: a review that could not see
+        the join would be reviewing a report set it had not established was complete,
+        and §36's whole discipline is that the join comes first.  The node writes
+        ``reviewed`` and ``round`` itself rather than letting a router count, so the
+        numbers the decision was made with are the numbers on the record.
+        """
+
+        reports = _latest_reports(
+            [SubagentOutcome.model_validate(item) for item in state.get("reports") or []])
         barrier = check_join("master-review",
                              [subagent.id for subagent in self.subagents],
                              [report.subagent_id for report in reports])
         blocking = [report for report in reports if report.blocking]
-        cancelled = self.runtime.cancelled
+        cancelled = self._cancelled()
         stopped = bool(self.policy.stop_on_blocking_failure and blocking) or cancelled
+        rounds_done = int(state.get("round") or 1)
+        reviews_used = int(state.get("reviewed") or 0) + 1
+        self._review_round = rounds_done
+        self._reviews_used = reviews_used
         self._record(FlowStage.MASTER_REVIEW,
                      detail=f"{barrier.describe()}; {len(blocking)} blocking report(s)"
                             + ("" if not stopped else " — stopping before synthesis"))
@@ -24309,24 +24630,442 @@ class HierarchicalFlow:
             # A cancelled mission has no aggregate to give: synthesising from the
             # units that happened to finish would present a partial answer as the
             # mission's answer.
-            return {"stopped": True,
+            return {"stopped": True, "reviewed": reviews_used, "round": rounds_done,
                     "stop_reason": "cancelled: " + (self.runtime.token.reason or "operator")}
-        return {"stopped": stopped,
-                "stop_reason": ("" if not stopped else
-                                "blocking subagent failure: "
-                                + ", ".join(report.role for report in blocking[:3]))}
+        if stopped:
+            # §37's blocking stop is the same rule §34 already had, kept because a
+            # mission configured to refuse a synthesis over a failure must not let a
+            # follow-up round quietly become the synthesis.
+            self._record(FlowStage.MASTER_REVIEW,
+                         detail="no follow-up round: a blocking subagent failure stands")
+            return {"stopped": True, "reviewed": reviews_used, "round": rounds_done,
+                    "stop_reason": ("blocking subagent failure: "
+                                    + ", ".join(report.role for report in blocking[:3]))}
+
+        # 1. every lens, over every report, with the mission's own criteria as data.
+        ordered = [next(report for report in reports if report.subagent_id == subagent.id)
+                   for subagent in self.subagents]
+        questions = [question for subagent in self.subagents
+                     for question in subagent.addresses_questions]
+        mission_evidence = [item for report in ordered for item in report.evidence]
+        # §36.3's four mechanical rules, applied to the whole mission's evidence.  A
+        # mission criterion is not the union of the Subagents' criteria: "the image
+        # integrity is proven" is a fact about every artefact the mission touched, and
+        # only the mission level can judge it.  Reusing the rules is the point — a
+        # second, looser judge would make `final` a matter of opinion.
+        mission_checks = assess_criteria(
+            list(self.context.completion_criteria), evidence=mission_evidence,
+            reports=[report for item in ordered
+                     for report in (_report_of(outcome) for outcome in item.outcomes)
+                     if report is not None],
+            scope=self.context.scope_entries,
+            gaps=[gap for report in ordered for gap in report.gaps],
+            questions=questions)
+        review = review_reports(
+            ordered, objective=self.context.objective, questions=questions,
+            criteria=list(self.context.completion_criteria),
+            scope_entries=self.context.scope_entries,
+            round_number=rounds_done,
+            evidence_ids=[item.id for item in mission_evidence],
+            mission_checks=mission_checks)
+        review = review.model_copy(update={"barrier": barrier})
+        self._master_reviews.append(review)
+        # Close the previous round's count: the evidence *this* review sees is what the
+        # last round added, and storing it here is what makes `added` a measured number
+        # rather than a claim the report makes about itself.
+        if self._round_evidence:
+            before, _ = self._round_evidence[-1]
+            self._round_evidence[-1] = (before, len(review.evidence_ids))
+        self._round_evidence.append((len(review.evidence_ids), len(review.evidence_ids)))
+
+        # 2. what the next round would do, chosen before the decision so the decision
+        #    can refuse it for a bound it can see.
+        seats = self._master_seats()
+        assignments = (plan_follow_ups(
+            review, reports=ordered, subagents=self.subagents, policy=self.policy,
+            round_number=rounds_done + 1, licence_remaining=seats) 
+            if not stopped else [])
+        # Saturation is measured in *substance*, not in ids: §36 and §37 both create new
+        # evidence rows by giving a Worker a new objective, so an id-only test would
+        # never see a round that added nothing new to think about.  Two rows are the same
+        # contribution when their statements normalise to the same claim (§36.2's rule).
+        claims = {_claim_key(item.statement)
+                  for report in ordered for item in report.evidence}
+        added = (len(claims - self._last_claims) if self._last_claims is not None
+                 else None)
+        self._last_claims = claims
+        # ``round_number`` is the round being *reviewed*, because ``max_replan_rounds``
+        # counts follow-up rounds the mission has already used: the first review is
+        # round 1 and it may still open one follow-up, which then reviews as round 2.
+        # A round that planned work and had all of it refused is a bound, not a pause:
+        # without this the loop would return to the review, plan the same assignments,
+        # and revisit the same refusal for ever.  The refusals move from the replan
+        # record onto the decision, where a reader looks for the reason a loop ended.
+        last_round = self._follow_up_rounds[-1] if self._follow_up_rounds else {}
+        blocked: list[str] = []
+        if last_round and not last_round.get("admitted") and last_round.get("refused"):
+            blocked = list(last_round.get("refusals") or [])[:3]
+        decision = decide_master(
+            review, policy=self.policy, round_number=rounds_done,
+            reviews_used=reviews_used, cancelled=False,
+            deadline_expired=self.runtime.expired(), assignments=assignments,
+            evidence_added=added, blocked=blocked)
+        self._master_decisions.append(decision)
+        self._record(FlowStage.MASTER_REVIEW, detail=decision.summary())
+        # ``stopped`` keeps its old meaning — "no aggregate will be produced" — and
+        # §37's stop is a *different* fact, recorded on the decision.  Folding them
+        # together would make a mission that finished its criteria look like one that
+        # failed, which is the one thing a bounded loop must never report.
+        update: dict[str, Any] = {
+            "reviews": [json.loads(model_to_json(review))],
+            "decisions": [json.loads(model_to_json(decision))],
+            "reviewed": reviews_used, "round": rounds_done,
+            "stopped": False, "stop_reason": "",
+        }
+        if decision.action == "continue":
+            # Nothing is created here: this round's fan-out already happened, so the
+            # node writes what the next round needs and the router sends it back.
+            update["replan"] = [json.loads(model_to_json(item))
+                                for item in decision.assignments]
+            update["follow_ups"] = [json.loads(model_to_json(item))
+                                    for item in decision.assignments]
+            update["round"] = rounds_done + 1
+        return update
 
     def _after_master_review(self, state: Mapping[str, Any]) -> str:
-        """Either synthesise, or end the mission with no aggregate at all."""
+        """Synthesise, replan, or end the mission with no aggregate at all."""
 
         _graph, _send, _command = _langgraph_primitives()
         _state_graph, _start, end = _graph
-        return end if state.get("stopped") else FlowStage.MASTER_SYNTHESIZE.value
+        if state.get("stopped"):
+            return end
+        if list(state.get("replan") or []):
+            return FlowStage.MASTER_REPLAN.value
+        return FlowStage.MASTER_SYNTHESIZE.value
+
+    def _node_master_replan(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        """Open a bounded follow-up round: create what was planned, spend what it costs.
+
+        The node does the *creation* (a licence seat, a validated draft, a registered
+        Worker grant) and the router does the *orchestration* (send the branches), for
+        the same reason §36 splits them: creation needs the ledger, and a conditional
+        edge cannot see a ledger.
+
+        Both routes are created here, and both are bounded here.  An existing Subagent's
+        follow-up is one more runtime Worker for it — planned from the finding, spent
+        against §36's per-Subagent cap *and* its licence — so an existing route is not
+        free just because it spends no Master seat.  A new Subagent spends a Master seat
+        and is validated by §22's specification gates first, so a follow-up that cannot
+        justify itself is refused by the same code that refuses a bad plan.
+
+        Nothing is created for a refusal: every branch below either produces an entry
+        the router can send to or a line in the record saying why it could not.
+        """
+
+        assignments = [FollowUpAssignment.model_validate(item)
+                       for item in state.get("replan") or []]
+        started = time.monotonic()
+        round_no = int(state.get("round") or 2)
+        admitted: list[dict[str, Any]] = []
+        refusals: list[str] = []
+        for assignment in assignments:
+            if assignment.route == "existing":
+                admitted_entry = self._follow_up_on_existing(assignment, round_no)
+            else:
+                admitted_entry = self._follow_up_new(assignment, round_no)
+            if isinstance(admitted_entry, str):
+                refusals.append(admitted_entry)
+            else:
+                admitted.append(admitted_entry)
+        self._follow_up_rounds.append({
+            "round": round_no, "admitted": len(admitted), "refused": len(refusals),
+            "created": [entry["subagent"]["id"] for entry in admitted
+                        if entry.get("kind") == "new"],
+            "revisited": [entry["subagent"]["id"] for entry in admitted
+                          if entry.get("kind") == "revisit"],
+            "refusals": list(refusals)})
+        self._record(FlowStage.MASTER_REPLAN, detail=(
+            f"round {round_no}: {len(admitted)} follow-up(s) admitted, "
+            f"{len(refusals)} refused"
+            + (f"; {refusals[0][:90]}" if refusals else "")))
+        return {"follow_ups": [], "replan": [], "admitted": admitted,
+                "replan_seconds": time.monotonic() - started,
+                "refusals": refusals}
+
+    def _follow_up_on_existing(self, assignment: FollowUpAssignment,
+                               round_no: int) -> dict[str, Any] | str:
+        """One more runtime Worker for a Subagent that is already in the mission.
+
+        Returns the entry the router fans out, or the reason it could not be made.  The
+        two ceilings are checked with the *same* function §36 uses, so a follow-up can
+        never be a way around the per-Subagent cap or the licence — it is a third
+        consumer of both, and it says which one refused it.
+        """
+
+        subagent = self._by_id.get(assignment.target_subagent)
+        if subagent is None:                     # pragma: no cover - ids come from the plan
+            return f"{assignment.target_subagent} is no longer in the mission"
+        licence = self.runtime.spawns.licence(subagent.id)
+        # The follow-up budget is the Master's, counted separately from the Subagent's
+        # own §36 seats — but the licence is shared, because a Worker is a Worker
+        # however it was decided on.
+        spent = self._follow_up_workers.get(subagent.id, 0)
+        why = self._follow_up_refusals(subagent, spent=spent, licence=licence)
+        if why:
+            return f"{subagent.role}: {'; '.join(why[:2])}"
+        plan = self._follow_up_plan(subagent, assignment, round_no)
+        if plan is None:
+            return f"{subagent.role}: the follow-up could not be planned from the finding"
+        try:
+            worker = runtime_worker_from_plan(plan, index=round_no + 1, subagent=subagent)
+        except (ValueError, TypeError) as exc:
+            return f"{subagent.role}: {str(exc)[:120]}"
+        remaining = max(0, (licence.remaining if licence is not None else 0) - 1)
+        try:
+            self.runtime.spawns.spawn(subagent.id, worker.id, SpawnTier.WORKER)
+        except SpawnRefused as exc:
+            return f"{subagent.role}: the spawn licence refused another Worker " \
+                   f"({exc.refusal.detail[:80]})"
+        self._runtime_spawned[subagent.id] = self._runtime_spawned.get(subagent.id, 0) + 1
+        self._follow_up_workers[subagent.id] = spent + 1
+        record = RuntimeSpawnRecord(subagent_id=subagent.id, worker_id=worker.id,
+                                    name=worker.name, gap=assignment.gap,
+                                    plan=plan, round=round_no + 1,
+                                    licence_remaining=remaining)
+        self._runtime_records.setdefault(subagent.id, []).append(record)
+        self._register_follow_up_worker(subagent, worker, assignment)
+        self._record(FlowStage.MASTER_REPLAN, unit=worker.id, parent=subagent.id,
+                     detail=f"follow-up Worker for the {assignment.lens.value} lens: "
+                            f"{assignment.objective[:110]}")
+        return {"kind": "revisit", "subagent": json.loads(model_to_json(subagent)),
+                "plan": json.loads(model_to_json(plan)),
+                "worker": json.loads(model_to_json(worker)),
+                "record": json.loads(model_to_json(record)),
+                "assignment": json.loads(model_to_json(assignment))}
+
+    def _follow_up_new(self, assignment: FollowUpAssignment,
+                       round_no: int) -> dict[str, Any] | str:
+        """Create a runtime Subagent for a gap nobody owns, through the licence.
+
+        The licence is spent *before* the unit is added anywhere, so a refusal leaves
+        the mission exactly as it was — no half-created Subagent, no orphaned Workers.
+        The draft is validated by §22's own checks first, which is what makes "a
+        follow-up goes through the same planning process" true rather than decorative.
+        """
+
+        try:
+            subagent = follow_up_subagent(assignment, context=self.context)
+        except (ValueError, TypeError) as exc:
+            return f"{assignment.role}: {str(exc)[:140]}"
+        draft = follow_up_draft(assignment, context=self.context)
+        validation = validate_subagent_specs(
+            [draft], self.context, existing=[item.role for item in self.subagents])
+        if not validation.ok:
+            detail = "; ".join(problem.detail for problem in validation.blocking_problems)
+            return f"{assignment.role}: refused by the specification gates ({detail[:140]})"
+        try:
+            self.runtime.spawns.spawn("master", subagent.id, SpawnTier.SUBAGENT)
+        except SpawnRefused as exc:
+            return f"{assignment.role}: the spawn ledger refused a subagent " \
+                   f"({exc.refusal.detail[:90]})"
+        self._licensed.add(subagent.id)
+        self.subagents = [*self.subagents, subagent]
+        self._by_id = {item.id: item for item in self.subagents}
+        self.runtime.register_subagent(subagent)
+        for worker in subagent.workers:
+            self.runtime.register_worker(worker, subagent)
+            if self.router is not None:
+                self.grants[worker.id] = grant_for_worker(
+                    worker, subagent, paths=self.router.paths,
+                    network=self.policy.allow_network)
+        self._follow_ups.append(assignment)
+        self._record(FlowStage.MASTER_REPLAN, unit=subagent.id, parent="master",
+                     detail=f"new subagent for the {assignment.lens.value} lens: "
+                            f"{assignment.objective[:110]}")
+        return {"kind": "new", "subagent": json.loads(model_to_json(subagent)),
+                "assignment": json.loads(model_to_json(assignment))}
+
+    def _follow_up_refusals(self, subagent: FlowSubagent, *, spent: int,
+                            licence: Any) -> list[str]:
+        """Every reason the Master may not direct another Worker at this Subagent.
+
+        Four bounds, all reported: the Master's own follow-up budget, the mission's
+        deadline, a cancellation, and the Subagent's licence — which the follow-up
+        shares with §36 because there is one ledger and one account of what a Worker
+        cost.  The Subagent's §36 budget is deliberately *not* one of them: a
+        Subagent that spent its own seats answering its own gaps has not thereby used
+        up the Master's right to answer a review.
+        """
+
+        reasons: list[str] = []
+        if self._cancelled():
+            reasons.append("the mission was cancelled")
+        if self.runtime.expired():
+            reasons.append("the mission deadline has expired")
+        if spent >= self.policy.max_follow_up_workers_per_subagent:
+            reasons.append(f"the master follow-up budget of "
+                           f"{self.policy.max_follow_up_workers_per_subagent} worker(s) "
+                           f"per subagent is spent")
+        if licence is not None and licence.remaining <= 0:
+            reasons.append("the Subagent's SpawnLedger licence is exhausted")
+        return reasons
+
+    def _follow_up_plan(self, subagent: FlowSubagent, assignment: FollowUpAssignment,
+                        round_no: int) -> RuntimePlan | None:
+        """The runtime Worker plan a follow-up assignment implies, or ``None``.
+
+        Built from the finding rather than from the Subagent's own readiness: the gap
+        here was found by the *Master*, so asking the Subagent what it thinks is
+        missing would be asking the wrong party.  The plan is still one Worker, one
+        gap, one criterion — §36.6's shape — because a follow-up that could ask for a
+        team would be a replan, and a replan is a new mission.
+        """
+
+        target = (assignment.gap or assignment.objective)[:160].strip()
+        if len(target) < 12:                      # pragma: no cover - model enforces it
+            return None
+        role = subagent.role[:48]
+        try:
+            return RuntimePlan(
+                subagent_id=subagent.id, gap=assignment.gap[:300],
+                name=f"follow-up-{content_id('flw', assignment.gap, length=6)}",
+                target=target,
+                objective=f"close the reviewed gap for {role}: "
+                          f"{assignment.lens.value} on {target[:120]}",
+                work_unit=f"{role} follow-up",
+                tools=list(assignment.tools) or _tools_for_follow_up((), [subagent]),
+                expected_evidence="at least one sourced observation addressing the gap",
+                output_schema="EvidenceSet",
+                completion_criteria=list(assignment.completion_criteria)[:1],
+                source="criterion",
+                rationale=(f"the master review's {assignment.lens.value} lens found a "
+                           f"concern inside this Subagent's assignment and it still "
+                           f"holds a runtime Worker seat"))
+        except (ValueError, TypeError):
+            return None
+
+    def _after_master_replan(self, state: Mapping[str, Any]) -> Any:
+        """Fan the follow-up work out, or go straight to synthesis if nothing was made.
+
+        A follow-up round is sent the same way the first round is: one ``Send`` per unit
+        of work, built from the branch's own state.  The difference is the payload — a
+        revisit carries the runtime Worker it is re-running and the round number, so the
+        Subagent re-enters its *own* aggregate with one more unit rather than starting
+        over.
+        """
+
+        _graph, send_cls, _command = _langgraph_primitives()
+        admitted = list(state.get("admitted") or [])
+        if not admitted:
+            # Nothing to run, but the loop is not over until a decision says so: the
+            # review gets the refusals and records the stop.  The route can only be taken
+            # once per round, because the review that follows it carries those refusals
+            # and therefore stops instead of planning the same work again.
+            if state.get("round") and int(state.get("round") or 1) > 1:
+                return FlowStage.MASTER_REVIEW.value
+            return FlowStage.MASTER_SYNTHESIZE.value
+        sends: list[Any] = []
+        for entry in admitted:
+            subagent = FlowSubagent.model_validate(entry["subagent"])
+            payload = {**_master_state(self.mission_id, self.context.objective),
+                       "subagent": subagent.id, "wave": 0}
+            if entry.get("kind") == "revisit":
+                payload.update({"revisit": True,
+                                "runtime": [entry["plan"]],
+                                "worker": entry["worker"],
+                                "round": int(state.get("round") or 2)})
+            sends.append(send_cls("master-subagent", payload))
+        return sends
+
+    # -- 7b. the follow-up round's own bookkeeping (§37) ----------------------
+
+    def _master_seats(self) -> int | None:
+        """How many new Subagents the Master may still create, if that is knowable.
+
+        ``None`` means the ledger is not enforcing a licence for this run, which is a
+        property of a caller that supplied its own units rather than a licence that is
+        infinite: ``plan_follow_ups`` treats it as "one seat at most" and the ledger
+        still refuses the creation if it disagrees.
+        """
+
+        licence = self.runtime.spawns.licence("master")
+        return None if licence is None else max(0, licence.remaining)
+
+    def _register_follow_up_worker(self, subagent: FlowSubagent, worker: FlowWorker,
+                                   assignment: FollowUpAssignment) -> None:
+        """Attach one more Worker to an existing Subagent, and make it legal everywhere.
+
+        Three registrations, because three different parts of the run have to agree:
+        the *plan* (the Subagent's worker list, so its waves and joins include it), the
+        *ledger* (a zero-sized child licence, so it cannot create anything itself), and
+        the *router* (a grant derived from its own assignment, never widened).  Skipping
+        any one of them would produce a Worker that runs but is invisible to a gate.
+        """
+
+        known = {item.id for item in subagent.workers}
+        if worker.id in known:                   # pragma: no cover - ids are derived
+            return
+        updated = subagent.model_copy(update={"workers": [*subagent.workers, worker]})
+        self._by_id[subagent.id] = updated
+        self.subagents = [updated if item.id == subagent.id else item
+                          for item in self.subagents]
+        self.runtime.register_worker(worker, updated)
+        if self.router is not None:
+            self.grants[worker.id] = grant_for_worker(
+                worker, updated, paths=self.router.paths,
+                network=self.policy.allow_network)
+        self._settled.setdefault(subagent.id, set())
+        self._follow_ups.append(assignment)
+
+    def _admit_revisit(self, subagent: FlowSubagent,
+                       state: Mapping[str, Any]) -> dict[str, Any]:
+        """Re-enter an existing Subagent's graph to run one follow-up Worker (§37).
+
+        The branch carries the plan and the Worker the replan node created, so the
+        Subagent's own ``_node_subagent_plan`` runs the round exactly as it runs a §36
+        runtime round — same fan-out, same review, same join, same aggregate.  Its
+        report replaces the earlier one at the master's join, which is what makes the
+        next review see the *current* state of that Subagent rather than a stack of
+        reports about it.
+        """
+
+        runtime = list(state.get("runtime") or [])
+        prior = self._latest.get(subagent.id)
+        # The Subagent's earlier outcomes are replayed into the branch: its aggregate
+        # requires every Worker it has ever run, and the units that settled last round
+        # are still settled.  Their reviews are already in the run's ledger, so nothing
+        # is judged twice — the branch only brings the *outcomes* forward.
+        carried = [json.loads(model_to_json(outcome))
+                   for outcome in (prior.outcomes if prior is not None else [])]
+        try:
+            admitted = self._admit_subagent(subagent, int(state.get("wave") or 0),
+                                            runtime=runtime,
+                                            round_no=int(state.get("round") or 2),
+                                            outcomes=carried,
+                                            worker_payloads=[state.get("worker") or {}],
+                                            spawned=[json.loads(model_to_json(record))
+                                                     for record in
+                                                     self._runtime_records.get(subagent.id, ())])
+        except (QueueTimeout, BudgetExceeded) as exc:
+            self._record(FlowStage.DEFERRED, unit=subagent.id, parent="master",
+                         detail=f"follow-up deferred: {redact_text(str(exc))[:100]}")
+            return {"reports": []}
+        except CancellationRequested as exc:
+            self._record(FlowStage.DEFERRED, unit=subagent.id, parent="master",
+                         detail=f"follow-up cancelled: {redact_text(str(exc))[:100]}")
+            return {"reports": []}
+        # One row per branch, and the round is on it: a branch that ran a follow-up is
+        # distinguishable from the branch that ran the plan.
+        self._record(FlowStage.MASTER_REPLAN, unit=subagent.id, parent="master",
+                     detail=f"round {int(state.get('round') or 2)}: follow-up Worker ran "
+                            f"and re-aggregated")
+        return admitted
 
     def _node_master_synthesize(self, state: Mapping[str, Any]) -> dict[str, Any]:
         """The final join: synthesise only once every Subagent has reported."""
 
-        reports = [SubagentOutcome.model_validate(item) for item in state.get("reports") or []]
+        reports = _latest_reports(
+            [SubagentOutcome.model_validate(item) for item in state.get("reports") or []])
         # Raises PrematureAggregate rather than producing a partial answer.
         barrier = check_join("master-synthesize",
                              [subagent.id for subagent in self.subagents],
@@ -24398,6 +25137,9 @@ class HierarchicalFlow:
             browser=browser_summary,
             reviews=self.review_ledger(),
             retasks=self.retasks(),
+            master_reviews=self.master_reviews(),
+            master_decisions=self.master_decisions(),
+            follow_ups=self.follow_ups(),
             research={"workers": len(self._research),
                       "audits": {worker_id: audit["audit"]
                                  for worker_id, audit in self._research.items()},
@@ -24606,8 +25348,9 @@ def run_flow_self_test(console: "Console | None" = None) -> list[FlowCheck]:
     flow = HierarchicalFlow(context=context, subagents=units)
     structures = flow.structures()
     add("the master graph has one node per stage, not per role",
-        structures["master"] == ["master-plan", "master-review", "master-subagent",
-                                 "master-synthesize"], structures["master"])
+        structures["master"] == ["master-plan", "master-replan", "master-review",
+                                 "master-subagent", "master-synthesize"],
+        structures["master"])
     add("the subagent graph has one node per worker stage",
         structures["subagent"] == ["subagent", "subagent-aggregate", "worker-task"],
         structures["subagent"])
@@ -26676,7 +27419,10 @@ def interrupt_then_resume(root: Path, *, limit: int = 2) -> tuple[
     crasher = _SparkRunner(scope=context.scope_entries, limit=limit)
     # Runtime Workers off: this fixture is about resuming a fixed plan, and a Subagent
     # that plans one more Worker (§36) changes which units the resume has to repeat.
-    fixed_plan = FlowPolicy(allow_runtime_workers=False)
+    # The plan is fixed: no §36 runtime Workers and no §37 follow-ups, so "every unit
+    # re-runs" and "the evidence matches the archive" mean exactly what they say.
+    fixed_plan = FlowPolicy(allow_runtime_workers=False, allow_follow_ups=False,
+                            max_replan_rounds=0)
     flow = HierarchicalFlow(context=context, subagents=units, runner=crasher,
                             policy=fixed_plan,
                             runtime=ConcurrencyRuntime(ResourceLimits(
@@ -26710,7 +27456,10 @@ def run_resume_self_test() -> list[ResumeCheck]:
     checks: list[ResumeCheck] = []
     # The resumption fixture is a fixed plan: a Subagent that plans one more Worker (§36)
     # would change which units the resume has to repeat, which is a different question.
-    fixed_plan = FlowPolicy(allow_runtime_workers=False)
+    # The plan is fixed: no §36 runtime Workers and no §37 follow-ups, so "every unit
+    # re-runs" and "the evidence matches the archive" mean exactly what they say.
+    fixed_plan = FlowPolicy(allow_runtime_workers=False, allow_follow_ups=False,
+                            max_replan_rounds=0)
 
     def add(name: str, ok: bool, detail: Any = "") -> None:
         checks.append(ResumeCheck(name=name, ok=bool(ok), detail=str(detail)[:150]))
@@ -47965,7 +48714,2025 @@ def run_aggregate_self_test() -> list[AggregateCheck]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 37. Entry point
+# 37. Master review and bounded replanning: a mission that knows when to stop
+# --------------------------------------------------------------------------
+#
+# §36 gave a Subagent the right to plan one more Worker for its *own* gaps.  This
+# section gives the Master the same right over the mission — and, more importantly,
+# the obligation to refuse it.  After every Subagent has reported the Master asks
+# five questions of each report: is it about this mission (relevance), can it carry
+# its claims (sufficiency), does it contradict another report (contradictions), does
+# it repeat one (duplication), and what does nobody cover (coverage).  Those five
+# answers become a bounded follow-up assignment — to an existing Subagent, or to a
+# new runtime Subagent that goes through the same specification gates as the planned
+# ones (§22, §23).
+#
+# The acceptance clause is not "the Master may replan".  It is *the system cannot
+# loop indefinitely and always reaches a final or partial report*.  So the loop is
+# bounded in five independent places, and every one of them is on the record:
+#
+# 1.  **A round cap.**  ``FlowPolicy.max_replan_rounds`` (default 1) limits how many
+#     follow-up rounds a mission may open at all.  The cap is a *policy* number, not
+#     a recursion limit: the graph's own limit is left free, so the bound is one a
+#     reader can point at in the result rather than one that arrives as an exception.
+# 2.  **A review budget.**  ``FlowPolicy.max_master_reviews`` (default 3) limits how
+#     many times the Master may review in one mission.  Round cap and review budget
+#     are deliberately two numbers: with ``max_replan_rounds=0`` the mission still
+#     reviews once, which is what makes "review without replanning" a real mode.
+# 3.  **A spawn licence.**  A new runtime Subagent costs a seat out of the Master's
+#     :class:`SpawnLedger` licence, which cannot be topped up.  A follow-up to an
+#     existing Subagent costs nothing from that licence — but it still has to fit in
+#     that Subagent's own runtime Worker budget (§36), so neither route is free.
+# 4.  **The mission deadline.**  An expired deadline refuses the next round, and the
+#     partial report says so instead of starting work it cannot finish.
+# 5.  **Saturation.**  A round that collects no new evidence (nothing the mission did
+#     not already hold) ends the loop even if every other bound still has room: more
+#     identical work is not more evidence, and "we could look again" is not a reason
+#     to.
+#
+# Every refusal is *recorded*, not merely obeyed.  A ``MasterDecision`` that says
+# `stop` carries the whole list — round cap, licence, deadline, saturation — so the
+# final report can explain why it stopped asking rather than leaving the reader to
+# guess.  That is the same discipline §36 applied to a Subagent's readiness, one
+# level up.
+
+
+class StopCondition(str, Enum):
+    """Why the Master stopped asking for more work.
+
+    The five conditions are the task's own list, and drawing a *complete* boundary
+    around them is what makes the loop analysable: a mission that finished has
+    exactly one of these on its record, and every one of them is either a success
+    (the work is done, or further work is provably useless) or a bound the operator
+    set.  ``NONE`` exists for the single review a stopped mission never reaches —
+    it is never the reason a loop ended, because a loop that never ran did not end.
+    """
+
+    NONE = "none"                  # no stop: the loop is still running
+    COMPLETE = "complete"          # every mission completion criterion is met
+    SATURATION = "saturation"      # another round added no new evidence
+    BUDGET = "budget"              # the round cap or the review budget is spent
+    DEADLINE = "deadline"          # the mission deadline has expired
+    BLOCKED = "blocked"            # the remaining work cannot be done at all
+
+    @property
+    def is_success(self) -> bool:
+        """Whether stopping here means the mission actually finished its work."""
+
+        return self in {StopCondition.COMPLETE, StopCondition.SATURATION}
+
+    @property
+    def explains_itself(self) -> bool:
+        """Every condition except ``NONE`` is a bound the record can describe."""
+
+        return self is not StopCondition.NONE
+
+
+class ReviewLens(str, Enum):
+    """The five questions the Master asks of every Subagent report.
+
+    These are lenses, not scores: each one produces at most one finding per report,
+    with the evidence it looked at and the remedy it implies.  A lens that found
+    nothing says so, because "the Master looked and had no complaint" is a different
+    fact from "the Master did not look" — and only the first one belongs in a report.
+    """
+
+    RELEVANCE = "relevance"            # is this about the mission at all?
+    SUFFICIENCY = "sufficiency"        # can this report carry its claims?
+    CONTRADICTIONS = "contradictions"  # does it disagree with another report?
+    DUPLICATION = "duplication"        # does it repeat work already done?
+    COVERAGE = "coverage"              # what does nobody cover?
+
+
+class LensVerdict(str, Enum):
+    """What one lens concluded about one report.
+
+    ``SATISFIED`` and ``CONCERNS`` are the two ordinary outcomes; ``NOT_APPLICABLE``
+    is for a lens with nothing to judge (a report that collected no evidence cannot
+    duplicate anything).  Keeping the third case explicit is what stops the review
+    from quietly treating "no data" as "no problem".
+    """
+
+    SATISFIED = "satisfied"
+    CONCERNS = "concerns"
+    NOT_APPLICABLE = "not-applicable"
+
+
+class MasterLensFinding(StrictModel):
+    """One lens's conclusion about one report, with what a remedy would target.
+
+    ``target`` is the part of the report the finding is about — a claim, a question,
+    a role — and it is what a follow-up assignment points at.  A finding with no
+    target is a complaint the Master cannot act on, so the model refuses one.
+    """
+
+    lens: ReviewLens
+    verdict: LensVerdict = LensVerdict.SATISFIED
+    #: What the lens looked at, kept so a reader can reproduce the judgement.
+    checked: str = ""
+    target: str = ""
+    detail: str = ""
+    #: The evidence ids the finding rests on, when it rests on evidence.
+    evidence_ids: list[str] = Field(default_factory=list)
+    #: Whether a follow-up assignment would be a remedy.  A lens may find a concern
+    #: that no further work can fix (a source that does not exist), and saying so is
+    #: the difference between a plan and a wish.
+    actionable: bool = False
+    remedy: str = ""
+
+    @model_validator(mode="after")
+    def _consistent(self) -> "MasterLensFinding":
+        if self.verdict is LensVerdict.SATISFIED and (self.detail or self.target):
+            raise ValueError("a satisfied lens has nothing to complain about, so it "
+                             "names no target and no detail")
+        if self.verdict is LensVerdict.CONCERNS:
+            if len(self.detail.strip()) < 12:
+                raise ValueError("a concern must say what is wrong, in a sentence a "
+                                 "reader can check")
+            if not self.target.strip():
+                raise ValueError("a concern must name the target a remedy would act on")
+        if self.actionable and not self.remedy.strip():
+            raise ValueError("an actionable finding must say what would remedy it")
+        if self.verdict is LensVerdict.NOT_APPLICABLE and self.actionable:
+            raise ValueError("a lens with nothing to judge has nothing to remedy")
+        return self
+
+    @property
+    def concerning(self) -> bool:
+        return self.verdict is LensVerdict.CONCERNS
+
+    def describe(self) -> str:
+        if self.verdict is LensVerdict.SATISFIED:
+            return f"{self.lens.value}: satisfied — {self.checked[:120]}"
+        if self.verdict is LensVerdict.NOT_APPLICABLE:
+            return f"{self.lens.value}: not applicable — {self.checked[:120]}"
+        tail = f" → {self.remedy[:100]}" if self.actionable else " (no remedy available)"
+        return f"{self.lens.value}: {self.detail[:140]}{tail}"
+
+
+class ReportReview(StrictModel):
+    """One Subagent report, judged on all five lenses.
+
+    The record is deliberately per-report rather than per-lens-over-the-mission:
+    a concern belongs to the report it is about, so the follow-up it justifies has
+    an owner.  Mission-wide coverage gaps are the one exception, and they are
+    attached to the report whose scope they fall nearest to — with ``covers_all``
+    set when the gap is nobody's in particular.
+    """
+
+    subagent_id: str = Field(min_length=1)
+    role: str = ""
+    status: EntityStatus = EntityStatus.SUCCEEDED
+    findings: list[MasterLensFinding] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _all_five_lenses(self) -> "ReportReview":
+        seen = [finding.lens for finding in self.findings]
+        missing = [lens.value for lens in ReviewLens if lens not in seen]
+        if missing:
+            raise ValueError(f"a report review answers all five lenses; missing "
+                             f"{', '.join(missing)}")
+        if len(seen) != len(set(seen)):
+            raise ValueError("a report review answers each lens once")
+        return self
+
+    def finding(self, lens: ReviewLens) -> MasterLensFinding:
+        return next(item for item in self.findings if item.lens is lens)
+
+    @property
+    def concerns(self) -> list[MasterLensFinding]:
+        return [item for item in self.findings if item.concerning]
+
+    @property
+    def actionable(self) -> list[MasterLensFinding]:
+        return [item for item in self.concerns if item.actionable]
+
+    @property
+    def satisfied(self) -> bool:
+        return not self.concerns
+
+    def summary(self) -> str:
+        if self.satisfied:
+            return f"{self.role or self.subagent_id}: all five lenses satisfied"
+        names = ", ".join(finding.lens.value for finding in self.concerns)
+        return (f"{self.role or self.subagent_id}: {len(self.concerns)} concern(s) "
+                f"({names}); {len(self.actionable)} actionable")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"subagent_id": self.subagent_id, "role": self.role,
+                "status": self.status.value,
+                "findings": [{"lens": finding.lens.value,
+                              "verdict": finding.verdict.value,
+                              "target": finding.target, "detail": finding.detail,
+                              "checked": finding.checked,
+                              "evidence_ids": list(finding.evidence_ids),
+                              "actionable": finding.actionable,
+                              "remedy": finding.remedy}
+                             for finding in self.findings],
+                "concerns": len(self.concerns), "actionable": len(self.actionable),
+                "summary": self.summary()}
+
+
+class CoverageGap(StrictModel):
+    """A question or criterion no report answers, and how it was established.
+
+    A gap is only worth a follow-up if it is *checkable*: ``checked_by`` names the
+    rule that decided it, so the Master cannot open a round on a hunch.  ``owner``
+    is the report nearest the gap when one exists, which is what makes a follow-up
+    to an existing Subagent possible instead of always creating a new one.
+    """
+
+    target: str = Field(min_length=1)
+    #: ``question``, ``criterion`` or ``objective``.
+    kind: str = Field(default="question", pattern="^(question|criterion|objective)$")
+    #: The role whose report should have covered it, when one should have.
+    owner: str = ""
+    checked_by: str = ""
+    detail: str = ""
+
+    @property
+    def owned(self) -> bool:
+        return bool(self.owner.strip())
+
+    def describe(self) -> str:
+        where = f" (nearest: {self.owner})" if self.owned else " (unassigned)"
+        return f"{self.kind}: {self.target[:160]}{where}"
+
+
+class FollowUpAssignment(StrictModel):
+    """One bounded piece of extra work, addressed to somebody specific.
+
+    The task allows two routes and this model is both of them: ``EXISTING`` means
+    the assignment goes to a Subagent the mission already has (it plans one more
+    Worker for the gap, through §36's gates), and ``NEW`` means the Master spends a
+    licence seat on a Subagent that did not exist.  ``route`` is a field rather than
+    an inference so the record says which bound applied: an existing Subagent's
+    runtime budget or the Master's spawn licence.
+    """
+
+    route: str = Field(pattern="^(existing|new)$")
+    target_subagent: str = ""
+    role: str = Field(min_length=3)
+    objective: str = Field(min_length=15)
+    #: The gap, quoted from the review that found it.
+    gap: str = Field(min_length=12)
+    #: Which lens justified the assignment.  A follow-up with no lens behind it is
+    #: the Master re-planning the mission, which is not what this loop is for.
+    lens: ReviewLens
+    #: What the assignment must return, in countable terms.
+    completion_criteria: list[str] = Field(min_length=1)
+    #: The tools it may use — the narrowest set the mission already holds, never a
+    #: widened grant.
+    tools: list[str] = Field(default_factory=list)
+    justification: str = Field(min_length=15)
+    #: The round this assignment belongs to, so a later round can tell whether the
+    #: gap it was created for is still open.
+    round: int = Field(default=1, ge=1)
+    #: The seat it spent, when it spent one: ``""`` for an existing Subagent.
+    licence_remaining: int | None = None
+
+    @model_validator(mode="after")
+    def _route_is_carried_through(self) -> "FollowUpAssignment":
+        if self.route == "existing" and not self.target_subagent.strip():
+            raise ValueError("a follow-up to an existing Subagent must name it")
+        if self.route == "new" and self.target_subagent.strip():
+            raise ValueError("a follow-up that creates a Subagent cannot also name an "
+                             "existing one")
+        if self.route == "existing" and self.licence_remaining is not None:
+            raise ValueError("only a new Subagent spends the Master's licence")
+        if any(word in self.objective.lower()
+               for word in ("everything", "all of the", "any remaining")):
+            raise ValueError("a follow-up closes one gap: an objective that restates "
+                             "the whole mission is a replan, not a remedy")
+        return self
+
+    def describe(self) -> str:
+        where = (f"→ {self.target_subagent}" if self.route == "existing"
+                 else "→ new subagent")
+        return (f"round {self.round} {where} for {self.lens.value}: "
+                f"{self.objective[:110]}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"route": self.route, "target_subagent": self.target_subagent,
+                "role": self.role, "objective": self.objective, "gap": self.gap,
+                "lens": self.lens.value,
+                "completion_criteria": list(self.completion_criteria),
+                "tools": list(self.tools), "justification": self.justification,
+                "round": self.round, "licence_remaining": self.licence_remaining}
+
+
+class MasterReview(StrictModel):
+    """One pass of the Master over every report it has received.
+
+    The review is the *decision input*, not the decision: it records what each lens
+    saw and what the mission still does not cover, and :func:`decide_master` turns
+    that into a stop-or-continue with every refusal listed.  Splitting them is what
+    lets the self-test hold the observations fixed and vary only the budget.
+    """
+
+    #: Which review of the mission this is: 1-based, and never renumbered.
+    round: int = Field(default=1, ge=1)
+    observations: list[ReportReview] = Field(default_factory=list)
+    #: Mission-level gaps: what no report covers.
+    coverage: list[CoverageGap] = Field(default_factory=list)
+    #: The mission criteria this review judged, and whether each was met.
+    criteria_met: list[str] = Field(default_factory=list)
+    criteria_unmet: list[str] = Field(default_factory=list)
+    #: Evidence the mission held when this review began, so the next round can
+    #: tell what it added.
+    evidence_ids: list[str] = Field(default_factory=list)
+    #: What this review waited for, as §36 does one level down.
+    barrier: JoinBarrier | None = None
+
+    @model_validator(mode="after")
+    def _one_observation_per_report(self) -> "MasterReview":
+        ids = [item.subagent_id for item in self.observations]
+        if len(ids) != len(set(ids)):
+            raise ValueError("a review observes each report once; a duplicate "
+                             "observation would double-count its evidence")
+        return self
+
+    @property
+    def concerns(self) -> list[MasterLensFinding]:
+        return [finding for item in self.observations for finding in item.concerns]
+
+    @property
+    def actionable(self) -> list[MasterLensFinding]:
+        """Concerns a follow-up could actually address, in report order."""
+
+        return [finding for item in self.observations for finding in item.actionable]
+
+    @property
+    def complete(self) -> bool:
+        """Whether the mission's own completion criteria are all met.
+
+        Vacuously true is not true: a review that judged no mission criteria has not
+        established that the mission is finished, so it has to say so rather than
+        claim a completeness it never tested.
+        """
+
+        return bool(self.criteria_met) and not self.criteria_unmet
+
+    @property
+    def open_targets(self) -> list[str]:
+        """Every gap worth another round: actionable concerns, then coverage gaps."""
+
+        targets = [f"{finding.lens.value}: {finding.target}"[:200]
+                   for finding in self.actionable]
+        targets.extend(gap.describe() for gap in self.coverage)
+        return list(dict.fromkeys(targets))
+
+    def by_satisfaction(self) -> dict[str, int]:
+        satisfied = sum(1 for item in self.observations if item.satisfied)
+        return {"satisfied": satisfied, "concerns": len(self.observations) - satisfied}
+
+    def summary(self) -> str:
+        counts = self.by_satisfaction()
+        return (f"review {self.round}: {counts['satisfied']} report(s) satisfied, "
+                f"{counts['concerns']} with concerns "
+                f"({len(self.actionable)} actionable); {len(self.coverage)} coverage "
+                f"gap(s); {len(self.criteria_unmet)} unmet criterion/criteria")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"round": self.round,
+                "observations": [item.to_dict() for item in self.observations],
+                "coverage": [gap.describe() for gap in self.coverage],
+                "criteria_met": list(self.criteria_met),
+                "criteria_unmet": list(self.criteria_unmet),
+                "evidence": len(self.evidence_ids),
+                "barrier": self.barrier.describe() if self.barrier else "not met",
+                "summary": self.summary()}
+
+
+class MasterDecision(StrictModel):
+    """Stop or continue, with every bound that had a say.
+
+    ``continue`` is only reachable when *no* bound refused the round and at least one
+    actionable gap exists.  ``refusals`` is therefore never empty on a ``stop`` that
+    was not a success: an operator who asks "why did it stop here?" gets the whole
+    list rather than the first branch that returned.
+    """
+
+    #: ``continue``, ``stop`` or ``final`` — ``final`` is a stop the Master reached
+    #: by finishing the mission's own criteria, and it is kept separate so a report
+    #: can say "done" without also having to say "and here is why I could not go on".
+    action: str = Field(pattern="^(continue|stop|final)$")
+    condition: StopCondition = StopCondition.NONE
+    round: int = Field(default=1, ge=1)
+    #: The assignments the next round would run, in priority order.  Empty on a stop.
+    assignments: list[FollowUpAssignment] = Field(default_factory=list)
+    #: Every bound that refused more work, in precedence order.
+    refusals: list[str] = Field(default_factory=list)
+    basis: str = Field(min_length=12)
+
+    @model_validator(mode="after")
+    def _consistent(self) -> "MasterDecision":
+        if self.action == "continue":
+            if not self.assignments:
+                raise ValueError("a continue decision carries the work it continues "
+                                 "with; otherwise it is a stop in disguise")
+            if self.refusals:
+                raise ValueError("a continue decision has no bound refusing it")
+            if self.condition is not StopCondition.NONE:
+                raise ValueError("continuing is not a stop condition")
+        else:
+            if self.assignments:
+                raise ValueError("a stop decision does not carry assignments: the work "
+                                 "it would have done is the refusal, not a plan")
+            if self.condition is StopCondition.NONE:
+                raise ValueError("a stop decision names the condition that stopped it")
+        if self.action == "final" and self.condition is not StopCondition.COMPLETE:
+            raise ValueError("a final decision means the completion criteria were met")
+        return self
+
+    @property
+    def stopped(self) -> bool:
+        return self.action != "continue"
+
+    @property
+    def finished(self) -> bool:
+        """Whether the mission may synthesise a complete answer."""
+
+        return self.action == "final"
+
+    def summary(self) -> str:
+        if self.action == "continue":
+            return (f"continue (round {self.round}): {len(self.assignments)} "
+                    f"assignment(s) — {self.basis[:120]}")
+        if self.action == "final":
+            return f"final: {self.basis[:140]}"
+        return (f"stop ({self.condition.value}): {self.basis[:120]}"
+                + (f" [{len(self.refusals)} refusal(s)]" if self.refusals else ""))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"action": self.action, "condition": self.condition.value,
+                "round": self.round,
+                "assignments": [item.to_dict() for item in self.assignments],
+                "refusals": list(self.refusals), "basis": self.basis,
+                "summary": self.summary()}
+
+
+class ReplanRound(StrictModel):
+    """One round of the review → decide → assign loop, as it happened.
+
+    Kept because the loop's *history* is the evidence that it was bounded: a mission
+    that opened three rounds and stopped at the cap has a record of three, and a
+    reader can check each one against the budget instead of trusting a boolean.
+    """
+
+    round: int = Field(ge=1)
+    review: MasterReview
+    decision: MasterDecision
+    #: Evidence count before and after the round, so saturation is checkable.
+    evidence_before: int = Field(default=0, ge=0)
+    evidence_after: int = Field(default=0, ge=0)
+    #: The Subagent ids this round created, and the ones it asked for more work.
+    created: list[str] = Field(default_factory=list)
+    revisited: list[str] = Field(default_factory=list)
+    seconds: float = Field(default=0.0, ge=0)
+
+    @property
+    def added(self) -> int:
+        """Net new evidence this round: the saturation signal, as a number."""
+
+        return max(0, self.evidence_after - self.evidence_before)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"round": self.round, "review": self.review.to_dict(),
+                "decision": self.decision.to_dict(),
+                "evidence_before": self.evidence_before,
+                "evidence_after": self.evidence_after, "added": self.added,
+                "created": list(self.created), "revisited": list(self.revisited),
+                "seconds": round(self.seconds, 3)}
+
+
+
+# --------------------------------------------------------------------------
+# 37.6 The demo's own check record
+# --------------------------------------------------------------------------
+
+
+class MasterReviewCheck(StrictModel):
+    """One assertion in the §37 self-test."""
+
+    name: str = Field(min_length=1)
+    ok: bool
+    detail: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "ok": self.ok, "detail": self.detail}
+
+
+
+# --------------------------------------------------------------------------
+# 37.1 The five lenses, applied to a report
+# --------------------------------------------------------------------------
+
+
+def _topic_words(text: str) -> set[str]:
+    """The content words of a statement, folded and stop-worded.
+
+    Deliberately the same fold the aggregate uses (§36.2), so "the same thing" means
+    the same thing across the two sections: a reader comparing a Subagent's
+    reconciliation with the Master's duplication lens is comparing like with like.
+
+    One difference is deliberate.  ``_claim_key`` drops hyphens, because two spellings
+    of one claim should compare equal; for *topic* matching that is wrong — an
+    objective about "advisory-backed risks" and a role called "published-advisories"
+    share a subject, and folding both to one word loses it.  Word separators are
+    therefore split before the fold here, and only here.
+    """
+
+    split = re.sub(r"[^a-z0-9]+", " ", text.lower())
+    return {word for word in _claim_key(split).split()
+            if len(word) > 3 and word not in _RELEVANCE_STOPWORDS}
+
+
+def _objective_focus(objective: str) -> set[str]:
+    """The words of the mission objective that a report must be *about*.
+
+    Two words is the threshold everywhere else in this build, and it is the right one
+    here too: a report that shares one word with the objective ("example.com") shares a
+    noun, not a subject.
+    """
+
+    return _topic_words(objective)
+
+
+def _report_statements(report: "SubagentOutcome") -> list[str]:
+    """Everything a report asserts, in the order it asserts it."""
+
+    lines = [item.statement for item in report.evidence]
+    lines.extend(outcome.summary for outcome in report.outcomes if outcome.summary)
+    return [line for line in lines if line.strip()]
+
+
+#: Phrases that make a line a *bookkeeping* record rather than a claim about the
+#: target: a count of what a Worker did, or a restatement of the assignment it was
+#: given.  Both are honest, and neither is evidence about the world, so the
+#: contradiction and duplication lenses read past them.  Without this, two Workers
+#: given different jobs look like two Workers contradicting each other about one.
+_BOOKKEEPING = re.compile(
+    r"observation\(s\) collected|the result addresses|^gapgap|^gap-", re.IGNORECASE)
+
+
+def _is_bookkeeping(line: str) -> bool:
+    """True when a statement reports what a Worker did rather than what it found."""
+
+    return bool(_BOOKKEEPING.search(_claim_key(line)[:80])) or bool(
+        _BOOKKEEPING.search(line))
+
+
+def _relevance_finding(report: "SubagentOutcome", focus: set[str],
+                       scope: set[str] | None = None) -> MasterLensFinding:
+    """Is this report about the mission, or about something adjacent to it?
+
+    "About" is judged against the report's whole record — the assignment it was given
+    and the assertions it returned — because a Worker whose own statement is narrow
+    ("every record type has a value or an unknown") is still doing mission work if its
+    assignment names the mission's subject.  A test that only read the statements would
+    call honest narrow work irrelevant, which would make the lens useless.
+
+    Three tests, in decreasing strength, and any one of them settles it:
+
+    1.  **two content words** shared with the mission objective — the same threshold
+        §36 uses for "the same subject", so the two sections agree about what "about"
+        means;
+    2.  **one objective word and one scope word** — the report names both the mission's
+        subject and its authorised target, which is specific even when the vocabulary
+        is thin;
+    3.  **two words** shared between the report's *objective* and the mission's — the
+        assignment itself is on-mission, whatever the rows came back saying.
+
+    A report with no assertions, no objective and no role is not *irrelevant*: there is
+    nothing to be relevant.  That is the sufficiency lens's problem, and this one says
+    so rather than inventing a concern.
+    """
+
+    scope = scope or set()
+    statements = _report_statements(report)
+    assignment = " ".join(part for part in (report.role, report.objective) if part)
+    if not statements and not assignment.strip():
+        return MasterLensFinding(
+            lens=ReviewLens.RELEVANCE, verdict=LensVerdict.NOT_APPLICABLE,
+            checked="the report asserts nothing and was assigned nothing, so relevance "
+                    "has no subject")
+    checked_lines = [assignment] if assignment.strip() else []
+    checked_lines.extend(line for line in statements if not _is_bookkeeping(line))
+    strong: list[str] = []
+    weak: list[str] = []
+    for line in checked_lines:
+        words = _topic_words(line)
+        if len(words & focus) >= 2:
+            strong.append(line)
+        elif len(words & focus) >= 1 and len(words & scope) >= 1:
+            weak.append(line)
+    in_scope_of_work = len(_topic_words(assignment) & focus) >= 2
+    if strong or in_scope_of_work:
+        return MasterLensFinding(
+            lens=ReviewLens.RELEVANCE, verdict=LensVerdict.SATISFIED,
+            checked=(f"{len(strong)} line(s) share two content words with the objective; "
+                     f"the assignment is on-mission: "
+                     f"{'yes' if in_scope_of_work else 'no'}"))
+    if weak:
+        return MasterLensFinding(
+            lens=ReviewLens.RELEVANCE, verdict=LensVerdict.SATISFIED,
+            checked=(f"{len(weak)} line(s) name both the mission's subject and its "
+                     f"authorised target"))
+    return MasterLensFinding(
+        lens=ReviewLens.RELEVANCE, verdict=LensVerdict.CONCERNS,
+        target=(report.role or report.subagent_id),
+        detail=("nothing it asserts and nothing it was assigned shares two content "
+                "words with the mission objective, and nothing it names is in scope"),
+        actionable=True,
+        remedy=(f"re-point {report.role or report.subagent_id} at the objective and "
+                f"re-read its own sources for what bears on it"))
+
+
+def _sufficiency_finding(report: "SubagentOutcome") -> MasterLensFinding:
+    """Can this report carry its claims: evidence, a join, and no withheld gap.
+
+    Sufficiency is not "enough evidence" in the abstract — the mission has no such
+    threshold and inventing one would make the review arbitrary.  It is three
+    checkable things: the report brought evidence, its aggregate waited for its
+    Workers, and nothing it withheld was left unexplained.
+    """
+
+    problems: list[str] = []
+    if not report.evidence:
+        problems.append("it carries no evidence at all")
+    if report.aggregate_basis is not None and not report.aggregate_basis.satisfied:
+        problems.append(f"its join was not met ({report.aggregate_basis.describe()})")
+    unexplained = [item for item in report.failed if not item.consequence.strip()]
+    if unexplained:
+        problems.append(f"{len(unexplained)} withheld unit(s) have no stated consequence")
+    if report.readiness is not None and report.readiness.missing:
+        problems.append(f"{len(report.readiness.missing)} required Worker(s) never settled")
+    if not problems:
+        return MasterLensFinding(
+            lens=ReviewLens.SUFFICIENCY, verdict=LensVerdict.SATISFIED,
+            checked=(f"{len(report.evidence)} evidence item(s), join met, "
+                     f"{len(report.withheld)} withheld unit(s) explained"),
+            evidence_ids=report.evidence_ids[:10])
+    return MasterLensFinding(
+        lens=ReviewLens.SUFFICIENCY, verdict=LensVerdict.CONCERNS,
+        target=(report.role or report.subagent_id),
+        detail=("; ".join(problems))[:300],
+        evidence_ids=report.evidence_ids[:10],
+        actionable=not report.evidence,
+        remedy=("give the report evidence to carry: one sourced observation per claim"
+                if not report.evidence else
+                "re-run the units whose work was withheld and forward what passes"))
+
+
+def _contradiction_findings(report: "SubagentOutcome",
+                            others: Sequence["SubagentOutcome"]) -> MasterLensFinding:
+    """Does this report disagree with another one — and is the disagreement visible?
+
+    The Master's job here is *not* to settle the conflict; §36 already froze it with
+    both sides and what would settle it.  The Master's job is to notice a conflict the
+    reports did not record for themselves, which is the case that would otherwise
+    reach synthesis as two flatly contradictory claims with nothing marking them.
+    """
+
+    recorded = list(report.disagreements)
+    # Worker bookkeeping ("advisory-reader: 1 observation(s) collected") differs only in
+    # the count, so a naive comparison reads two Workers doing different jobs as a
+    # disagreement about the target.  Contradictions are about the *target*, so the
+    # statements considered here are the ones that are not bookkeeping.
+    left_rows = [line for line in _report_statements(report) if not _is_bookkeeping(line)]
+    for other in others:
+        right_rows = [line for line in _report_statements(other) if not _is_bookkeeping(line)]
+        for left in left_rows:
+            for right in right_rows:
+                if not _contradicts(left, right):
+                    continue
+                if any(left[:60] == item.left_statement[:60]
+                       and right[:60] == item.right_statement[:60]
+                       for item in recorded):
+                    continue
+                return MasterLensFinding(
+                    lens=ReviewLens.CONTRADICTIONS, verdict=LensVerdict.CONCERNS,
+                    target=(report.role or report.subagent_id),
+                    detail=(f"contradicts {other.role or other.subagent_id} without "
+                            f"recording it: {left[:90]} vs {right[:90]}")[:300])
+    if recorded:
+        return MasterLensFinding(
+            lens=ReviewLens.CONTRADICTIONS, verdict=LensVerdict.SATISFIED,
+            checked=(f"{len(recorded)} disagreement(s) frozen with both sides and a "
+                     f"stated resolution path"))
+    return MasterLensFinding(
+        lens=ReviewLens.CONTRADICTIONS, verdict=LensVerdict.SATISFIED,
+        checked="no statement in this report contradicts another report")
+
+
+def _duplication_finding(report: "SubagentOutcome",
+                         others: Sequence["SubagentOutcome"]) -> MasterLensFinding:
+    """Does this report repeat another one — and was the repetition reconciled?
+
+    Two Workers finding the same record is corroboration and §36 keeps it.  Two
+    *reports* making the same claim is duplication: nothing new was learned, and the
+    mission is paying licence and time for a second opinion that is really a first
+    one.  The lens therefore measures claims that normalise to the same statement
+    across reports, and asks whether the reports noticed.
+    """
+
+    # Only substantive assertions are candidates for duplication: a bookkeeping line
+    # ("3 observation(s) collected") is about the Worker, and two Workers reporting
+    # their own counts is not the mission learning the same thing twice.
+    own = [_claim_key(line) for line in _report_statements(report)
+           if not _is_bookkeeping(line)]
+    if not own:
+        return MasterLensFinding(
+            lens=ReviewLens.DUPLICATION, verdict=LensVerdict.NOT_APPLICABLE,
+            checked="the report asserts nothing, so it duplicates nothing")
+    shared = 0
+    example = ""
+    for other in others:
+        theirs = {_claim_key(line) for line in _report_statements(other)
+                  if not _is_bookkeeping(line)}
+        hits = [key for key in own if key in theirs]
+        if hits:
+            shared += len(hits)
+            example = example or hits[0]
+    if not shared:
+        return MasterLensFinding(
+            lens=ReviewLens.DUPLICATION, verdict=LensVerdict.SATISFIED,
+            checked=f"none of its {len(own)} assertion(s) repeats another report")
+    reconciled = bool(report.reconciliation.merged)
+    if reconciled:
+        return MasterLensFinding(
+            lens=ReviewLens.DUPLICATION, verdict=LensVerdict.SATISFIED,
+            checked=(f"{shared} claim(s) repeat another report and were reconciled "
+                     f"inside the aggregate"))
+    return MasterLensFinding(
+        lens=ReviewLens.DUPLICATION, verdict=LensVerdict.CONCERNS,
+        target=(report.role or report.subagent_id),
+        detail=(f"{shared} assertion(s) restate another report and the aggregate did not "
+                f"reconcile them; e.g. {example[:120]}"),
+        actionable=False,
+        remedy="")
+
+
+def _coverage_gaps(reports: Sequence["SubagentOutcome"], *,
+                   questions: Sequence[str] = (),
+                   criteria: Sequence[str] = ()) -> list[CoverageGap]:
+    """What nobody covers: unanswered questions, then unmet mission criteria.
+
+    The test for "answered" is deliberately stingy.  A statement counts as an answer
+    when it shares subject matter with the question *and* says something the question
+    did not — otherwise a Worker whose whole finding is "the result addresses: <the
+    question>" would mark the question answered by echoing it.  That is exactly the
+    failure mode a coverage review exists to catch, so the echo guard is the point of
+    the function rather than a detail of it.
+    """
+
+    gaps: list[CoverageGap] = []
+    for question in dict.fromkeys(text.strip() for text in questions if text.strip()):
+        wanted = _topic_words(question)
+        if not wanted:
+            continue
+        owner = ""
+        answered = False
+        for report in reports:
+            for check in _report_criteria(report):
+                if check.met and len(_topic_words(check.criterion) & wanted) >= 2:
+                    answered = True
+                    break
+            if answered:
+                break
+            for statement in _report_statements(report):
+                words = _topic_words(statement)
+                if len(words & wanted) < 2:
+                    continue
+                # An echo adds nothing: if the statement's content words are a subset
+                # of the question's, it restates the question rather than answering it.
+                if not (words - wanted):
+                    continue
+                answered = True
+                break
+            if answered:
+                break
+        if answered:
+            continue
+        owner = next((report.role for report in reports
+                      if any(_topic_words(question) & wanted == _topic_words(question) & wanted
+                             for _ in report.open_questions)), "")
+        gaps.append(CoverageGap(
+            target=question, kind="question", owner=owner,
+            checked_by=("no report's met criterion or non-echoing statement shares two "
+                        "content words with it"),
+            detail="nobody answered it"))
+    for criterion in dict.fromkeys(text.strip() for text in criteria if text.strip()):
+        wanted = _topic_words(criterion)
+        met = any(check.met and (len(_topic_words(check.criterion) & wanted) >= 2
+                                 or _claim_key(check.criterion) == _claim_key(criterion))
+                  for report in reports for check in _report_criteria(report))
+        if met:
+            continue
+        gaps.append(CoverageGap(
+            target=criterion, kind="criterion", owner="",
+            checked_by="no report's criterion checks record it as met",
+            detail="the mission criterion is not satisfied by any report"))
+    return gaps
+
+
+def _report_criteria(report: "SubagentOutcome") -> list["CriterionCheck"]:
+    """The criteria checks a report carries — ``[]`` for a report that never ran."""
+
+    return list(report.criteria_checks or [])
+
+
+def review_reports(reports: Sequence["SubagentOutcome"], *,
+                   objective: str = "",
+                   questions: Sequence[str] = (),
+                   criteria: Sequence[str] = (),
+                   scope_entries: Sequence[str] = (),
+                   round_number: int = 1,
+                   evidence_ids: Sequence[str] = (),
+                   mission_checks: Sequence["CriterionCheck"] = ()) -> MasterReview:
+    """Apply all five lenses to every report, and collect what nobody covers.
+
+    Deterministic and offline, like every other judgement in this build: the Master
+    reviews the *record*, never a model's opinion of it.  A grader that can be argued
+    into a pass is not a control.
+
+    Four lenses are per-report and are applied in the loop.  The fifth — coverage — is
+    mission-wide by construction (nothing covers a gap), so it is computed once and
+    then *assigned*: a gap naming an owner lands on that report, and a gap nobody owns
+    lands on every report that could plausibly have caught it.  "Could plausibly have"
+    is decided by :func:`_nearest_owners`, which is deliberately generous: a gap with
+    no plausible owner is reported at the mission level and is nobody's concern lens.
+    """
+
+    focus = _objective_focus(objective)
+    scope = set()
+    for entry in scope_entries:
+        scope |= _topic_words(str(entry))
+    # Criteria are judged by the caller's mission-level checks when it brought them, and
+    # an unmet one is still a coverage gap — it is the deepest kind, because a mission
+    # criterion nobody met is exactly what the next round should be aimed at.  The
+    # per-report criterion list is not consulted as well: it would report the same gap
+    # once per report whose own criteria happened to read similarly.
+    gaps = _coverage_gaps(reports, questions=questions,
+                          criteria=() if mission_checks else criteria)
+    gaps.extend(CoverageGap(
+        target=check.criterion, kind="criterion",
+        checked_by="the mission-level criterion check did not pass",
+        detail=(check.shortfall or "no report's evidence satisfies it")[:240])
+        for check in mission_checks if not check.met)
+    owners = _nearest_owners(gaps, reports)
+    observations: list[ReportReview] = []
+    for report in reports:
+        others = [other for other in reports if other.subagent_id != report.subagent_id]
+        mine = [gap for gap in gaps if report.subagent_id in owners.get(id(gap), ())
+                or gap.owner.strip().lower() == report.role.strip().lower()]
+        if mine:
+            coverage = MasterLensFinding(
+                lens=ReviewLens.COVERAGE, verdict=LensVerdict.CONCERNS,
+                target=mine[0].target[:200],
+                detail=("nobody covers: "
+                        + "; ".join(gap.target[:120] for gap in mine))[:300],
+                actionable=True,
+                remedy=(f"a bounded follow-up for this report, aimed at "
+                        f"{mine[0].target[:110]}"))
+        elif gaps:
+            coverage = MasterLensFinding(
+                lens=ReviewLens.COVERAGE, verdict=LensVerdict.SATISFIED,
+                checked="the mission-level gap(s) fall to another report")
+        else:
+            coverage = MasterLensFinding(
+                lens=ReviewLens.COVERAGE, verdict=LensVerdict.SATISFIED,
+                checked="every mission question is answered by some report")
+        observations.append(ReportReview(
+            subagent_id=report.subagent_id, role=report.role, status=report.status,
+            findings=[
+                _relevance_finding(report, focus, scope),
+                _sufficiency_finding(report),
+                _contradiction_findings(report, others),
+                _duplication_finding(report, others),
+                coverage,
+            ]))
+    # Mission criteria are judged by the caller's own mechanical checks when it has
+    # them: §36.3's four rules applied to the *whole* mission's evidence, which is the
+    # only level at which a mission criterion ("the image integrity is proven") can be
+    # answered.  Without checks the criteria are simply unjudged, and an unjudged
+    # criterion is reported as unmet rather than assumed met.
+    if mission_checks:
+        met = [check.criterion for check in mission_checks if check.met]
+        unmet = [check.criterion for check in mission_checks if not check.met]
+    else:
+        unmet = [gap.target for gap in gaps if gap.kind == "criterion"]
+        met = [text for text in criteria if text not in unmet] if criteria else []
+    return MasterReview(
+        round=round_number, observations=observations, coverage=gaps,
+        criteria_met=met, criteria_unmet=unmet,
+        evidence_ids=list(dict.fromkeys(evidence_ids)))
+
+
+def _nearest_owners(gaps: Sequence[CoverageGap],
+                    reports: Sequence["SubagentOutcome"]) -> dict[int, tuple[str, ...]]:
+    """For each unowned gap, the report ids whose subject matter is nearest to it.
+
+    A gap the reviewing pass could not place (a mission criterion, say) is not
+    arbitrary: it belongs to a report whose role shares words with it, or — when no
+    report shares a word — to every report, because if nobody's subject matter covers
+    it then nobody's exclusion of it was justified.
+    """
+
+    owners: dict[int, tuple[str, ...]] = {}
+    for gap in gaps:
+        if gap.owned:
+            continue
+        wanted = _topic_words(gap.target)
+        near = tuple(report.subagent_id for report in reports
+                     if len(_topic_words(report.role + " " + report.objective) & wanted) >= 1)
+        owners[id(gap)] = near or tuple(report.subagent_id for report in reports)
+    return owners
+
+
+# --------------------------------------------------------------------------
+# 37.2 Stop or continue: every bound, in precedence order
+# --------------------------------------------------------------------------
+
+
+def replan_refusals(review: MasterReview, *, policy: "FlowPolicy", round_number: int,
+                    reviews_used: int, deadline_expired: bool = False,
+                    cancelled: bool = False,
+                    evidence_added: int | None = None,
+                    blocked: Sequence[str] = ()) -> list[str]:
+    """Every reason the Master may not open another round, checked and reported.
+
+    All of them are evaluated; none returns early.  That is the same discipline §36
+    applies to a Subagent's expansion, and it is here for the same reason: "why did
+    it stop?" should have one answer per bound, not one answer in total.
+    """
+
+    reasons: list[str] = list(blocked)
+    if cancelled:
+        reasons.append("the mission was cancelled")
+    if deadline_expired:
+        reasons.append("the mission deadline has expired")
+    if not policy.allow_follow_ups:
+        reasons.append("follow-up assignments are disabled for this mission")
+    if round_number > policy.max_replan_rounds:
+        reasons.append(f"the replanning budget of {policy.max_replan_rounds} round(s) "
+                       f"is spent")
+    if reviews_used >= policy.max_master_reviews:
+        reasons.append(f"the review budget of {policy.max_master_reviews} review(s) "
+                       f"is spent")
+    if evidence_added is not None and evidence_added <= 0:
+        reasons.append("the last round added no new evidence (saturation)")
+    return reasons
+
+
+def decide_master(review: MasterReview, *, policy: "FlowPolicy", round_number: int = 1,
+                  reviews_used: int = 1, deadline_expired: bool = False,
+                  cancelled: bool = False, assignments: Sequence[FollowUpAssignment] = (),
+                  evidence_added: int | None = None,
+                  blocked: Sequence[str] = ()) -> MasterDecision:
+    """Turn a review into a bounded decision: finish, stop, or continue.
+
+    The order of the questions is the whole design.
+
+    1.  **Cancelled or out of time?**  That is an operator's bound, not the mission's
+        opinion, so it wins over everything — including a complete-looking mission,
+        because a mission cancelled mid-round did not finish it.
+    2.  **Are the mission's own criteria met?**  Then the mission is ``final``.  A lens
+        may still have a concern, and a concern that survives a complete mission is a
+        *limitation to report*, not a reason to spend the operator's budget looking for
+        more.  Making it one would mean no mission ever finishes on its own terms.
+    3.  **Is a *number* spent?**  The round cap, the review budget, or the operator
+        switching follow-ups off.  That is ``budget``: a bound the operator set, which
+        the report must state rather than disguise as an opinion.
+    4.  **Was the last round empty?**  No new evidence, or nothing to assign.  That is
+        ``saturation``: the shape of a loop that would keep going and learn nothing.
+    5.  Otherwise **continue**, with the assignments already chosen — and if none could
+        be chosen, that is saturation too, because a continue with no work is a loop.
+
+    ``stop_on_blocking_failure`` adds one more bound at the front of that list: if the
+    mission is configured to refuse a synthesis over a blocking failure, a review with
+    a blocking report left over does not get to spend a round trying again.
+    """
+
+    reasons = replan_refusals(review, policy=policy, round_number=round_number,
+                              reviews_used=reviews_used,
+                              deadline_expired=deadline_expired, cancelled=cancelled,
+                              evidence_added=evidence_added, blocked=blocked)
+    if cancelled or deadline_expired:
+        return MasterDecision(
+            action="stop",
+            condition=StopCondition.BLOCKED if cancelled else StopCondition.DEADLINE,
+            round=round_number, refusals=reasons,
+            basis=("the mission was cancelled before another round could start"
+                   if cancelled else
+                   "the mission deadline expired before another round could start"))
+    nominated = [item for item in assignments if item.route == "existing"]
+    if review.complete:
+        # A follow-up that has nowhere to go — every remaining concern sits outside an
+        # existing Subagent and the Master has no seat left — is not a reason to keep a
+        # finished mission open.  It is recorded, because "we finished with these
+        # limitations" is the honest ending.
+        return MasterDecision(
+            action="final", condition=StopCondition.COMPLETE, round=round_number,
+            refusals=([f"{len(nominated)} concern(s) remain outside every existing "
+                       f"Subagent; they are reported as limitations"]),
+            basis=(f"every mission criterion is met ({len(review.criteria_met)}); "
+                   f"{len(review.coverage)} coverage gap(s) and "
+                   f"{len(review.concerns)} concern(s) remain as stated limitations"))
+    if reasons:
+        return MasterDecision(
+            action="stop", condition=stop_condition_for(reasons), round=round_number,
+            refusals=reasons,
+            basis=("no further round is allowed: " + "; ".join(reasons)))
+    open_targets = review.open_targets
+    if not open_targets:
+        return MasterDecision(
+            action="stop", condition=StopCondition.SATURATION, round=round_number,
+            refusals=["the review found nothing another round could act on"],
+            basis=(f"every lens is satisfied and every mission question is answered, "
+                   f"but {len(review.criteria_unmet)} mission criterion/criteria are "
+                   f"still unmet"))
+    if not assignments:
+        return MasterDecision(
+            action="stop", condition=StopCondition.SATURATION, round=round_number,
+            refusals=[f"{len(open_targets)} target(s) are open and none can be assigned: "
+                      f"no existing Subagent's objective covers them"],
+            basis=("further work would be a new mission rather than a remedy, so none "
+                   "is planned"))
+    return MasterDecision(
+        action="continue", condition=StopCondition.NONE, round=round_number,
+        assignments=list(assignments),
+        basis=(f"{len(assignments)} bounded follow-up(s) for {len(open_targets)} open "
+               f"target(s); round {round_number} of {policy.max_replan_rounds}"))
+
+
+def stop_condition_for(refusals: Sequence[str]) -> StopCondition:
+    """Which :class:`StopCondition` a non-empty refusal list describes.
+
+    ``budget`` and ``deadline`` are different bounds and a report that folded them
+    together would hide which one bit; a cancellation is ``blocked`` because the work
+    did not become impossible, it became unrequested.
+    """
+
+    lowered = " ".join(refusals).lower()
+    if "cancelled" in lowered:
+        return StopCondition.BLOCKED
+    if "deadline" in lowered:
+        return StopCondition.DEADLINE
+    if "saturation" in lowered:
+        return StopCondition.SATURATION
+    return StopCondition.BUDGET
+
+
+# --------------------------------------------------------------------------
+# 37.3 Turning a concern into a bounded assignment
+# --------------------------------------------------------------------------
+
+
+def _tools_for_follow_up(reports: Sequence["SubagentOutcome"],
+                         subagents: Sequence["FlowSubagent"]) -> list[str]:
+    """The narrowest tool set the mission already holds, never a widened grant.
+
+    A follow-up inherits *one* tool from the work it is following up on, because that
+    is the smallest thing that can close a gap the same sources could close.  When the
+    reports carry no tool at all — an adopted aggregate, for instance — the mission's
+    own Subagents are asked, and a mission with no tools gets the read-only default.
+    """
+
+    for subagent in subagents:
+        for worker in subagent.workers:
+            if worker.tools:
+                return [worker.tools[0]]
+    return ["evidence.read"]
+
+
+def _available_tools(tools: Sequence[str], context: "MasterContext") -> list[str]:
+    """The tools of ``tools`` this deployment actually has, or its narrowest default.
+
+    A follow-up may not widen a grant (§37.3), and it may not invent one either: a tool
+    the mission does not hold is a plan defect, and §22's capability check would refuse
+    the draft for it.  Choosing the intersection here means the refusal never has to
+    happen for a reason the Master could have seen.
+    """
+
+    known = [tool for tool in tools if not context.available_tools
+             or tool in context.available_tools]
+    if known:
+        return list(dict.fromkeys(known))
+    return list(context.available_tools[:1]) or ["read-only analysis"]
+
+
+def _owner_for(gap: str, reports: Sequence["SubagentOutcome"],
+               subagents: Sequence["FlowSubagent"]) -> str:
+    """The existing Subagent a gap belongs to, by role, or ``""`` when none does."""
+
+    wanted = _topic_words(gap)
+    by_role = {subagent.role.strip().lower(): subagent for subagent in subagents}
+    for report in reports:
+        subagent = by_role.get(report.role.strip().lower())
+        if subagent is None:
+            continue
+        if len(_topic_words(subagent.objective) & wanted) >= 1:
+            return subagent.id
+    return ""
+
+
+def plan_follow_ups(review: MasterReview, *, reports: Sequence["SubagentOutcome"],
+                    subagents: Sequence["FlowSubagent"], policy: "FlowPolicy",
+                    round_number: int = 1,
+                    licence_remaining: int | None = None,
+                    max_new_subagents: int = 1) -> list[FollowUpAssignment]:
+    """The assignments a continue decision would run, most-specific first.
+
+    Two routes, and the choice between them is a *bound*, not a preference:
+
+    *   **existing** — the gap falls inside a Subagent the mission already has, and
+        that Subagent still holds runtime Worker budget (§36).  Nothing is spent from
+        the Master's licence, and the follow-up goes through the same planning,
+        review and retask gates as the original work.
+    *   **new** — the gap belongs to nobody, and the Master still holds a licence
+        seat.  A new Subagent is a bigger instrument, so it is spent last and once:
+        ``max_new_subagents`` defaults to 1 because a round that created a team would
+        be a replan, and a replan is a new mission, not a remedy.
+
+    Nothing is returned for a lens that found a concern with no remedy: an assignment
+    with no way to close its gap is busy-work, and the loop would spin on it.
+    """
+
+    assignments: list[FollowUpAssignment] = []
+    seen: set[tuple[str, str]] = set()
+    tools = _tools_for_follow_up(reports, subagents)
+    seats = licence_remaining if licence_remaining is not None else max_new_subagents
+    created = 0
+    for finding in review.actionable:
+        if finding.lens is ReviewLens.CONTRADICTIONS:
+            # A contradiction is settled by re-reading a source, not by collecting
+            # more of it: another Worker would produce a third opinion, not a fact.
+            continue
+        target = finding.target.strip()[:200]
+        if not target:
+            continue
+        owner = _owner_for(finding.target, reports, subagents)
+        key = (_claim_key(target), owner)
+        if key in seen:
+            # Two lenses may point at one target — a report that drifted *and* left a
+            # gap — and one follow-up answers both.  The owner is part of the key
+            # because "nobody covers X" is true of each report it falls to.
+            continue
+        seen.add(key)
+        if owner:
+            assignments.append(FollowUpAssignment(
+                route="existing", target_subagent=owner,
+                role=next((subagent.role for subagent in subagents
+                           if subagent.id == owner), "follow-up"),
+                objective=(f"close one gap reported by the master review: "
+                           f"{finding.remedy or finding.detail[:140]}")[:400],
+                gap=finding.detail[:300] or finding.target[:300],
+                lens=finding.lens,
+                completion_criteria=[
+                    f"at least one reviewed observation addresses: {target[:100]}"],
+                tools=tools,
+                justification=(f"the {finding.lens.value} lens found a concern inside "
+                               f"this Subagent's own assignment, so one more Worker "
+                               f"closes it without widening the mission"),
+                round=round_number))
+            continue
+        if finding.lens is ReviewLens.RELEVANCE:
+            # Drift is fixed by re-pointing a report that exists, never by hiring a new
+            # one: a new Subagent working on an objective nobody misread learns nothing
+            # about why the first one read it wrong.
+            continue
+        if created >= max(0, seats):
+            continue
+        created += 1
+        role = f"gap-{finding.lens.value}-{content_id('flw', target, length=6)}"
+        assignments.append(FollowUpAssignment(
+            route="new", role=role,
+            objective=(f"cover what no report covers for the mission: {target[:200]}"),
+            gap=finding.detail[:300] or finding.target[:300],
+            lens=finding.lens,
+            completion_criteria=[
+                f"at least one reviewed observation addresses: {target[:100]}"],
+            tools=tools,
+            justification=("no existing Subagent's objective covers this gap and the "
+                           "master review named it explicitly"),
+            round=round_number,
+            licence_remaining=max(0, seats - created)))
+    return assignments
+
+
+def follow_up_draft(assignment: FollowUpAssignment, *,
+                    context: "MasterContext") -> "SubagentSpecDraft":
+    """A follow-up assignment as a specification draft, ready for §22's gates.
+
+    This is what makes a runtime Subagent *not* a shortcut: the draft goes through
+    :func:`validate_subagent_specs` exactly as the planned team did, so an
+    unjustified follow-up is refused by the same code that refuses a bad plan.  The
+    draft is derived from the assignment rather than invented beside it — every field
+    traces to the finding that justified it.
+    """
+
+    objective = assignment.objective.strip()
+    if len(objective) < 12:                   # pragma: no cover - the model enforces it
+        objective = f"{objective}: close the reviewed gap"
+    return SubagentSpecDraft(
+        role=assignment.role,
+        role_basis=RoleBasis.VERIFICATION,
+        objective=objective[:400],
+        justification=assignment.justification[:400],
+        scope_entries=list(context.scope_entries[:3]) or ["example.com"],
+        required_inputs=["the reviewed results so far"],
+        allowed_capabilities=_available_tools(assignment.tools, context),
+        deliverables=[Deliverable(
+            name=f"{assignment.role} follow-up rows",
+            format="structured-table",
+            fields=["statement", "source", "retrieved_at", "confidence"],
+            measurable_check=(
+                "one row per observation the follow-up made, each with a source id "
+                "and a retrieval time"))],
+        evidence=EvidenceRequirement(
+            description=(f"evidence collected for the follow-up gap: "
+                         f"{assignment.gap[:160]}"),
+            accepted_kinds=[EvidenceKind.OBSERVATION],
+            minimum_items=1, minimum_sources=1,
+            source_forms=list(context.scope_entries[:3])),
+        rubric=QualityRubric(
+            criteria=[
+                RubricCriterion(
+                    criterion=assignment.completion_criteria[0][:120], weight=3,
+                    test=(f"a reviewer confirms: "
+                          f"{assignment.completion_criteria[0][:100]}"),
+                    blocking=True),
+                RubricCriterion(
+                    criterion="every claim cites a collected source", weight=2,
+                    test="each statement carries at least one evidence id from this mission")],
+            passing_score=70, reviewer="master", max_review_rounds=2),
+        termination=TerminationCriteria(
+            objective_satisfied_when=(
+                f"at least 1 completion criterion is met: "
+                f"{assignment.completion_criteria[0][:100]}"),
+            max_tasks=4, max_attempts_per_task=2,
+            stop_on=list(assignment.completion_criteria)),
+        workers=[WorkerInstruction(
+            name=f"{assignment.role[:32]} reader",
+            objective=(f"read the sources that bear on: {objective[:160]}"),
+            tools=_available_tools(assignment.tools, context),
+            completion_criteria=list(assignment.completion_criteria))],
+        depends_on=[],
+        max_workers=2,
+        addresses_questions=[assignment.gap[:200]],
+        indivisible=True)
+
+
+def follow_up_subagent(assignment: FollowUpAssignment, *,
+                       context: "MasterContext") -> "FlowSubagent":
+    """Materialise a follow-up assignment as a unit the graph can run.
+
+    The same shape a planned Subagent has, so every downstream gate — the join, the
+    seven review dimensions, the retask, the aggregate — applies without a special
+    case.  Ids are derived from the assignment, so two rounds cannot accidentally
+    share one.
+    """
+
+    draft = follow_up_draft(assignment, context=context)
+    return team_units(context, [draft])[0].model_copy(
+        update={"role": assignment.role[:80]})
+
+
+# --------------------------------------------------------------------------
+# 37.5 The demo: three reports, five lenses, and four ways to stop
+# --------------------------------------------------------------------------
+
+
+def _review_item(statement: str, *, worker: str, tag: str = "advisory") -> "EvidenceItem":
+    """One observation for the review demo, sourced so it can carry a claim."""
+
+    return EvidenceItem(
+        id=content_id("ev", worker, statement, length=10),
+        kind=EvidenceKind.OBSERVATION, statement=statement,
+        sources=[SourceReference(
+            kind=SourceKind.PUBLIC_WEB, url=f"https://{tag}.test/{worker}",
+            title=tag, retrieved_at=datetime(2026, 5, 4, 10, 0,
+                                             tzinfo=timezone.utc),
+            retrieval_method=RetrievalMethod.HTTP, http_status=200)],
+        confidence=Confidence.LOW, confidence_basis="one retrieval",
+        collected_by=worker)
+
+
+def _review_report(role: str, *, objective: str = "", statements: Sequence[str] = (),
+                   worker: str = "wrk-1",
+                   status: EntityStatus = EntityStatus.SUCCEEDED,
+                   criteria: Sequence["CriterionCheck"] = (),
+                   questions: Sequence[str] = (),
+                   gaps: Sequence["UnknownValue"] = (),
+                   withheld: Sequence[str] = (),
+                   disagreement: "Disagreement | None" = None) -> "SubagentOutcome":
+    """A Subagent report built from statements, for the review demo and its checks."""
+
+    evidence = [_review_item(statement, worker=worker) for statement in statements]
+    outcome = WorkerOutcome(
+        worker_id=worker, subagent_id=content_id("sa", role, length=12),
+        status=status, attempt=1,
+        summary=(f"{worker}: {len(evidence)} observation(s) collected"),
+        evidence_ids=[item.id for item in evidence])
+    return SubagentOutcome(
+        subagent_id=content_id("sa", role, length=12), role=role,
+        objective=objective or role,
+        status=status, outcomes=[outcome], evidence=evidence,
+        aggregate_basis=check_join(f"subagent-aggregate:{role}", [worker], [worker]),
+        open_questions=list(questions), gaps=list(gaps), withheld=list(withheld),
+        disagreements=[disagreement] if disagreement is not None else [],
+        criteria_checks=list(criteria))
+
+
+def master_review_cases() -> dict[str, dict[str, Any]]:
+    """Two report sets: one that fails four lenses, one that passes all five.
+
+    The first set is built so each concern has exactly one cause, and a reader can see
+    which lens bit:
+
+    *   ``published-advisories`` is on-mission and carries evidence, but it repeats
+        ``mirror-index``'s claim (duplication: nothing new was learned) and it disagrees
+        with ``quotes-and-forwards`` about whether the advisory names the component
+        without recording the disagreement (contradictions);
+    *   ``quotes-and-forwards`` is the other side of that conflict, recorded nowhere;
+    *   ``dns-records`` collected nothing at all (sufficiency) and works on registrar
+        dates the objective is not about (relevance);
+    *   one mission question is answered by nobody (coverage), and one mission
+        criterion is unmet by every report (coverage again, of the deeper kind).
+
+    The second set is one report that satisfies all five, which is what makes ``final``
+    reachable: a review where every lens is satisfied and the criteria are met.
+    """
+
+    question = "the published advisories name the affected component"
+    criterion = "each documented risk cites an advisory"
+    objective = ("map the publicly documented exposure of example.com and rank the "
+                 "advisory-backed risks")
+    on_mission = ("rank the advisory-backed exposure of example.com from its published "
+                  "advisories")
+    names_it = "the published advisories name the affected component"
+    repeats_it = "the edge gateway session handling is the affected component"
+    # The same subject, opposite polarity: a contradiction only if both sides share
+    # their subject words, which is the conservative rule §36.2 uses.
+    affirms_it = "the published advisories name the affected component"
+    denies_it = "the published advisories never name the affected component"
+    criteria = [CriterionCheck(criterion=criterion, met=False,
+                               shortfall="no report's evidence cites a first-party advisory",
+                               critical=True)]
+    concerns = [
+        _review_report("published-advisories", objective=on_mission, worker="wrk-adv",
+                       statements=[affirms_it], criteria=criteria,
+                       questions=[question]),
+        _review_report("quotes-and-forwards", objective=on_mission, worker="wrk-qf",
+                       statements=[denies_it], criteria=criteria),
+        _review_report("dns-records", objective="renewal dates of the registrar",
+                       worker="wrk-dns", status=EntityStatus.BLOCKED,
+                       gaps=[UnknownValue(
+                           reason=UnknownReason.UNAVAILABLE, determined_by="dns-records",
+                           detail="every resolver in scope refused the query")]),
+    ]
+    mirror = _review_report("mirror-index", objective=on_mission, worker="wrk-mirror",
+                            statements=[affirms_it], criteria=criteria)
+    clean = _review_report(
+        "published-advisories", objective=on_mission, worker="wrk-clean",
+        statements=[repeats_it],
+        criteria=[CriterionCheck(criterion=criterion, met=True,
+                                 evidence_ids=[content_id("ev", "wrk-clean", names_it,
+                                                          length=10)],
+                                 critical=True)])
+    return {
+        "concerns": {"reports": [concerns[0], mirror, concerns[1], concerns[2]],
+                     "objective": objective, "questions": [question],
+                     "criteria": [criterion]},
+        "clean": {"reports": [clean], "objective": objective,
+                  "questions": [question], "criteria": [criterion]},
+    }
+
+
+def render_master_review(review: MasterReview,
+                         decision: MasterDecision) -> Group:
+    """One review and the decision it produced: the lenses, the gaps, and the bound."""
+
+    head = Table(title=f"review {review.round} — {review.summary()}", title_justify="left",
+                 box=None, pad_edge=False)
+    head.add_column("report", no_wrap=True)
+    head.add_column("finding", overflow="fold", max_width=76)
+    for observation in review.observations:
+        if observation.satisfied:
+            head.add_row(escape(observation.role or observation.subagent_id),
+                         "[green]all five lenses satisfied[/green]")
+            continue
+        first = True
+        for finding in observation.concerns:
+            head.add_row(escape((observation.role or observation.subagent_id)
+                                if first else ""), escape(finding.describe()[:200]))
+            first = False
+
+    gaps = Table(title="what nobody covered", title_justify="left", box=None,
+                 pad_edge=False, expand=False)
+    gaps.add_column("gap", overflow="fold", max_width=88)
+    for gap in review.coverage or []:
+        gaps.add_row(escape(gap.describe()[:220]))
+    if not review.coverage:
+        gaps.add_row("[green]nothing: every mission question is answered[/green]")
+
+    verdict = Table(title=f"the decision — {decision.action}", title_justify="left",
+                    box=None, pad_edge=False, expand=False)
+    verdict.add_column("field", style="dim", no_wrap=True)
+    verdict.add_column("value", overflow="fold", max_width=72)
+    verdict.add_row("stop condition", escape(decision.condition.value))
+    verdict.add_row("basis", escape(decision.basis[:220]))
+    for refusal in decision.refusals:
+        verdict.add_row("refusal", escape(refusal[:200]))
+    for assignment in decision.assignments:
+        verdict.add_row("next", escape(assignment.describe()[:200]))
+
+    rows: list[Any] = [head, Text(""), gaps, Text(""), verdict]
+    if decision.finished:
+        rows += [Text(""), Text("every mission criterion is met: this is a final report, "
+                                "and the concerns above are the limitations it carries",
+                                style="dim")]
+    elif decision.stopped:
+        rows += [Text(""), Text("the loop stopped on a bound, not on success: the "
+                                "refusals above are why it stopped asking", style="dim")]
+    return Group(*rows)
+
+
+def master_review_demo() -> dict[str, Any]:
+    """The demo payload: one review, four decisions, and the loop that ended each way."""
+
+    cases = master_review_cases()
+    reviews = {
+        "concerns": review_reports(cases["concerns"]["reports"],
+                                   objective=cases["concerns"]["objective"],
+                                   questions=cases["concerns"]["questions"],
+                                   criteria=cases["concerns"]["criteria"],
+                                   scope_entries=["example.com"]),
+        "clean": review_reports(cases["clean"]["reports"],
+                                objective=cases["clean"]["objective"],
+                                questions=cases["clean"]["questions"],
+                                criteria=cases["clean"]["criteria"],
+                                scope_entries=["example.com"]),
+    }
+    policy = FlowPolicy()
+    concerns = reviews["concerns"]
+    assignments = plan_follow_ups(
+        concerns, reports=cases["concerns"]["reports"], subagents=[],
+        policy=policy, round_number=1, licence_remaining=2)
+    decisions = {
+        # the ordinary case: work remains and the budget allows it
+        "continue": decide_master(concerns, policy=policy, round_number=1,
+                                  assignments=assignments),
+        # the cap: the same review, one round later than the policy allows
+        "budget": decide_master(concerns, policy=policy, round_number=2,
+                                assignments=assignments),
+        # a round that added nothing is saturation even with budget in hand
+        "saturation": decide_master(concerns, policy=policy, round_number=1,
+                                    assignments=assignments, evidence_added=0),
+        # and a mission whose own criteria are met finishes, concerns and all
+        "final": decide_master(reviews["clean"], policy=policy, round_number=1,
+                               assignments=[]),
+    }
+    # The loop, run to its end: every round re-reviews the same reports, so nothing is
+    # ever added and the third review is the one that sees it.  The point of showing it
+    # is that it *stops* — with a number, not with a stack.
+    rounds: list[dict[str, Any]] = []
+    for index in range(1, policy.max_master_reviews + 1):
+        decided = decide_master(concerns, policy=policy, round_number=index,
+                                reviews_used=index, assignments=assignments,
+                                evidence_added=(None if index == 1 else 0))
+        rounds.append({"round": index, "action": decided.action,
+                       "condition": decided.condition.value,
+                       "refusals": len(decided.refusals)})
+        if decided.stopped:
+            break
+    signals = {
+        "every lens was answered for every report": all(
+            len(observation.findings) == len(ReviewLens)
+            for review in reviews.values() for observation in review.observations),
+        "a duplicate claim was caught": any(
+            finding.lens is ReviewLens.DUPLICATION
+            for finding in concerns.concerns),
+        "an unrecorded contradiction was caught": any(
+            finding.lens is ReviewLens.CONTRADICTIONS
+            for finding in concerns.concerns),
+        "a report with no evidence was caught": any(
+            finding.lens is ReviewLens.SUFFICIENCY for finding in concerns.concerns),
+        "an unanswered question became a coverage gap": bool(concerns.coverage),
+        "the loop stopped on a bound": rounds[-1]["action"] != "continue",
+        "every bound that stopped it is named": all(
+            decision.refusals for decision in decisions.values()
+            if decision.stopped and not decision.finished),
+        "a complete mission finishes as final": decisions["final"].finished,
+        "the clean review has no concerns": not reviews["clean"].concerns,
+    }
+    return {
+        "reviews": {name: review.to_dict() for name, review in reviews.items()},
+        "findings": {name: [f"{observation.role}: {finding.describe()}"
+                            for observation in review.observations
+                            for finding in observation.findings]
+                     for name, review in reviews.items()},
+        "coverage": [gap.describe() for gap in concerns.coverage],
+        "assignments": [item.to_dict() for item in assignments],
+        "decisions": {name: decision.to_dict() for name, decision in decisions.items()},
+        "loop": rounds,
+        "signals": signals,
+        "acceptance": {"all_signals": all(signals.values()), "signals": signals},
+    }
+
+
+def render_master_review_demo(payload: Mapping[str, Any]) -> Group:
+    """The demo: five lenses over three reports, then four ways the loop can end."""
+
+    signals = Table(title="can the loop run for ever?", title_justify="left", box=None,
+                    pad_edge=False, expand=False)
+    signals.add_column("", width=2)
+    signals.add_column("signal", overflow="fold", max_width=64)
+    for name, ok in payload["acceptance"]["signals"].items():
+        glyph, colour = ("✔", "green") if ok else ("✘", "red")
+        signals.add_row(f"[{colour}]{glyph}[/{colour}]", escape(name))
+
+    lenses = Table(title="the five lenses, as they were applied", title_justify="left",
+                   box=None, pad_edge=False, expand=False)
+    lenses.add_column("report", no_wrap=True)
+    lenses.add_column("finding", overflow="fold", max_width=78)
+    for finding in payload["findings"]["concerns"]:
+        role, _, detail = finding.partition(": ")
+        lenses.add_row(escape(role[:22]), escape(detail[:180]))
+
+    coverage = Table(title="what nobody covered", title_justify="left", box=None,
+                     pad_edge=False, expand=False)
+    coverage.add_column("gap", overflow="fold", max_width=88)
+    for gap in payload["coverage"] or ["nothing: every question was answered"]:
+        coverage.add_row(escape(gap[:200]))
+
+    decisions = Table(title="four reviews, four endings", title_justify="left",
+                      box=None, pad_edge=False, expand=False)
+    decisions.add_column("name", no_wrap=True)
+    decisions.add_column("decision", overflow="fold", max_width=74)
+    for name, decision in payload["decisions"].items():
+        decisions.add_row(escape(name), escape(str(decision["summary"])[:190]))
+
+    loop = Table(title="the loop, run to its end", title_justify="left", box=None,
+                 pad_edge=False, expand=False)
+    loop.add_column("round", no_wrap=True)
+    loop.add_column("what happened", overflow="fold", max_width=60)
+    for entry in payload["loop"]:
+        loop.add_row(escape(str(entry["round"])),
+                     escape(f"{entry['action']} ({entry['condition']}); "
+                            f"{entry['refusals']} bound(s) named"))
+
+    tail = Text("a mission that cannot loop for ever says which bound stopped it, and a "
+                "mission that finished says so without also claiming it was cut short",
+                style="dim")
+    return Group(signals, Text(""), lenses, Text(""), coverage, Text(""), decisions,
+                 Text(""), loop, Text(""), tail)
+
+
+def run_master_review_self_test() -> list["MasterReviewCheck"]:
+    """Prove §37's acceptance clause: no unbounded loop, and always a report.
+
+    Every check is a property of the record rather than of one run: the fixtures vary
+    the *bounds* over one fixed set of observations, so a failure points at the bound
+    that failed rather than at a coincidence in the data.
+    """
+
+    checks: list[MasterReviewCheck] = []
+
+    def add(name: str, ok: bool, detail: Any = "") -> None:
+        checks.append(MasterReviewCheck(name=name, ok=bool(ok), detail=str(detail)[:150]))
+
+    def raises(fn: Callable[[], Any], exc: type[BaseException]) -> bool:
+        try:
+            fn()
+        except exc:
+            return True
+        except Exception:                     # noqa: BLE001 - a wrong error is a failure
+            return False
+        return False
+
+    cases = master_review_cases()
+    concerns = review_reports(cases["concerns"]["reports"],
+                              objective=cases["concerns"]["objective"],
+                              questions=cases["concerns"]["questions"],
+                              criteria=cases["concerns"]["criteria"],
+                              scope_entries=["example.com"])
+    clean = review_reports(cases["clean"]["reports"],
+                           objective=cases["clean"]["objective"],
+                           questions=cases["clean"]["questions"],
+                           criteria=cases["clean"]["criteria"],
+                           scope_entries=["example.com"])
+    policy = FlowPolicy()
+
+    # ---- 1. all five lenses, every report ------------------------------
+    add("every report is judged on all five lenses",
+        all(len(observation.findings) == 5 for observation in concerns.observations),
+        [len(observation.findings) for observation in concerns.observations])
+    add("the five lenses are the task's five",
+        {finding.lens for observation in concerns.observations
+         for finding in observation.findings} == set(ReviewLens))
+    add("a report with nothing to duplicate says not-applicable rather than satisfied",
+        _duplication_finding(_review_report("empty", worker="wrk-e"),
+                             []).verdict is LensVerdict.NOT_APPLICABLE)
+
+    def lens_twice() -> None:
+        ReportReview(subagent_id="sa-x", findings=[
+            MasterLensFinding(lens=ReviewLens.RELEVANCE, verdict=LensVerdict.SATISFIED),
+            MasterLensFinding(lens=ReviewLens.RELEVANCE, verdict=LensVerdict.SATISFIED)])
+
+    add("a review cannot answer one lens twice", raises(lens_twice, ValueError))
+
+    def missing_lens() -> None:
+        ReportReview(subagent_id="sa-x", findings=[
+            MasterLensFinding(lens=ReviewLens.RELEVANCE, verdict=LensVerdict.SATISFIED)])
+
+    add("a review cannot skip a lens", raises(missing_lens, ValueError))
+
+    # ---- 2. each lens bites where it should ---------------------------
+    add("duplication catches a repeated claim",
+        any(finding.lens is ReviewLens.DUPLICATION for finding in concerns.concerns),
+        [finding.lens.value for finding in concerns.concerns])
+    add("contradictions catches a conflict nobody recorded",
+        any(finding.lens is ReviewLens.CONTRADICTIONS for finding in concerns.concerns))
+    add("sufficiency catches a report with no evidence",
+        any(finding.lens is ReviewLens.SUFFICIENCY for finding in concerns.concerns))
+    add("relevance catches a report about something else",
+        any(finding.lens is ReviewLens.RELEVANCE for finding in concerns.concerns))
+    add("coverage turns an unanswered question into a gap", bool(concerns.coverage),
+        [gap.describe() for gap in concerns.coverage])
+    add("a report echoing the question does not count as answering it",
+        bool(_coverage_gaps(
+            [_review_report("echoer", statements=[
+                "the published advisories name the affected component"],
+                worker="wrk-echo")],
+            questions=["the published advisories name the affected component"])))
+    add("a clean review has no concerns", not clean.concerns,
+        [finding.describe() for finding in clean.concerns])
+    add("a concern without a target is refused",
+        raises(lambda: MasterLensFinding(
+            lens=ReviewLens.SUFFICIENCY, verdict=LensVerdict.CONCERNS,
+            detail="something is missing", target=""), ValueError))
+    add("an actionable concern without a remedy is refused",
+        raises(lambda: MasterLensFinding(
+            lens=ReviewLens.SUFFICIENCY, verdict=LensVerdict.CONCERNS,
+            detail="something is missing", target="the report",
+            actionable=True), ValueError))
+
+    # ---- 3. the decision, on one fixed review --------------------------
+    assignments = plan_follow_ups(concerns, reports=cases["concerns"]["reports"],
+                                  subagents=[], policy=policy, round_number=1,
+                                  licence_remaining=2)
+    add("work that is open and affordable is assigned",
+        bool(assignments) and all(item.route == "new" for item in assignments),
+        [item.route for item in assignments])
+    cont = decide_master(concerns, policy=policy, round_number=1,
+                         assignments=assignments)
+    add("the decision continues when the budget allows it", cont.action == "continue",
+        cont.summary())
+    add("a continue carries the work it continues with", bool(cont.assignments))
+    add("a review with concerns is not called final",
+        decide_master(concerns, policy=policy, round_number=1,
+                      assignments=assignments).action != "final")
+
+    def assignment_without_work() -> None:
+        MasterDecision(action="continue", condition=StopCondition.NONE,
+                       assignments=[], basis="continue with nothing")
+
+    add("a continue with no assignment is refused", 
+        raises(assignment_without_work, ValueError))
+
+    def stop_with_work() -> None:
+        MasterDecision(action="stop", condition=StopCondition.BUDGET,
+                       assignments=list(assignments), basis="stop but keep planning")
+
+    add("a stop cannot carry assignments", raises(stop_with_work, ValueError))
+
+    def final_on_budget() -> None:
+        MasterDecision(action="final", condition=StopCondition.BUDGET, basis="finished?")
+
+    add("final is only reachable on completion",
+        raises(final_on_budget, ValueError))
+
+    # ---- 4. the five stopping conditions, one at a time ----------------
+    at_cap = decide_master(concerns, policy=policy, round_number=2,
+                           assignments=assignments)
+    add("the round cap stops the loop", at_cap.action == "stop"
+        and at_cap.condition is StopCondition.BUDGET, at_cap.summary())
+    add("the cap names itself as the reason", any("replanning budget" in reason
+                                                  for reason in at_cap.refusals),
+        at_cap.refusals)
+    reviews_spent = decide_master(concerns, policy=policy, round_number=1,
+                                  reviews_used=policy.max_master_reviews,
+                                  assignments=assignments)
+    add("the review budget stops the loop", reviews_spent.condition is StopCondition.BUDGET,
+        reviews_spent.refusals)
+    late = decide_master(concerns, policy=policy, round_number=1,
+                         assignments=assignments, deadline_expired=True)
+    add("an expired deadline stops the loop", late.condition is StopCondition.DEADLINE,
+        late.summary())
+    cancelled = decide_master(concerns, policy=policy, round_number=1,
+                              assignments=assignments, cancelled=True)
+    add("a cancellation stops the loop", cancelled.condition is StopCondition.BLOCKED)
+    saturated = decide_master(concerns, policy=policy, round_number=1,
+                              assignments=assignments, evidence_added=0)
+    add("a round that added nothing is saturation",
+        saturated.condition is StopCondition.SATURATION, saturated.summary())
+    nothing_to_do = decide_master(concerns, policy=policy, round_number=1,
+                                  assignments=[])
+    add("a review with nothing to assign does not loop",
+        nothing_to_do.action == "stop", nothing_to_do.summary())
+    finished = decide_master(clean, policy=policy, round_number=1, assignments=[])
+    add("a mission that met its criteria finishes", finished.finished, finished.summary())
+    add("finishing is not a budget stop", finished.condition.is_success)
+    off = FlowPolicy(allow_follow_ups=False)
+    switched_off = decide_master(concerns, policy=off, round_number=1,
+                                 assignments=assignments)
+    add("follow-ups switched off is a budget stop", switched_off.stopped,
+        switched_off.refusals)
+    add("every bound that had a say is named",
+        len(decide_master(concerns, policy=FlowPolicy(allow_follow_ups=False),
+                          round_number=2, reviews_used=3, assignments=assignments,
+                          deadline_expired=True).refusals) >= 4,
+        decide_master(concerns, policy=FlowPolicy(allow_follow_ups=False),
+                      round_number=2, reviews_used=3, assignments=assignments,
+                      deadline_expired=True).refusals)
+
+    # ---- 5. the loop terminates, whatever the bounds -------------------
+    for cap in (0, 1, 2, 3):
+        bounded = FlowPolicy(max_replan_rounds=cap, max_master_reviews=cap + 2)
+        trace: list[str] = []
+        for index in range(1, bounded.max_master_reviews + 2):
+            step = decide_master(concerns, policy=bounded, round_number=index,
+                                 reviews_used=index, assignments=assignments,
+                                 evidence_added=(None if index == 1 else 0))
+            trace.append(step.action)
+            if step.stopped:
+                break
+        add(f"with a cap of {cap} the loop stops", trace[-1] != "continue"
+            and len(trace) <= bounded.max_master_reviews + 1, trace)
+        add(f"with a cap of {cap} every step is a decision", all(
+            step in {"continue", "stop", "final"} for step in trace), trace)
+
+    # ---- 6. a follow-up is a specification, not a wish -----------------
+    drafts = [follow_up_draft(item, context=_selftest_context("exposure"))
+              for item in assignments[:1]]
+    add("a follow-up becomes a specification draft", bool(drafts))
+    if drafts:
+        validation = validate_subagent_specs(
+            drafts, _selftest_context("exposure"),
+            existing=[unit.role for unit in flow_units_for(
+                _selftest_context("exposure"), "exposure")])
+        add("a follow-up passes the same specification gates as a plan",
+            validation.ok, [problem.detail[:80] for problem in validation.blocking_problems])
+        add("the draft carries one measurable deliverable and a stop condition",
+            bool(drafts[0].deliverables[0].measurable_check)
+            and drafts[0].termination.is_measurable())
+        unit = follow_up_subagent(assignments[0], context=_selftest_context("exposure"))
+        add("a follow-up materialises as a runnable Subagent",
+            bool(unit.workers) and unit.role == assignments[0].role,
+            f"{unit.role}: {len(unit.workers)} worker(s)")
+
+    def whole_mission_objective() -> None:
+        FollowUpAssignment(route="new", role="everything-again",
+                           objective="do everything again for any remaining gaps",
+                           gap="the review found concerns", lens=ReviewLens.COVERAGE,
+                           completion_criteria=["at least one row"],
+                           justification="because the review said so")
+
+    add("a follow-up cannot restate the whole mission",
+        raises(whole_mission_objective, ValueError))
+
+    def existing_without_target() -> None:
+        FollowUpAssignment(route="existing", role="revisit",
+                           objective="close the coverage gap in this report",
+                           gap="nobody covers the affected component",
+                           lens=ReviewLens.COVERAGE,
+                           completion_criteria=["at least one row"],
+                           justification="the review named this report as the owner")
+
+    add("a revisit must name the Subagent it revisits",
+        raises(existing_without_target, ValueError))
+
+    # ---- 7. the demo, and the record's shape --------------------------
+    demo = master_review_demo()
+    add("the demo payload is serialisable",
+        json.loads(json.dumps(demo, default=str))["acceptance"]["all_signals"])
+    add("the demo shows every signal passing",
+        all(demo["acceptance"]["signals"].values()),
+        [name for name, ok in demo["acceptance"]["signals"].items() if not ok])
+    add("the demo's loop stops", demo["loop"][-1]["action"] != "continue",
+        demo["loop"])
+    add("the demo names all four endings",
+        set(demo["decisions"]) == {"continue", "budget", "saturation", "final"},
+        sorted(demo["decisions"]))
+    review_payload = concerns.to_dict()
+    add("the review serialises every lens",
+        all(len(observation["findings"]) == 5
+            for observation in review_payload["observations"]))
+    add("the decision serialises its refusals",
+        isinstance(cont.to_dict()["refusals"], list))
+
+    # ---- 8. the loop, inside the graph ---------------------------------
+    # The fixtures above prove the *decisions*; these prove the graph honestly runs them,
+    # and — the acceptance clause — that it comes to a stop on its own.
+    context = _selftest_context("exposure")
+    units = flow_units_for(context, "exposure")
+    looped = HierarchicalFlow(
+        context=context, subagents=units,
+        runner=_CountingRunner(scope=context.scope_entries),
+        policy=FlowPolicy(max_review_rounds=2, max_replan_rounds=1,
+                          max_runtime_workers_per_subagent=0,
+                          max_follow_up_workers_per_subagent=1))
+    loop_result = looped.run()
+    order = loop_result.stage_order()
+    add("the run reaches the replan stage", "master-replan" in order, order)
+    add("the replan stage sits between the review and the synthesis",
+        order.index("master-review") < order.index("master-replan")
+        <= order.index("master-synthesize"), order)
+    add("the loop stops on its own", loop_result.decision is not None
+        and loop_result.decision.stopped, loop_result.stop_reason)
+    add("the stop condition is one of the five the task names",
+        loop_result.stop_condition in {
+            StopCondition.COMPLETE, StopCondition.SATURATION, StopCondition.BUDGET,
+            StopCondition.DEADLINE, StopCondition.BLOCKED}, loop_result.stop_condition)
+    add("a stopped loop still reports", loop_result.synthesis is not None)
+    add("the mission reports one aggregate per subagent, follow-ups included",
+        len(loop_result.reports) == len(looped.subagents)
+        and {report.subagent_id for report in loop_result.reports}
+        == {subagent.id for subagent in looped.subagents},
+        len(loop_result.reports))
+    add("the number of reviews is bounded by the review budget",
+        len(looped.master_reviews()) <= looped.policy.max_master_reviews,
+        len(looped.master_reviews()))
+    add("the number of follow-up rounds is bounded by the round cap",
+        len([item for item in looped.master_rounds()
+             if item.decision.action == "continue"]) <= looped.policy.max_replan_rounds,
+        len(looped.master_rounds()))
+    add("every decision carries the reason it stopped",
+        all(decision.refusals for decision in looped.master_decisions()
+            if decision.stopped and not decision.finished),
+        [decision.summary()[:60] for decision in looped.master_decisions()])
+    add("the result carries the reviews and the decisions",
+        len(loop_result.master_reviews) >= 1 and len(loop_result.master_decisions) >= 1)
+    add("the result serialises the loop",
+        json.loads(json.dumps(loop_result.to_dict(), default=str))["stop_condition"]
+        == loop_result.stop_condition.value)
+
+    # the cap at zero: one review, no continuation, still a report
+    fixed = HierarchicalFlow(
+        context=context, subagents=units,
+        runner=_CountingRunner(scope=context.scope_entries),
+        policy=FlowPolicy(allow_runtime_workers=False, max_replan_rounds=0))
+    fixed_result = fixed.run()
+    add("a mission with no replan budget reviews exactly once",
+        len(fixed.master_reviews()) == 1, len(fixed.master_reviews()))
+    add("a mission with no replan budget never reaches the replan stage",
+        "master-replan" not in fixed_result.stage_order(), fixed_result.stage_order())
+    add("a mission with no replan budget still reports",
+        fixed_result.synthesis is not None)
+
+    # the blockers: a mission configured to stop on failure must not replan past it
+    dead_units = flow_units_for(context, "exposure")
+    everything = [worker.id for subagent in dead_units for worker in subagent.workers]
+    dead = HierarchicalFlow(
+        context=context, subagents=dead_units,
+        runner=_CountingRunner(scope=context.scope_entries, failing=everything),
+        policy=FlowPolicy(max_review_rounds=1, allow_runtime_workers=False,
+                          allow_follow_ups=True))
+    dead_result = dead.run()
+    add("a blocking failure stops before any replanning",
+        dead_result.stopped and "master-replan" not in dead_result.stage_order(),
+        dead_result.stage_order())
+    add("a stopped mission produces no aggregate", dead_result.synthesis is None)
+
+    # cancellation is a bound too, and it is recorded as one
+    cancelled_units = flow_units_for(context, "exposure")
+    cancelling = HierarchicalFlow(
+        context=context, subagents=cancelled_units,
+        runner=_CountingRunner(scope=context.scope_entries),
+        policy=FlowPolicy(allow_runtime_workers=False))
+    token = cancelling.runtime.token
+    token.cancel("operator stopped the mission")
+    cancelled_result = cancelling.run()
+    add("a cancelled mission stops before synthesis", cancelled_result.stopped,
+        cancelled_result.stop_reason)
+    add("a cancelled mission names the cancellation",
+        "cancel" in cancelled_result.stop_reason.lower(), cancelled_result.stop_reason)
+    return checks
+
+@app.command("review-master",
+             help="Master review and bounded replanning: five lenses, five stop conditions.")
+def review_master_command(
+    self_test: bool = typer.Option(False, "--self-test",
+                                   help="Prove the review and its bounds, offline."),
+    demo: bool = typer.Option(False, "--demo",
+                              help="Five lenses over four reports, then four endings."),
+    next_report: str | None = typer.Option(
+        None, "--next",
+        help="Review a mission's Subagent reports from JSON ('-' for stdin)."),
+    objective: str = typer.Option("", "--objective",
+                                  help="The mission objective the reports are judged against."),
+    rounds: int = typer.Option(1, "--rounds", min=0, max=3,
+                               help="How many follow-up rounds the policy allows."),
+    reviews: int = typer.Option(3, "--reviews", min=1, max=6,
+                                help="How many reviews the policy allows."),
+    follow_ups: bool = typer.Option(True, "--follow-ups/--no-follow-ups",
+                                    help="Whether the Master may open a follow-up round."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Review a mission's reports, or explain why the loop stopped asking for more.
+
+    Exit codes follow the same rule as the rest of the build: ``OK`` when the mission is
+    finished or safely bounded, ``POLICY`` when it stopped short of its own criteria, so
+    a pipeline can tell "done" from "bounded" without parsing prose.
+    """
+
+    console = get_console()
+
+    if self_test:
+        checks = run_master_review_self_test()
+        failures = [check for check in checks if not check.ok]
+        if as_json:
+            _emit(json.dumps({"checks": [check.to_dict() for check in checks],
+                              "passed": len(checks) - len(failures),
+                              "failed": len(failures)}, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        table = Table(box=None, pad_edge=False)
+        table.add_column("check", no_wrap=True)
+        table.add_column("detail", overflow="fold")
+        for check in checks:
+            glyph, colour = ("✔", "green") if check.ok else ("✘", "red")
+            table.add_row(f"[{colour}]{glyph}[/{colour}]", escape(check.name),
+                          escape(check.detail))
+        console.print(table)
+        colour = "green" if not failures else "red"
+        console.print(f"\n[{colour}]{len(checks) - len(failures)} passed[/] · "
+                      f"{len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    if demo:
+        payload = master_review_demo()
+        if as_json:
+            _emit(json.dumps(payload, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(render_master_review_demo(payload))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    if next_report:
+        try:
+            raw = (sys.stdin.read() if next_report == "-"
+                   else Path(next_report).expanduser().read_text(encoding="utf-8"))
+            payload = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            console.print(f"[red]✘[/red] not a mission report set: "
+                          f"{escape(_first_sentence(str(exc))[:200])}")
+            raise typer.Exit(ExitCode.USAGE) from exc
+        try:
+            reports = [SubagentOutcome.model_validate(item)
+                       for item in payload.get("reports") or []]
+            mission = str(payload.get("objective") or objective)
+            questions = [str(item) for item in payload.get("questions") or []]
+            criteria = [str(item) for item in payload.get("criteria") or []]
+            subagents = [FlowSubagent.model_validate(item)
+                         for item in payload.get("subagents") or []]
+            scope = [str(item) for item in payload.get("scope") or []]
+        except (KeyError, ValueError) as exc:
+            console.print(f"[red]✘[/red] not a mission report set: "
+                          f"{escape(_first_sentence(str(exc))[:200])}")
+            raise typer.Exit(ExitCode.USAGE) from exc
+        policy = FlowPolicy(allow_follow_ups=follow_ups, max_replan_rounds=rounds,
+                            max_master_reviews=reviews)
+        review = review_reports(reports, objective=mission or objective,
+                                questions=questions, criteria=criteria,
+                                scope_entries=scope)
+        assignments = plan_follow_ups(review, reports=reports, subagents=subagents,
+                                      policy=policy, round_number=1)
+        decision = decide_master(review, policy=policy, round_number=1,
+                                 assignments=assignments)
+        if as_json:
+            _emit(json.dumps({"review": review.to_dict(),
+                              "decisions": {"first": decision.to_dict()},
+                              "assignments": [item.to_dict() for item in assignments],
+                              "stop_condition": decision.condition.value},
+                             indent=2, default=str))
+            raise typer.Exit(ExitCode.OK if decision.finished or decision.stopped
+                             else ExitCode.POLICY)
+        console.print()
+        console.print(render_master_review(review, decision))
+        console.print()
+        raise typer.Exit(ExitCode.OK if decision.finished or decision.stopped
+                         else ExitCode.POLICY)
+
+    console.print("[red]✘[/red] choose --demo, --self-test or --next FILE")
+    raise typer.Exit(ExitCode.USAGE)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 38. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 

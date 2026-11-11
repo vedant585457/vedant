@@ -27,6 +27,7 @@ python vedant_osint.py outcomes --self-test  # Worker statuses, no verdicts
 python vedant_osint.py review --self-test    # seven dimensions, pass or revise
 python vedant_osint.py retask --self-test    # a revise becomes a specific assignment
 python vedant_osint.py aggregate --self-test # reviewed work only, and never early
+python vedant_osint.py review-master --self-test # five lenses, five ways to stop
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -884,13 +885,57 @@ python vedant_osint.py aggregate --next team.json   # aggregate reviewed results
   cannot be topped up; with either exhausted the Subagent returns a bounded partial
   report naming what it could not get and why it stopped asking.
 
+## Master review and bounded replanning
+
+A Subagent judges its own team; the Master judges the mission. After the join it applies
+five lenses to every report and then either finishes, stops, or opens one *bounded*
+follow-up round.
+
+```bash
+python vedant_osint.py review-master --self-test   # 70 bounded-loop checks, offline
+python vedant_osint.py review-master --demo        # five lenses, four endings
+python vedant_osint.py review-master --next mission.json --objective "…"
+```
+
+- **Five lenses, each able to bite.** `relevance` (does what the report asserts or was
+  assigned share subject matter with the objective?), `sufficiency` (evidence, a met
+  join, and a stated consequence for everything it withheld), `contradictions` (does it
+  disagree with another report *without recording it*?), `duplication` (does it restate
+  another report that the aggregate never reconciled?) and `coverage` (which mission
+  question or criterion does nobody satisfy?). Each lens answers for every report —
+  including `not-applicable`, which is how "nothing to judge" stays distinguishable from
+  "judged and fine".
+- **A follow-up has two routes and both go through the gates.** An `existing` follow-up
+  is one more runtime Worker for a Subagent that is already running, spent against
+  `max_follow_up_workers_per_subagent` and the Subagent's own `SpawnLedger` licence — it
+  never bypasses §36's gates because it *is* §36's path with a Master-chosen gap. A `new`
+  follow-up spends a Master licence seat and its draft passes the same
+  `validate_subagent_specs` that a plan does, so an unjustified follow-up is refused by
+  the same code that refuses a bad plan.
+- **The loop cannot run indefinitely.** Five independent bounds, each reported when it
+  bites: `max_replan_rounds` (follow-up rounds), `max_master_reviews` (reviews — a
+  separate number, because the *last* review is the `final`/`stop` decision), the Master's
+  licence, the mission deadline, and saturation. Saturation is measured in claims, not
+  rows: a round that produced only re-worded evidence has added nothing, whatever its
+  row count says.
+- **Every mission reaches a final or partial report.** `final` means the mission met its
+  own stated completion criteria — judged by the same four mechanical rules the aggregate
+  uses, applied to the whole mission's evidence. `stop` names the bound (`budget`,
+  `deadline`, `blocked`, `saturation`) and lists every refusal, so a reader can see why it
+  stopped asking instead of inferring it. A mission that finished never reports itself as
+  cut short, and one that was cut short never claims to be finished.
+- **The record is the evidence.** `FlowResult.master_reviews`, `.master_decisions` and
+  `.follow_ups` carry the whole loop, and `master_rounds()` pairs each review with the
+  round it opened and the evidence that round added — so "it was bounded" is a number a
+  reader can check rather than a property the code claims about itself.
+
 ## Status
 
 | Phase | Scope | State |
 |-------|-------|-------|
 | 1 | Foundation — CLI skeleton, config probing, version reporting | ✅ done |
 | 2 | Contracts — settings, `doctor`, preflight, models, state, renderer, lifecycle, resilience, model adapter | ✅ done |
-| 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control, Worker outcome contract, Subagent quality review, targeted Worker retasking, Subagent aggregation with bounded runtime Workers) |
+| 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control, Worker outcome contract, Subagent quality review, targeted Worker retasking, Subagent aggregation with bounded runtime Workers, Master review with bounded replanning) |
 | 4 | Browser — browser-use / Playwright sessions and capture | 🟡 started (policy, scope, capture, guarded closure, agent mode) |
 | 5 | Collection — passive OSINT sources, artefact hashing | 🟡 started (source-aware web research; safe document/page extraction with injection defence; read-only artifact manifests, hashing and access ledger) |
 | 6 | Synthesis — cross-source correlation and reporting | 🟡 started (deterministic timelines, explained indicator correlation, content de-duplication) |
