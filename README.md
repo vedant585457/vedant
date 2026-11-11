@@ -696,7 +696,7 @@ statement about observables, not about a person. `timeline` keeps both distincti
 visible in the schema itself.
 
 ```bash
-python vedant_osint.py timeline --self-test        # 145 forensic-time checks, offline
+python vedant_osint.py timeline --self-test        # 146 forensic-time checks, offline
 python vedant_osint.py timeline --demo             # order, links, duplicates
 python vedant_osint.py timeline --timestamp "04/05/2026 12:00" "2026-05-04T12:00:00+02:00"
 python vedant_osint.py timeline --record "a:domain=evil.example.org;hash=<sha256>"
