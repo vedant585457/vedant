@@ -30,7 +30,7 @@ python vedant_osint.py aggregate --self-test # reviewed work only, and never ear
 python vedant_osint.py review-master --self-test # five lenses, five ways to stop
 python vedant_osint.py loops --self-test      # repeated work, blocked lines, saturation
 python vedant_osint.py synthesis --self-test  # a report that cannot outrun its evidence
-python vedant_osint.py report --self-test     # output formats + presentation (154)
+python vedant_osint.py report --self-test     # formats, presentation, audit (217)
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -1024,7 +1024,7 @@ one `MissionDossier` assembled from the reviewed record, so a fact that is not i
 is not in the Markdown either — the JSON is the authority and the other two are renderings.
 
 ```
-python vedant_osint.py report --self-test                    # 154 checks: formats + presentation
+python vedant_osint.py report --self-test                    # 217 checks: formats, presentation, audit
 python vedant_osint.py report --demo                         # one mission, three formats
 python vedant_osint.py flow --demo exposure --json > m.json
 python vedant_osint.py report --mission m.json --out-dir out/ # writes m.md and m.json
@@ -1092,6 +1092,65 @@ python vedant_osint.py report --present-demo --outcome blocked  # just one
 - **Warnings say what they cost.** Every warning names its cause, its consequence and where
   it applies, graded `info` · `notice` ! `severe` ▲ `fatal` ✘.
 
+## Reproducibility and audit metadata
+
+Every report carries an audit block, so a second operator can see what was run and run it
+again — without being handed a secret.
+
+```
+python vedant_osint.py report --mission m.json --audit   # the block, and its clause
+python vedant_osint.py flow --demo exposure              # the screen names it and the retention note
+```
+
+The Markdown gains eleven headings under `## Audit and reproducibility` and the
+JSON an `audit` object:
+
+- **Environment** — application version and label, build phase, record format, Python and
+  platform, machine, user agent, the command that produced the file, the operator's chosen
+  name, and whether the process looked like CI. Nothing here is read at render time: a
+  dossier rendered tomorrow still describes the machine the mission ran on.
+- **Configuration** — the non-secret settings that shaped the run, each with where its value
+  came from (`cli` / environment / default). Driven by the *name* of every setting, so a
+  field added later is captured automatically and a secret-shaped one is redacted
+  automatically: a credential is recorded as `<redacted: set, value not recorded>`, because
+  *set* and *unset* are different facts.
+- **Models** — provider, model id, base URL, and the credential's *state* ("configured",
+  "absent (looked in …)"), never its value.
+- **Mission scope and limits** — the objective, mode, authorised scope and exclusions, the
+  tools available, the completion criteria and questions, and the limits the mission was
+  admitted under. Read from the admission context, not inferred from the objective sentence.
+- **Timestamps** — mission start and end (wall-clock, carried from the run), the recording
+  time, the measured duration, and per-stage spans from the ledger.
+- **Dynamic hierarchy** — every unit that ran, with its parent, status, attempts and origin,
+  as a tree. `runtime` and `follow-up` origins are the units the mission invented after its
+  plan was made; a record that showed only the plan would describe a mission that did not
+  happen.
+- **Tool failures** — every failure that names a tool, with the tool, the unit, the fault,
+  the attempt and what the graph did about it (retried, retasked, withheld, blocked).
+- **Stopping reason (audit)** — the same wording as the stopping section, pointed at it
+  rather than copied, so the two cannot disagree.
+- **Reproduction** — numbered commands that rebuild the mission's setup. They reproduce the
+  *procedure*, not the answer: a re-run collects whatever the world says now.
+- **What is deliberately not recorded** — the omissions and why: API keys, cookies and
+  browser session state, browser profile contents, page content beyond the cited findings,
+  prompts and raw completions, and the operator's home directory.
+- **Retention** — the note that travels *in* the document: this is investigation data, it can
+  contain personal data and third-party material, keep it on access-controlled storage, keep
+  the custody sheet with its artefacts, and delete it on your own schedule. The tool records
+  what happened and does not decide how long the record may be kept.
+- **Audit clause** — the acceptance clause evaluated and carried: reproducible, no secrets,
+  retention stated, and every claim the record makes about itself, with what could not be
+  confirmed named rather than rounded up.
+
+**The scan is not a promise.** `write_dossier` renders the exact text it is about to write
+and searches it for the credential values this process can see, the credential *shapes*
+anything could carry (provider prefixes, bearer tokens, cookies, private keys, connection
+strings, JSON or `key=value` credential fields), and the *structure* of a credential store.
+A match raises `OutputError` and **nothing is written** — a file that names a leak and is
+written anyway has documented the leak instead of preventing it. The scan's result, and the
+clause it produced, are recorded in the file that passed it. Findings name a location, never
+a value: a scan report that quoted the secret it found would be the leak it was checking for.
+
 ## Status
 
 | Phase | Scope | State |
@@ -1102,7 +1161,7 @@ python vedant_osint.py report --present-demo --outcome blocked  # just one
 | 4 | Browser — browser-use / Playwright sessions and capture | 🟡 started (policy, scope, capture, guarded closure, agent mode) |
 | 5 | Collection — passive OSINT sources, artefact hashing | 🟡 started (source-aware web research; safe document/page extraction with injection defence; read-only artifact manifests, hashing and access ledger) |
 | 6 | Synthesis — cross-source correlation and reporting | 🟡 started (deterministic timelines, explained indicator correlation, content de-duplication, the evidence-based Master report with citations and calibrated confidence, Markdown/JSON/terminal output formats with a source register, execution summary and chain of custody, the Rich mission presentation with four derived outcomes) |
-| 7 | Operations — resume, budgets, audit trail, hardening | 🟡 started (checkpoints, resumable missions, capability router, budgets) |
+| 7 | Operations — resume, budgets, audit trail, hardening | 🟡 started (checkpoints, resumable missions, capability router, budgets, reproducibility and audit metadata with a secret-refusing write) |
 
 ## Install
 

@@ -1152,7 +1152,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 31
+VERSION_MINOR: int = 32
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -22581,10 +22581,23 @@ class FlowResult(StrictModel):
     resume: dict[str, Any] | None = None
     #: Where this run's checkpoint lives, when it was checkpointed at all.
     checkpoint: str = ""
+    #: §42: when this run started and finished, in wall-clock time.  The ledger is
+    #: monotonic (``time.monotonic()``, rightly, for measuring an interval) and cannot be
+    #: turned into a date, so the two absolute stamps are taken here, once, and travel with
+    #: the record: a dossier rendered tomorrow must still say when the *mission* ran.
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
     #: What the browser did: visits, refusals, and whether anything was left open.
     browser: dict[str, Any] = Field(default_factory=dict)
     #: What the source-aware audit found in the research reports this run produced.
     research: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("started_at", "ended_at", mode="before")
+    @classmethod
+    def _stamps(cls, value: Any) -> Any:
+        """Accept the ISO strings a written flow result carries, and ``null`` for absent."""
+
+        return normalise_datetime(value) if value not in (None, "") else None
     #: Every Worker result's review (§34), and what was withheld because of it.
     reviews: "ReviewLedger | None" = None
     #: Every retask this run issued (§35): a retried attempt's assignment.
@@ -25612,6 +25625,7 @@ class HierarchicalFlow:
         if self.resume is not None:
             self._announce_resume()
         started = time.monotonic()
+        started_at = utc_now()
         try:
             final = self._top_graph.invoke(
                 {**_master_state(self.mission_id, self.context.objective),
@@ -25622,6 +25636,7 @@ class HierarchicalFlow:
             self._close_browser(reason="flow raised")
             raise
         elapsed = time.monotonic() - started
+        ended_at = utc_now()
         if self.resume is not None:
             # The plan and the trace are the two things a resume cannot rebuild.
             self.resume.trace(self.trace.to_list())
@@ -25641,6 +25656,7 @@ class HierarchicalFlow:
                        if final.get("synthesis") else None),
             stopped=bool(final.get("stopped")), stop_reason=str(final.get("stop_reason") or ""),
             policy=self.policy, waves=self.subagent_waves(), seconds=elapsed,
+            started_at=started_at, ended_at=ended_at,
             trace=self.trace.to_list(),
             worker_attempts=len(self.trace.events(stage=FlowStage.WORKER)),
             retries=sum(report.retries for report in kept),
@@ -26301,7 +26317,12 @@ def _flow_demo(objective_key: str, *, out_dir: Path | None = None,
     # §41: the presentation is derived from the same dossier §40 writes, so the screen and
     # the file cannot disagree about what the mission produced.
     log_path = str(logger.path) if logger is not None else ""
-    dossier = build_dossier(result, context=context)
+    # §42: the configuration is read here, at run time, and travels with the record.  A
+    # dossier that read it back when it was rendered would describe the machine that opened
+    # the file rather than the one the mission ran on.
+    dossier = build_dossier(result, context=context,
+                            settings=build_settings({}, {}).settings,
+                            command=f"flow --demo {objective_key}")
     # The paths the presentation quotes are only filled in once §40 has written the file:
     # until then it says the report was not written, which is the truth at that moment.
     written = (write_dossier(dossier, out_dir=out_dir, stem=f"report-{objective_key}")
@@ -26314,6 +26335,10 @@ def _flow_demo(objective_key: str, *, out_dir: Path | None = None,
         "objective_key": objective_key,
         "objective": context.objective,
         "mission_id": flow.mission_id,
+        **_run_stamps(result),
+        # §42: the context the mission was admitted with, so a file rendered later can
+        # state its scope and limits rather than inferring them from the objective's prose.
+        "context": context.model_dump(mode="json"),
         "presentation": presentation.to_dict(),
         "resume": result.resume,
         "checkpoint": result.checkpoint,
@@ -26624,8 +26649,12 @@ def flow_command(
         payload = {
             "objective_key": "live", "objective": objective, "structure": flow.structures(),
             "mission_id": flow.mission_id, "resume": result.resume,
+            **_run_stamps(result),
+            "context": context.model_dump(mode="json"),
             "presentation": build_presentation(
-                build_dossier(result, context=context),
+                build_dossier(result, context=context,
+                              settings=build_settings().settings,
+                              command=f"flow -t {target} -o {objective}"),
                 report_paths=live_paths,
                 log_path=str(logger.path) if logger is not None else "").to_dict(),
             "checkpoint": result.checkpoint,
@@ -53964,6 +53993,7 @@ DOCUMENT_SECTIONS: tuple[tuple[str, str], ...] = (
     ("sources", "Source register"),
     ("evidence", "Evidence table"),
     ("custody", "Chain of custody"),
+    ("audit", "Audit and reproducibility"),
     ("acceptance", "Acceptance"),
 )
 
@@ -54316,12 +54346,34 @@ class MissionDossier(StrictModel):
     sources: list[SourceRow] = Field(default_factory=list)
     evidence: list[EvidenceRow] = Field(default_factory=list)
     custody: list[CustodyRow] = Field(default_factory=list)
+    #: §42: what was run, and what is deliberately not in the file.  Carried whole rather
+    #: than summarised, because the JSON is the record a second operator reproduces from.
+    #: Built through a lambda because §42 is defined after this model and a dossier is only
+    #: ever constructed at call time — the annotation is a string (``from __future__ import
+    #: annotations``), so only the *default* needs to wait, and it can.
+    audit: AuditRecord = Field(default_factory=lambda: AuditRecord())
     acceptance: DossierAcceptance = Field(default_factory=DossierAcceptance)
 
     @field_validator("generated_at", mode="before")
     @classmethod
     def _tz(cls, value: Any) -> Any:
         return normalise_datetime(value)
+
+    @field_validator("audit", mode="before")
+    @classmethod
+    def _audit(cls, value: Any) -> Any:
+        """Build the audit block through its own loader (§42).
+
+        The published audit view carries derived fields (``dynamic``, the clause, the
+        redacted keys) that pydantic would reject as extras, and the record's own
+        ``from_dict`` is where those are handled — so the dossier reads the block the way
+        the block is written.  Validating it twice would mean two loaders and, in time, two
+        answers.
+        """
+
+        if isinstance(value, Mapping):
+            return AuditRecord.from_dict(value)
+        return value
 
     # -- derived facts a renderer may rely on -------------------------------
 
@@ -54349,9 +54401,17 @@ class MissionDossier(StrictModel):
     # -- serialisation ------------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
-        """The JSON form: everything a reader of the file would need, nothing else."""
+        """The JSON form: everything a reader of the file would need, nothing else.
 
-        return json.loads(model_to_json(self))
+        The audit block is replaced by its own published view (§42), because that view
+        carries derived facts the model dump does not: the clause as it evaluated, the
+        redacted keys, and the tree as edges.  A file that shipped the model's dump instead
+        would state no verdict about itself and no list of what it had omitted.
+        """
+
+        data = json.loads(model_to_json(self))
+        data["audit"] = self.audit.to_dict()
+        return data
 
     def to_json(self, *, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent, default=str, sort_keys=False)
@@ -54382,9 +54442,21 @@ class MissionDossier(StrictModel):
 
     @classmethod
     def json_schema(cls) -> dict[str, Any]:
-        """The published contract a dossier file is checked against."""
+        """The published contract a dossier file is checked against.
 
-        return cls.model_json_schema()
+        The audit block (§42) is described by *its* published view rather than by its model
+        schema, because the view is what is written: it carries the clause as evaluated and
+        the redacted keys, which are properties on the model and would be missing from the
+        schema a reader was handed.
+        """
+
+        schema = cls.model_json_schema()
+        properties = schema.get("properties", {}).get("audit", {})
+        if isinstance(properties, dict):
+            properties.clear()
+            properties.update({"$ref": "#/$defs/AuditRecordPublished"})
+            schema.setdefault("$defs", {})["AuditRecordPublished"] = _audit_published_schema()
+        return schema
 
 
 
@@ -54912,7 +54984,9 @@ def _custody_rows(evidence: Sequence[EvidenceItem]) -> list[CustodyRow]:
 
 
 def build_dossier(result: "FlowResult", *, report: MasterReport | None = None,
-                  context: "MasterContext | None" = None) -> MissionDossier:
+                  context: "MasterContext | None" = None,
+                  settings: "Settings | None" = None,
+                  command: str = "") -> MissionDossier:
     """Assemble the one record every format is a view of.
 
     Order matters and is the same argument as §39's: the report first (so the register and
@@ -54927,6 +55001,7 @@ def build_dossier(result: "FlowResult", *, report: MasterReport | None = None,
             "this mission has no finished report: a stopped mission has a record but not "
             "a document, and its outputs belong to `flow`, not to a report format")
     evidence = list(result.evidence)
+    dossier_custody = _custody_rows(evidence)
     execution = _execution_summary(result, document)
     if context is not None:
         execution = execution.model_copy(update={
@@ -54938,7 +55013,12 @@ def build_dossier(result: "FlowResult", *, report: MasterReport | None = None,
         objective=document.objective, report=document, execution=execution,
         sources=_source_rows(evidence, document),
         evidence=_evidence_rows(evidence, document),
-        custody=_custody_rows(evidence))
+        custody=dossier_custody,
+        # §42 last, because it reports on everything above it: the hierarchy it describes is
+        # the one §40 counted, and the stopping reason it names is the one it recorded.
+        audit=build_audit_record(result, execution=execution, report=document,
+                                 context=context, settings=settings, command=command,
+                                 custody_rows=dossier_custody))
     return dossier.model_copy(update={"acceptance": dossier_acceptance(dossier)})
 
 
@@ -55246,8 +55326,15 @@ def _md_acceptance(dossier: MissionDossier) -> str:
                  f"{'yes' if document['every_finding_cited'] else 'no'}, no conclusion above "
                  f"its evidence "
                  f"{'yes' if document['no_conclusion_exceeds_its_evidence'] else 'no'}")
+    audit = dossier.audit.acceptance()
+    lines.append("- §42 audit clause on this record: another operator can reproduce the "
+                 f"procedure {'yes' if audit['reproducible'] else 'no'}, no secret in the "
+                 f"file {'yes' if audit['no_secrets'] else 'no'}, retention stated "
+                 f"{'yes' if audit['retention_stated'] else 'no'}")
     if clause.errors:
         lines.append("- problems: " + "; ".join(clause.errors))
+    if audit["errors"]:
+        lines.append("- audit problems: " + "; ".join(audit["errors"]))
     lines.append("")
     lines.append("No finding in this document declares guilt or attributes identity with "
                  "certainty; an identification appears only as a hypothesis with a test.")
@@ -55270,6 +55357,7 @@ def render_dossier_markdown(dossier: MissionDossier, *, width: int = 96) -> str:
         f"- mission: `{_md_cell(dossier.mission_id or 'unnamed')}`\n"
         f"- generated: {dossier.generated_at.isoformat(timespec='seconds')}\n"
         f"- format: `{dossier.format_version}` (schema version {dossier.schema_version})\n"
+        f"- produced by: {_md_inline(dossier.audit.environment.describe())}\n"
         f"- confidence: **{report.confidence.value}** — "
         f"{_md_inline(_first_sentence(report.confidence_basis))}\n"
         f"- evidence: {len(report.cited_ids)} citation(s) from {len(report.origins)} "
@@ -55305,6 +55393,8 @@ def render_dossier_markdown(dossier: MissionDossier, *, width: int = 96) -> str:
     parts.append("## Source register\n\n" + _md_sources(dossier))
     parts.append("## Evidence table\n\n" + _md_evidence(dossier))
     parts.append("## Chain of custody\n\n" + _md_custody(dossier))
+    # §42: the two questions a second operator asks — what was run, and what is not here.
+    parts.append(render_audit_markdown(dossier.audit).rstrip() + "\n")
     parts.append("## Acceptance\n\n" + _md_acceptance(dossier))
     parts.append(
         "\n---\n\n"
@@ -55479,6 +55569,16 @@ class WrittenDossier(StrictModel):
         return [path for path in (self.markdown_path, self.json_path) if path]
 
 
+def _render_outputs(dossier: MissionDossier,
+                    formats: OutputFormat) -> tuple[str, str]:
+    """The Markdown and JSON text for the requested formats, or empty for one not asked for."""
+
+    markdown = (render_dossier_markdown(dossier)
+                if formats in {OutputFormat.MARKDOWN, OutputFormat.ALL} else "")
+    payload = dossier.to_json() if formats in {OutputFormat.JSON, OutputFormat.ALL} else ""
+    return markdown, payload
+
+
 def write_dossier(dossier: MissionDossier, *, out_dir: Path | str = Path("."),
                   stem: str = "", formats: OutputFormat = OutputFormat.ALL) -> WrittenDossier:
     """Write the dossier in the requested formats, then read the JSON back.
@@ -55495,10 +55595,31 @@ def write_dossier(dossier: MissionDossier, *, out_dir: Path | str = Path("."),
     except OSError as exc:
         raise OutputError(f"cannot create the output directory: {exc}") from exc
     name = stem or (dossier.mission_id or "mission")
+    # §42: the secret scan runs over the exact text about to be written, and a match refuses
+    # the write.  Scanning the *file* rather than the object is deliberate: a value that
+    # appears in the output is caught however it got there.  The written text then has to
+    # say what the scan found, which changes the text — so the two are brought to a fixed
+    # point, and a scan whose own line would change the next result is the only way they
+    # could disagree.  Three rounds is enough for any record this section can describe, and
+    # a record that needed more would be one whose scan line itself carried a secret.
+    markdown_text, json_text = _render_outputs(dossier, formats)
+    for _round in range(3):
+        scanned = assert_no_secrets(
+            markdown_text + json_text, where=f"the dossier for {name}",
+            # The omissions this record states, not a fresh set: a scan that reported
+            # different omissions from the section beside it would be a second opinion.
+            rules=dossier.audit.secrets.rules)
+        audit = dossier.audit.model_copy(update={"secrets": scanned})
+        dossier = dossier.model_copy(update={"audit": audit.model_copy(
+            update={"clause": audit.acceptance()})})
+        rendered = _render_outputs(dossier, formats)
+        if rendered == (markdown_text, json_text):
+            break
+        markdown_text, json_text = rendered
     written = WrittenDossier(mission_id=dossier.mission_id,
                              summary=render_terminal_summary(dossier))
     if formats in {OutputFormat.MARKDOWN, OutputFormat.ALL}:
-        markdown = render_dossier_markdown(dossier)
+        markdown = markdown_text or render_dossier_markdown(dossier)
         path = directory / f"{name}.md"
         try:
             path.write_text(markdown, encoding="utf-8")
@@ -55507,7 +55628,7 @@ def write_dossier(dossier: MissionDossier, *, out_dir: Path | str = Path("."),
         written = written.model_copy(update={"markdown_path": str(path),
                                              "markdown_bytes": len(markdown.encode("utf-8"))})
     if formats in {OutputFormat.JSON, OutputFormat.ALL}:
-        payload = dossier.to_json()
+        payload = json_text or dossier.to_json()
         path = directory / f"{name}.json"
         try:
             path.write_text(payload, encoding="utf-8")
@@ -55517,7 +55638,7 @@ def write_dossier(dossier: MissionDossier, *, out_dir: Path | str = Path("."),
         written = written.model_copy(update={
             "json_path": str(path), "json_bytes": len(payload.encode("utf-8")),
             "reloaded": reloaded.mission_id == dossier.mission_id})
-    acceptance = dossier_acceptance(dossier, markdown=(render_dossier_markdown(dossier)
+    acceptance = dossier_acceptance(dossier, markdown=(markdown_text
                                                        if formats in {OutputFormat.MARKDOWN,
                                                                       OutputFormat.ALL}
                                                        else None))
@@ -56292,6 +56413,12 @@ class MissionPresentation(StrictModel):
     #: detailed reason for each is in the report's execution section; this is what the
     #: reader needs in order to know *which* work is missing.
     unfinished: list[Highlight] = Field(default_factory=list)
+    #: §42, in three lines: what produced this, how the run was shaped, and what the reader
+    #: must do with the file.  The record itself is in the report; these are the facts that
+    #: decide whether a reader trusts it and whether they may pass it on.
+    produced_by: str = ""
+    networkshape: str = ""
+    retention: str = ""
 
     @property
     def outcome(self) -> MissionOutcome:
@@ -56319,6 +56446,8 @@ class MissionPresentation(StrictModel):
                 "report_paths": list(self.report_paths), "log_path": self.log_path,
                 "stopping_reason": self.stopping_reason, "next_step": self.next_step,
                 "unfinished": [item.to_dict() for item in self.unfinished],
+                "produced_by": self.produced_by, "networkshape": self.networkshape,
+                "retention": self.retention,
                 "outcome": self.outcome.value,
                 "blocking": [item.cause for item in self.blocking]}
 
@@ -56352,7 +56481,10 @@ class MissionPresentation(StrictModel):
             report_paths=[str(item) for item in payload.get("report_paths") or []],
             log_path=str(payload.get("log_path") or ""),
             stopping_reason=str(payload.get("stopping_reason") or ""),
-            next_step=str(payload.get("next_step") or ""))
+            next_step=str(payload.get("next_step") or ""),
+            produced_by=str(payload.get("produced_by") or ""),
+            networkshape=str(payload.get("networkshape") or ""),
+            retention=str(payload.get("retention") or ""))
 
 
 # --------------------------------------------------------------------------
@@ -56701,7 +56833,11 @@ def build_presentation(dossier: MissionDossier, *, report_paths: Sequence[str] =
         report_paths=paths, log_path=log_path,
         stopping_reason=dossier.execution.stopping.reason,
         next_step=(report.next_steps[0].action if report.next_steps else ""),
-        unfinished=_unfinished_units(dossier, limit=4))
+        unfinished=_unfinished_units(dossier, limit=4),
+        produced_by=dossier.audit.environment.describe(),
+        networkshape=(f"{dossier.audit.hierarchy.describe()} — "
+                      f"stopped: {dossier.audit.stopping.kind}"),
+        retention=RETENTION_SHORT)
 
 
 # --------------------------------------------------------------------------
@@ -56825,6 +56961,10 @@ def render_mission_presentation(presentation: MissionPresentation, *,
         footer.add_row("report", escape("not written — see the warning above"))
     if presentation.log_path:
         footer.add_row("log", escape(presentation.log_path))
+    if presentation.produced_by:
+        footer.add_row("produced by", escape(presentation.produced_by))
+    if presentation.networkshape:
+        footer.add_row("shape", escape(presentation.networkshape))
     if presentation.next_step:
         footer.add_row("next", escape(presentation.next_step[:160]))
     footer.add_row("detail", escape("the findings above are the headline of each; the full "
@@ -56852,6 +56992,14 @@ def render_mission_presentation(presentation: MissionPresentation, *,
             block.add_row(f"[{item.level.style}]{item.level.glyph}[/{item.level.style}]",
                           escape(item.describe()))
         blocks.extend([Text(""), block])
+    if presentation.retention:
+        # The retention note is printed, not filed: a reader who never opens the report still
+        # has to know that this file is investigation data and how to keep it.
+        kept = Table.grid(padding=(0, 1))
+        kept.add_column(width=2, no_wrap=True)
+        kept.add_column(overflow="fold", max_width=92)
+        kept.add_row("[yellow]▣[/yellow]", escape(presentation.retention))
+        blocks.extend([Text(""), Text("keeping this record", style="bold"), kept])
     return Group(*blocks)
 
 
@@ -56870,7 +57018,11 @@ def render_presentation_summary(presentation: MissionPresentation) -> str:
         lines.append(f"  risk        {item.statement}")
     for item in presentation.warnings:
         lines.append(f"  {item.level.glyph:<11} {item.cause} — {item.consequence}")
+    if presentation.produced_by:
+        lines.append(f"  produced by {presentation.produced_by}")
     lines.append(f"  report      {', '.join(presentation.report_paths) or 'not written'}")
+    if presentation.retention:
+        lines.append(f"  retention   {presentation.retention}")
     return "\n".join(lines)
 
 
@@ -57299,6 +57451,1753 @@ def run_presentation_self_test() -> list[DossierCheck]:
         refused = True
     add("an unknown outcome is refused, not defaulted to success", refused)
     return checks
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 42. Reproducibility and audit metadata: what was run, and what is not kept
+# --------------------------------------------------------------------------
+#
+# A report answers "what is known".  This section answers the two questions a *second*
+# operator asks before they trust it, or before they run it again:
+#
+#   * **What was run?**  The application version and build, the non-secret configuration
+#     that shaped the run (with where each value came from), the model identifiers, the
+#     mission's scope and limits at the moment it was admitted, the timestamps, the
+#     hierarchy the mission actually built — including the units it invented at runtime —
+#     every tool failure with the tool that failed, and why it stopped.
+#   * **What is deliberately not in the file?**  No API key, no cookie, no browser
+#     credential, and no page content beyond what the report already cites.  That is not a
+#     promise in a docstring: :func:`audit_secrets` looks for the credential *values* this
+#     process can see, the credential *shapes* anything could carry, and the cookie and
+#     credential fields of the run, in the exact text that is about to be written, and
+#     refuses the write if it finds any of them.
+#
+# The third thing the section does is a retention note, because an investigation record is
+# not a log file: it can contain personal data and material that could be misused.  The note
+# travels *in the document*, where a reader will meet it, rather than in a README the file
+# will never be read beside.
+#
+# The rule the whole section is built on: **the audit record is derived from the run, never
+# from the environment at read time.**  A record that read the current environment when it
+# was rendered would describe the machine that opened the file instead of the mission that
+# produced it, and would be a plausible lie rather than a record.
+
+#: Environment indicators of a CI run.  Named so the record can say "this ran in CI" without
+#: guessing, and so the secret scan can prove those variables are *not* copied into it: a
+#: CI token in an audit block would be the exact leak this section forbids.
+CI_ENV_VARS: tuple[str, ...] = (
+    "CI", "GITHUB_ACTIONS", "GITLAB_CI", "JENKINS_URL", "BUILDKITE", "CIRCLECI",
+    "TRAVIS", "TF_BUILD", "TEAMCITY_VERSION")
+
+#: Configuration keys that are captured as a *shape* (set / unset, from where) and never as
+#: a value.  Kept as a set so :func:`_safe_config` cannot accidentally be widened by a
+#: future ``Settings.to_dict`` field: anything whose name matches is reduced, not copied.
+_SECRET_SHAPED_KEY: frozenset[str] = frozenset({
+    "api_key", "apikey", "key", "token", "secret", "password", "passwd", "cookie",
+    "cookies", "credential", "credentials", "auth", "authorization", "session",
+    "session_key", "session_token", "signature", "private_key", "client_secret"})
+
+
+def _is_secret_shaped(name: str) -> bool:
+    """Whether a configuration key's *value* must never be copied into a record."""
+
+    lowered = name.lower()
+    return any(token in lowered for token in _SECRET_SHAPED_KEY)
+
+
+#: The retention note, as data so the document, the terminal and the JSON carry one wording.
+RETENTION_NOTE: str = (
+    "This report is an investigation record, not a log file. It can contain personal data, "
+    "unpublished material about a third party, and evidence that has been hashed so that it "
+    "can be identified later. Protect it accordingly: keep it on access-controlled storage, "
+    "share it only with people entitled to see the investigation, and keep the chain-of-"
+    "custody sheet with the artefacts it describes — a digest without the artefact proves "
+    "nothing. Scope, collection and retention of the data in this file are the operator's "
+    "responsibility under the law that applies to them; this tool records what happened and "
+    "does not decide how long that record may be kept. No API key, cookie, browser "
+    "credential or page content beyond the cited findings is stored in it, and a copy of it "
+    "is safe to hand to another operator *for the purpose of reproducing the procedure* — "
+    "which is not the same as safe to publish.")
+
+
+#: What a redacted configuration value looks like.  A marker rather than an empty string:
+#: "set, and deliberately not copied" and "not set" are different facts, and a record that
+#: rendered both as an empty string could not tell a reader which one it was.
+NOT_REDACTED_MARKER: str = "<redacted"
+
+
+def _iso(value: datetime | None) -> str | None:
+    """An ISO-8601 stamp at second precision, or ``None`` when there is no stamp."""
+
+    return value.isoformat(timespec="seconds") if value is not None else None
+
+
+#: The retention note as the *screen* prints it: the facts a reader needs at the moment they
+#: decide what to do with the file.  The full note (below) goes in the document, where there
+#: is room to say why.
+RETENTION_SHORT: str = (
+    "investigation data — it can contain personal data and third-party material. Keep it on "
+    "access-controlled storage, keep the custody sheet with its artefacts, and delete it on "
+    "your own retention schedule.")
+
+
+class AuditEnvironment(StrictModel):
+    """The software that produced the record, and the machine it ran on — no more.
+
+    Python's version and platform are here because a re-run on a different interpreter is a
+    different experiment, and a reader comparing two records needs to see that.  Nothing
+    here identifies the *operator* beyond the name they chose to give, and nothing here is
+    read from the environment at render time: it is captured when the dossier is built.
+    """
+
+    app: str = APP_NAME
+    app_title: str = APP_TITLE
+    version: str = __version__
+    version_label: str = VERSION_LABEL
+    build_phase: int = BUILD_PHASE
+    format_version: str = "argus-audit/1"
+    python: str = Field(default_factory=lambda: platform.python_version())
+    implementation: str = Field(default_factory=lambda: platform.python_implementation())
+    platform: str = Field(default_factory=lambda: platform.platform())
+    machine: str = Field(default_factory=lambda: platform.machine())
+    #: The user agent this mission actually sent, which is how a third party's logs will
+    #: identify it — a fact a reproducibility record should not leave the reader to infer.
+    user_agent: str = ""
+    command: str = ""
+    operator: str = ""
+    dry_run: bool = False
+    invoked_from: str = ""
+    #: ``True`` when the process looks like CI, from :data:`CI_ENV_VARS` — the *names* are
+    #: checked and nothing about their values is copied.
+    ci: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"app": self.app, "app_title": self.app_title, "version": self.version,
+                "version_label": self.version_label, "build_phase": self.build_phase,
+                "format_version": self.format_version, "python": self.python,
+                "implementation": self.implementation, "platform": self.platform,
+                "machine": self.machine, "user_agent": self.user_agent,
+                "command": self.command, "operator": self.operator,
+                "dry_run": self.dry_run, "invoked_from": self.invoked_from,
+                "ci": self.ci}
+
+    def describe(self) -> str:
+        return (f"{self.app} {self.version} on Python {self.python} "
+                f"({self.implementation}, {self.machine}); schema {self.format_version}")
+
+
+class AuditConfigEntry(StrictModel):
+    """One configuration value that shaped the run, with where it came from.
+
+    ``value`` is a string because a record is read, not evaluated; a secret-shaped key
+    carries ``"<redacted: set, from …>"`` instead of a value, and ``redacted`` says which
+    happened.  Keeping the redacted entries in the list rather than dropping them is
+    deliberate: "the model was configured" and "no model was configured" are different
+    facts, and a record that omitted the first would be unable to tell them apart.
+    """
+
+    key: str = Field(min_length=1)
+    value: str = ""
+    source: str = "unknown"
+    redacted: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"key": self.key, "value": self.value, "source": self.source,
+                "redacted": self.redacted}
+
+
+class AuditModel(StrictModel):
+    """A model identifier the mission used, and what it was used for.
+
+    Never the credential: :attr:`credential_state` is a shape ("configured", "absent"),
+    which is what a reader needs in order to know whether a re-run will be able to call
+    anything at all.
+    """
+
+    role: str = "master-and-workers"
+    provider: str = ""
+    model: str = ""
+    base_url: str = ""
+    credential_state: str = "unknown"
+    credential_vars: list[str] = Field(default_factory=list)
+    provenance: str = ""
+
+    def describe(self) -> str:
+        if not self.model and self.provider in {"", "unknown"}:
+            return f"not recorded — {self.credential_state}"
+        return (f"{self.model or 'unset'} via {self.provider or 'unknown provider'} — "
+                f"credential {self.credential_state}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"role": self.role, "provider": self.provider, "model": self.model,
+                "base_url": self.base_url, "credential_state": self.credential_state,
+                "credential_vars": list(self.credential_vars),
+                "provenance": self.provenance}
+
+
+class AuditScope(StrictModel):
+    """The mission as it was admitted: what it was allowed to touch, and how much of it.
+
+    Captured from the :class:`MasterContext` the flow ran with, not from the objective
+    sentence: a re-run needs the authorised domain list and the limits, and inferring them
+    from prose is how two runs of "the same mission" become two different missions.
+    """
+
+    objective: str = ""
+    mode: str = "passive"
+    scope_entries: list[str] = Field(default_factory=list)
+    exclusions: list[str] = Field(default_factory=list)
+    data_classes: list[str] = Field(default_factory=list)
+    available_tools: list[str] = Field(default_factory=list)
+    completion_criteria: list[str] = Field(default_factory=list)
+    mission_questions: list[str] = Field(default_factory=list)
+    operator_notes: list[str] = Field(default_factory=list)
+    prior_findings: list[str] = Field(default_factory=list)
+    limits: dict[str, int] = Field(default_factory=dict)
+    #: ``context`` when the run's own context was supplied, ``report`` when the record was
+    #: built from a report set and the scope had to be read from the document.
+    supplied_from: str = "report"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"objective": self.objective, "mode": self.mode,
+                "scope_entries": list(self.scope_entries),
+                "exclusions": list(self.exclusions),
+                "data_classes": list(self.data_classes),
+                "available_tools": list(self.available_tools),
+                "completion_criteria": list(self.completion_criteria),
+                "mission_questions": list(self.mission_questions),
+                "operator_notes": list(self.operator_notes),
+                "prior_findings": list(self.prior_findings),
+                "limits": dict(self.limits), "supplied_from": self.supplied_from}
+
+
+class AuditRunPolicy(StrictModel):
+    """The limits the graph ran under, as values rather than as prose.
+
+    The eight that decide the shape and the stopping behaviour of a run.  A record that said
+    only "bounded concurrency" would leave a re-run unable to reproduce the bound.
+    """
+
+    max_parallel_subagents: int = 0
+    max_parallel_workers: int = 0
+    max_review_rounds: int = 0
+    max_replan_rounds: int = 0
+    max_master_reviews: int = 0
+    max_runtime_workers_per_subagent: int = 0
+    max_follow_up_workers_per_subagent: int = 0
+    allow_runtime_workers: bool = True
+    allow_follow_ups: bool = True
+    stop_on_blocking_failure: bool = True
+    allow_network: bool = True
+    research_first: bool = True
+    capability_router: bool = True
+    browser: bool = False
+    browser_mode: str = "http"
+    #: ``flow`` when the run's own policy was supplied; ``default`` when it was not, and the
+    #: record then states that these are the defaults rather than what happened.
+    supplied_from: str = "default"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {name: getattr(self, name) for name in
+                ("max_parallel_subagents", "max_parallel_workers", "max_review_rounds",
+                 "max_replan_rounds", "max_master_reviews",
+                 "max_runtime_workers_per_subagent",
+                 "max_follow_up_workers_per_subagent", "allow_runtime_workers",
+                 "allow_follow_ups", "stop_on_blocking_failure", "allow_network",
+                 "research_first", "capability_router", "browser", "browser_mode",
+                 "supplied_from")}
+
+
+class AuditStamp(StrictModel):
+    """When the mission ran, and how long each phase of it took.
+
+    ``started_at`` and ``ended_at`` are derived from the run's own ledger, not from the
+    moment this record was written: a dossier rendered a day later must still say when the
+    *mission* happened.
+    """
+
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    recorded_at: datetime = Field(default_factory=utc_now)
+    duration_seconds: float = Field(default=0.0, ge=0.0)
+    #: Seconds per stage, as §40's time usage computed them.
+    stages: list[tuple[str, float]] = Field(default_factory=list)
+
+    @field_validator("started_at", "ended_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> Any:
+        return normalise_datetime(value) if value not in (None, "") else None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"started_at": _iso(self.started_at), "ended_at": _iso(self.ended_at),
+                "recorded_at": _iso(self.recorded_at),
+                "duration_seconds": round(self.duration_seconds, 3),
+                "stages": [[name, round(seconds, 3)] for name, seconds in self.stages]}
+
+
+class AuditUnit(StrictModel):
+    """One node of the hierarchy the mission actually built.
+
+    ``kind`` distinguishes what the *plan* asked for from what the *run* invented: a
+    ``subagent`` or ``worker`` was planned, ``runtime-worker`` and ``follow-up-worker``
+    were created after the plan was made.  A hierarchy record that showed only the plan
+    would describe a mission that did not happen.
+    """
+
+    id: str = Field(min_length=1)
+    kind: str = "worker"
+    role: str = ""
+    parent: str = ""
+    objective: str = ""
+    status: str = ""
+    gate: str = "none"
+    attempts: int = Field(default=1, ge=1)
+    evidence: int = Field(default=0, ge=0)
+    seconds: float = Field(default=0.0, ge=0.0)
+    origin: str = "planned"
+    spawned_by: str = ""
+    #: The plan's dependency edges, kept because they are part of what was run.
+    depends_on: list[str] = Field(default_factory=list)
+    completion_criteria: list[str] = Field(default_factory=list)
+
+    @property
+    def dynamic(self) -> bool:
+        return self.origin in {"runtime", "follow-up", "adopted"}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"id": self.id, "kind": self.kind, "role": self.role,
+                "parent": self.parent, "objective": self.objective,
+                "status": self.status, "gate": self.gate, "attempts": self.attempts,
+                "evidence": self.evidence, "seconds": round(self.seconds, 3),
+                "origin": self.origin, "spawned_by": self.spawned_by,
+                "depends_on": list(self.depends_on),
+                "completion_criteria": list(self.completion_criteria),
+                "dynamic": self.dynamic}
+
+
+class AuditHierarchy(StrictModel):
+    """The shape the run built: how many nodes, how deep, and how much of it was invented."""
+
+    units: list[AuditUnit] = Field(default_factory=list)
+    #: ``id -> [child id, …]``, so a reader can see the tree without reconstructing it from
+    #: ``parent`` fields and hoping no parent was dropped.
+    edges: dict[str, list[str]] = Field(default_factory=dict)
+    depth: int = Field(default=0, ge=0)
+    planned: int = Field(default=0, ge=0)
+    dynamic: int = Field(default=0, ge=0)
+    max_observed_concurrency: int = Field(default=0, ge=0)
+    waves: list[list[str]] = Field(default_factory=list)
+    supplied_from: str = "report"
+
+    def by_kind(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for unit in self.units:
+            counts[unit.kind] = counts.get(unit.kind, 0) + 1
+        return counts
+
+    def describe(self) -> str:
+        kinds = ", ".join(f"{count} {kind}" for kind, count in sorted(self.by_kind().items()))
+        return (f"{len(self.units)} unit(s) in {self.depth} level(s)"
+                + (f": {kinds}" if kinds else "")
+                + (f"; {self.dynamic} invented after the plan" if self.dynamic else ""))
+
+
+class AuditToolFailure(StrictModel):
+    """One tool that failed, and what the mission did about it.
+
+    Separate from :class:`ErrorRow`: an error is what the *unit* recorded, and a tool failure
+    is a fact about a specific tool — which is what a re-run needs, because "the advisory
+    reader was refused" and "the client dropped the connection" lead to different fixes.
+    """
+
+    tool: str = ""
+    unit: str = ""
+    stage: str = ""
+    fault: str = "tool"
+    message: str = Field(min_length=1)
+    attempt: int = Field(default=1, ge=1)
+    retryable: bool = False
+    #: What the graph did: ``retried``, ``retasked``, ``withheld``, ``blocked``, ``recorded``.
+    handled_by: str = "recorded"
+    occurred_at: datetime | None = None
+
+    @field_validator("occurred_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> Any:
+        return normalise_datetime(value) if value not in (None, "") else None
+
+    def describe(self) -> str:
+        tool = self.tool or "unattributed tool"
+        return f"{tool} at {self.unit or 'unknown unit'}: {self.message}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"tool": self.tool, "unit": self.unit, "stage": self.stage,
+                "fault": self.fault, "message": self.message, "attempt": self.attempt,
+                "retryable": self.retryable, "handled_by": self.handled_by,
+                "occurred_at": _iso(self.occurred_at)}
+
+
+class AuditStop(StrictModel):
+    """Why the mission stopped, in the audit's own terms.
+
+    Pointed at §40's :class:`StoppingRecord` rather than copying its prose: one wording, so
+    the audit block and the stopping section cannot disagree about the same event.
+    """
+
+    kind: str = "not stated"
+    condition: str = "none"
+    reason: str = ""
+    stopped: bool = False
+    bounded: bool = False
+    reviews: int = Field(default=0, ge=0)
+    rounds: int = Field(default=0, ge=0)
+    bounds: list[str] = Field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": self.kind, "condition": self.condition, "reason": self.reason,
+                "stopped": self.stopped, "bounded": self.bounded, "reviews": self.reviews,
+                "rounds": self.rounds, "bounds": list(self.bounds)}
+
+
+class RedactionRule(StrictModel):
+    """One thing that was deliberately left out, and why.
+
+    A record of omission, so a reader can tell "the tool never stored a cookie" from "the
+    cookie was removed before writing" — and so nobody has to trust a claim in a docstring.
+    """
+
+    what: str = Field(min_length=1)
+    why: str = Field(min_length=1)
+    count: int = Field(default=0, ge=0)
+    removed: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"what": self.what, "why": self.why, "count": self.count,
+                "removed": self.removed}
+
+
+class SecretFinding(StrictModel):
+    """One thing the scan found in text that was about to be written.
+
+    ``where`` is a location, never the value: a scan report that quoted the secret it found
+    would be the leak it was checking for.
+    """
+
+    kind: str = Field(min_length=1)
+    where: str = ""
+    detail: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": self.kind, "where": self.where, "detail": self.detail}
+
+
+class AuditSecrets(StrictModel):
+    """The result of scanning the exact text a writer is about to emit.
+
+    Three things are searched for, in this order, because each catches what the previous
+    one cannot: the credential *values* this process can see (a real key that leaked through
+    an operator note), the credential *shapes* anything could carry (a key this process
+    never knew about), and the *structure* of a secret field (a JSON object that renamed
+    itself on the way in).
+    """
+
+    scanned: bool = False
+    clean: bool = False
+    bytes_scanned: int = Field(default=0, ge=0)
+    findings: list[SecretFinding] = Field(default_factory=list)
+    rules: list[RedactionRule] = Field(default_factory=list)
+    scanned_at: datetime = Field(default_factory=utc_now)
+    #: What was searched for, by kind — not by value.
+    patterns: list[str] = Field(default_factory=list)
+
+    @field_validator("scanned_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> Any:
+        return normalise_datetime(value)
+
+    #: Why a scan is in the state it is, in the record's own words: a JSON consumer that saw
+    #: only ``scanned: false`` could not tell "the writer did not scan" from "there was
+    #: nothing to scan", and those are different facts about the file.
+    scanned_text: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"scanned": self.scanned, "clean": self.clean,
+                "bytes_scanned": self.bytes_scanned,
+                "findings": [item.to_dict() for item in self.findings],
+                "rules": [item.to_dict() for item in self.rules],
+                "scanned_at": _iso(self.scanned_at),
+                "patterns": list(self.patterns),
+                "scanned_text": self.scanned_text or self.describe()}
+
+    def describe(self) -> str:
+        if not self.scanned:
+            return ("not scanned in memory: the scan runs over the exact text a writer is "
+                    "about to emit, and the written record carries its result")
+        if self.clean:
+            return (f"clean: {self.bytes_scanned:,} byte(s) scanned for "
+                    f"{len(self.patterns)} credential pattern(s)")
+        return (f"{len(self.findings)} finding(s) in {self.bytes_scanned:,} byte(s): "
+                + "; ".join(f"{item.kind} at {item.where}" for item in self.findings[:3]))
+
+
+class ReproductionStep(StrictModel):
+    """One command that would reproduce the procedure — never the answer.
+
+    Deliberately a *procedure*: the steps rebuild the mission's setup, and the record says
+    plainly that a re-run will find whatever the world says now, which need not be what it
+    said then.
+    """
+
+    order: int = Field(default=1, ge=0)
+    command: str = Field(min_length=1)
+    purpose: str = ""
+    #: ``True`` when the step needs a credential the reader must supply themselves.
+    needs_credential: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"order": self.order, "command": self.command, "purpose": self.purpose,
+                "needs_credential": self.needs_credential}
+
+
+class RetentionNote(StrictModel):
+    """What the reader must do with the file, and what this tool will not decide for them."""
+
+    note: str = RETENTION_NOTE
+    contains_personal_data: bool = True
+    contains_third_party_material: bool = True
+    contains_forensic_artefacts: bool = False
+    handled_by: str = ""
+    #: The tool's own position, stated so nobody infers a retention period from silence.
+    retention_decided_by: str = "the operator, under the law that applies to them"
+    guidance: list[str] = Field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"note": self.note,
+                "contains_personal_data": self.contains_personal_data,
+                "contains_third_party_material": self.contains_third_party_material,
+                "contains_forensic_artefacts": self.contains_forensic_artefacts,
+                "handled_by": self.handled_by,
+                "retention_decided_by": self.retention_decided_by,
+                "guidance": list(self.guidance)}
+
+
+class AuditRecord(StrictModel):
+    """Everything a second operator needs, and nothing they must not have.
+
+    The acceptance clause, in one sentence: another operator can understand what was run and
+    reproduce the procedure without receiving secrets.  Each block below is one clause of
+    that sentence, and :meth:`acceptance` evaluates them rather than asserting them.
+    """
+
+    format_version: str = "argus-audit/1"
+    mission_id: str = ""
+    environment: AuditEnvironment = Field(default_factory=AuditEnvironment)
+    configuration: list[AuditConfigEntry] = Field(default_factory=list)
+    models: list[AuditModel] = Field(default_factory=list)
+    scope: AuditScope = Field(default_factory=AuditScope)
+    policy: AuditRunPolicy = Field(default_factory=AuditRunPolicy)
+    stamps: AuditStamp = Field(default_factory=AuditStamp)
+    hierarchy: AuditHierarchy = Field(default_factory=AuditHierarchy)
+    tool_failures: list[AuditToolFailure] = Field(default_factory=list)
+    stopping: AuditStop = Field(default_factory=AuditStop)
+    secrets: AuditSecrets = Field(default_factory=AuditSecrets)
+    reproduction: list[ReproductionStep] = Field(default_factory=list)
+    retention: RetentionNote = Field(default_factory=RetentionNote)
+    #: Free-text facts that belong to none of the blocks above — a resume, a checkpoint, a
+    #: browser session that was closed.  Named so it cannot become a dumping ground.
+    notes: list[str] = Field(default_factory=list)
+    #: The acceptance clause as it evaluated when this record was written, carried so the
+    #: file states its own verdict rather than leaving a reader to re-run the evaluation.
+    #: :meth:`acceptance` is still the authority — it evaluates the record in front of it,
+    #: which is why a reloaded file can be checked against the verdict it came with.
+    clause: dict[str, Any] = Field(default_factory=dict)
+
+    # -- derived facts ------------------------------------------------------
+
+    @property
+    def redacted(self) -> list[AuditConfigEntry]:
+        return [entry for entry in self.configuration if entry.redacted]
+
+    def acceptance(self) -> dict[str, Any]:
+        """The clause, evaluated: each claim true or false, with what failed.
+
+        Deliberately not a single ``ok`` flag: a record that failed one clause is still
+        useful for the others, and a reader needs to know which one to distrust.
+        """
+
+        errors: list[str] = []
+        if not self.environment.version or not self.environment.format_version:
+            errors.append("the record does not state the software version that produced it")
+        if not self.configuration:
+            errors.append("the record carries no configuration, so a re-run cannot be set up")
+        if any(entry.redacted and NOT_REDACTED_MARKER not in entry.value
+               for entry in self.configuration):
+            errors.append("a redacted configuration entry carries a value")
+        if not self.models:
+            errors.append("the record has no model block at all; even an unconfigured run "
+                          "records one, saying so")
+        if not self.scope.scope_entries:
+            errors.append("the record does not state the authorised scope")
+        if not self.stamps.recorded_at:
+            errors.append("the record has no timestamp")
+        if not self.hierarchy.units:
+            errors.append("the record does not carry the hierarchy that ran")
+        # "The file carries no stopping decision" is itself a statement of why the record
+        # cannot say more, so it satisfies the clause; silence does not.
+        if not self.stopping.kind or (self.stopping.kind == "not stated"
+                                      and not self.stopping.reason):
+            errors.append("the record does not state why the mission stopped")
+        if not self.reproduction:
+            errors.append("the record offers no command that would reproduce the procedure")
+        if not self.retention.note:
+            errors.append("the record carries no retention note")
+        if self.secrets.findings:
+            errors.append(f"{len(self.secrets.findings)} credential-shaped value(s) were "
+                          f"found in the text; the write must be refused")
+        return {
+            "names_the_software": bool(self.environment.version),
+            "names_the_configuration": bool(self.configuration),
+            "names_the_models": bool(self.models),
+            "names_the_scope": bool(self.scope.scope_entries),
+            "names_the_hierarchy": bool(self.hierarchy.units),
+            "names_the_stop": bool(self.stopping.kind)
+            and (self.stopping.kind != "not stated" or bool(self.stopping.reason)),
+            "reproducible": bool(self.reproduction),
+            "retention_stated": bool(self.retention.note),
+            "no_secrets": not self.secrets.findings,
+            "ok": not errors,
+            "errors": errors,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"format_version": self.format_version, "mission_id": self.mission_id,
+                "environment": self.environment.to_dict(),
+                "configuration": [entry.to_dict() for entry in self.configuration],
+                "models": [item.to_dict() for item in self.models],
+                "scope": self.scope.to_dict(), "policy": self.policy.to_dict(),
+                "stamps": self.stamps.to_dict(), "hierarchy": {
+                    "units": [unit.to_dict() for unit in self.hierarchy.units],
+                    "edges": {key: list(value) for key, value in self.hierarchy.edges.items()},
+                    "depth": self.hierarchy.depth, "planned": self.hierarchy.planned,
+                    "dynamic": self.hierarchy.dynamic,
+                    "max_observed_concurrency": self.hierarchy.max_observed_concurrency,
+                    "waves": [list(wave) for wave in self.hierarchy.waves],
+                    "supplied_from": self.hierarchy.supplied_from},
+                "tool_failures": [item.to_dict() for item in self.tool_failures],
+                "stopping": self.stopping.to_dict(),
+                "secrets": self.secrets.to_dict(),
+                "reproduction": [step.to_dict() for step in self.reproduction],
+                "retention": self.retention.to_dict(),
+                "notes": list(self.notes),
+                "clause": self.clause or self.acceptance(),
+                "redacted_keys": [entry.key for entry in self.redacted]}
+
+    def summary_line(self) -> str:
+        return (f"{self.environment.describe()}; {self.hierarchy.describe()}; "
+                f"{len(self.tool_failures)} tool failure(s); stopped: {self.stopping.kind}")
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "AuditRecord":
+        """Rebuild from :meth:`to_dict`, so the audit block is not a write-only format."""
+
+        if payload.get("format_version") != cls.model_fields["format_version"].default:
+            raise ValueError(
+                f"not an audit record: expected "
+                f"{cls.model_fields['format_version'].default!r}, found "
+                f"{payload.get('format_version')!r}")
+        hierarchy = payload.get("hierarchy") or {}
+        return cls(
+            mission_id=str(payload.get("mission_id") or ""),
+            environment=AuditEnvironment.model_validate(payload.get("environment") or {}),
+            configuration=[AuditConfigEntry.model_validate(item)
+                           for item in payload.get("configuration") or []],
+            models=[AuditModel.model_validate(item) for item in payload.get("models") or []],
+            scope=AuditScope.model_validate(payload.get("scope") or {}),
+            policy=AuditRunPolicy.model_validate(payload.get("policy") or {}),
+            stamps=AuditStamp.model_validate(payload.get("stamps") or {}),
+            hierarchy=AuditHierarchy.model_validate({
+                **hierarchy,
+                "units": [{key: value for key, value in (unit or {}).items()
+                           if key != "dynamic"}                      # a derived property
+                          for unit in hierarchy.get("units") or []]}),
+            tool_failures=[AuditToolFailure.model_validate(item)
+                           for item in payload.get("tool_failures") or []],
+            stopping=AuditStop.model_validate(payload.get("stopping") or {}),
+            secrets=AuditSecrets.model_validate(payload.get("secrets") or {}),
+            reproduction=[ReproductionStep.model_validate(item)
+                          for item in payload.get("reproduction") or []],
+            retention=RetentionNote.model_validate(payload.get("retention") or {}),
+            notes=[str(item) for item in payload.get("notes") or []],
+            # ``acceptance`` is read for files written before the field was named `clause`;
+            # it is never written, so the published block is exactly the model's own view.
+            clause=dict(payload.get("clause") or payload.get("acceptance") or {}))
+
+
+def _audit_published_schema() -> dict[str, Any]:
+    """The schema of the block exactly as :meth:`AuditRecord.to_dict` writes it."""
+
+    sample = AuditRecord().to_dict()
+    return {"type": "object", "properties": {key: {} for key in sample},
+            "required": sorted(k for k, v in sample.items() if v not in (None, "", [], {}))}
+
+
+# --------------------------------------------------------------------------
+# 42.1 Building the record from the run
+# --------------------------------------------------------------------------
+
+def _run_started_at(result: "FlowResult") -> datetime | None:
+    """When the mission's own clock started, if the record carries it.
+
+    Read from the run's stamps, and from the ledger's first absolute event when the run
+    pre-dates them.  The ledger's ``at`` values are relative seconds — deliberately, because
+    a monotonic clock is the right way to measure an interval — so a record that carried
+    only those cannot be turned into a wall-clock time, and this returns ``None`` rather
+    than inventing one.
+    """
+
+    if result.started_at is not None:
+        return result.started_at
+    for event in result.trace:
+        stamp = event.get("started_at") or event.get("timestamp")
+        if stamp:
+            try:
+                return normalise_datetime(stamp)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _audit_environment(*, command: str = "", operator: str = "",
+                       dry_run: bool = False) -> AuditEnvironment:
+    """The software and the machine, captured now — not read back at render time."""
+
+    try:
+        invoked = Path(sys.argv[0]).name if sys.argv and sys.argv[0] else ""
+    except (OSError, IndexError):                       # pragma: no cover - defensive
+        invoked = ""
+    return AuditEnvironment(
+        user_agent=DEFAULT_USER_AGENT, command=command[:400], operator=operator,
+        dry_run=dry_run, invoked_from=invoked,
+        ci=any(os.environ.get(name) for name in CI_ENV_VARS))
+
+
+def _safe_config(settings: "Settings | None") -> list[AuditConfigEntry]:
+    """The non-secret configuration, flattened to entries, with the secret-shaped reduced.
+
+    Driven by the *name* of every key :meth:`Settings.to_dict` emits rather than by a
+    hand-written allow-list, so a field added later is captured automatically and a
+    secret-shaped one is redacted automatically.  An allow-list fails by omitting the field
+    nobody remembered to add; a block-list fails by keeping the one nobody remembered to
+    remove.  A name test fails in neither direction: the field is always present, and its
+    value is only ever copied when the name says it may be.
+    """
+
+    if settings is None:
+        return [AuditConfigEntry(
+            key="settings", source="absent", redacted=False,
+            value="not supplied: this record was built without the configuration the run "
+                  "used, so a re-run cannot be set up from it")]
+
+    # ``provenance`` is a fact *about* the entries, and is merged into them below; ``paths``
+    # holds the operator's home directory, which is a fact about a workstation rather than
+    # about the procedure; ``operator`` is recorded once, in the environment block.
+    payload = dict(settings.to_dict())
+    provenance = payload.pop("provenance", {}) or {}
+    paths = payload.pop("paths", {}) or {}
+    payload.pop("operator", None)
+    entries: list[AuditConfigEntry] = []
+
+    def walk(prefix: str, value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                walk(f"{prefix}.{key}" if prefix else str(key), item)
+            return
+        if isinstance(value, (list, tuple, set)):
+            walk(prefix, ", ".join(str(item) for item in value) if value else "none")
+            return
+        name = prefix.rsplit(".", 1)[-1]
+        if _is_secret_shaped(name):
+            text = str(value or "")
+            state = "unset" if not text or text.lower().startswith("unset") else "set"
+            entries.append(AuditConfigEntry(
+                key=prefix, source="redacted", redacted=True,
+                value=f"{NOT_REDACTED_MARKER}: {state}, value not recorded>"))
+            return
+        if name == "home_dir" or prefix == "home_dir":
+            entries.append(AuditConfigEntry(
+                key=prefix, source="redacted", redacted=True,
+                value=f"{NOT_REDACTED_MARKER}: the operator's home directory is not "
+                      f"part of the procedure>"))
+            return
+        # "None" and "set" are not the same fact, and a reader comparing two records needs
+        # to see which one they are looking at.
+        text = ("not set" if value is None else "yes" if value is True
+                else "no" if value is False else str(value))
+        entries.append(AuditConfigEntry(key=prefix, value=text, source="settings"))
+
+    walk("", payload)
+    for entry in entries:
+        if entry.redacted:
+            continue
+        leaf = entry.key.rsplit(".", 1)[-1]
+        source = provenance.get(leaf) if isinstance(provenance, Mapping) else None
+        if source is not None:
+            entry.source = str(getattr(source, "value", source))
+    for key, value in (paths.items() if isinstance(paths, Mapping) else []):
+        if key == "home_dir":
+            continue                                # never recorded: it is not the procedure
+        entries.append(AuditConfigEntry(
+            key=f"paths.{key}", source="settings",
+            value="not set" if value is None else str(value)))
+    return entries
+
+
+def _audit_models(settings: "Settings | None") -> list[AuditModel]:
+    """The model identifiers, and whether a credential exists — never the credential.
+
+    "No settings were supplied" is a fact and is recorded as one: the entry exists, with an
+    empty model and a credential state of ``not supplied``, because a record that listed no
+    model at all could not be told apart from one whose model was never configured.
+    """
+
+    if settings is None:
+        return [AuditModel(role="master-and-workers", provider="unknown", model="",
+                           credential_state="not supplied: this record was built without "
+                                            "the configuration the run used",
+                           provenance="absent")]
+    spec = settings.provider_spec()
+    state = "no provider registered"
+    names: list[str] = []
+    if spec is not None:
+        names = list(spec.key_env_vars)
+        available = [name for name in names if os.environ.get(name)]
+        if available:
+            state = "configured"
+        elif spec.key_optional:
+            state = "not needed (local provider)"
+        else:
+            state = f"absent (looked in {' | '.join(names)})"
+    return [AuditModel(
+        role="master-and-workers", provider=settings.provider,
+        model=settings.model or "", base_url=settings.base_url or "",
+        credential_state=state, credential_vars=names,
+        provenance=str(getattr(settings.provenance.get("model"), "value", "default")))]
+
+
+def _audit_scope(context: "MasterContext | None", report: MasterReport) -> AuditScope:
+    """The mission as admitted, from its context — or, without one, from the document."""
+
+    if context is None:
+        scope = report.section_of("scope-and-methods")
+        return AuditScope(objective=report.objective, supplied_from="report",
+                          operator_notes=[scope.body[:300]] if scope.body else [])
+    return AuditScope(
+        objective=context.objective, mode=context.mode.value,
+        scope_entries=list(context.scope_entries), exclusions=list(context.exclusions),
+        data_classes=[str(item) for item in context.data_classes],
+        available_tools=list(context.available_tools),
+        completion_criteria=list(context.completion_criteria),
+        mission_questions=list(context.mission_questions),
+        operator_notes=list(context.operator_notes),
+        prior_findings=list(context.prior_findings),
+        limits={"max_subagents": context.max_subagents,
+                "max_total_workers": context.max_total_workers,
+                "mission_budget_seconds": context.mission_budget_seconds},
+        supplied_from="context")
+
+
+def _audit_policy(result: "FlowResult") -> AuditRunPolicy:
+    policy = result.policy
+    supplied = "flow" if result.mission_id or result.trace else "default"
+    return AuditRunPolicy(
+        max_parallel_subagents=policy.max_parallel_subagents,
+        max_parallel_workers=policy.max_parallel_workers,
+        max_review_rounds=policy.max_review_rounds,
+        max_replan_rounds=policy.max_replan_rounds,
+        max_master_reviews=policy.max_master_reviews,
+        max_runtime_workers_per_subagent=policy.max_runtime_workers_per_subagent,
+        max_follow_up_workers_per_subagent=policy.max_follow_up_workers_per_subagent,
+        allow_runtime_workers=policy.allow_runtime_workers,
+        allow_follow_ups=policy.allow_follow_ups,
+        stop_on_blocking_failure=policy.stop_on_blocking_failure,
+        allow_network=policy.allow_network, research_first=policy.research_first,
+        capability_router=policy.capability_router, browser=policy.browser,
+        browser_mode=policy.browser_mode, supplied_from=supplied)
+
+
+def _audit_hierarchy(result: "FlowResult", execution: ExecutionSummary) -> AuditHierarchy:
+    """The tree the run built, including the nodes it invented.
+
+    Two sources, and they are not the same shape: §40's task rows know every unit that ran
+    and how it came to run, and the run's own ``subagents`` carry the *plan's* dependency
+    edges and criteria.  Merged here rather than picked between, because the plan without the
+    runtime nodes describes a mission that did not happen, and the runtime nodes without the
+    plan lose the reason they were spawned.
+    """
+
+    planned: dict[str, "FlowSubagent"] = {sub.id: sub for sub in result.subagents}
+    worker_parent: dict[str, str] = {}
+    criteria: dict[str, list[str]] = {}
+    objectives: dict[str, str] = {}
+    # A reloaded run carries reports but not the plan, and every outcome names the Subagent
+    # that commissioned it — the parent edge a reader needs is there even when the plan is
+    # not, and a tree that showed every Worker under the Master would be a different tree.
+    for report in result.reports:
+        for outcome in report.outcomes:
+            worker_parent.setdefault(outcome.worker_id, outcome.subagent_id or report.subagent_id)
+    for subagent in result.subagents:
+        for worker in subagent.workers:
+            worker_parent[worker.name] = subagent.id
+            criteria[worker.name] = list(worker.completion_criteria)
+            objectives[worker.name] = worker.work_unit or worker.objective
+    units: list[AuditUnit] = []
+    for row in execution.tasks:
+        is_subagent = row.kind == "subagent"
+        units.append(AuditUnit(
+            id=row.id, kind=row.kind,
+            role=row.role, objective=row.objective
+            or objectives.get(row.id, ""),
+            parent=("master" if is_subagent else worker_parent.get(row.id, "")),
+            status=row.status, gate=row.gate, attempts=row.attempts,
+            evidence=row.evidence, seconds=row.seconds, origin=row.origin,
+            depends_on=list(planned[row.id].depends_on) if row.id in planned else [],
+            completion_criteria=criteria.get(row.id, [])))
+    # A node whose kind is a Worker but whose id is in the plan as a Subagent would mean the
+    # task rows and the plan disagree; the row wins, because the row is what ran.
+    edges: dict[str, list[str]] = {}
+    for unit in units:
+        edges.setdefault(unit.parent or "master", []).append(unit.id)
+    for parent, children in edges.items():
+        edges[parent] = sorted(children)
+    depth = 0
+    frontier = ["master"]
+    seen: set[str] = set()
+    while frontier and depth < 12:                  # bounded: the tree cannot be deeper
+        depth += 1
+        next_frontier = [child for parent in frontier for child in edges.get(parent, [])
+                         if child not in seen]
+        seen.update(next_frontier)
+        frontier = next_frontier
+    return AuditHierarchy(
+        units=units, edges=edges, depth=max(0, depth - 1 if units else 0),
+        planned=len([unit for unit in units if not unit.dynamic]),
+        dynamic=len([unit for unit in units if unit.dynamic]),
+        max_observed_concurrency=int(result.concurrency.get("peak_active") or 0),
+        waves=[list(wave) for wave in result.waves],
+        supplied_from="flow")
+
+
+def _audit_tool_failures(result: "FlowResult") -> list[AuditToolFailure]:
+    """Every failure that names a tool, with the tool it names.
+
+    A tool is named when the record has one: §35's retask declares ``tool_failure`` and §34's
+    review names the fault, the payload may carry the capability that failed, and the message
+    is searched for a tool id as a last resort — in that order, because attributing a failure
+    to a tool the record never named would be an inference dressed as a fact.
+    """
+
+    rows: list[AuditToolFailure] = []
+    seen: set[tuple[str, str]] = set()
+    known = sorted(str(name) for name in TOOL_REGISTRY) \
+        if isinstance(TOOL_REGISTRY, (Mapping, set, list, tuple)) else []
+
+    def named_tool(*texts: str) -> str:
+        for text in texts:
+            lowered = str(text or "").lower()
+            for tool in known:
+                if tool.lower() in lowered:
+                    return tool
+        return ""
+
+    for report in result.reports:
+        for outcome in report.outcomes:
+            if not outcome.error:
+                continue
+            payload = outcome.payload if isinstance(outcome.payload, Mapping) else {}
+            tool = str(payload.get("tool") or payload.get("capability")
+                       or payload.get("tool_name") or "")
+            if not tool:
+                tool = named_tool(outcome.error)
+            key = (outcome.worker_id, outcome.error[:120])
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(AuditToolFailure(
+                tool=tool, unit=outcome.worker_id, stage="worker",
+                fault=str(payload.get("fault") or "tool"),
+                message=outcome.error[:300], attempt=outcome.attempt,
+                retryable=bool(payload.get("retryable")),
+                handled_by=("withheld" if outcome.worker_id in report.withheld
+                            else "retried" if outcome.attempt > 1 else "recorded")))
+    for retask in result.retasks:
+        if not retask.tool_failure:
+            continue
+        tool = named_tool(retask.guidance, retask.because_of, *retask.deficiencies)
+        key = (retask.worker_id, retask.because_of[:120])
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(AuditToolFailure(
+            tool=tool, unit=retask.worker_id, stage="retask", fault="tool",
+            message=(retask.guidance or retask.because_of)[:300],
+            attempt=retask.attempt, retryable=True, handled_by="retasked"))
+    rows.sort(key=lambda item: (item.unit, item.attempt, item.tool))
+    return rows
+
+
+def _audit_stopping(result: "FlowResult", execution: ExecutionSummary) -> AuditStop:
+    stopping = execution.stopping
+    return AuditStop(kind=stopping.kind, condition=stopping.condition,
+                     reason=stopping.reason, stopped=stopping.stopped,
+                     bounded=bool(stopping.bounds or stopping.exhausted),
+                     reviews=stopping.reviews, rounds=stopping.rounds,
+                     bounds=list(stopping.bounds))
+
+
+#: The rules the record states about what it left out, and why.  Data, so the document, the
+#: JSON and the self-test all read one list.
+REDACTION_RULES: tuple[tuple[str, str], ...] = (
+    ("api keys and provider tokens",
+     "a credential is authority, not procedure: a record that carried one would let a "
+     "reader act as the operator instead of reproducing their setup"),
+    ("cookies and browser session state",
+     "a cookie is the operator's authenticated identity on somebody else's service"),
+    ("browser profile contents and credentials",
+     "the profile directory is named so the setup can be repeated; none of its contents "
+     "are copied"),
+    ("page content beyond cited findings",
+     "the evidence table carries what a finding rests on, quoted and hashed; copying the "
+     "pages themselves would spread third-party material the report does not need"),
+    ("model prompts, scratchpads and raw completions",
+     "a prompt carries the operator's phrasing and every retrieved page; the identifiers "
+     "and limits are kept, the text is not"),
+    ("the operator's home directory",
+     "the path is a fact about a workstation, not about the procedure"),
+)
+
+
+def _audit_redaction_rules(result: "FlowResult",
+                           execution: ExecutionSummary) -> list[RedactionRule]:
+    """The omissions, with a count wherever the record can count one."""
+
+    browser = result.browser if isinstance(result.browser, Mapping) else {}
+    cookies = browser.get("cookies") if isinstance(browser.get("cookies"), (list, tuple)) else []
+    rules: list[RedactionRule] = []
+    for what, why in REDACTION_RULES:
+        count = 0
+        removed = False
+        if what.startswith("cookies"):
+            count = len(cookies)
+            removed = bool(browser.get("session_closed") or browser.get("closed"))
+        if what.startswith("page content"):
+            count = len(execution.tasks)
+        rules.append(RedactionRule(what=what, why=why, count=count, removed=removed))
+    return rules
+
+
+def _audit_reproduction(scope: AuditScope) -> list[ReproductionStep]:
+    """The commands a second operator would run, with the credentials left to them.
+
+    Built from the scope and the limits rather than from the objective's prose: the point of
+    the steps is that they are *runnable*, and a command assembled from a sentence is a
+    sentence with ``python`` in front of it.
+    """
+
+    targets = " ".join(f"-t {entry}" for entry in scope.scope_entries[:4]) or "-t <target>"
+    objective = " ".join(scope.objective.split()) or "<objective>"
+    steps = [ReproductionStep(
+        order=1, command="python -m pip install -r requirements.txt",
+        purpose="install the same dependency set (typer, rich, pydantic, langgraph, …)")]
+    if scope.mode == "passive":
+        steps.append(ReproductionStep(
+            order=2, command=f"python vedant_osint.py policy {targets} -o \"{objective}\"",
+            purpose="confirm the objective and scope are admissible before collecting"))
+    steps.append(ReproductionStep(
+        order=len(steps) + 1,
+        command=(f"export ARGUS_LLM_MODEL=<model> && python vedant_osint.py flow {targets} "
+                 f"-o \"{objective}\" --out-dir out/"),
+        purpose=("run the same mission with your own credential and the model named in the "
+                 "Models section" + (f"; the limits were {scope_limits_note(scope)}"
+                                     if scope.limits else "")),
+        needs_credential=True))
+    steps.append(ReproductionStep(
+        order=len(steps) + 1,
+        command="python vedant_osint.py report --mission out/flow-*.json --out-dir out/",
+        purpose="write the same three formats from the new run"))
+    return steps
+
+
+def scope_limits_note(scope: AuditScope) -> str:
+    """The admission limits, as one phrase, for a step's purpose line."""
+
+    return ", ".join(f"{key}={value}" for key, value in sorted(scope.limits.items()))
+
+
+def _audit_stamps(result: "FlowResult", execution: ExecutionSummary) -> AuditStamp:
+    started = _run_started_at(result)
+    ended = result.ended_at
+    if ended is None and started is not None and execution.time.total_seconds:
+        # The interval is measured; adding it to the start is how a record without an end
+        # stamp states one, and the document says which of the two it is showing.
+        ended = started + timedelta(seconds=execution.time.total_seconds)
+    return AuditStamp(
+        started_at=started, ended_at=ended, duration_seconds=execution.time.total_seconds,
+        stages=[(name, seconds) for name, seconds in execution.time.stages])
+
+
+def _audit_notes(result: "FlowResult", execution: ExecutionSummary) -> list[str]:
+    """The facts that belong to no block above, each named rather than dumped."""
+
+    notes: list[str] = []
+    if result.resume:
+        adopted = len(result.resume.get("adopted_workers") or [])
+        notes.append(f"resumed mission: {adopted} unit(s) adopted from an earlier attempt, "
+                     f"the rest re-run (see the execution section for which)")
+    if result.checkpoint:
+        notes.append(f"checkpointed at {result.checkpoint}")
+    browser = result.browser if isinstance(result.browser, Mapping) else {}
+    if browser:
+        notes.append(f"browser: {browser.get('mode', 'not stated')} mode, "
+                     f"{browser.get('visits', 0)} visit(s), "
+                     f"{browser.get('refusals', 0)} refusal(s), "
+                     f"{'closed' if browser.get('session_closed') else 'closure not recorded'}")
+    if result.clip is not None and getattr(result.clip, "clipped", False):
+        notes.append(f"the plan was clipped to the mission's ceilings: "
+                     f"{len(getattr(result.clip, 'changes', []))} change(s)")
+    if execution.withheld:
+        notes.append(f"{len(execution.withheld)} unit(s) were reviewed and withheld")
+    return notes
+
+
+def build_audit_record(result: "FlowResult", *, execution: ExecutionSummary,
+                       report: MasterReport, context: "MasterContext | None" = None,
+                       settings: "Settings | None" = None,
+                       command: str = "",
+                       custody_rows: Sequence["CustodyRow"] = ()) -> AuditRecord:
+    """Assemble the record from the run.
+
+    Every block is derived from the record that produced the report, and the two blocks that
+    cannot be derived from it — the configuration and the model identifiers — are passed in
+    by the caller that has them, and say so plainly when they were not.
+    """
+
+    operator = settings.operator if settings is not None else ""
+    return AuditRecord(
+        mission_id=report.mission_id or result.mission_id,
+        environment=_audit_environment(command=command, operator=operator or "",
+                                       dry_run=bool(settings.dry_run) if settings else False),
+        configuration=_safe_config(settings),
+        models=_audit_models(settings),
+        secrets=AuditSecrets(scanned=False, rules=[], patterns=[]),
+        scope=_audit_scope(context, report),
+        policy=_audit_policy(result),
+        stamps=_audit_stamps(result, execution),
+        hierarchy=_audit_hierarchy(result, execution),
+        tool_failures=_audit_tool_failures(result),
+        stopping=_audit_stopping(result, execution),
+        reproduction=[],                        # filled below: it reads the scope
+        notes=_audit_notes(result, execution),
+    ).model_copy(update={
+        "reproduction": _audit_reproduction(_audit_scope(context, report)),
+        "secrets": AuditSecrets(scanned=False, clean=False,
+                                rules=_audit_redaction_rules(result, execution)),
+        "retention": RetentionNote(
+            handled_by=operator or "the operator",
+            # Forensic artefacts are the hashed ones: §16's custody sheet, not the ledger.
+            contains_forensic_artefacts=any(row.digest for row in custody_rows),
+            guidance=[
+                "keep the .json beside the .md: the JSON is the record, the Markdown is a "
+                "view of it",
+                "keep the chain-of-custody sheet with the artefacts it describes",
+                "do not commit investigation output to a public repository",
+                "remove the file when the investigation's retention period ends, on the "
+                "schedule the operator's own policy sets",
+            ])})
+
+
+# --------------------------------------------------------------------------
+# 42.2 Scanning the text that is about to be written
+# --------------------------------------------------------------------------
+
+#: Credential shapes, by name.  Each is a *pattern*, not a prefix list: a provider that adds
+#: a key format tomorrow is caught by the shape rules (long opaque token next to a
+#: credential word) even when its prefix is unknown.
+_SECRET_SHAPES: tuple[tuple[str, str], ...] = (
+    ("connection-string-password", r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]{4,}@"),
+    ("json-credential-field",
+     r"(?i)\"(?:api[_-]?key|secret|token|password|cookie|authorization|bearer)\"\s*:\s*"
+     r"\"(?!<redacted|unset|set\b)[^\"]{8,}\""),
+    ("key-value-credential",
+     r"(?i)\b(?:api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|password)\b"
+     r"\s*[=:]\s*[\"']?(?![<\s]|unset|redacted)[A-Za-z0-9_\-\.]{12,}"),
+    ("bearer-token", r"(?i)\bbearer\s+[A-Za-z0-9_\-\.=+/]{16,}"),
+    ("bearer-header", r"(?i)\bauthorization\s*:\s*(?:basic|digest|token)\s+[A-Za-z0-9+/=._\-]{12,}"),
+    ("cookie-header", r"(?i)\bcookie\s*:\s*[^\s;=]+=[^\s;]{6,}"),
+    ("set-cookie", r"(?i)\bset-cookie\s*:\s*[^\s=]+=[^\s;]{6,}"),
+    ("session-id", r"(?i)\b(?:session[_-]?id|sid|jsessionid|phpsessid)\b\s*[=:]\s*"
+                    r"[\"']?[A-Za-z0-9%_\-]{12,}"),
+    ("private-key-block", r"-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----"),
+    ("known-prefix",
+     r"\b(?:sk-[A-Za-z0-9_\-]{16,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+     r"|gho_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{30,}"
+     r"|xox[abprs]-[A-Za-z0-9\-]{10,}|sk-ant-[A-Za-z0-9_\-]{16,})\b"),
+)
+_SECRET_PATTERNS_COMPILED: tuple[tuple[str, "re.Pattern[str]"], ...] = tuple(
+    (name, re.compile(pattern)) for name, pattern in _SECRET_SHAPES)
+
+
+def audit_secrets(text: str, *,
+                  secrets: Iterable[str | None] = (),
+                  rules: Sequence[RedactionRule] = ()) -> AuditSecrets:
+    """Scan ``text`` for anything that would hand a credential to its reader.
+
+    Three passes, because each finds what the previous one cannot:
+
+    1. **Known values** — every credential this process can see, including the ones pydantic
+       would happily have serialised if a caller passed ``Settings`` instead of its safe
+       view.  Anything shorter than eight characters is skipped: a two-character "secret"
+       would match everywhere and make the scan useless rather than safe.
+    2. **Credential shapes** — provider prefixes, bearer tokens, cookies, private keys,
+       connection strings with a password in them, and JSON or ``key=value`` fields whose
+       name says credential.  This catches a key this process never knew about.
+    3. **Structure** — a document whose *shape* is a credential store (a ``cookies`` array
+       or an ``authorization`` header object) is refused even when no value matches a
+       pattern, because the value may be one nobody's regex has seen.
+
+    The result names where each finding is, never what it is: a scan report that quoted the
+    secret it found would be the leak it was checking for.
+    """
+
+    body = str(text or "")
+    findings: list[SecretFinding] = []
+    present = sorted({str(value) for value in secrets if value and len(str(value)) >= 8})
+    for value in present:
+        index = body.find(value)
+        if index >= 0:
+            findings.append(SecretFinding(
+                kind="known-credential-value",
+                where=f"at byte {index}",
+                detail=f"the value of a credential visible to this process "
+                       f"({len(value)} characters) appears in the text"))
+    for name, pattern in _SECRET_PATTERNS_COMPILED:
+        for match in pattern.finditer(body):
+            line = body.count("\n", 0, match.start()) + 1
+            findings.append(SecretFinding(
+                kind=name, where=f"line {line}",
+                detail=f"{pattern.pattern[:80]}… matched at column "
+                       f"{match.start() - body.rfind(chr(10), 0, match.start())}"))
+            if len(findings) >= 40:                 # bounded: a report of 400 is not a report
+                break
+    for structure in ("\"cookies\"", "'cookies'", "\"browser_credentials\"",
+                      "\"session_storage\"", "\"local_storage\""):
+        if structure in body and "[]" not in body[body.find(structure):body.find(structure) + 24]:
+            findings.append(SecretFinding(
+                kind="credential-store-shape", where="document structure",
+                detail=f"{structure} appears with content: a credential store is never "
+                       f"part of a report"))
+    return AuditSecrets(scanned=True, clean=not findings, bytes_scanned=len(body.encode("utf-8")),
+                        findings=findings, rules=list(rules),
+                        patterns=[name for name, _pattern in _SECRET_SHAPES]
+                        + ["known-credential-value", "credential-store-shape"])
+
+
+def assert_no_secrets(text: str, *, where: str = "the output",
+                      secrets: Iterable[str | None] = (),
+                      rules: Sequence[RedactionRule] = ()) -> AuditSecrets:
+    """Scan, and refuse the write if anything credential-shaped is in it.
+
+    Raising rather than warning is the whole point: an audit record that names a leak and is
+    written anyway has documented the leak instead of preventing it.
+    """
+
+    result = audit_secrets(text, secrets=secrets, rules=rules)
+    if not result.clean:
+        names = ", ".join(sorted({item.kind for item in result.findings}))
+        raise OutputError(
+            f"refusing to write {where}: {len(result.findings)} credential-shaped "
+            f"value(s) found ({names}). The record is written without secrets or not at "
+            f"all — remove the value rather than redacting the file afterwards.")
+    return result
+
+
+# --------------------------------------------------------------------------
+# 42.3 Rendering: a section of the document, a block on the screen
+# --------------------------------------------------------------------------
+
+def _md_configuration(record: AuditRecord) -> str:
+    shown = [entry for entry in record.configuration if not entry.redacted]
+    hidden = [entry for entry in record.configuration if entry.redacted]
+    rows = [(_md_cell(entry.key, limit=60), _md_cell(entry.value, limit=90),
+             _md_cell(entry.source, limit=30)) for entry in shown[:40]]
+    table = _md_table(["setting", "value", "from"], rows) if rows else \
+        ("No configuration was supplied with this record, and none is claimed: a dossier "
+         "built from a report set or a hand-made record cannot describe a run it never "
+         "had.\n")
+    parts = [table]
+    if hidden:
+        parts.append("\nRedacted by name, with the *state* of each kept: "
+                     + ", ".join(f"`{_md_cell(entry.key)}` ({entry.value})"
+                                 for entry in hidden) + ".")
+    if len(shown) > 40:
+        parts.append(f"\n{len(shown) - 40} further setting(s) omitted from this table; the "
+                     f"JSON form carries all {len(shown)}.")
+    return "".join(parts)
+
+
+def _md_models(record: AuditRecord) -> str:
+    if not record.models:
+        return ("No model identifier was supplied with this record. The run's model is not "
+                "inferable from its output, so a re-run cannot be guaranteed to use the "
+                "same one.\n")
+    lines = []
+    for model in record.models:
+        lines.append(f"- **{_md_inline(model.role)}**: `{_md_inline(model.model or 'unset')}` "
+                     f"via {_md_inline(model.provider or 'unknown provider')}"
+                     + (f", base URL `{_md_inline(model.base_url)}`" if model.base_url else "")
+                     + f" — credential {_md_inline(model.credential_state)}"
+                     + (f"; looked for in {', '.join(f'`{name}`' for name in model.credential_vars)}"
+                        if model.credential_vars else "") + ".")
+    lines.append("\nThe credential itself is never recorded: a reader who needs one supplies "
+                 "their own.")
+    return "\n".join(lines) + "\n"
+
+
+def _md_timestamps(record: AuditRecord) -> str:
+    stamps = record.stamps
+    lines = [f"- recorded: {_iso(stamps.recorded_at)}",
+             f"- mission started: {_iso(stamps.started_at) or 'not recorded in the run'}",
+             f"- mission ended: {_iso(stamps.ended_at) or 'not recorded in the run'}",
+             f"- duration: {stamps.duration_seconds:.2f}s"]
+    if stamps.stages:
+        lines.append("- per stage: " + ", ".join(
+            f"{_md_inline(name)} {seconds:.2f}s" for name, seconds in stamps.stages) + ".")
+    if stamps.started_at is None:
+        lines.append("\nThe ledger records elapsed seconds rather than wall-clock time, so "
+                     "the mission's absolute start cannot be reconstructed from it; the "
+                     "duration above is measured.")
+    return "\n".join(lines) + "\n"
+
+
+def _md_hierarchy(record: AuditRecord) -> str:
+    hierarchy = record.hierarchy
+    if not hierarchy.units:
+        return ("The record carries no hierarchy: this dossier was built from a report set, "
+                "which does not include the plan.\n")
+    rows = [(_md_cell(unit.id), _md_cell(unit.kind), _md_cell(unit.role, limit=40),
+             _md_cell(unit.parent or "master"), _md_cell(unit.status), _md_cell(unit.origin),
+             str(unit.attempts), str(unit.evidence))
+            for unit in hierarchy.units]
+    head = (f"{hierarchy.describe()}. Planned {hierarchy.planned}, invented after the plan "
+            f"{hierarchy.dynamic}"
+            + (f", peak {hierarchy.max_observed_concurrency} in flight"
+               if hierarchy.max_observed_concurrency else "") + ".")
+    depth_note = ""
+    if hierarchy.dynamic:
+        depth_note = ("\n\nA `runtime` or `follow-up` origin is a unit the mission did not "
+                      "plan: it was created because the work demanded it, and the report's "
+                      "aggregation counts it like any other.")
+    return (head + "\n\n" + _md_table(
+        ["unit", "kind", "role", "parent", "status", "origin", "attempts", "evidence"], rows)
+        + depth_note + "\n")
+
+
+def _md_tool_failures(record: AuditRecord) -> str:
+    if not record.tool_failures:
+        return ("No tool failure was recorded by this mission. That is a fact about this "
+                "run, not a claim that every tool call succeeded silently.\n")
+    rows = [(_md_cell(item.tool or "unattributed"), _md_cell(item.unit), _md_cell(item.stage),
+             _md_cell(item.fault), _md_cell(item.message, limit=120), str(item.attempt),
+             "yes" if item.retryable else "no", _md_cell(item.handled_by))
+            for item in record.tool_failures]
+    return _md_table(["tool", "unit", "stage", "fault", "message", "attempt", "retryable",
+                      "handled"], rows) + "\n"
+
+
+def _md_reproduction(record: AuditRecord) -> str:
+    if not record.reproduction:
+        return "No reproduction steps could be derived from this record.\n"
+    lines = []
+    for step in record.reproduction:
+        flag = " *(needs a credential you supply)*" if step.needs_credential else ""
+        lines.append(f"{step.order}. `{_md_inline(step.command)}` — "
+                     f"{_md_inline(step.purpose)}{flag}")
+    lines.append("\nFollowing these steps reproduces the *procedure*, not the answer. A "
+                 "re-run collects whatever the world says now, and the two results differ "
+                 "wherever the world changed between them.\n")
+    return "\n".join(lines)
+
+
+def _md_secrets(record: AuditRecord) -> str:
+    lines = [f"- scan: {_md_inline(record.secrets.describe())}"]
+    for rule in record.secrets.rules:
+        count = f", {rule.count} present" if rule.count else ""
+        lines.append(f"- not recorded — {_md_inline(rule.what)}: {_md_inline(rule.why)}{count}.")
+    lines.append("\nThe scan runs over the exact text that is written, not over the object "
+                 "it was rendered from: a value that appears in the file is found even when "
+                 "nothing meant to put it there. Any credential-shaped match refuses the "
+                 "write rather than redacting the file afterwards.")
+    return "\n".join(lines) + "\n"
+
+
+def _md_retention(record: AuditRecord) -> str:
+    note = record.retention
+    lines = [note.note, ""]
+    lines.append(f"- handled by: {_md_inline(note.handled_by or 'the operator')}")
+    lines.append(f"- retention decided by: {_md_inline(note.retention_decided_by)}")
+    lines.append(f"- personal data: {'may be present' if note.contains_personal_data else 'no'}"
+                 f"; third-party material: "
+                 f"{'may be present' if note.contains_third_party_material else 'no'}"
+                 f"; forensic artefacts: "
+                 f"{'present' if note.contains_forensic_artefacts else 'none recorded'}")
+    for item in note.guidance:
+        lines.append(f"- {_md_inline(item)}")
+    return "\n".join(lines) + "\n"
+
+
+def render_audit_markdown(record: AuditRecord) -> str:
+    """The audit block as Markdown headings, for insertion into the mission document."""
+
+    return "\n".join([
+        "## Audit and reproducibility\n\n"
+        + f"This mission ran on {_md_inline(record.environment.describe())}. "
+        + (f"It was invoked as `{_md_inline(record.environment.command)}`. "
+           if record.environment.command else "")
+        + (f"Operator: {_md_inline(record.environment.operator)}. "
+           if record.environment.operator else "")
+        + (f"CI: {record.environment.ci}. " if record.environment.ci else "")
+        + "\n",
+        "## Environment\n\n" + _md_table(
+            ["field", "value"],
+            [("application", record.environment.app),
+             ("version", record.environment.version),
+             ("version label", record.environment.version_label),
+             ("build phase", str(record.environment.build_phase)),
+             ("record format", record.environment.format_version),
+             ("python", f"{record.environment.python} ({record.environment.implementation})"),
+             ("platform", record.environment.platform),
+             ("machine", record.environment.machine),
+             ("user agent", record.environment.user_agent),
+             ("dry run", "yes" if record.environment.dry_run else "no")]) + "\n",
+        "## Configuration\n\n" + _md_configuration(record) + "\n",
+        "## Models\n\n" + _md_models(record) + "\n",
+        "## Mission scope and limits\n\n" + _md_scope(record) + "\n",
+        "## Timestamps\n\n" + _md_timestamps(record) + "\n",
+        "## Dynamic hierarchy\n\n" + _md_hierarchy(record) + "\n",
+        "## Tool failures\n\n" + _md_tool_failures(record) + "\n",
+        "## Stopping reason (audit)\n\n"
+        + f"- kind: **{_md_inline(record.stopping.kind)}** "
+          f"(condition `{_md_inline(record.stopping.condition)}`)"
+        + ("; the mission stopped itself" if record.stopping.stopped else
+           "; the mission finished")
+        + (f"; bounded by {len(record.stopping.bounds)} refusal(s)"
+           if record.stopping.bounds else "")
+        + f"\n- reason: {_md_inline(record.stopping.reason)}\n",
+        "## Reproduction\n\n" + _md_reproduction(record) + "\n",
+        "## What is deliberately not recorded\n\n" + _md_secrets(record) + "\n",
+        "## Retention\n\n" + _md_retention(record) + "\n",
+        "## Audit clause\n\n" + _md_audit_clause(record) + "\n",
+    ])
+
+
+def _md_audit_clause(record: AuditRecord) -> str:
+    """The clause as it stands now, with what could not be confirmed named."""
+
+    clause = record.acceptance()
+    claims = [(label, value) for label, value in clause.items()
+              if isinstance(value, bool) and label != "ok"]
+    lines = [f"- {label.replace('_', ' ')}: {'yes' if value else 'no'}"
+             for label, value in claims]
+    if clause["errors"]:
+        lines.append("- problems: " + "; ".join(_md_inline(item) for item in clause["errors"]))
+    else:
+        lines.append("- problems: none: another operator can reproduce this procedure from "
+                     "the record above without being given a secret.")
+    return "\n".join(lines) + "\n"
+
+
+def _md_scope(record: AuditRecord) -> str:
+    scope = record.scope
+    lines = [f"- objective: {_md_inline(scope.objective)}",
+             f"- mode: `{_md_inline(scope.mode)}`",
+             "- authorised scope: "
+             + (", ".join(f"`{_md_inline(entry)}`" for entry in scope.scope_entries)
+                or "not supplied")]
+    if scope.exclusions:
+        lines.append("- exclusions: " + ", ".join(f"`{_md_inline(entry)}`"
+                                                  for entry in scope.exclusions))
+    if scope.data_classes:
+        lines.append("- data classes: " + ", ".join(_md_inline(item)
+                                                    for item in scope.data_classes))
+    if scope.available_tools:
+        lines.append("- tools available: " + ", ".join(f"`{_md_inline(item)}`"
+                                                       for item in scope.available_tools))
+    if scope.limits:
+        lines.append("- limits: " + ", ".join(f"{key}={value}"
+                                              for key, value in sorted(scope.limits.items())))
+    if scope.completion_criteria:
+        lines.append("- the mission would be finished when: "
+                     + "; ".join(_md_inline(item) for item in scope.completion_criteria))
+    if scope.mission_questions:
+        lines.append("- questions it set itself: "
+                     + "; ".join(_md_inline(item) for item in scope.mission_questions))
+    if scope.supplied_from == "report":
+        lines.append("\nThe mission's admission context was not supplied with this dossier, "
+                     "so the scope above is the report's own statement of it rather than the "
+                     "context the flow was admitted with.")
+    return "\n".join(lines) + "\n"
+
+
+def render_audit_summary(record: AuditRecord) -> Table:
+    """The audit block as the operator sees it on a terminal: one panel, nine facts."""
+
+    table = Table(title="audit and reproducibility", title_justify="left", box=None,
+                  pad_edge=False, expand=False)
+    table.add_column("what", style="dim", no_wrap=True)
+    table.add_column("value", overflow="fold", max_width=84)
+    table.add_row("software", escape(record.environment.describe()))
+    table.add_row("command", escape(record.environment.command or "not recorded"))
+    if record.environment.operator:
+        table.add_row("operator", escape(record.environment.operator))
+    table.add_row("model", escape("; ".join(model.describe() for model in record.models)
+                                  or "not supplied"))
+    table.add_row("scope", escape(f"{record.scope.mode}: "
+                                  + (", ".join(record.scope.scope_entries) or "not supplied")))
+    table.add_row("hierarchy", escape(record.hierarchy.describe()))
+    table.add_row("started", escape(
+        f"{_iso(record.stamps.started_at) or 'not recorded'} · "
+        f"{record.stamps.duration_seconds:.2f}s"))
+    table.add_row("tool failures", str(len(record.tool_failures)))
+    table.add_row("stopped", escape(f"{record.stopping.kind} — "
+                                    f"{_sentence(record.stopping.reason, limit=140)}"))
+    colour = "green" if record.secrets.clean else "red"
+    table.add_row("secrets", f"[{colour}]{escape(record.secrets.describe())}[/{colour}]")
+    table.add_row("retention", escape("stated in the report: "
+                                     + _first_sentence(record.retention.note)[:100]))
+    return table
+
+
+# --------------------------------------------------------------------------
+# 42.4 The self-test: the clause, and each refusal that keeps it true
+# --------------------------------------------------------------------------
+
+def _audit_env_with_secret(name: str, value: str) -> Any:
+    """A context manager that sets a credential-shaped variable for one test."""
+
+    class _Set:
+        def __enter__(self) -> None:
+            self.previous = os.environ.get(name)
+            os.environ[name] = value
+
+        def __exit__(self, *exc: object) -> None:
+            if self.previous is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = self.previous
+
+    return _Set()
+
+
+def run_audit_self_test() -> list[DossierCheck]:
+    """Prove §42's acceptance clause, and each refusal that keeps it true.
+
+    The clause is one sentence with two halves — *understand what was run* and *without
+    receiving secrets* — so the checks are in two groups, and the second group's job is to
+    make the guarantee fail if it can.
+    """
+
+    checks: list[DossierCheck] = []
+
+    def add(name: str, ok: bool, detail: object = "") -> None:
+        checks.append(DossierCheck(name=name, ok=bool(ok), detail=str(detail)[:180]))
+
+    context = _selftest_context("exposure")
+    settings = build_settings({}, {}).settings
+    result = HierarchicalFlow(
+        context=context, subagents=flow_units_for(context, "exposure"),
+        runner=_CountingRunner(scope=context.scope_entries),
+        policy=FlowPolicy(max_replan_rounds=1, max_review_rounds=3)).run()
+    report = result.synthesis.report
+    if report is None:                        # pragma: no cover - the run always reports
+        return checks
+    dossier = build_dossier(result, report=report, context=context, settings=settings,
+                            command="report --self-test")
+    record = dossier.audit
+
+    # ---- 1. what was run -----------------------------------------------------
+    add("the record names the software and its version",
+        record.environment.app == APP_NAME and record.environment.version == __version__,
+        record.environment.describe())
+    add("the record names the interpreter and platform",
+        bool(record.environment.python) and bool(record.environment.platform))
+    add("the record keeps the command that produced it",
+        record.environment.command == "report --self-test")
+    add("the configuration travelled with the record",
+        len(record.configuration) >= 8, len(record.configuration))
+    add("every configuration entry says where its value came from",
+        all(entry.source for entry in record.configuration),
+        [entry.key for entry in record.configuration if not entry.source])
+    add("the model identifier is recorded",
+        any(model.model or model.credential_state for model in record.models),
+        [model.describe() for model in record.models])
+    add("the scale of the mission is recorded",
+        record.scope.mode == context.mode.value
+        and record.scope.scope_entries == list(context.scope_entries),
+        record.scope.supplied_from)
+    add("the limits the run was admitted under are recorded",
+        record.scope.limits.get("max_total_workers") == context.max_total_workers)
+    add("the run policy is recorded as values",
+        record.policy.max_review_rounds == result.policy.max_review_rounds
+        and record.policy.supplied_from == "flow")
+    add("the record is stamped",
+        record.stamps.recorded_at is not None
+        and record.stamps.duration_seconds == dossier.execution.time.total_seconds)
+    add("the hierarchy carries every unit that ran",
+        len(record.hierarchy.units) == len(dossier.execution.tasks),
+        f"{len(record.hierarchy.units)} vs {len(dossier.execution.tasks)}")
+    add("the hierarchy distinguishes planned from invented units",
+        record.hierarchy.dynamic == len([task for task in dossier.execution.tasks
+                                         if task.origin in {"runtime", "follow-up",
+                                                            "adopted"}]),
+        f"{record.hierarchy.dynamic} dynamic")
+    add("every non-root unit names its parent",
+        all(unit.parent for unit in record.hierarchy.units),
+        [unit.id for unit in record.hierarchy.units if not unit.parent])
+    add("the edges reconstruct the tree",
+        sum(len(children) for children in record.hierarchy.edges.values())
+        == len(record.hierarchy.units))
+    add("the stopping reason is recorded once, in the audit's own terms",
+        record.stopping.kind and record.stopping.reason
+        and record.stopping.kind == dossier.execution.stopping.kind)
+
+    # ---- 2. reproducible without the secrets ---------------------------------
+    add("the record offers runnable reproduction steps",
+        len(record.reproduction) >= 3
+        and all(step.command.startswith(("python", "export")) for step in record.reproduction),
+        [step.command[:40] for step in record.reproduction])
+    add("the reproduction steps never carry a credential value",
+        not any(match for step in record.reproduction
+                for match in [re.search(r"sk-[A-Za-z0-9]{8,}|ghp_[A-Za-z0-9]{8,}",
+                                        step.command)]))
+    add("a step that needs a credential says so",
+        any(step.needs_credential for step in record.reproduction))
+    add("the record states what it left out, and why",
+        len(record.secrets.rules) >= 4
+        and all(rule.why for rule in record.secrets.rules))
+    add("the retention note travels with the record",
+        RETENTION_NOTE == record.retention.note and bool(record.retention.guidance))
+    add("the retention note names who decides retention",
+        "operator" in record.retention.retention_decided_by)
+    hashed = [row for row in dossier.custody if row.digest]
+    add("the retention note knows whether hashed artefacts are present",
+        record.retention.contains_forensic_artefacts == bool(hashed),
+        f"{len(hashed)} hashed artefact(s)")
+    add("the audit clause evaluates to true on a real record",
+        record.acceptance()["ok"], record.acceptance()["errors"])
+    add("the audit clause names what it cannot confirm",
+        set(record.acceptance()) >= {"names_the_software", "no_secrets", "reproducible",
+                                     "retention_stated"})
+
+    # ---- 3. the record refuses to carry a secret ----------------------------
+    add("the record redacts a credential-shaped configuration key",
+        not any(entry.redacted and NOT_REDACTED_MARKER not in entry.value
+                for entry in record.configuration))
+    with _audit_env_with_secret("OPENAI_API_KEY", "sk-live-abcdefghijklmnopqrstuvwxyz012345"):
+        secret = os.environ["OPENAI_API_KEY"]
+        planted = _safe_config(build_settings({}, {}).settings)
+        add("a live key in the environment is not copied into the configuration block",
+            all(secret not in entry.value for entry in planted))
+        add("a live key in text is found by the scan",
+            not audit_secrets(f"the key was {secret} in a note").clean,
+            "known-credential-value")
+        add("a key this process never knew is found by its shape",
+            not audit_secrets("token sk-proj-AAAABBBBCCCCDDDDEEEEFFFF1234").clean,
+            "known-prefix")
+        add("a bearer token is found", not audit_secrets(
+            "Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345").clean)
+        add("a cookie header is found",
+            not audit_secrets("Cookie: session=abcd1234efgh5678").clean)
+        add("a connection string with a password is found",
+            not audit_secrets("postgres://user:hunter2pass@db.example/x").clean)
+        add("a private key block is found",
+            not audit_secrets("-----BEGIN RSA PRIVATE KEY-----\nabc").clean)
+        add("a JSON credential field is found", not audit_secrets(
+            '{"api_key": "abcd1234efgh5678ijkl"}').clean)
+        add("a cookie store is refused even with no matchable value",
+            not audit_secrets('{"cookies": [{"name": "a", "value": "b"}]}').clean)
+        add("a scanned record records what it searched for, not what it found",
+            "known-credential-value" in
+            audit_secrets("nothing here", secrets=[secret]).patterns)
+        try:
+            assert_no_secrets(f"leaked {secret}", where="the test file")
+            refused = False
+        except OutputError:
+            refused = True
+        add("a write carrying a credential is refused, not redacted", refused)
+        add("the scan reports where, never what",
+            all(secret not in finding.detail
+                for finding in audit_secrets(f"x {secret}").findings))
+
+    # ---- 4. and the guarantee holds on text that is clean -------------------
+    clean = audit_secrets("the mission collected 6 items from 5 origins")
+    add("clean text scans clean", clean.clean and clean.bytes_scanned > 0)
+    add("a redacted placeholder does not trip the shape scan",
+        audit_secrets(f'{{"api_key": "{NOT_REDACTED_MARKER}: set, value not recorded>"}}').clean,
+        [item.kind for item in
+         audit_secrets(f'{{"api_key": "{NOT_REDACTED_MARKER}: set, value not recorded>"}}'
+                       ).findings])
+    add("the record's own redaction marker does not trip its own scan",
+        audit_secrets(json.dumps(_safe_config(settings), default=str)).clean,
+        [item.kind for item in audit_secrets(
+            json.dumps([entry.to_dict() for entry in _safe_config(settings)])).findings])
+
+    # ---- 5. the document and the JSON carry it, and round-trip -------------
+    markdown = render_dossier_markdown(dossier)
+    for heading in ("Audit and reproducibility", "Environment", "Configuration", "Models",
+                    "Mission scope and limits", "Timestamps", "Dynamic hierarchy",
+                    "Tool failures", "Reproduction", "What is deliberately not recorded",
+                    "Retention", "Audit clause"):
+        add(f"the document has an {heading} section", f"## {heading}" in markdown)
+    add("the document names the software in its header",
+        f"produced by: {dossier.audit.environment.describe()}" in markdown or
+        dossier.audit.environment.version in markdown)
+    add("the document carries the retention note", RETENTION_NOTE[:60] in markdown)
+    add("the acceptance section reports the audit clause",
+        "§42 audit clause" in markdown)
+    payload = dossier.to_dict()["audit"]
+    reloaded = AuditRecord.from_dict(json.loads(json.dumps(payload)))
+    add("the audit record round-trips through JSON",
+        reloaded.to_dict() == payload, "differs")
+    add("the JSON publishes the audit block with its clause as written",
+        bool(payload.get("clause")) and payload["format_version"] == "argus-audit/1")
+    add("a record that has not been written says so, and why",
+        payload["secrets"]["scanned"] is False
+        and payload["secrets"]["clean"] is False
+        and "the scan runs over" in payload["secrets"]["scanned_text"])
+    add("a record from another format version is refused", _refuses_value_error(
+        lambda: AuditRecord.from_dict({**payload, "format_version": "argus-audit/9"})))
+    written = write_dossier(dossier, out_dir=Path(tempfile.mkdtemp(prefix="audit-")),
+                            formats=OutputFormat.ALL)
+    written_record = MissionDossier.load(
+        Path(written.json_path).read_text(encoding="utf-8")).audit
+    add("a written dossier records that it was scanned",
+        written_record.secrets.scanned and written_record.secrets.bytes_scanned > 0,
+        written_record.secrets.describe())
+    add("the written file states its own audit verdict",
+        bool(written_record.clause) and "no_secrets" in written_record.clause)
+    add("the written file is what was scanned",
+        Path(written.json_path).read_text(encoding="utf-8").count(
+            dossier.audit.secrets.describe()[:12]) >= 0)
+    return checks
+
+
+def _refuses_value_error(fn: Any) -> bool:
+    try:
+        fn()
+    except ValueError:
+        return True
+    except Exception:                          # noqa: BLE001 - a wrong error is a failure
+        return False
+    return False
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -58406,6 +60305,9 @@ def report_command(
     as_json: bool = typer.Option(False, "--json", help="Emit the dossier as JSON on stdout."),
     summary_only: bool = typer.Option(
         False, "--summary", help="Print the terminal summary and nothing else."),
+    audit: bool = typer.Option(
+        False, "--audit",
+        help="Print the §42 audit block: what was run, and what is deliberately not in it."),
 ) -> None:
     """Render a finished mission: the document, the record, and the summary.
 
@@ -58424,7 +60326,8 @@ def report_command(
         raise typer.Exit(ExitCode.USAGE)
 
     if self_test:
-        checks = [*run_dossier_self_test(), *run_presentation_self_test()]
+        checks = [*run_dossier_self_test(), *run_presentation_self_test(),
+                  *run_audit_self_test()]
         failures = [check for check in checks if not check.ok]
         if as_json:
             _emit(json.dumps({"checks": [check.to_dict() for check in checks],
@@ -58499,6 +60402,27 @@ def report_command(
                          indent=2, default=str))
         raise typer.Exit(ExitCode.OK if written.acceptance.ok else ExitCode.POLICY)
 
+    if audit:
+        # The block, its clause, and the two commands that would settle the question for a
+        # colleague: everything needed to decide whether to trust or to re-run the file.
+        console.print()
+        console.print(render_audit_summary(dossier.audit))
+        console.print()
+        clause = dossier.audit.acceptance()
+        colour = "green" if clause["ok"] else "red"
+        console.print(Text(f"[{colour}]{'✔' if clause['ok'] else '✘'}[/{colour}] "
+                           f"audit clause: reproducible "
+                           f"{_mark(clause['reproducible'])} · no secrets "
+                           f"{_mark(clause['no_secrets'])} · retention stated "
+                           f"{_mark(clause['retention_stated'])}"))
+        for problem in clause["errors"]:
+            console.print(Text(f"  [red]·[/red] {escape(problem[:200])}"))
+        if not dossier.audit.secrets.scanned:
+            console.print("  [dim]the scan runs when the file is written; --summary and "
+                          "--audit print without writing[/dim]")
+        console.print()
+        raise typer.Exit(ExitCode.OK if clause["ok"] else ExitCode.POLICY)
+
     if present:
         # The written paths, not the requested ones: the screen must point at files that
         # exist, which is why it is built after the write rather than before it.
@@ -58554,11 +60478,18 @@ def _dossier_from_flow_file(source: str, console: Console) -> MissionDossier:
     try:
         result = _flow_result_from_payload(payload)
         report = MasterReport.model_validate(synthesis["report"])
+        # §42: the scope the mission was admitted under, when the file carries it.  A file
+        # written before this section existed has none, and the record then says the scope
+        # came from the report rather than pretending otherwise.
+        context = (MasterContext.model_validate(payload["context"])
+                   if isinstance(payload.get("context"), Mapping) else None)
     except (ValueError, KeyError, TypeError) as exc:
         console.print(f"[red]✘[/red] not a flow result: "
                       f"{escape(_first_sentence(str(exc))[:200])}")
         raise typer.Exit(ExitCode.USAGE) from exc
-    return build_dossier(result, report=report)
+    return build_dossier(result, report=report, context=context,
+                         settings=build_settings().settings,
+                         command=f"report --mission {source}")
 
 
 def _dossier_from_report_set(source: str, console: Console, *, objective: str,
@@ -58610,7 +60541,25 @@ def _dossier_from_report_set(source: str, console: Console, *, objective: str,
             claims=[], gaps=list(report.gaps), limitations=list(report.limitations),
             confidence=report.confidence, confidence_basis=report.confidence_basis,
             uncertainty_statement=report.uncertainty_statement, report=report))
-    return build_dossier(result, report=report, context=context)
+    return build_dossier(result, report=report, context=context,
+                         settings=build_settings().settings,
+                         command=f"report --reports {source}")
+
+
+def _run_stamps(result: "FlowResult") -> dict[str, Any]:
+    """The run's two absolute stamps, in the form a flow payload carries (§42).
+
+    Serialised to strings rather than datetimes because the payload is JSON, and left out
+    when absent rather than written as null: a file that says nothing about when the mission
+    ran must not look like a file that says it ran at no time.
+    """
+
+    stamps: dict[str, Any] = {}
+    for key in ("started_at", "ended_at"):
+        value = getattr(result, key, None)
+        if value is not None:
+            stamps[key] = value.isoformat(timespec="seconds")
+    return stamps
 
 
 def _flow_result_from_payload(payload: Mapping[str, Any]) -> FlowResult:
@@ -58634,6 +60583,7 @@ def _flow_result_from_payload(payload: Mapping[str, Any]) -> FlowResult:
             {key: value for key, value in synthesis.items() if key != "report"}),
         stopped=bool(payload.get("stopped")),
         stop_reason=str(payload.get("stop_reason") or ""),
+        started_at=payload.get("started_at"), ended_at=payload.get("ended_at"),
         waves=[list(item) for item in payload.get("waves") or []],
         structure=[str(item) for item in payload.get("structure") or []],
         seconds=float(payload.get("seconds") or 0.0),
