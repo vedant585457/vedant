@@ -1003,6 +1003,12 @@ recommended lawful next steps.
   asserts it stays inside the mission's scope and authorisation, and must be passive — this
   build plans passive collection, and a recommendation is a plan.
 
+The document is assembled, asserted against its own acceptance clause, and only then
+returned: a report that cannot show a citation for a finding, or that states a level above
+what its origins and its claim's kind allow, is refused rather than printed. The executive
+summary is written last and may count what is still open — it may never claim to have
+excluded the alternatives, because excluding one takes evidence, not silence.
+
 ```
 python vedant_osint.py synthesis --self-test              # 50 calibration checks
 python vedant_osint.py synthesis --demo                   # one claim, three evidence bases
@@ -1018,7 +1024,7 @@ python vedant_osint.py synthesis --reports mission.json   # assemble the documen
 | 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control, Worker outcome contract, Subagent quality review, targeted Worker retasking, Subagent aggregation with bounded runtime Workers, Master review with bounded replanning, loop detection with strategy change, blocked lines and saturation stops, evidence-based Master synthesis with cited findings and calibrated confidence) |
 | 4 | Browser — browser-use / Playwright sessions and capture | 🟡 started (policy, scope, capture, guarded closure, agent mode) |
 | 5 | Collection — passive OSINT sources, artefact hashing | 🟡 started (source-aware web research; safe document/page extraction with injection defence; read-only artifact manifests, hashing and access ledger) |
-| 6 | Synthesis — cross-source correlation and reporting | 🟡 started (deterministic timelines, explained indicator correlation, content de-duplication) |
+| 6 | Synthesis — cross-source correlation and reporting | 🟡 started (deterministic timelines, explained indicator correlation, content de-duplication, the evidence-based Master report with citations and calibrated confidence) |
 | 7 | Operations — resume, budgets, audit trail, hardening | 🟡 started (checkpoints, resumable missions, capability router, budgets) |
 
 ## Install
