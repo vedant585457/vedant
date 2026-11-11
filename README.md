@@ -21,6 +21,7 @@ python vedant_osint.py router --self-test     # the controlled capability router
 python vedant_osint.py browser --self-test    # browser research, guaranteed closure
 python vedant_osint.py research --self-test   # source-aware web research
 python vedant_osint.py extract --self-test    # bounded, untrusted document extraction
+python vedant_osint.py artifacts --self-test  # read-only artifact handling, no writes
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -637,6 +638,56 @@ python vedant_osint.py extract --limits         # the size, time and text ceilin
   prohibitions spelled out — and `document_claims`, which cites a hostile page for
   its *hostility* rather than for its demands.
 
+## Read-only forensic artifacts
+
+`artifacts` describes local evidence the operator explicitly names — and never
+changes it. No disk images, no memory captures, no deleted-file recovery: those
+are named as *not implemented* in every manifest, so no reader can infer a
+capability this build does not have.
+
+```bash
+python vedant_osint.py artifacts --self-test            # 167 read-only checks, offline
+python vedant_osint.py artifacts --demo                 # a small case, end to end
+python vedant_osint.py artifacts --path ~/evidence --verify
+python vedant_osint.py artifacts --path report.docx --copy --json
+python vedant_osint.py artifacts --limits               # ceilings, and what is not done
+```
+
+- **Only what was named, only under the root it named.** The case is opened with
+  the supplied paths resolved once; anything outside them is refused with the
+  reason and recorded as a refusal. `..` that escapes, a control character in a
+  path, a fifo, a socket or a device is refused before a byte is read.
+- **Never modified.** Directories are walked without following symlinks (a
+  symlink out of the root is a reported limit, not a silent skip), sources are
+  opened read-only, and analysis happens on a copy under the case directory whose
+  digest is verified before it is used. The self-test parses the section's own
+  source to prove it contains no mutating filesystem call, and that the only
+  `mkdir` targets the case directory.
+- **Hashes and paths recorded, always.** Every file gets sha256, sha1 and md5,
+  its size, mode, owner, inode, link count, its supplied *and* resolved path, and
+  an entry id derived from path and content. Readable artefacts also get the
+  metadata their format advertises (title, author, pages, language) and a count of
+  the instructions their text carried, read once from a bounded prefix. A file
+  larger than the hash ceiling is *sampled* — and the digest records the window it
+  used, so a reviewer can recompute the identical value instead of a whole-file
+  hash that would fail for the wrong reason.
+- **Every access is a ledger row.** `stat`, `read`, `hash`, `copy`, `extract`,
+  `verify`, `refused` — with the time, the byte count, the digest before and
+  after, and whether the access left the source unchanged.
+- **Timestamps carry their caveats.** `mtime` is what the filesystem says, not
+  what the file says; `ctime` is an inode change, not a creation; `atime` may be
+  disabled by a mount option. A future or pre-1980 `mtime` is marked unreliable
+  rather than quietly quoted.
+- **Unsupported formats return clear partial results.** Identification is by
+  magic number first, suffix second, content last — a `.pdf` that holds plain
+  text is reported as text *with the suffix disagreement named*. A binary blob is
+  identified, sized, timestamped and hashed, then explicitly labelled: identified
+  and hashed only, with no reader in this build.
+- **Tampering is detected, not assumed away.** `--verify` recomputes every digest
+  after ingestion and reports drift; a file that was removed is a finding, not a
+  skip. Previews of text artefacts go through the Task 20 scanner and defanger,
+  so a file whose first line is an instruction appears in the record quoted.
+
 ## Status
 
 | Phase | Scope | State |
@@ -645,7 +696,7 @@ python vedant_osint.py extract --limits         # the size, time and text ceilin
 | 2 | Contracts — settings, `doctor`, preflight, models, state, renderer, lifecycle, resilience, model adapter | ✅ done |
 | 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control) |
 | 4 | Browser — browser-use / Playwright sessions and capture | 🟡 started (policy, scope, capture, guarded closure, agent mode) |
-| 5 | Collection — passive OSINT sources, artefact hashing | 🟡 started (source-aware web research; safe document/page extraction with injection defence) |
+| 5 | Collection — passive OSINT sources, artefact hashing | 🟡 started (source-aware web research; safe document/page extraction with injection defence; read-only artifact manifests, hashing and access ledger) |
 | 6 | Synthesis — cross-source correlation and reporting | ⬜ |
 | 7 | Operations — resume, budgets, audit trail, hardening | 🟡 started (checkpoints, resumable missions, capability router, budgets) |
 
