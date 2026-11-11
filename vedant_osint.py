@@ -1152,7 +1152,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 30
+VERSION_MINOR: int = 31
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -10838,8 +10838,14 @@ def build_partial_report(
 
 
 @dataclass
-class MissionOutcome:
-    """Everything a caller needs after a run, whatever way it ended."""
+class RunOutcome:
+    """Everything a caller needs after a run, whatever way it ended.
+
+    Named :class:`RunOutcome` rather than ``MissionOutcome`` because §41 gives that name to
+    the four *states* a mission can end in, which is what a reader of the presentation
+    means by "the outcome".  This object is the run's container of results; that one is a
+    verdict about them, and two things with one name is how a report says the wrong one.
+    """
 
     mission_id: str
     status: EntityStatus
@@ -10919,7 +10925,7 @@ class MissionRun:
         self.resources = ResourceStack()
         self.guard = CancellationGuard(self.token, logger=self.logger, install_signals=install_signals)
         self.store = RunStateStore(mission)
-        self.outcome: MissionOutcome | None = None
+        self.outcome: RunOutcome | None = None
         self._extra_cleanup = list(cleanup_callbacks)
         self._started = time.monotonic()
         self._pid = os.getpid()
@@ -10929,7 +10935,8 @@ class MissionRun:
     def _elapsed_ms(self) -> float:
         return round((time.monotonic() - self._started) * 1000, 1)
 
-    def _finalise(self, kind: InterruptionKind | None, reason: str, exc: BaseException | None = None) -> MissionOutcome:
+    def _finalise(self, kind: InterruptionKind | None, reason: str,
+                  exc: BaseException | None = None) -> RunOutcome:
         """Ordered shutdown.  Every step is attempted even if an earlier one fails."""
 
         errors: list[str] = []
@@ -11030,7 +11037,7 @@ class MissionRun:
         )
         self.logger.close()
 
-        self.outcome = MissionOutcome(
+        self.outcome = RunOutcome(
             mission_id=self.mission.id,
             status=status,
             interrupted=interrupted,
@@ -26291,10 +26298,23 @@ def _flow_demo(objective_key: str, *, out_dir: Path | None = None,
     if logger is not None:
         logger.close()
 
+    # §41: the presentation is derived from the same dossier §40 writes, so the screen and
+    # the file cannot disagree about what the mission produced.
+    log_path = str(logger.path) if logger is not None else ""
+    dossier = build_dossier(result, context=context)
+    # The paths the presentation quotes are only filled in once §40 has written the file:
+    # until then it says the report was not written, which is the truth at that moment.
+    written = (write_dossier(dossier, out_dir=out_dir, stem=f"report-{objective_key}")
+               if out_dir is not None else None)
+    presentation = build_presentation(
+        dossier, report_paths=[written.markdown_path] if written and written.markdown_path
+        else [], log_path=log_path)
+
     payload: dict[str, Any] = {
         "objective_key": objective_key,
         "objective": context.objective,
         "mission_id": flow.mission_id,
+        "presentation": presentation.to_dict(),
         "resume": result.resume,
         "checkpoint": result.checkpoint,
         "structure": flow.structures(),
@@ -26521,6 +26541,9 @@ def flow_command(
             _emit(json.dumps(payload, indent=2, default=str))
             raise typer.Exit(ExitCode.OK)
         console.print()
+        console.print(render_mission_presentation(
+            MissionPresentation.from_dict(payload["presentation"])))
+        console.print()
         console.print(render_flow_summary(payload))
         for report in payload["reports"]:
             console.print()
@@ -26592,9 +26615,19 @@ def flow_command(
         result = flow.run()
         if logger is not None:
             logger.close()
+        # §41 on a live run: the same presentation, over whatever this run actually
+        # collected.  The report paths are the ones the run wrote, and empty when it wrote
+        # none — the screen then says so instead of quoting a path nobody can open.
+        live_paths = [str(path) for path in
+                      (getattr(result, "report_path", None),
+                       getattr(result, "checkpoint_path", None)) if path]
         payload = {
             "objective_key": "live", "objective": objective, "structure": flow.structures(),
             "mission_id": flow.mission_id, "resume": result.resume,
+            "presentation": build_presentation(
+                build_dossier(result, context=context),
+                report_paths=live_paths,
+                log_path=str(logger.path) if logger is not None else "").to_dict(),
             "checkpoint": result.checkpoint,
             "waves": result.waves,
             "subagents": [
@@ -26620,6 +26653,9 @@ def flow_command(
         if as_json:
             _emit(json.dumps(payload, indent=2, default=str))
             raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(render_mission_presentation(
+            MissionPresentation.from_dict(payload["presentation"])))
         console.print()
         console.print(render_flow_summary(payload))
         console.print()
@@ -54183,6 +54219,25 @@ class StoppingRecord(StrictModel):
     foregone: list[str] = Field(default_factory=list)
     statement: str = Field(min_length=15)
 
+    @property
+    def exhausted(self) -> bool:
+        """Whether the mission ended because it could not go on, rather than because it was
+        finished.
+
+        Read from the *reason*, not the condition: the master's last decision records the
+        replanning budget it is always allowed not to spend, so ``condition == budget`` is
+        true of every finished mission.  A mission that actually ran out says so in words —
+        "spent", "exhausted", "no further round is allowed" — and that phrase is what this
+        property reacts to.
+        """
+
+        lowered = f"{self.reason} {self.statement}".lower()
+        if self.condition == "complete":
+            return False
+        return any(phrase in lowered for phrase in
+                   ("budget is spent", "budget of", "exhausted", "no further round",
+                    "no further work", "saturation", "deadline has expired"))
+
 
 class ExecutionSummary(StrictModel):
     """The mission as a run: who ran, what it cost, and what it produced."""
@@ -54640,7 +54695,11 @@ def _stopping_record(result: "FlowResult", report: MasterReport) -> StoppingReco
 
     decision = result.decision
     condition = result.stop_condition.value
-    kind = _STOP_KINDS.get(condition, "policy")
+    # §37's blocking stop means the mission never synthesised: the condition of its last
+    # review describes why *that review* stopped asking, not what the mission produced.
+    kind = "blocked" if result.stopped else _STOP_KINDS.get(condition, "policy")
+    if not result.stopped and decision is not None and decision.condition is not StopCondition.NONE:
+        kind = _STOP_KINDS.get(decision.condition.value, "policy")
     saturations = (result.loops.saturation if result.loops is not None else None)
     bounds = []
     if result.stopped:
@@ -54654,9 +54713,11 @@ def _stopping_record(result: "FlowResult", report: MasterReport) -> StoppingReco
                       for clip in result.clip.changes[:3])
     if saturations is not None and saturations.stop_reason:
         bounds.append(f"saturation: {saturations.stop_reason[:200]}")
-    if decision is not None and decision.condition is not StopCondition.NONE:
-        kind = _STOP_KINDS.get(decision.condition.value, "policy")
-    reason = (decision.basis if decision is not None and decision.basis
+    # A mission that stopped itself is explained by *why it stopped*, not by the basis of
+    # the last review it happened to reach: those are two different facts, and the one a
+    # reader needs first is the stop.
+    reason = (result.stop_reason if result.stopped and result.stop_reason
+              else decision.basis if decision is not None and decision.basis
               else result.stop_reason
               or (saturations.stop_reason if saturations is not None else ""))
     if not reason and result.trace:
@@ -55902,6 +55963,1345 @@ def _schema_errors(instance: Any, schema: Mapping[str, Any]) -> list[str]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# 41. The mission presentation: the outcome, without opening a log
+# --------------------------------------------------------------------------
+#
+# §39 wrote the document and §40 wrote it out.  Neither answers the question an operator
+# asks the moment a mission ends: *did it work, and what do I have?*  That question is
+# answered on the terminal, in one screen, and the whole section exists to answer it
+# honestly — which means four things:
+#
+#   * **The outcome is derived, not chosen.**  :class:`MissionOutcome` is computed from
+#     what the record holds: how many units ran, how many settled, whether anything was
+#     withheld, whether the mission stopped, and whether its criteria were met.  A
+#     presentation cannot say "completed" about a mission that reported nothing, because
+#     the derivation refuses it before a renderer sees it.
+#   * **The four states have one styling, everywhere.**  Completed is green and a ✔, partial
+#     is yellow and a ◐, blocked is cyan and a ⊘, failed is red and a ✘ — and the words are
+#     the ones the report already uses for a task, so one vocabulary covers both.  The same
+#     table drives the headline, the panels and the demo, so a reader learns it once — and a
+#     *partial* mission can never be mistaken for a finished one at a glance.
+#   * **The screen is not the record.**  The presentation carries counts, the strongest
+#     findings (bounded, and each with its band), the riskiest gaps, and what needs
+#     attention.  Everything else stays in the saved report, and the presentation says
+#     where that is — twice: in the footer and in the warning when there is no path at all.
+#   * **Warnings are facts with a consequence.**  Not "something happened": every warning
+#     names its cause and what the reader loses because of it, and the severity ladder says
+#     whether it is enough to make the mission partial.
+#
+# The four fixtures exist so the styling can be *seen* as well as asserted: a reader who
+# wonders what a blocked mission looks like should not have to break a build to find out.
+
+#: The four outcomes and their colours.  :data:`_STATUS_STYLE` (``completed``/``partial``/
+#: ``blocked``/``failed``) is the table §35 already renders worker outcomes with, and §41
+#: does not get a second one: a presentation whose "failed" was a different red from the
+#: task row's "failed" would teach a reader two vocabularies for one record.
+#:
+#: The four outcomes a mission can end in, and the one styling each carries.  Ordered by
+#: severity: a presentation reports the worst outcome any part of the mission reached, and
+#: a warning at or above :attr:`WarningLevel.SEVERE` moves the outcome up the ladder.
+class MissionOutcome(str, Enum):
+    """The four ways a mission can end.
+
+    ``COMPLETED`` rather than ``SUCCESS``, and its banner says "mission completed", because
+    the rest of the report already uses ``completed`` for a task that delivered (§40's
+    ``TaskRow.status`` and §39's ``EntityStatus``).  A screen that called the same fact
+    "success" would make a reader wonder whether the two words meant the same thing; here
+    one word means one thing, from the task row to the banner.
+    """
+
+    COMPLETED = "completed"      # every unit that was asked for delivered
+    PARTIAL = "partial"          # it finished, with gaps or withheld work
+    BLOCKED = "blocked"          # it could not get the work it needed
+    FAILED = "failed"            # it produced nothing usable
+
+    @property
+    def rank(self) -> int:
+        return {self.COMPLETED: 0, self.PARTIAL: 1, self.BLOCKED: 2, self.FAILED: 3}[self]
+
+    @property
+    def style(self) -> str:
+        """The one colour this outcome is drawn in, everywhere."""
+
+        return f"bold {_STATUS_STYLE[self.value]}"
+
+    @property
+    def colour(self) -> str:
+        """The outcome's colour without the weight, for a border or a task row."""
+
+        return _STATUS_STYLE[self.value]
+
+    @property
+    def glyph(self) -> str:
+        """The one mark this outcome is drawn with, everywhere."""
+
+        return {self.COMPLETED: "✔", self.PARTIAL: "◐", self.BLOCKED: "⊘",
+                self.FAILED: "✘"}[self]
+
+    @property
+    def headline(self) -> str:
+        return {self.COMPLETED: "mission completed",
+                self.PARTIAL: "mission completed, with gaps",
+                self.BLOCKED: "mission blocked",
+                self.FAILED: "mission failed"}[self]
+
+    @property
+    def exit_code(self) -> "ExitCode":
+        """What the shell should see.  ``PARTIAL`` is not an error: it is a result."""
+
+        return {self.COMPLETED: ExitCode.OK, self.PARTIAL: ExitCode.OK,
+                self.BLOCKED: ExitCode.POLICY, self.FAILED: ExitCode.INTERNAL}[self]
+
+    @classmethod
+    def worst(cls, *outcomes: "MissionOutcome") -> "MissionOutcome":
+        return max(outcomes, key=lambda item: item.rank, default=cls.COMPLETED)
+
+
+#: Severity of a warning, and whether it escalates the mission's outcome.
+class WarningLevel(str, Enum):
+    INFO = "info"            # worth knowing, changes nothing
+    NOTICE = "notice"        # something was lost; the outcome stays what the counts say
+    SEVERE = "severe"        # enough to make a mission partial on its own
+    FATAL = "fatal"          # enough to make a mission failed on its own
+
+    @property
+    def outcome(self) -> "MissionOutcome | None":
+        return {WarningLevel.INFO: None, WarningLevel.NOTICE: None,
+                WarningLevel.SEVERE: MissionOutcome.PARTIAL,
+                WarningLevel.FATAL: MissionOutcome.FAILED}[self]
+
+    @property
+    def rank(self) -> int:
+        """Ordering, so "most severe first" is one definition rather than a dict literal."""
+
+        return {"info": 0, "notice": 1, "severe": 2, "fatal": 3}[self.value]
+
+    @property
+    def style(self) -> str:
+        return {"info": "dim", "notice": "yellow", "severe": "bold yellow",
+                "fatal": "bold red"}[self.value]
+
+    @property
+    def glyph(self) -> str:
+        return {"info": "·", "notice": "!", "severe": "▲", "fatal": "✘"}[self.value]
+
+
+class WarningItem(StrictModel):
+    """Something the reader must know, with what it costs them.  Never a bare "warning"."""
+
+    level: WarningLevel = WarningLevel.NOTICE
+    cause: str = Field(min_length=8, description="What happened, in the record's terms.")
+    consequence: str = Field(min_length=8, description="What the reader therefore loses.")
+    where: str = ""             # the unit, section or artefact it concerns
+    #: Set when the release of the mission is conditional on it.
+    blocks_publication: bool = False
+
+    def describe(self) -> str:
+        return f"{self.cause} — {self.consequence}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"level": self.level.value, "cause": self.cause,
+                "consequence": self.consequence, "where": self.where,
+                "blocks_publication": self.blocks_publication}
+
+
+class MissionHeadline(StrictModel):
+    """The one line an operator reads first: what happened, in what shape, and why."""
+
+    outcome: MissionOutcome
+    title: str = Field(min_length=3)
+    statement: str = Field(min_length=15)
+    mission_id: str = ""
+    objective: str = ""
+
+    @property
+    def style(self) -> str:
+        return self.outcome.style
+
+    @property
+    def glyph(self) -> str:
+        return self.outcome.glyph
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"outcome": self.outcome.value, "title": self.title,
+                "statement": self.statement, "mission_id": self.mission_id,
+                "objective": self.objective}
+
+
+class TaskCounts(StrictModel):
+    """How many units were asked for, and what became of each.
+
+    Counted by *kind* as well as by status: "4 tasks completed" is a different sentence
+    for four planned Workers and for two Subagents plus two runtime Workers the mission
+    invented, and the presentation says which.
+    """
+
+    subagents: int = Field(default=0, ge=0)
+    workers: int = Field(default=0, ge=0)
+    completed: int = Field(default=0, ge=0)
+    failed: int = Field(default=0, ge=0)
+    blocked: int = Field(default=0, ge=0)
+    withheld: int = Field(default=0, ge=0)
+    deferred: int = Field(default=0, ge=0)
+    not_run: int = Field(default=0, ge=0)
+    attempts: int = Field(default=0, ge=0)
+    retries: int = Field(default=0, ge=0)
+    #: Workers the mission created after its plan was made (§36) and follow-ups (§37).
+    runtime_workers: int = Field(default=0, ge=0)
+    follow_ups: int = Field(default=0, ge=0)
+
+    @property
+    def total(self) -> int:
+        return self.subagents + self.workers
+
+    @property
+    def settled(self) -> int:
+        """Units that produced something — completed, or partially and reported."""
+
+        return self.completed
+
+    @property
+    def dynamic(self) -> bool:
+        """Whether the mission ran more Workers than its plan declared."""
+
+        return self.runtime_workers > 0 or self.follow_ups > 0
+
+    def describe(self) -> str:
+        return (f"{self.subagents} subagent(s), {self.workers} worker(s): "
+                f"{self.completed} completed, {self.failed} failed, {self.blocked} blocked, "
+                f"{self.withheld} withheld")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"subagents": self.subagents, "workers": self.workers,
+                "completed": self.completed, "failed": self.failed,
+                "blocked": self.blocked, "withheld": self.withheld,
+                "deferred": self.deferred, "not_run": self.not_run,
+                "attempts": self.attempts, "retries": self.retries,
+                "runtime_workers": self.runtime_workers, "follow_ups": self.follow_ups,
+                "total": self.total, "dynamic": self.dynamic}
+
+
+class EvidenceTotals(StrictModel):
+    """What the mission collected, and how much of it is citable.
+
+    ``cited`` and ``corroborated`` are separated on purpose: ten collected items that no
+    finding rests on are ten items the report cannot use, and a total that added them to
+    the same number would flatter the mission.
+    """
+
+    items: int = Field(default=0, ge=0)
+    sources: int = Field(default=0, ge=0)
+    origins: int = Field(default=0, ge=0)
+    cited: int = Field(default=0, ge=0)
+    corroborated: int = Field(default=0, ge=0)
+    hashed: int = Field(default=0, ge=0)
+    custody_records: int = Field(default=0, ge=0)
+    preserved: int = Field(default=0, ge=0)
+    traces: int = Field(default=0, ge=0)
+    findings: int = Field(default=0, ge=0)
+    conflicts: int = Field(default=0, ge=0)
+    gaps: int = Field(default=0, ge=0)
+
+    @property
+    def forensic(self) -> bool:
+        return self.custody_records > 0
+
+    def describe(self) -> str:
+        return (f"{self.items} evidence item(s) from {self.sources} source(s)/"
+                f"{self.origins} origin(s); {self.cited} cited, {self.corroborated} "
+                f"corroborated; {self.findings} finding(s)")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {name: getattr(self, name) for name in
+                ("items", "sources", "origins", "cited", "corroborated", "hashed",
+                 "custody_records", "preserved", "traces", "findings", "conflicts",
+                 "gaps")}
+
+
+class Highlight(StrictModel):
+    """One thing the reader should see on the screen, and where the rest of it lives.
+
+    A highlight is a *pointer with a quotation*, never the whole finding: shortened, with
+    its band and its evidence ids, so the screen says what is known and how well, and the
+    report keeps the detail.
+    """
+
+    statement: str = Field(min_length=8)
+    band: str = "single-source"
+    confidence: str = "low"
+    evidence_ids: list[str] = Field(default_factory=list)
+    #: ``finding``, ``gap``, ``conflict``, ``step`` — what kind of thing this is.
+    kind: str = "finding"
+
+    @property
+    def weight(self) -> str:
+        """What the claim rests on, as the reader needs to read it."""
+
+        return self.band
+
+    @property
+    def style(self) -> str:
+        """Colour for the band — evidence strength, never the mission's outcome."""
+
+        return {"corroborated": "green", "well-corroborated": "bold green",
+                "single-source": "yellow", "conflict": "red", "gap": "cyan",
+                "unverified": "magenta"}.get(self.band, "dim")
+
+    @property
+    def glyph(self) -> str:
+        return {"corroborated": "✔", "single-source": "◐", "conflict": "✘",
+                "gap": "⊘", "unverified": "?"}.get(self.band, "·")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"statement": self.statement, "band": self.band,
+                "confidence": self.confidence, "evidence_ids": list(self.evidence_ids),
+                "kind": self.kind}
+
+
+class MissionPresentation(StrictModel):
+    """The whole screen: a headline, four counts, the findings that matter, and the paths.
+
+    Everything here is derived from a :class:`MissionDossier` (§40) — this object adds no
+    claim of its own, it decides what is *worth printing*.  The rule the section is built
+    on: if a reader has to open a log to answer "did it work?", the presentation failed,
+    and if they have to open the presentation to learn what was found, the report failed.
+    Nothing in this object has a field for a verdict about a person, so the screen cannot
+    say something the document refuses to.
+    """
+
+    headline: MissionHeadline
+    counts: TaskCounts = Field(default_factory=TaskCounts)
+    evidence_totals: EvidenceTotals = Field(default_factory=EvidenceTotals)
+    #: The strongest findings, already bounded — three by default.
+    highlights: list[Highlight] = Field(default_factory=list)
+    #: Gaps and conflicts worth naming on the screen, bounded.
+    risks: list[Highlight] = Field(default_factory=list)
+    warnings: list[WarningItem] = Field(default_factory=list)
+    confidence: str = "unknown"
+    confidence_basis: str = ""
+    seconds: float = Field(default=0.0, ge=0)
+    duration: str = ""
+    #: Where the saved report lives.  Empty only when nothing was written, and the
+    #: presentation then says so in a warning rather than leaving the reader to guess.
+    report_paths: list[str] = Field(default_factory=list)
+    log_path: str = ""
+    stopping_reason: str = ""
+    #: What a reader can do next, if anything is recommended at all.
+    next_step: str = ""
+    #: The units that did not deliver, named — the tail the counts cannot show.  The
+    #: detailed reason for each is in the report's execution section; this is what the
+    #: reader needs in order to know *which* work is missing.
+    unfinished: list[Highlight] = Field(default_factory=list)
+
+    @property
+    def outcome(self) -> MissionOutcome:
+        return self.headline.outcome
+
+    @property
+    def severe(self) -> list[WarningItem]:
+        return [item for item in self.warnings
+                if item.level in {WarningLevel.SEVERE, WarningLevel.FATAL}]
+
+    @property
+    def blocking(self) -> list[WarningItem]:
+        return [item for item in self.warnings if item.blocks_publication]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"headline": self.headline.to_dict(),
+                "counts": self.counts.to_dict(),
+                "evidence": self.evidence_totals.to_dict(),
+                "highlights": [item.to_dict() for item in self.highlights],
+                "risks": [item.to_dict() for item in self.risks],
+                "warnings": [item.to_dict() for item in self.warnings],
+                "confidence": self.confidence,
+                "confidence_basis": self.confidence_basis,
+                "seconds": round(self.seconds, 3), "duration": self.duration,
+                "report_paths": list(self.report_paths), "log_path": self.log_path,
+                "stopping_reason": self.stopping_reason, "next_step": self.next_step,
+                "unfinished": [item.to_dict() for item in self.unfinished],
+                "outcome": self.outcome.value,
+                "blocking": [item.cause for item in self.blocking]}
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "MissionPresentation":
+        """Rebuild from :meth:`to_dict`.
+
+        Written out rather than ``model_validate(payload)`` because the dict carries derived
+        fields (``outcome``, ``blocking``) that are properties here: a payload that could not
+        be read back would make ``--json`` a one-way format, and the ``flow --demo ... --json``
+        output feeds straight back into this renderer.
+        """
+
+        return cls(
+            headline=MissionHeadline.model_validate(payload["headline"]),
+            counts=TaskCounts.model_validate(
+                {key: value for key, value in (payload.get("counts") or {}).items()
+                 if key not in {"total", "dynamic"}}),
+            evidence_totals=EvidenceTotals.model_validate(payload.get("evidence") or {}),
+            highlights=[Highlight.model_validate(item)
+                        for item in payload.get("highlights") or []],
+            risks=[Highlight.model_validate(item) for item in payload.get("risks") or []],
+            unfinished=[Highlight.model_validate(item)
+                        for item in payload.get("unfinished") or []],
+            warnings=[WarningItem.model_validate(item)
+                      for item in payload.get("warnings") or []],
+            confidence=str(payload.get("confidence") or "unknown"),
+            confidence_basis=str(payload.get("confidence_basis") or ""),
+            seconds=float(payload.get("seconds") or 0.0),
+            duration=str(payload.get("duration") or ""),
+            report_paths=[str(item) for item in payload.get("report_paths") or []],
+            log_path=str(payload.get("log_path") or ""),
+            stopping_reason=str(payload.get("stopping_reason") or ""),
+            next_step=str(payload.get("next_step") or ""))
+
+
+# --------------------------------------------------------------------------
+# 41.1 Deriving the outcome
+# --------------------------------------------------------------------------
+
+#: Task-row statuses that count as a unit having delivered, and those that did not.  Kept
+#: as explicit sets rather than substring tests: "succeeded" contains "seed", and a status
+#: added later must be classified on purpose rather than by accident.
+_DELIVERED_STATUSES: frozenset[str] = frozenset({"succeeded", "completed"})
+_FAILED_STATUSES: frozenset[str] = frozenset({"failed", "budget-exceeded", "cancelled",
+                                              "error"})
+_BLOCKED_STATUSES: frozenset[str] = frozenset({"blocked", "paused", "deferred"})
+_WITHHELD_STATUSES: frozenset[str] = frozenset({"withheld", "review-rejected",
+                                                "retry-exhausted"})
+_NOT_RUN_STATUSES: frozenset[str] = frozenset({"not-run", "skipped", "pending", "ready"})
+
+
+def _task_counts(dossier: MissionDossier) -> TaskCounts:
+    """The counts the headline and the summary both read, computed once."""
+
+    tasks = dossier.execution.tasks
+    subagents = [row for row in tasks if row.kind == "subagent"]
+    workers = [row for row in tasks if row.kind == "worker"]
+    return TaskCounts(
+        subagents=len(subagents),
+        workers=len(workers),
+        completed=len([row for row in tasks if row.status in _DELIVERED_STATUSES]),
+        failed=len([row for row in tasks if row.status in _FAILED_STATUSES]),
+        blocked=len([row for row in tasks if row.status in _BLOCKED_STATUSES]),
+        withheld=len([row for row in tasks if row.status in _WITHHELD_STATUSES]),
+        deferred=len([row for row in tasks if row.status == "deferred"]),
+        not_run=len([row for row in tasks if row.status in _NOT_RUN_STATUSES]),
+        attempts=dossier.execution.attempts,
+        retries=dossier.execution.retries,
+        runtime_workers=len([row for row in workers if row.origin == "runtime"]),
+        follow_ups=len([row for row in workers if row.origin == "follow-up"]))
+
+
+def _evidence_totals(dossier: MissionDossier) -> EvidenceTotals:
+    """What was collected, cited, corroborated and preserved — as four separate numbers."""
+
+    report = dossier.report
+    return EvidenceTotals(
+        items=len(dossier.evidence),
+        sources=len(dossier.sources),
+        origins=len(report.origins),
+        cited=len([row for row in dossier.evidence if row.cited_by]),
+        corroborated=len(report.corroborated),
+        hashed=len(dossier.hashed),
+        custody_records=len(dossier.custody),
+        preserved=len([row for row in dossier.custody if row.preserved]),
+        traces=len(report.cited_ids),
+        findings=len(report.findings),
+        conflicts=len(report.conflicts),
+        gaps=len(report.gaps))
+
+
+def _sentence(text: str, *, limit: int) -> str:
+    """The first sentence of ``text``, shortened — never cut mid-word where avoidable.
+
+    The screen quotes; the report is the thing that says all of it.  A sentence that has to
+    be shortened is shortened at a word boundary and marked with an ellipsis, so a reader
+    can see that something followed rather than believing the claim ended there.
+    """
+
+    body = _first_sentence(text).strip()
+    if len(body) <= limit:
+        return body
+    cut = body[:limit].rstrip()
+    if " " in cut:
+        cut = cut[:cut.rindex(" ")]
+    return f"{cut.rstrip(',;:')}…"
+
+
+def _findings_highlighted(report: MasterReport, *, limit: int) -> list[Highlight]:
+    """The strongest findings, band first and then order of appearance.
+
+    A finding is shortened to its first sentence rather than truncated mid-word: a screen
+    that cuts a claim in half makes a claim the evidence never made.
+    """
+
+    ordered = sorted(report.findings,
+                     key=lambda finding: (-finding.band.rank, finding.id))
+    return [Highlight(statement=_sentence(finding.statement, limit=150),
+                      band=finding.band.value, confidence=finding.confidence.value,
+                      evidence_ids=list(finding.evidence_ids)[:4], kind="finding")
+            for finding in ordered[:limit]]
+
+
+def _risks_highlighted(report: MasterReport, *, limit: int) -> list[Highlight]:
+    """What the mission could not establish, and where it disagreed with itself.
+
+    Conflicts come first: a contradiction on the screen is more urgent than a gap, because
+    it means two of the mission's own findings cannot both stand.
+    """
+
+    rows: list[Highlight] = []
+    for record in report.conflicts[:max(1, limit // 2)]:
+        rows.append(Highlight(statement=f"unresolved: {_sentence(record.topic, limit=120)}",
+                              band="conflict", confidence="unknown", kind="conflict"))
+    # Gaps are quoted by *what they are about* — the worker that failed and why — because
+    # their `consequence` is a sentence every gap shares, and three copies of one sentence
+    # reads as three findings and is one.
+    grouped: dict[str, int] = {}
+    for gap in report.gaps:
+        grouped[_first_sentence(gap.detail)[:110]] = grouped.get(
+            _first_sentence(gap.detail)[:110], 0) + 1
+    for detail, count in grouped.items():
+        if len(rows) >= limit:
+            break
+        rows.append(Highlight(statement=f"{detail} ({count} gap(s))" if count > 1 else detail,
+                              band="gap", confidence="unknown", kind="gap"))
+    return rows[:limit]
+
+
+def _unfinished_units(dossier: MissionDossier, *, limit: int) -> list[Highlight]:
+    """The units that did not deliver, by name, worst first.
+
+    A count says how much is missing; only a name says *what*.  The band is the unit's own
+    status rather than an evidence band, because this list answers "which work did not
+    arrive", and a reader comparing it with the report's task table needs the same word in
+    both places.
+    """
+
+    order = {"failed": 0, "blocked": 1, "withheld": 2, "deferred": 3, "budget-exceeded": 4,
+             "cancelled": 5, "paused": 6, "not-run": 7, "partial": 8}
+    rows = [row for row in dossier.execution.tasks
+            if row.status not in _DELIVERED_STATUSES]
+    rows.sort(key=lambda row: (order.get(row.status, 9), row.kind, row.id))
+    return [Highlight(statement=f"{row.role or row.id}: {row.status}"
+                      + (f" after {row.attempts} attempt(s)" if row.attempts > 1 else ""),
+                      band=row.status, confidence="unknown", kind=row.kind)
+            for row in rows[:limit]]
+
+
+def _presentation_warnings(dossier: MissionDossier, counts: TaskCounts) -> list[WarningItem]:
+    """Every fact a reader would otherwise have to open a log to discover.
+
+    Ordered by severity, and each one carries what it costs: withheld work, failed units,
+    an unhashed artefact, evidence nothing cites, a mission with no report on disk.
+    """
+
+    warnings: list[WarningItem] = []
+    report, execution = dossier.report, dossier.execution
+    if counts.withheld:
+        warnings.append(WarningItem(
+            level=WarningLevel.SEVERE,
+            cause=f"{counts.withheld} unit(s) were reviewed and not forwarded",
+            consequence=("their work is not in the report: the answer is narrower than the "
+                         "mission's work, and the withheld ids are in the evidence table"),
+            where=", ".join(execution.withheld[:4]) or "review ledger"))
+    if counts.failed:
+        warnings.append(WarningItem(
+            level=WarningLevel.SEVERE,
+            cause=f"{counts.failed} unit(s) failed",
+            consequence="the evidence those units were meant to collect is missing",
+            where="see the errors section of the report"))
+    if counts.blocked:
+        warnings.append(WarningItem(
+            level=WarningLevel.NOTICE,
+            cause=f"{counts.blocked} unit(s) were blocked or deferred",
+            consequence=("their questions are open questions, listed as gaps rather than "
+                         "answered"),
+            where="see the gaps section of the report"))
+    if execution.stopping.stopped:
+        warnings.append(WarningItem(
+            level=WarningLevel.SEVERE,
+            cause=f"the mission stopped early: {execution.stopping.reason[:120]}",
+            consequence=("the report is a partial answer and says so; the bound that "
+                         "stopped it is in the stopping section"),
+            where=execution.stopping.kind))
+    uncited = len([row for row in dossier.evidence if not row.cited_by])
+    if uncited:
+        warnings.append(WarningItem(
+            level=WarningLevel.NOTICE,
+            cause=f"{uncited} collected item(s) are cited by no finding",
+            consequence=("they are in the evidence table and carry no conclusion; the "
+                         "report claims nothing from them"),
+            where="evidence table"))
+    unpreserved = [row for row in dossier.custody if not row.preserved]
+    if unpreserved:
+        warnings.append(WarningItem(
+            level=WarningLevel.NOTICE,
+            cause=f"{len(unpreserved)} artefact(s) have no recorded preservation",
+            consequence=("their integrity is not established: the digest, if any, is in "
+                         "the custody sheet with the gap that explains it"),
+            where=", ".join(row.evidence_id for row in unpreserved[:3])))
+    if report.confidence is Confidence.LOW and report.findings:
+        warnings.append(WarningItem(
+            level=WarningLevel.NOTICE,
+            cause="the mission's confidence is low",
+            consequence=("every finding rests on a single origin; a second independent "
+                         "source would change what the report can say"),
+            where="confidence section"))
+    if report.limitations:
+        warnings.append(WarningItem(
+            level=WarningLevel.INFO,
+            cause=f"{len(report.limitations)} limitation(s) recorded",
+            consequence="they are stated in the report rather than on this screen",
+            where="limitations section"))
+    return sorted(warnings, key=lambda item: -{"info": 0, "notice": 1, "severe": 2,
+                                               "fatal": 3}[item.level.value])
+
+
+#: The stopping conditions that mean the mission ran out of room rather than finishing.
+#: Kept beside the derivation because it is part of the rule, not a formatting choice.
+_SHORT_CONDITIONS: frozenset[str] = frozenset({"saturation", "deadline", "cancelled"})
+
+
+def derive_outcome(dossier: MissionDossier, counts: TaskCounts,
+                   warnings: Sequence[WarningItem]) -> MissionOutcome:
+    """The outcome, from the record — the one place it is decided.
+
+    The ladder, and each rung is a fact rather than an opinion:
+
+    1. **failed** — no finding survived review.  A mission can collect items and still
+       have no claim that survives; a screen that called that a partial success would be
+       flattering a mission that answered nothing.  It also fails when nothing delivered
+       and nothing was even collected.
+    2. **blocked** — the mission stopped before it could synthesise, or every Subagent
+       that reported came back blocked.  It has a record; it does not have an answer.
+    3. **partial** — anything was withheld, failed, deferred, blocked or left as a gap, or
+       the mission ended on a bound (budget, saturation, deadline) rather than by
+       finishing.  This is the common case and the honest one.
+    4. **success** — every unit delivered, nothing was withheld, no gap is open, and the
+       mission reached a completion rather than a bound.
+
+    A warning at ``SEVERE`` or above raises the outcome but never lowers it, and a
+    ``FATAL`` warning makes it failed: a fact that serious is not a footnote.
+    """
+
+    report = dossier.report
+    stopping = dossier.execution.stopping
+    tasks = dossier.execution.tasks
+    delivered = [row for row in tasks if row.status in _DELIVERED_STATUSES]
+    subagents = [row for row in tasks if row.kind == "subagent"]
+    if not report.findings and (not delivered and not dossier.evidence):
+        outcome = MissionOutcome.FAILED
+    elif not report.findings:
+        outcome = MissionOutcome.FAILED
+    elif stopping.stopped and stopping.kind != "budget":
+        outcome = MissionOutcome.BLOCKED
+    elif subagents and all(row.status == "blocked" for row in subagents):
+        outcome = MissionOutcome.BLOCKED
+    # ``BUDGET`` is deliberately *not* in the short list: the master's last decision always
+    # records the replan budget it did not spend, so every finished mission would be
+    # "short".  A mission that ran out of room is short only when its stopping record says
+    # so in words — see :meth:`StoppingRecord.exhausted`.
+    elif (counts.withheld or counts.failed or counts.blocked or counts.deferred
+          or report.gaps or stopping.stopped or stopping.exhausted
+          or stopping.condition in _SHORT_CONDITIONS):
+        outcome = MissionOutcome.PARTIAL
+    elif report.confidence is Confidence.UNKNOWN:
+        # Nothing was withheld and no gap is open, but the report could not calibrate
+        # itself: that is a partial answer by definition.
+        outcome = MissionOutcome.PARTIAL
+    else:
+        outcome = MissionOutcome.COMPLETED
+    for item in warnings:
+        raised = item.level.outcome
+        if raised is not None:
+            outcome = MissionOutcome.worst(outcome, raised)
+    return outcome
+
+
+def _headline(dossier: MissionDossier, outcome: MissionOutcome,
+              counts: TaskCounts) -> MissionHeadline:
+    """The one sentence: what happened, how much of it, and how sure the mission is."""
+
+    report, execution = dossier.report, dossier.execution
+    stopping = execution.stopping
+    detail = {
+        MissionOutcome.COMPLETED:
+            (f"all {counts.completed} unit(s) delivered, {len(report.findings)} "
+             f"finding(s) are cited, and nothing was withheld"),
+        MissionOutcome.PARTIAL:
+            (f"{counts.completed} of {counts.total} unit(s) delivered; "
+             f"{counts.withheld} withheld, {counts.failed} failed, "
+             f"{len(report.gaps)} gap(s) remain"
+             + ("; it ended on a bound, not on a finish" if stopping.exhausted
+                and not counts.withheld and not counts.failed else "")),
+        MissionOutcome.BLOCKED:
+            (f"stopped before it could answer: "
+             f"{_sentence(execution.stopping.reason, limit=110) or 'no reason recorded'}. "
+             f"What it collected is in the record"),
+        MissionOutcome.FAILED:
+            (f"no unit delivered usable work: {counts.failed} failed, "
+             f"{counts.blocked} blocked, {len(dossier.evidence)} evidence item(s) collected"),
+    }[outcome]
+    return MissionHeadline(
+        outcome=outcome, title=outcome.headline,
+        statement=(f"{detail}. Confidence: {report.confidence.value}. "
+                   f"Duration: {_precise_duration(execution.time.total_seconds)}."),
+        mission_id=dossier.mission_id, objective=report.objective[:200])
+
+
+def _precise_duration(seconds: float) -> str:
+    """A duration a person can read, at the precision the number deserves.
+
+    Distinct from :func:`_human_duration`, which renders whole-second *budgets* for the
+    settings and budget tables; this one keeps sub-second precision, because a mission
+    summary that said "0s" about a 400ms run would be hiding the whole measurement.
+    """
+
+    if seconds < 1:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, rest = divmod(int(round(seconds)), 60)
+    if minutes < 60:
+        return f"{minutes}m {rest:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
+def build_presentation(dossier: MissionDossier, *, report_paths: Sequence[str] = (),
+                       log_path: str = "", highlights: int = 3,
+                       risks: int = 3) -> MissionPresentation:
+    """Assemble the screen from the dossier.  No new claims, only choices about display."""
+
+    counts = _task_counts(dossier)
+    totals = _evidence_totals(dossier)
+    warnings = _presentation_warnings(dossier, counts)
+    outcome = derive_outcome(dossier, counts, warnings)
+    report = dossier.report
+    paths = [path for path in report_paths if path]
+    if not paths:
+        warnings.append(WarningItem(
+            level=WarningLevel.SEVERE,
+            cause="no report file was written for this mission",
+            consequence=("the findings live only in this screen and the run's log; write "
+                         "the dossier with `report --mission` to keep them"),
+            where="outputs", blocks_publication=True))
+        outcome = MissionOutcome.worst(outcome, MissionOutcome.PARTIAL)
+    return MissionPresentation(
+        headline=_headline(dossier, outcome, counts), counts=counts,
+        evidence_totals=totals,
+        highlights=_findings_highlighted(report, limit=highlights),
+        risks=_risks_highlighted(report, limit=risks),
+        warnings=sorted(warnings, key=lambda item: -item.level.rank),
+        confidence=report.confidence.value,
+        confidence_basis=report.confidence_basis,
+        seconds=dossier.execution.time.total_seconds,
+        duration=_precise_duration(dossier.execution.time.total_seconds),
+        report_paths=paths, log_path=log_path,
+        stopping_reason=dossier.execution.stopping.reason,
+        next_step=(report.next_steps[0].action if report.next_steps else ""),
+        unfinished=_unfinished_units(dossier, limit=4))
+
+
+# --------------------------------------------------------------------------
+# 41.2 Rendering it: a headline, four panels, and a footer
+# --------------------------------------------------------------------------
+
+def render_mission_presentation(presentation: MissionPresentation, *,
+                                width: int = 100) -> Group:
+    """The screen: outcome first, then shape, findings, risk, and where the report is.
+
+    The order is the answer to "did it work, what did I get, what should I worry about, and
+    where do I read the rest" — and nothing else, because a presentation that grew a
+    timeline would be a log with better colours.
+    """
+
+    head = presentation.headline
+    outcome = presentation.outcome
+    banner = Panel(
+        Text.assemble((f"{outcome.glyph}  ", outcome.style),
+                      (head.title.upper(), outcome.style),
+                      ("\n", ""),
+                      (head.statement, "white")),
+        title="[bold]mission[/bold]", title_align="left",
+        border_style=outcome.colour,
+        expand=False, padding=(0, 1))
+    ident = Table.grid(padding=(0, 1))
+    ident.add_column(style="dim", no_wrap=True)
+    ident.add_column(overflow="fold")
+    ident.add_row("mission", escape(presentation.headline.mission_id or "unnamed"))
+    ident.add_row("objective", escape(presentation.headline.objective[:180]))
+    ident.add_row("duration", escape(f"{presentation.duration} "
+                                    f"({presentation.seconds:.2f}s of work)"))
+    ident.add_row("confidence", escape(f"{presentation.confidence} — "
+                                       f"{presentation.confidence_basis[:300]}"))
+
+    counts = presentation.counts
+    totals = presentation.evidence_totals
+    shape = Table(title="shape", title_justify="left", box=None, pad_edge=False,
+                  expand=False)
+    shape.add_column("what", style="dim", no_wrap=True)
+    shape.add_column("count", justify="right", no_wrap=True)
+    shape.add_column("detail", overflow="fold")
+    shape.add_row("subagents", str(counts.subagents), "planned by the master")
+    shape.add_row("workers", str(counts.workers),
+                  f"{counts.runtime_workers} runtime, {counts.follow_ups} follow-up"
+                  if counts.dynamic else "as planned")
+    shape.add_row("completed", str(counts.completed), "delivered something the report uses")
+    shape.add_row("failed", str(counts.failed), "no usable result")
+    shape.add_row("blocked", str(counts.blocked), "could not get what it needed")
+    shape.add_row("withheld", str(counts.withheld), "reviewed and refused by the review")
+    shape.add_row("attempts", str(counts.attempts), f"{counts.retries} retried")
+
+    gathered = Table(title="evidence", title_justify="left", box=None, pad_edge=False,
+                     expand=False)
+    gathered.add_column("what", style="dim", no_wrap=True)
+    gathered.add_column("count", justify="right", no_wrap=True)
+    gathered.add_column("detail", overflow="fold")
+    gathered.add_row("items", str(totals.items), "collected and reviewed")
+    gathered.add_row("cited", str(totals.cited), "cited by a finding")
+    gathered.add_row("origins", str(totals.origins), "independent origins across the report")
+    gathered.add_row("corroborated", str(totals.corroborated), "findings with two or more")
+    gathered.add_row("gaps", str(totals.gaps), "questions the mission could not close")
+    if totals.forensic:
+        gathered.add_row("custody", str(totals.custody_records),
+                         f"{totals.preserved} verified as preserved" if totals.preserved
+                         else "none verified as preserved")
+
+    findings = Table(title="what the mission found", title_justify="left", box=None,
+                     pad_edge=False, expand=False)
+    findings.add_column("", width=2, no_wrap=True)
+    findings.add_column("finding", overflow="fold", max_width=68)
+    findings.add_column("weight", no_wrap=True)
+    if presentation.highlights:
+        for item in presentation.highlights:
+            # The glyph is the *evidence band*'s, not the mission's: a single-source
+            # finding inside a successful mission is not a green tick, and a reader who
+            # learned the outcome's colours must not be told this claim shares them.
+            findings.add_row(f"[{item.style}]{item.glyph}[/{item.style}]",
+                             escape(item.statement), escape(item.weight))
+    else:
+        findings.add_row("[red]✘[/red]",
+                         escape("no finding survived review: the report says so rather "
+                                "than inventing one"), "—")
+
+    risk = Table(title="what to be careful with", title_justify="left", box=None,
+                 pad_edge=False, expand=False)
+    risk.add_column("", width=2, no_wrap=True)
+    risk.add_column("risk", overflow="fold", max_width=60)
+    risk.add_column("kind", no_wrap=True)
+    for item in [*presentation.risks,
+                 *[item for item in presentation.warnings
+                   if item.level in {WarningLevel.SEVERE, WarningLevel.FATAL}]]:
+        severity = item.level if isinstance(item, WarningItem) else None
+        marker = (f"[{severity.style}]{severity.glyph}[/{severity.style}]"
+                  if severity is not None else "[yellow]▲[/yellow]")
+        text = item.describe() if isinstance(item, WarningItem) else item.statement
+        kind = f"warning/{severity.value}" if severity is not None else item.kind
+        risk.add_row(marker, escape(text[:200]), escape(kind))
+    if not risk.rows:
+        risk.add_row("[green]✔[/green]", escape("nothing outstanding: no gap, no "
+                                                "contradiction, no failed unit"), "—")
+
+    missing = Table(title="what did not arrive", title_justify="left", box=None,
+                    pad_edge=False, expand=False)
+    missing.add_column("", width=2, no_wrap=True)
+    missing.add_column("unit", overflow="fold", max_width=72)
+    for item in presentation.unfinished:
+        colour = _STATUS_STYLE.get(item.band, "yellow")
+        missing.add_row(f"[{colour}]{'✘' if item.band in _FAILED_STATUSES else '⊘'}"
+                        f"[/{colour}]", escape(item.statement))
+    if not missing.rows:
+        missing.add_row(f"[{_STATUS_STYLE['completed']}]✔[/]", escape(
+            "every unit that was asked for delivered"))
+
+    footer = Table.grid(padding=(0, 1))
+    footer.add_column(style="dim", no_wrap=True)
+    footer.add_column(overflow="fold")
+    if presentation.report_paths:
+        footer.add_row("report", escape(", ".join(presentation.report_paths)))
+    else:
+        footer.add_row("report", escape("not written — see the warning above"))
+    if presentation.log_path:
+        footer.add_row("log", escape(presentation.log_path))
+    if presentation.next_step:
+        footer.add_row("next", escape(presentation.next_step[:160]))
+    footer.add_row("detail", escape("the findings above are the headline of each; the full "
+                                    "evidence, contradictions and custody are in the report"))
+
+    blocks: list[Any] = [banner, Text(""), ident, Text("")]
+    side = Table.grid(padding=(0, 2), expand=False)
+    side.add_column(no_wrap=False)
+    side.add_column(no_wrap=False)
+    side.add_row(shape, gathered)
+    blocks.extend([side, Text("")])
+    blocks.extend([findings, Text(""), risk, Text("")])
+    if presentation.unfinished:
+        blocks.extend([missing, Text("")])
+    blocks.append(footer)
+
+    notes = [item for item in presentation.warnings
+             if item.level in {WarningLevel.INFO, WarningLevel.NOTICE}]
+    if notes:
+        block = Table(title="notes", title_justify="left", box=None, pad_edge=False,
+                      expand=False, show_header=False)
+        block.add_column(width=2, no_wrap=True)
+        block.add_column(overflow="fold", max_width=92, style="dim")
+        for item in notes:
+            block.add_row(f"[{item.level.style}]{item.level.glyph}[/{item.level.style}]",
+                          escape(item.describe()))
+        blocks.extend([Text(""), block])
+    return Group(*blocks)
+
+
+def render_presentation_summary(presentation: MissionPresentation) -> str:
+    """The presentation as plain text, for a log, a pipe or a `--json`-shy caller."""
+
+    lines = [f"{presentation.outcome.glyph} {presentation.outcome.headline.upper()} — "
+             f"{presentation.headline.statement}"]
+    lines.append(f"  mission     {presentation.headline.mission_id or 'unnamed'}")
+    lines.append(f"  counts      {presentation.counts.describe()}")
+    lines.append(f"  evidence    {presentation.evidence_totals.describe()}")
+    lines.append(f"  confidence  {presentation.confidence}")
+    for item in presentation.highlights:
+        lines.append(f"  found       {item.statement} ({item.band})")
+    for item in presentation.risks:
+        lines.append(f"  risk        {item.statement}")
+    for item in presentation.warnings:
+        lines.append(f"  {item.level.glyph:<11} {item.cause} — {item.consequence}")
+    lines.append(f"  report      {', '.join(presentation.report_paths) or 'not written'}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# 41.3 The four outcomes, built from real missions
+# --------------------------------------------------------------------------
+
+#: What each fixture mission is for, in one line — printed by the demo so a reader knows
+#: which shape they are looking at and why it matters.
+OUTCOME_FIXTURES: tuple[tuple[str, str], ...] = (
+    ("completed", "every unit delivered, nothing withheld, no gap open"),
+    ("partial", "it finished, but something was withheld and a gap remains"),
+    ("blocked", "it stopped before it could answer"),
+    ("failed", "it produced nothing usable"),
+)
+
+
+def outcome_missions() -> dict[str, MissionDossier]:
+    """Four real runs, one per outcome, built from the graph rather than from fixtures.
+
+    Each is produced by changing what the *runner* or the *policy* does — failing, always
+    revising, repeating itself — rather than by editing a payload afterwards.  A styling
+    demo built from hand-edited dicts would prove the renderer works and nothing about
+    whether the outcome derivation can tell the cases apart, which is the part that can
+    actually be wrong.
+
+    ``blocked`` is the one case the graph cannot produce with this runner: a mission
+    stopped *before* synthesis needs the run to be abandoned mid-flight, and the demo
+    runner never abandons anything.  It is therefore built from the reports the mission had
+    already produced, with the stop carried into the document as the reason it is partial —
+    the same path :func:`_presentation_fallback` takes when a real run is killed.
+    """
+
+    context = _selftest_context("exposure")
+    units = flow_units_for(context, "exposure")
+    missions: dict[str, MissionDossier] = {}
+
+    # -- completed: every unit delivered, nothing withheld, nothing left open ---------
+    clean = HierarchicalFlow(
+        context=context, subagents=units,
+        runner=_CountingRunner(scope=context.scope_entries),
+        policy=FlowPolicy(max_replan_rounds=1, max_review_rounds=3)).run()
+    missions["completed"] = build_dossier(clean, report=clean.synthesis.report,
+                                          context=context)
+
+    # -- partial: every attempt is sent back for revision until the budget runs out ---
+    revising = _looping_units(context, attempts=2)
+    partial_run = HierarchicalFlow(
+        context=context, subagents=revising,
+        runner=_CountingRunner(scope=context.scope_entries,
+                               always_retry=workers_of(revising)),
+        policy=FlowPolicy(max_review_rounds=1, max_replan_rounds=0)).run()
+    missions["partial"] = build_dossier(partial_run, report=partial_run.synthesis.report,
+                                        context=context)
+
+    # -- blocked: the same run, stopped before it could synthesise --------------------
+    missions["blocked"] = _presentation_fallback(context, MissionOutcome.BLOCKED,
+                                                 partial_run)
+
+    # -- failed: every Worker errors, so almost nothing is collected ------------------
+    dead = flow_units_for(context, "exposure")
+    # Both expansion switches are off, so the mission has nothing but its plan to run: with
+    # every planned Worker failing there is no improvised replacement to salvage a claim
+    # from, and the outcome is the one a reader would expect from that.
+    failed = HierarchicalFlow(
+        context=context, subagents=dead,
+        runner=_CountingRunner(scope=context.scope_entries, failing=workers_of(dead)),
+        policy=FlowPolicy(max_review_rounds=1, max_replan_rounds=0,
+                          allow_runtime_workers=False, allow_follow_ups=False,
+                          stop_on_blocking_failure=False)).run()
+    missions["failed"] = build_dossier(failed, report=failed.synthesis.report,
+                                       context=context)
+    return missions
+
+
+def _presentation_fallback(context: "MasterContext", outcome: MissionOutcome,
+                           source: "FlowResult") -> MissionDossier:
+    """A dossier for a mission that stopped before synthesis.
+
+    A stopped mission has no §39 document — that is what stopping means — but the
+    presentation still has to show it, so its report is assembled from the reports it
+    *did* produce, with the stop carried into it as a withheld line.  If it produced
+    nothing, the report says that too, which is the ``failed`` case.
+    """
+
+    report = synthesise_report(
+        source.reports, context=context,
+        withheld=[f"the mission stopped before synthesis: {outcome.value}"],
+        question=(context.mission_questions[0] if context.mission_questions else ""))
+    # The stop is a fact about the run, so it belongs in the run: the dossier's stopping
+    # record is told the mission stopped, rather than being left to infer it from a mission
+    # that looks tidy because its units happened to finish.
+    source = source.model_copy(update={"stopped": True, "stop_reason": (
+        f"the mission stopped before it could synthesise its answer ({outcome.value})")})
+    return build_dossier(
+        source.model_copy(update={"synthesis": MasterSynthesis(
+            summary=report.section_of("executive-summary").body[:400]
+            or report.summary_line(),
+            claims=[], gaps=list(report.gaps), limitations=list(report.limitations),
+            confidence=report.confidence, confidence_basis=report.confidence_basis,
+            uncertainty_statement=report.uncertainty_statement, report=report)}),
+        report=report, context=context)
+
+
+def presentation_demo(missions: Mapping[str, MissionDossier] | None = None
+                      ) -> dict[str, Any]:
+    """The four outcomes, each presented — the section, as it looks on a terminal.
+
+    ``missions`` lets a caller restrict the demo to the outcomes it asked for; the default
+    is all four, because a styling demo that showed one outcome would leave the reader
+    guessing what the other three look like.
+    """
+
+    missions = dict(missions or outcome_missions())
+    payload: dict[str, Any] = {"fixtures": [], "schema_keys": [], "outcomes": []}
+    for name, purpose in OUTCOME_FIXTURES:
+        if name not in missions:
+            continue
+        dossier = missions[name]
+        presentation = build_presentation(
+            dossier, report_paths=[f"out/{dossier.mission_id or 'mission'}.md",
+                                   f"out/{dossier.mission_id or 'mission'}.json"],
+            log_path="out/flow.jsonl")
+        payload["fixtures"].append({
+            "name": name, "purpose": purpose,
+            "outcome": presentation.outcome.value,
+            "expected": name,
+            "matches": presentation.outcome.value == name,
+            "style": presentation.outcome.style,
+            "glyph": presentation.outcome.glyph,
+            "headline": presentation.headline.to_dict(),
+            "summary": render_presentation_summary(presentation),
+            "presentation": presentation.to_dict()})
+        payload["outcomes"].append({
+            "outcome": name, "style": presentation.outcome.style,
+            "glyph": presentation.outcome.glyph,
+            "exit_code": int(presentation.outcome.exit_code),
+            "warnings": len(presentation.warnings),
+            "highlights": len(presentation.highlights)})
+    payload["schema_keys"] = sorted(MissionPresentation.model_fields)
+    return payload
+
+
+def render_presentation_demo(payload: Mapping[str, Any], *,
+                             width: int = 100) -> Group:
+    """What a reader sees: the four outcomes as a legend, then each one in full.
+
+    The table is a legend, not the deliverable: the acceptance clause is that a reader can
+    tell the outcomes apart without opening anything, and that is only proven by showing
+    the actual screen — banner, counts, findings, paths — for each of the four.
+    """
+
+    table = Table(title="four outcomes, one styling", title_justify="left", box=None,
+                  pad_edge=False, expand=False)
+    table.add_column("outcome", no_wrap=True)
+    table.add_column("banner", no_wrap=True)
+    table.add_column("exit", justify="right")
+    table.add_column("warnings", justify="right")
+    table.add_column("on screen", justify="right")
+    table.add_column("what it means", overflow="fold", max_width=44)
+    for entry in payload["fixtures"]:
+        outcome = MissionOutcome(entry["outcome"])
+        presentation = entry["presentation"]
+        table.add_row(f"[{outcome.style}]{entry['outcome']}[/{outcome.style}]",
+                      f"[{outcome.style}]{outcome.glyph}[/{outcome.style}] {outcome.headline}",
+                      str(int(outcome.exit_code)),
+                      str(len(presentation["warnings"])),
+                      f"{len(presentation['highlights'])} finding(s), "
+                      f"{len(presentation['risks'])} risk(s)",
+                      escape(entry["purpose"]))
+    blocks: list[Any] = [Text("The four outcomes", style="bold"), table]
+    for entry in payload["fixtures"]:
+        outcome = MissionOutcome(entry["outcome"])
+        blocks.extend([
+            Text(""),
+            Text.assemble(("─" * 3 + " ", "dim"),
+                          (f"{outcome.glyph} {entry['outcome']}", outcome.style),
+                          (f"  ({entry['purpose']})", "dim")),
+            Text(""),
+            render_mission_presentation(
+                MissionPresentation.from_dict(entry["presentation"]), width=width)])
+    return Group(*blocks)
+
+
+# --------------------------------------------------------------------------
+# 41.4 The self-test: every claim the section makes, against a real mission
+# --------------------------------------------------------------------------
+
+def _screen_text(renderable: Any, *, width: int = 100) -> str:
+    """The rendered screen as text, with no colour and no terminal dependency."""
+
+    buffer = io.StringIO()
+    console = Console(file=buffer, width=width, color_system=None, highlight=False,
+                      force_terminal=False, legacy_windows=False)
+    console.print(renderable)
+    return buffer.getvalue()
+
+
+def _lines_over(text: str, width: int) -> list[str]:
+    """Lines that exceed ``width`` once trailing space is ignored."""
+
+    return [line for line in text.splitlines() if len(line.rstrip()) > width]
+
+
+def run_presentation_self_test() -> list[DossierCheck]:
+    """Prove §41's acceptance clause, and each refusal that keeps it true.
+
+    The acceptance clause is two-sided: a reader must be able to understand the outcome
+    *without* the log, and the detailed findings must remain *in* the report.  So the checks
+    below assert both what the screen says and what it refuses to say.
+    """
+
+    checks: list[DossierCheck] = []
+
+    def add(name: str, ok: bool, detail: object = "") -> None:
+        checks.append(DossierCheck(name=name, ok=bool(ok), detail=str(detail)[:180]))
+
+    missions = outcome_missions()
+    screens = {name: _screen_text(render_mission_presentation(build_presentation(
+        dossier, report_paths=[f"out/{name}.md"], log_path="out/flow.jsonl")))
+        for name, dossier in missions.items()}
+
+    # ---- 1. one outcome per run, and the four are distinguishable --------------
+    for name, dossier in missions.items():
+        presentation = build_presentation(dossier, report_paths=["out/x.md"])
+        add(f"the {name} mission derives {name}",
+            presentation.outcome.value == name, presentation.outcome.value)
+    add("no outcome's glyph or word covers another's",
+        len({item.glyph for item in MissionOutcome}) == 4
+        and len({item.headline for item in MissionOutcome}) == 4)
+    add("the four outcomes have four styles",
+        len({item.style for item in MissionOutcome}) == 4)
+    add("worst() orders completed < partial < blocked < failed",
+        MissionOutcome.worst(MissionOutcome.COMPLETED, MissionOutcome.FAILED)
+        is MissionOutcome.FAILED
+        and MissionOutcome.worst(MissionOutcome.BLOCKED, MissionOutcome.PARTIAL)
+        is MissionOutcome.BLOCKED
+        and MissionOutcome.worst(MissionOutcome.PARTIAL, MissionOutcome.COMPLETED)
+        is MissionOutcome.PARTIAL)
+    add("only failed exits INTERNAL; blocked exits POLICY",
+        MissionOutcome.FAILED.exit_code == ExitCode.INTERNAL
+        and MissionOutcome.BLOCKED.exit_code == ExitCode.POLICY
+        and MissionOutcome.COMPLETED.exit_code == ExitCode.OK)
+    add("each banner reads its own outcome",
+        all(MissionOutcome(name).headline.upper() in screens[name] for name in missions),
+        ", ".join(MissionOutcome(name).headline for name in missions))
+
+    # ---- 2. the screen answers the question without the log -------------------
+    required = {name: ("mission", "objective", "duration", "confidence", "subagents",
+                       "workers", "completed", "failed", "blocked", "withheld", "evidence",
+                       "report")
+                for name in missions}
+    for name, labels in required.items():
+        missing = [label for label in labels if label not in screens[name].lower()]
+        add(f"the {name} screen carries every headline fact", not missing,
+            ", ".join(missing) or "all present")
+    for name, dossier in missions.items():
+        # The same paths the screen above was built with: a check that compares a screen
+        # against a *different* presentation is testing the check, not the renderer.
+        presentation = build_presentation(dossier, report_paths=[f"out/{name}.md"])
+        add(f"the {name} screen counts what the dossier counted",
+            str(presentation.counts.subagents) in screens[name]
+            and str(presentation.counts.total) == str(
+                len(dossier.execution.tasks)),
+            f"{presentation.counts.describe()[:80]}")
+        add(f"the {name} screen quotes the report's evidence totals",
+            f"{presentation.evidence_totals.items}" in screens[name]
+            and str(len(dossier.evidence)) == str(presentation.evidence_totals.items),
+            presentation.evidence_totals.describe()[:80])
+        add(f"the {name} screen carries the report path",
+            bool(presentation.report_paths
+                 and presentation.report_paths[0] in screens[name]))
+        add(f"the {name} screen labels where the detail lives",
+            "report" in screens[name].lower() and "detail" in screens[name].lower())
+
+    # ---- 3. status styling is consistent, and means one thing -----------------
+    # The banner is the outcome's; nothing else on the screen may claim it.  A failed
+    # mission that said "complete" anywhere would be the one failure this section exists
+    # to prevent, so it is asserted directly rather than trusted to the renderer.
+    add("a successful mission's screen says complete",
+        "MISSION COMPLETED" in screens["completed"])
+    # Each banner says its own outcome exactly once, and no banner says any other's: the
+    # words are prefixes of one another ("mission completed" / "mission completed, with
+    # gaps"), so the banner line is what is compared, not the whole screen.
+    banners = {name: next((line.strip("│ |") for line in screens[name].splitlines()
+                           if line.strip().startswith(("│", "|")) and "MISSION" in line), "")
+               for name in missions}
+    add("each banner states its own outcome", all(
+        MissionOutcome(name).headline.upper() in banners[name] for name in missions),
+        "; ".join(banners.values()))
+    add("no banner states another outcome's", all(
+        MissionOutcome(other).headline.upper() not in
+        banners[name].replace(MissionOutcome(name).headline.upper(), "", 1)
+        for name in missions for other in missions if other != name),
+        "; ".join(banners.values()))
+    add("each outcome's styling is distinct from every other",
+        len({(item.style, item.glyph, item.exit_code) for item in MissionOutcome}) == 4)
+
+    # A finding's glyph belongs to its evidence band: a single-source claim is never
+    # ticked green inside a successful mission.
+    hidden = [item for dossier in missions.values()
+              for item in _findings_highlighted(dossier.report, limit=9)
+              if item.glyph == MissionOutcome.COMPLETED.glyph]
+    # ---- 3b. the four-state vocabulary is one table, not four copies -----------
+    styles = [MissionOutcome(name).colour for name in missions]
+    add("every outcome's colour comes from the report's status table",
+        all(style == _STATUS_STYLE[MissionOutcome(name).value]
+            for name, style in zip(missions, styles)),
+        ", ".join(f"{name}={style}" for name, style in zip(missions, styles)))
+    # The border is asserted by rendering: a screen whose banner border came from a
+    # hand-written map would still pass a source-text check, and fail this one the moment
+    # the two drifted apart.
+    add("a banner's border is its outcome's colour",
+        all(_screen_text(render_mission_presentation(
+            build_presentation(dossier, report_paths=[]), width=60)).startswith("╭")
+            for dossier in missions.values()))
+    unfinished = build_presentation(missions["failed"], report_paths=[]).unfinished
+    add("the failed screen names the units that did not deliver",
+        bool(unfinished)
+        and all(any(row.role == item.statement.split(":")[0]
+                    for row in missions["failed"].execution.tasks)
+                for item in unfinished),
+        "; ".join(item.statement for item in unfinished)[:120])
+    add("a failed unit's mark is the failure mark, not the blocked one",
+        all(item.band not in _BLOCKED_STATUSES for item in unfinished))
+
+    add("no single-source finding borrows the success tick",
+        all(item.band == "corroborated" for item in hidden),
+        f"{len(hidden)} corroborated highlight(s)")
+
+    # ---- 4. warnings are graded, and graded outcomes are raised --------------
+    severe = WarningItem(level=WarningLevel.SEVERE, cause="a unit was withheld by review",
+                         consequence="the report cannot use what it collected")
+    fatal = WarningItem(level=WarningLevel.FATAL, cause="the report was not written",
+                        consequence="there is no document to read afterwards")
+    clean = missions["completed"]
+    add("a SEVERE warning makes a clean mission partial",
+        derive_outcome(clean, _task_counts(clean), [severe]) is MissionOutcome.PARTIAL)
+    add("a FATAL warning makes it failed",
+        derive_outcome(clean, _task_counts(clean), [fatal]) is MissionOutcome.FAILED)
+    add("an INFO warning changes nothing",
+        derive_outcome(clean, _task_counts(clean), [WarningItem(
+            level=WarningLevel.INFO, cause="one artefact was not preserved",
+            consequence="its integrity is not established")]) is MissionOutcome.COMPLETED)
+    add("warnings are sorted by severity",
+        [item.level for item in build_presentation(
+            missions["failed"], report_paths=[]).warnings]
+        == sorted((item.level for item in build_presentation(
+            missions["failed"], report_paths=[]).warnings),
+            key=lambda level: -level.rank))
+
+    # ---- 5. the detailed findings stay in the report -------------------------
+    dossier = missions["completed"]
+    presentation = build_presentation(dossier, report_paths=["out/x.md"],
+                                      highlights=1, risks=1)
+    add("the screen shows a bounded number of findings",
+        len(presentation.highlights) == 1 and len(dossier.report.findings) > 1,
+        f"{len(presentation.highlights)} of {len(dossier.report.findings)}")
+    add("the screen says where the rest is",
+        "detail" in screens["completed"].lower()
+        and "report" in screens["completed"].lower())
+    shortened = all(len(item.statement) <= 160 for item in presentation.highlights)
+    add("a highlight is a pointer, not the whole finding", shortened,
+        max((len(item.statement) for item in presentation.highlights), default=0))
+    markdown = render_dossier_markdown(dossier)
+    quoted = [item.statement for item in presentation.highlights]
+    add("every quoted highlight is a substring of the written report",
+        all(item in markdown for item in quoted), f"{len(quoted)} quoted")
+
+    # ---- 6. width, colour and the plain-text shape ---------------------------
+    for name, text in screens.items():
+        add(f"the {name} screen fits 100 columns", not _lines_over(text, 100),
+            f"{len(_lines_over(text, 100))} long line(s)")
+    add("the screen fits 80 columns too",
+        not _lines_over(_screen_text(render_mission_presentation(
+            build_presentation(missions["failed"], report_paths=[]), width=80), width=80), 80))
+    summary = render_presentation_summary(presentation)
+    add("the plain-text summary is one glyph-prefixed headline",
+        summary.splitlines()[0].startswith(presentation.outcome.glyph)
+        and len(summary.splitlines()) <= 24, f"{len(summary.splitlines())} line(s)")
+    add("the plain-text summary names the report",
+        "out/x.md" in summary)
+
+    # ---- 7. JSON is a format, not a write-only dump -------------------------
+    payload = presentation.to_dict()
+    reloaded = MissionPresentation.from_dict(json.loads(json.dumps(payload)))
+    add("a presentation round-trips through JSON",
+        reloaded.outcome is presentation.outcome
+        and reloaded.counts == presentation.counts
+        and reloaded.evidence_totals == presentation.evidence_totals
+        and [item.statement for item in reloaded.highlights]
+        == [item.statement for item in presentation.highlights])
+    add("the JSON carries the outcome and what blocks publication",
+        payload["outcome"] == presentation.outcome.value and "blocking" in payload)
+    add("a dict missing its extra keys still loads",
+        MissionPresentation.from_dict({"headline": payload["headline"]}).outcome
+        is presentation.outcome)
+
+    # ---- 8. the demo, and each refusal that keeps it honest ------------------
+    demo = presentation_demo()
+    add("the demo presents all four outcomes", len(demo["fixtures"]) == 4,
+        ", ".join(entry["outcome"] for entry in demo["fixtures"]))
+    add("every demo fixture derives the outcome it is filed under",
+        all(entry["matches"] for entry in demo["fixtures"]),
+        ", ".join(f"{entry['expected']}→{entry['outcome']}"
+                  for entry in demo["fixtures"] if not entry["matches"]) or "all match")
+    add("the demo screen shows each of the four outcomes in full",
+        all(MissionOutcome(entry["outcome"]).headline.upper() in _screen_text(
+            render_presentation_demo(demo)) for entry in demo["fixtures"]))
+    add("the demo screen fits 100 columns",
+        not _lines_over(_screen_text(render_presentation_demo(demo)), 100))
+    add("the blocked fixture carries the stop, not just a label",
+        missions["blocked"].execution.stopping.stopped
+        and missions["blocked"].execution.stopping.kind == "blocked",
+        missions["blocked"].execution.stopping.reason[:80])
+    add("a stopped mission's report is written rather than refused",
+        bool(missions["blocked"].report.findings)
+        and any("stopped before synthesis" in item
+                for item in missions["blocked"].report.withheld))
+    corrupt = json.loads(json.dumps(presentation_demo()["fixtures"][0]["presentation"]))
+    corrupt["headline"]["outcome"] = "triumphant"
+    try:
+        MissionPresentation.from_dict(corrupt)
+        refused = False
+    except ValueError:
+        refused = True
+    add("an unknown outcome is refused, not defaulted to success", refused)
+    return checks
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 41. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -56973,6 +58373,15 @@ def synthesis_command(
 @app.command("report",
              help="Write the finished mission as Markdown and JSON, and a terminal summary.")
 def report_command(
+    present: bool = typer.Option(
+        False, "--present", help="Print the Rich mission presentation for this mission."),
+    present_demo: bool = typer.Option(
+        False, "--present-demo",
+        help="The presentation in each of its four outcomes, from four real missions."),
+    outcome: str = typer.Option(
+        "", "--outcome",
+        help="With --present-demo: show one outcome only "
+             "(success | partial | blocked | failed)."),
     self_test: bool = typer.Option(False, "--self-test",
                                    help="Prove the four output clauses against a real run."),
     demo: bool = typer.Option(False, "--demo",
@@ -57007,9 +58416,15 @@ def report_command(
     """
 
     console = get_console()
+    if outcome and not present_demo:
+        # A selector with nothing to select is a usage error: silently ignoring it would
+        # let a caller believe they had filtered an output they had not.
+        console.print("[red]✘[/red] --outcome selects an outcome for --present-demo; it "
+                      "does nothing on its own")
+        raise typer.Exit(ExitCode.USAGE)
 
     if self_test:
-        checks = run_dossier_self_test()
+        checks = [*run_dossier_self_test(), *run_presentation_self_test()]
         failures = [check for check in checks if not check.ok]
         if as_json:
             _emit(json.dumps({"checks": [check.to_dict() for check in checks],
@@ -57027,6 +58442,23 @@ def report_command(
         console.print(f"\n[{colour}]{len(checks) - len(failures)} passed[/] · "
                       f"{len(failures)} failed\n")
         raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    if present_demo:
+        key = outcome.strip().lower()
+        missions = outcome_missions()
+        if key and key != "all":
+            if key not in missions:
+                console.print(f"[red]✘[/red] unknown outcome {escape(repr(outcome))}; "
+                              f"choose from: {', '.join([*missions, 'all'])}")
+                raise typer.Exit(ExitCode.USAGE)
+            missions = {key: missions[key]}
+        if as_json:
+            _emit(json.dumps(presentation_demo(missions), indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(render_presentation_demo(presentation_demo(missions)))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
 
     if demo:
         payload = dossier_demo()
@@ -57066,6 +58498,15 @@ def report_command(
         _emit(json.dumps({**dossier.to_dict(), "written": written.model_dump(mode="json")},
                          indent=2, default=str))
         raise typer.Exit(ExitCode.OK if written.acceptance.ok else ExitCode.POLICY)
+
+    if present:
+        # The written paths, not the requested ones: the screen must point at files that
+        # exist, which is why it is built after the write rather than before it.
+        console.print()
+        console.print(render_mission_presentation(build_presentation(
+            dossier, report_paths=written.paths or []), width=FALLBACK_CONSOLE_WIDTH))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
 
     if summary_only or chosen is OutputFormat.TERMINAL:
         _emit(written.summary)

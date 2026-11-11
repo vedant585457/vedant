@@ -30,7 +30,7 @@ python vedant_osint.py aggregate --self-test # reviewed work only, and never ear
 python vedant_osint.py review-master --self-test # five lenses, five ways to stop
 python vedant_osint.py loops --self-test      # repeated work, blocked lines, saturation
 python vedant_osint.py synthesis --self-test  # a report that cannot outrun its evidence
-python vedant_osint.py report --self-test     # Markdown, JSON and a bounded summary (91)
+python vedant_osint.py report --self-test     # output formats + presentation (154)
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -1024,7 +1024,7 @@ one `MissionDossier` assembled from the reviewed record, so a fact that is not i
 is not in the Markdown either — the JSON is the authority and the other two are renderings.
 
 ```
-python vedant_osint.py report --self-test                    # 91 checks: the four output clauses
+python vedant_osint.py report --self-test                    # 154 checks: formats + presentation
 python vedant_osint.py report --demo                         # one mission, three formats
 python vedant_osint.py flow --demo exposure --json > m.json
 python vedant_osint.py report --mission m.json --out-dir out/ # writes m.md and m.json
@@ -1055,6 +1055,43 @@ python vedant_osint.py report --mission m.json --summary      # screen only
   with that fact rather than omitted: a table that only showed the well-preserved artefact
   would be the one thing a forensic report must not be.
 
+## Mission presentation
+
+`flow` ends on one screen: what the mission produced, in the shape a reader needs before
+they open anything. It is rendered from the same dossier the report is written from, so the
+screen and the document cannot disagree about what happened.
+
+```
+python vedant_osint.py flow --demo exposure                    # presentation + flow detail
+python vedant_osint.py report --mission m.json --present       # the same screen, for a saved mission
+python vedant_osint.py report --present-demo                   # all four outcomes, from real runs
+python vedant_osint.py report --present-demo --outcome blocked  # just one
+```
+
+- **Four outcomes, one vocabulary.** `completed` (green ✔), `partial` (yellow ◐), `blocked`
+  (cyan ⊘), `failed` (red ✘). The words and colours are the ones the report already uses for
+  a task's status, so a reader learns them once; `partial` exits `0` because it is a result,
+  `blocked` exits `POLICY`, `failed` exits `INTERNAL`.
+- **The outcome is derived, not chosen.** It is read from the record: no finding that
+  survived review is `failed`; a mission stopped before it could synthesise, or whose
+  Subagents all came back blocked, is `blocked`; anything withheld, failed, deferred or left
+  as a gap — or a mission that ended on a bound instead of a finish — is `partial`. A
+  `SEVERE` warning raises the outcome to `partial`, a `FATAL` one to `failed`.
+- **One screen answers the question.** Mission, objective, duration, confidence and its
+  basis; the counts of Subagents and Workers (planned, runtime, follow-up) with completed,
+  failed, blocked and withheld; the evidence totals that matter (items, cited, origins,
+  corroborated, gaps); the strongest findings, each with its evidence band; the risks worth
+  naming; the units that did not arrive, by name; and where the report and log are.
+- **The screen is not the record.** Findings are shortened to a sentence — at a word
+  boundary, marked with an ellipsis — and the footer says the full evidence,
+  contradictions and custody are in the report. Nothing the presentation prints is a claim
+  the report does not make.
+- **A finding's mark is its evidence, not the mission's outcome.** A single-source finding
+  inside a successful mission shows ◐, never ✔: the outcome's styling describes the mission,
+  and borrowing it for a weak claim is how a report starts flattering itself.
+- **Warnings say what they cost.** Every warning names its cause, its consequence and where
+  it applies, graded `info` · `notice` ! `severe` ▲ `fatal` ✘.
+
 ## Status
 
 | Phase | Scope | State |
@@ -1064,7 +1101,7 @@ python vedant_osint.py report --mission m.json --summary      # screen only
 | 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control, Worker outcome contract, Subagent quality review, targeted Worker retasking, Subagent aggregation with bounded runtime Workers, Master review with bounded replanning, loop detection with strategy change, blocked lines and saturation stops, evidence-based Master synthesis with cited findings and calibrated confidence) |
 | 4 | Browser — browser-use / Playwright sessions and capture | 🟡 started (policy, scope, capture, guarded closure, agent mode) |
 | 5 | Collection — passive OSINT sources, artefact hashing | 🟡 started (source-aware web research; safe document/page extraction with injection defence; read-only artifact manifests, hashing and access ledger) |
-| 6 | Synthesis — cross-source correlation and reporting | 🟡 started (deterministic timelines, explained indicator correlation, content de-duplication, the evidence-based Master report with citations and calibrated confidence, Markdown/JSON/terminal output formats with a source register, execution summary and chain of custody) |
+| 6 | Synthesis — cross-source correlation and reporting | 🟡 started (deterministic timelines, explained indicator correlation, content de-duplication, the evidence-based Master report with citations and calibrated confidence, Markdown/JSON/terminal output formats with a source register, execution summary and chain of custody, the Rich mission presentation with four derived outcomes) |
 | 7 | Operations — resume, budgets, audit trail, hardening | 🟡 started (checkpoints, resumable missions, capability router, budgets) |
 
 ## Install
