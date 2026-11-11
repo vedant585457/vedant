@@ -555,6 +555,50 @@ and the five prohibitions.
     python vedant_osint.py browser --url https://example.com/ --scope example.com
     python vedant_osint.py flow --demo exposure --browser
 
+Source-aware web research
+-------------------------
+Reading a page is not the same as being entitled to report it.  A research Worker
+is given a :class:`ResearchBrief` — six fixed rules and a set of primary-first
+queries — and what it returns is audited before it can reach synthesis.
+
+*   **Primary sources first.**  Every source is *graded* from its host by a fixed
+    rule table: first-party advisories, CVE records and standards are primary;
+    independent reporting is secondary; aggregators and archives are tertiary; a
+    search engine is a search result and never citable.  The grade is assigned,
+    not accepted, so a Worker cannot promote its own source.
+*   **Corroboration counts origins, not pages.**  Two observations on one registrable
+    domain are one origin; an archive copy is a copy of the page it archived.  A
+    material claim needs two independent origins to be called corroborated, and is
+    labelled ``single-source`` when it has one.
+*   **Quotes are checked, not trusted.**  Every observation carries the exact span
+    it rests on, located in the fetched text, so a paraphrase fails and a fabricated
+    quote cannot be cited.
+*   **Publication is not retrieval.**  ``published_at`` comes from the page's own
+    markers or printed date — never from the fetch time, never from a *modified*
+    marker, never from a date in the future — and a page that states nothing is
+    reported ``undated`` rather than backfilled.
+*   **URL normalisation preserves the original.**  Tracking parameters, fragments,
+    default ports, ``www.`` and alternate views are removed for *comparison*; the
+    citation keeps the original string, and every normalisation is recorded.
+    Shorteners are dropped rather than followed, because their destination is not in
+    the URL.
+*   **Failures and contradictions are reported.**  An unreadable source is an
+    :class:`AccessFailure` and a gap; a disagreement is a :class:`Contradiction`
+    with both sides, never resolved by silence.
+
+The acceptance criterion is a final pass, not a hope:
+:func:`audit_web_report` re-assesses every claim from its evidence and then
+*labels or omits* what has nothing retrievable behind it.  ``flow`` runs that
+audit and the six-rule review on every research report (``research_first``,
+on by default), and a Worker that fails it is sent back with the remedy.
+
+::
+
+    python vedant_osint.py research --self-test     # 96 source-aware checks, offline
+    python vedant_osint.py research --demo          # what is corroborated, labelled, omitted
+    python vedant_osint.py research --normalize "https://WWW.Example.com:443/a/?utm_source=x"
+    python vedant_osint.py research --subject "example.com proxy flaw" --url https://example.com/a
+
 Structured model adapter
 ------------------------
 One model-calling interface sits between orchestration and every provider, so
@@ -713,7 +757,7 @@ from enum import Enum, IntEnum
 from pathlib import Path
 from typing import (Annotated, Any, Callable, ClassVar, Iterable, Iterator, Mapping,
                     Protocol, Sequence, TypedDict)
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 # --- third party: CLI surface -------------------------------------------------
 # Typer + Rich are the only hard imports.  They are imported at module level
@@ -746,7 +790,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 18
+VERSION_MINOR: int = 19
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -804,7 +848,8 @@ PHASE_ROADMAP: tuple[tuple[int, str, str], ...] = (
                          "LangGraph execution flow, bounded concurrency and budgets"),
     (4, "Browser", "browser-use over Playwright: policy, scope, capture, guaranteed "
                    "closure"),
-    (5, "Collection", "passive OSINT sources, artefact hashing/chain of custody"),
+    (5, "Collection", "passive OSINT sources, source-aware web research, artefact "
+                      "hashing/chain of custody"),
     (6, "Synthesis", "cross-source correlation, findings and report export"),
     (7, "Operations", "checkpoints and resumable missions, the controlled capability "
                       "router, budgets, audit trail"),
@@ -21330,6 +21375,10 @@ class FlowPolicy(StrictModel):
     #: in the file than this, so the number is written here rather than imported.
     browser_timeout_ms: int = Field(default=30_000, ge=1_000, le=180_000)
     browser_allow_forms: bool = False
+    #: Apply the source-aware research contract to every Worker's prompt, and audit
+    #: every research report the run produces.  On by default: a claim with nothing
+    #: retrievable behind it should not reach synthesis in any mission.
+    research_first: bool = True
 
     @classmethod
     def from_context(cls, context: "MasterContext", **overrides: Any) -> "FlowPolicy":
@@ -22028,6 +22077,8 @@ class FlowResult(StrictModel):
     checkpoint: str = ""
     #: What the browser did: visits, refusals, and whether anything was left open.
     browser: dict[str, Any] = Field(default_factory=dict)
+    #: What the source-aware audit found in the research reports this run produced.
+    research: dict[str, Any] = Field(default_factory=dict)
 
     @property
     def total_workers(self) -> int:
@@ -22254,6 +22305,10 @@ class HierarchicalFlow:
         self.grants: dict[str, Any] = {}
         #: Dispatches each Worker made through the router, in order.
         self.dispatch: list[dict[str, Any]] = []
+        #: The research brief each Worker was given, and what the audit found.
+        self._briefs: dict[str, "ResearchBrief"] = {}
+        self._research: dict[str, dict[str, Any]] = {}
+        self._last_source_review: dict[str, Any] = {}
         #: The write-ahead seam, when this run is checkpointed.  ``None`` is the
         #: ordinary case: a mission with nowhere to persist costs one check.
         self.resume: "ResumeLedger | None" = None
@@ -22462,6 +22517,13 @@ class HierarchicalFlow:
             if result is not None:
                 outcomes.append(result)
         self.router.remember([item for result in outcomes for item in result.evidence])
+        # What a research Worker claimed is audited before it is reported: a claim
+        # with nothing retrievable behind it is omitted or labelled *here*, not in the
+        # final synthesis where it would be too late to notice.
+        research = [report for report in
+                    (report_from_payload(getattr(result, "payload", {}) or {})
+                     for result in outcomes) if report is not None]
+        audited = [audit_web_report(report) for report in research]
         dispatched = {
             "worker": worker.id, "subagent": subagent.id,
             "grant": grant.to_dict(),
@@ -22470,6 +22532,11 @@ class HierarchicalFlow:
             "evidence": [json.loads(model_to_json(item))
                          for result in outcomes for item in result.evidence],
             "gaps": [refusal.to_gap().describe() for refusal in refusals],
+            "research": [{"worker": report.worker_id,
+                          "audit": report.audit.to_dict() if report.audit else {},
+                          "claims": [claim.to_dict() for claim in report.claims],
+                          "gaps": [gap.describe() for gap in report.gaps]}
+                         for report in audited],
         }
         self.dispatch.append(dispatched)
         return dispatched
@@ -22938,6 +23005,58 @@ class HierarchicalFlow:
         summary["policy"] = self.browser_policy.to_dict() if self.browser_policy else {}
         return summary
 
+    def research_brief(self, worker: FlowWorker) -> "ResearchBrief":
+        """The brief a research Worker is given: fixed rules, prepared queries.
+
+        Cached per Worker, because the same object is the prompt and the checklist —
+        a brief that changed between the two would let a Worker be reviewed against
+        rules it was never told.
+        """
+
+        brief = self._briefs.get(worker.id)
+        if brief is None:
+            subject = " ".join([self.context.objective, worker.objective,
+                                worker.work_unit]).strip()
+            brief = ResearchBrief.for_subject(subject,
+                                              corroboration_threshold=2,
+                                              max_queries=3)
+            self._briefs[worker.id] = brief
+        return brief
+
+    def _source_review(self, subagent: FlowSubagent, worker: FlowWorker,
+                       outcome: WorkerOutcome, verdict: "ReviewVerdict") -> "ReviewVerdict":
+        """Add the source-aware findings to the runner's verdict.
+
+        A research Worker's report is audited and checked against the six rules; the
+        findings are *merged* into the existing verdict rather than replacing it, so a
+        runner's own reason for a retry survives.  A Worker that returned no research
+        report at all is not failed for that — not every Worker is a researcher.
+        """
+
+        report = report_from_payload(outcome.payload)
+        if report is None:
+            # A retry carries the reviewer's instruction; if the Worker answered with no
+            # report at all, the instruction stands rather than being quietly cleared.
+            return (verdict.model_copy(update={"retry": True})
+                    if self.policy.research_first and verdict.verdict == "revise"
+                    and self._research.get(worker.id) else verdict)
+        audited = audit_web_report(report)
+        review = research_review(audited, brief=self.research_brief(worker))
+        findings = list(verdict.findings) + [item.describe() for item in review.findings]
+        approved = verdict.approved and review.approved
+        self._research[worker.id] = {
+            "audit": audited.audit.to_dict() if audited.audit else {},
+            "review": json.loads(model_to_json(review)),
+            "satisfied": [rule.value for rule in review.satisfied],
+            "violated": [rule.value for rule in review.violated],
+        }
+        if approved or not review.blocking:
+            return verdict.model_copy(update={"findings": findings})
+        return verdict.model_copy(update={
+            "findings": findings, "approved": False, "verdict": "revise", "retry": True,
+            "guidance": review.guidance,
+        })
+
     def _route_worker(self, subagent: FlowSubagent,
                       worker: FlowWorker) -> WorkerOutcome | None:
         """Ask the capability router what this Worker may do.
@@ -23051,8 +23170,15 @@ class HierarchicalFlow:
             # it is bounded, fair and cancellable like any other resource.
             with self.runtime.slot(ResourceKind.MODEL_CALL, unit=worker.id,
                                    deadline=deadline):
+                # The guidance a retry carries is the reviewer's, and the research
+                # contract rides with it — a Worker cannot be asked for sources it was
+                # never told to collect.
+                guidance = str(state.get("guidance") or "")
+                if self.policy.research_first:
+                    contract = self.research_brief(worker).system_prompt()
+                    guidance = (f"{guidance}\n\n{contract}" if guidance else contract)
                 outcome = self.runner.run_worker(subagent, worker, attempt=attempt,
-                                                 guidance=str(state.get("guidance") or ""))
+                                                 guidance=guidance)
         except (QueueTimeout, BudgetExceeded, CancellationRequested):
             raise
         except Exception as exc:              # a runner failure is an outcome, not a crash
@@ -23084,6 +23210,9 @@ class HierarchicalFlow:
         outcome = WorkerOutcome.model_validate(state.get("outcome"))
         round_number = int(state.get("round") or 1)
         verdict = self.runner.review_worker(subagent, worker, outcome, round_number=round_number)
+        if self.policy.research_first:
+            verdict = self._source_review(subagent, worker, outcome, verdict)
+            self._last_source_review[worker.id] = verdict
         allowed = min(worker.max_attempts, self.policy.max_review_rounds + 1)
         if verdict.retry and round_number >= allowed:
             # Out of attempts: the rejection stands, with the reason recorded.
@@ -23092,6 +23221,7 @@ class HierarchicalFlow:
                 "findings": list(verdict.findings) + [
                     f"attempts exhausted after {round_number} of {allowed}"],
             })
+
         self._record(FlowStage.REVIEW, unit=worker.id, parent=subagent.id,
                      wave=int(state.get("wave") or 0),
                      detail=f"{verdict.verdict} (attempt {round_number}/{allowed})")
@@ -23114,10 +23244,14 @@ class HierarchicalFlow:
         loop's shape is fixed and only its length is decided here.
         """
 
-        _graph, _send, _command = _langgraph_primitives()
-        _state_graph, _start, end = _graph
+        # The terminal value must be the graph's own sentinel.  The review node
+        # returns a plain dictionary rather than a value routed back through
+        # ``add_conditional_edges``' name map, so ``"END"`` — the string — is not the
+        # sentinel here and makes LangGraph look for a node of that name.
+        from langgraph.graph import END
+
         verdict = ReviewVerdict.model_validate(state.get("verdict"))
-        return FlowStage.WORKER.value if verdict.retry else end
+        return FlowStage.WORKER.value if verdict.retry else END
 
     # -- 5. the Subagent's join ----------------------------------------------
 
@@ -23342,6 +23476,15 @@ class HierarchicalFlow:
             checkpoint=(str(self.resume.store.path_for(self.mission_id))
                         if self.resume is not None else ""),
             browser=browser_summary,
+            research={"workers": len(self._research),
+                      "audits": {worker_id: audit["audit"]
+                                 for worker_id, audit in self._research.items()},
+                      "approved": sum(1 for audit in self._research.values()
+                                      if audit["review"].get("approved")),
+                      "material_claims": sum(audit["audit"].get("material_claims", 0)
+                                             for audit in self._research.values()),
+                      "material_sourced": sum(audit["audit"].get("material_sourced", 0)
+                                              for audit in self._research.values())},
         )
         if self.logger is not None:
             self.logger.log(
@@ -29911,7 +30054,2411 @@ def render_browser_capture(capture: BrowserCapture, summary: Mapping[str, Any]) 
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 29. Entry point
+# 29. Source-aware web research — what a claim is allowed to stand on
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Task 18 gave a Worker a way to *read* a page.  This gives it a way to *report*
+# one: which source kind it is, whether it is primary, what it literally said, when
+# it was published as against when we fetched it, and whether anything else disagrees.
+#
+# Five rules, each a check rather than a request to the model:
+#
+#   1.  **Prefer primary sources.**  A source is graded (:class:`SourceGrade`) from
+#       its *kind*, not from its prose.  A first-party advisory outranks a
+#       write-up of that advisory; a search snippet is not evidence of anything.
+#   2.  **Corroborate what matters.**  Two independent sources of at least
+#       second-hand grade make a material claim corroborated; two copies of one
+#       origin do not.
+#   3.  **Quote, don't paraphrase.**  Every observation carries the exact span it
+#       rests on, and the span is checked against the untrusted text it was taken
+#       from — a fabricated quote is caught mechanically.
+#   4.  **Publication is not retrieval.**  ``published_at`` and ``retrieved_at``
+#       are separate fields with separate rules; a page with no visible publication
+#       date says so instead of borrowing the fetch time.
+#   5.  **Failures and contradictions are reported.**  An access failure is an
+#       :class:`AccessFailure` on the report and an :class:`UnknownValue` gap, and a
+#       contradiction is recorded with both sides rather than resolved by silence.
+#
+# And the acceptance criterion, as a last pass over the finished report:
+# :func:`audit_web_report` either labels or drops every claim that has nothing
+# retrievable behind it, so "unsupported claims are labelled or omitted" is a
+# property of the object the mission hands back.
+
+
+class SourceGrade(str, Enum):
+    """How much a source is worth as *support*, independent of how it reads."""
+
+    PRIMARY = "primary"          # the party that did the thing, or its own document
+    SECONDARY = "secondary"      # an independent body reporting on the primary
+    TERTIARY = "tertiary"        # an aggregator, a directory, a mirror
+    SEARCH_RESULT = "search-result"   # a snippet: a pointer, never proof
+    UNKNOWN = "unknown"
+
+    @property
+    def rank(self) -> int:
+        """Higher is stronger.  Used for "prefer", never for "trust blindly"."""
+
+        return {"search-result": 0, "unknown": 1, "tertiary": 2,
+                "secondary": 3, "primary": 4}[self.value]
+
+    @property
+    def citable(self) -> bool:
+        """Whether a claim may rest on this alone."""
+
+        return self in {SourceGrade.PRIMARY, SourceGrade.SECONDARY, SourceGrade.TERTIARY}
+
+
+class AccessOutcome(str, Enum):
+    """The result of *trying* to read a source.  A failure is data, not a silence."""
+
+    OK = "ok"
+    BLOCKED = "blocked"              # 401/403, a login wall, a robots rule
+    NOT_FOUND = "not-found"          # 404/410
+    RATE_LIMITED = "rate-limited"    # 429
+    TIMEOUT = "timeout"
+    UNRESOLVED = "unresolved"        # DNS, TLS, connection refused
+    REFUSED = "refused"              # our own boundary: scope, credentials, browser policy
+    ERROR = "error"
+
+    @property
+    def success(self) -> bool:
+        return self is AccessOutcome.OK
+
+    @property
+    def retry_worthwhile(self) -> bool:
+        """Whether the same request could plausibly work later."""
+
+        return self in {AccessOutcome.TIMEOUT, AccessOutcome.RATE_LIMITED,
+                        AccessOutcome.ERROR}
+
+
+class SourceGradeRule(StrictModel):
+    """One normalisation rule: a domain pattern and the grade it implies.
+
+    Rules are matched against the *normalised* host, most specific first.  A
+    ``suffix`` rule covers a domain and its subdomains; a ``host`` rule covers one
+    exact host.  Nothing here can be widened at runtime.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    pattern: str = Field(min_length=3)
+    #: The grade every URL under this pattern gets.
+    grade: SourceGrade = SourceGrade.UNKNOWN
+    #: ``suffix`` (default) matches example.com and *.example.com; ``host`` is exact.
+    match: str = "suffix"
+    #: Human-readable reason, quoted in a report when the grade is explained.
+    why: str = ""
+
+    def covers(self, host: str) -> bool:
+        host = (host or "").lower().rstrip(".")
+        pattern = self.pattern.lower().lstrip(".")
+        if not host or not pattern:
+            return False
+        if self.match == "host":
+            return host == pattern
+        return host == pattern or host.endswith("." + pattern)
+
+
+#: The default grading table.  Deliberately small and explicit: it names the
+#: kinds of source an OSINT mission actually leans on, and everything else —
+#: including a domain nobody has vetted — falls to ``UNKNOWN``, which is not
+#: citable on its own.  A deployment may extend it, never remove from it.
+SOURCE_GRADE_RULES: tuple[SourceGradeRule, ...] = (
+    # first-party: the vendor's own advisory and documentation hosts
+    SourceGradeRule(pattern="example.com", grade=SourceGrade.PRIMARY,
+                    why="the mission's own first party"),
+    SourceGradeRule(pattern="github.com", grade=SourceGrade.PRIMARY,
+                    why="the project's own repository and releases"),
+    SourceGradeRule(pattern="nvd.nist.gov", grade=SourceGrade.PRIMARY,
+                    why="the authoritative CVE record"),
+    SourceGradeRule(pattern="cve.org", grade=SourceGrade.PRIMARY, why="the CVE programme"),
+    SourceGradeRule(pattern="cert.org", grade=SourceGrade.PRIMARY, why="the CERT/CC"),
+    SourceGradeRule(pattern="first.org", grade=SourceGrade.PRIMARY, why="the CVSS standard body"),
+    SourceGradeRule(pattern="ietf.org", grade=SourceGrade.PRIMARY, why="the protocol standard"),
+    # independent reporting and analysis
+    SourceGradeRule(pattern="theregister.com", grade=SourceGrade.SECONDARY),
+    SourceGradeRule(pattern="krebsonsecurity.com", grade=SourceGrade.SECONDARY),
+    SourceGradeRule(pattern="bleepingcomputer.com", grade=SourceGrade.SECONDARY),
+    SourceGradeRule(pattern="schneier.com", grade=SourceGrade.SECONDARY),
+    # aggregators and mirrors: usable as a pointer, weak as support
+    SourceGradeRule(pattern="cvedetails.com", grade=SourceGrade.TERTIARY),
+    SourceGradeRule(pattern="vulmon.com", grade=SourceGrade.TERTIARY),
+    SourceGradeRule(pattern="exploit-db.com", grade=SourceGrade.TERTIARY),
+    # the search engines themselves: a snippet is never proof
+    SourceGradeRule(pattern="google.com", grade=SourceGrade.SEARCH_RESULT),
+    SourceGradeRule(pattern="bing.com", grade=SourceGrade.SEARCH_RESULT),
+    SourceGradeRule(pattern="duckduckgo.com", grade=SourceGrade.SEARCH_RESULT),
+    SourceGradeRule(pattern="search.brave.com", grade=SourceGrade.SEARCH_RESULT),
+    SourceGradeRule(pattern="html.duckduckgo.com", grade=SourceGrade.SEARCH_RESULT),
+    # archives: content preserved, but a copy of something else
+    SourceGradeRule(pattern="web.archive.org", grade=SourceGrade.TERTIARY,
+                    why="a preserved copy; cite the original alongside it"),
+)
+
+#: Query parameters that identify a *campaign* rather than a *document*.  Dropped
+#: during normalisation so two links to one page compare equal.
+_TRACKING_PARAMETERS: frozenset[str] = frozenset({
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "utm_id", "utm_name", "utm_reader", "utm_referrer", "gclid", "dclid", "fbclid",
+    "msclkid", "mc_cid", "mc_eid", "ref", "ref_src", "referrer", "source",
+    "yclid", "igshid", "s_cid", "spm", "trk", "_ga", "_gl", "pk_campaign",
+})
+
+#: Hosts that only ever serve a redirect to the real page.
+_SHORTENER_HOSTS: frozenset[str] = frozenset({
+    "bit.ly", "t.co", "tinyurl.com", "goo.gl", "ow.ly", "buff.ly", "is.gd",
+    "rebrand.ly", "t.ly", "shorturl.at", "cutt.ly",
+})
+
+#: File extensions that mark a non-entity "page" — a share link, a print view.
+_NON_CANONICAL_SUFFIXES: tuple[str, ...] = (".pdf", ".zip", ".tar.gz")
+
+
+class NormalisedUrl(StrictModel):
+    """A URL after normalisation, with the original kept verbatim.
+
+    ``original`` is what the report cites when it quotes a link, because a
+    reference the reader cannot click is not a reference.  ``canonical`` is what
+    deduplication and equality use, because ``?utm_source=feed`` and no parameter
+    at all are the same document.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    original: str = ""
+    canonical: str = ""
+    scheme: str = ""
+    host: str = ""
+    #: The registrable-ish domain: ``www.releases.example.com`` → ``example.com``.
+    domain: str = ""
+    path: str = "/"
+    query: str = ""
+    #: True when a non-semantic component was removed (tracking params, default
+    #: port, ``www.``, a fragment, a trailing slash slash, a session id, …).
+    changed: bool = False
+    #: What was removed, so the report can explain the difference.
+    normalisations: list[str] = Field(default_factory=list)
+    #: The host is a URL shortener: the canonical URL is not the destination.
+    shortener: bool = False
+
+    @property
+    def key(self) -> str:
+        """The equality key: what makes two references the same source."""
+
+        return self.canonical or self.original
+
+    @property
+    def labelled(self) -> str:
+        """``domain/path`` — short enough for a table, specific enough to find."""
+
+        if not self.host:
+            return self.original[:80]
+        return f"{self.host}{self.path}"[:120]
+
+    def describe(self) -> str:
+        if not self.changed:
+            return self.original
+        return (f"{self.original} (normalised to {self.canonical}: "
+                f"{', '.join(self.normalisations)})")
+
+
+def normalise_url(raw: str, *,
+                  keep_parameters: Iterable[str] = ()) -> NormalisedUrl:
+    """Normalise one URL for comparison, preserving the original text.
+
+    Removed: the fragment, the default port, a leading ``www.``, tracking and
+    session parameters, the ``www.``/``m.``/``amp.`` host prefix, a trailing slash
+    on a path, and a trailing ``/amp`` or ``/print`` view.  Kept: the scheme (http
+    is *not* silently promoted to https, because an http reference is a fact about
+    the source), the case of the path (servers are case-sensitive), the order of
+    meaningful parameters, and anything the caller asks to keep.
+    """
+
+    text = (raw or "").strip()
+    if not text:
+        return NormalisedUrl(original="", canonical="")
+    notes: list[str] = []
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return NormalisedUrl(original=text, canonical=text, changed=False)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower().rstrip(".")
+    netloc = host
+    if host.startswith("www.") and len(host) > 4:
+        notes.append("removed www.")
+        host = host[4:]
+        netloc = host
+    port = parsed.port
+    if port is not None and not ((scheme == "http" and port == 80)
+                                 or (scheme == "https" and port == 443)):
+        netloc = f"{host}:{port}"
+    elif port is not None:
+        notes.append(f"removed the default port {port}")
+    path = parsed.path or "/"
+    if path != "/" and path.endswith("/"):
+        notes.append("removed the trailing slash")
+        path = path.rstrip("/") or "/"
+    if path.endswith(("/amp", "/print")):
+        notes.append("removed the alternate view")
+        path = path.rsplit("/", 1)[0] or "/"
+    keep = {item.lower() for item in keep_parameters}
+    kept: list[tuple[str, str]] = []
+    dropped: list[str] = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        lowered = key.lower()
+        if lowered in keep:
+            kept.append((key, value))
+        elif lowered in _TRACKING_PARAMETERS or lowered.startswith(("utm_", "pk_", "mtm_")):
+            dropped.append(key)
+        else:
+            kept.append((key, value))
+    if dropped:
+        notes.append(f"dropped {len(dropped)} tracking parameter(s): "
+                     f"{', '.join(sorted(set(dropped))[:3])}")
+    query = urlencode(kept, doseq=True)
+    canonical = urlunsplit((scheme, netloc, path, query, ""))
+    if parsed.fragment and not parsed.fragment.startswith(("!", "/")) and "=" not in parsed.fragment:
+        # A plain fragment is a position in a document, not a document.
+        notes.append("removed the fragment")
+    domain = _registrable_domain(host)
+    return NormalisedUrl(original=text, canonical=canonical, scheme=scheme, host=host,
+                         domain=domain, path=path, query=query,
+                         changed=bool(canonical != text),
+                         normalisations=notes or ([] if canonical == text else
+                                                  ["removed a redundant component"]),
+                         shortener=host in _SHORTENER_HOSTS)
+
+
+def _registrable_domain(host: str) -> str:
+    """A best-effort registrable domain, without a public-suffix dependency.
+
+    Two labels by default, three when the second label is a known two-part suffix
+    (``co.uk``, ``com.au``, …).  Deliberately approximate and *only* used for
+    grouping and for "same site" checks — never for a scope decision, which uses
+    the mission's own :class:`Scope`.
+    """
+
+    host = (host or "").lower().strip(".")
+    if not host or host.replace(".", "").isdigit():
+        return host
+    parts = host.split(".")
+    if len(parts) <= 2:
+        return host
+    two_part = {"co", "com", "net", "org", "gov", "edu", "ac", "or", "ne", "go"}
+    if parts[-2] in two_part and len(parts[-1]) == 2:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+def same_site(left: NormalisedUrl | str, right: NormalisedUrl | str) -> bool:
+    """Whether two references point at the same site (registrable domain)."""
+
+    def domain_of(value: NormalisedUrl | str) -> str:
+        if isinstance(value, NormalisedUrl):
+            return value.domain or value.host
+        return normalise_url(value).domain
+
+    first, second = domain_of(left), domain_of(right)
+    return bool(first) and first == second
+
+
+def grade_for(url: str | NormalisedUrl, *,
+              rules: Sequence[SourceGradeRule] = SOURCE_GRADE_RULES) -> SourceGrade:
+    """The grade a URL's host earns, most specific rule first."""
+
+    normalised = url if isinstance(url, NormalisedUrl) else normalise_url(str(url))
+    host = normalised.host
+    best: SourceGrade | None = None
+    best_specificity = -1
+    for rule in rules:
+        if not rule.covers(host):
+            continue
+        specificity = len(rule.pattern)
+        if specificity > best_specificity:
+            best, best_specificity = rule.grade, specificity
+    return best or SourceGrade.UNKNOWN
+
+
+
+class ClaimStatus(str, Enum):
+    """How well a claim stands up.  Ordered from worst to best."""
+
+    UNSUPPORTED = "unsupported"          # nothing retrievable behind it
+    SNIPPET_ONLY = "snippet-only"        # only a search result: never proof
+    SINGLE_SOURCE = "single-source"      # one real source
+    SUPPORTED = "supported"              # one source, but a primary one
+    CORROBORATED = "corroborated"        # ≥2 independent sources of real grade
+    CONTRADICTED = "contradicted"        # sources disagree; report both
+
+    @property
+    def rank(self) -> int:
+        return {"unsupported": 0, "snippet-only": 1, "single-source": 2,
+                "supported": 3, "contradicted": 3, "corroborated": 4}[self.value]
+
+    @property
+    def reportable(self) -> bool:
+        """Whether this may appear in a report at all."""
+
+        return self not in {ClaimStatus.UNSUPPORTED, ClaimStatus.SNIPPET_ONLY}
+
+
+
+
+# -- what a research Worker reports ----------------------------------------
+
+
+class AccessFailure(StrictModel):
+    """One source we tried to read and could not, and why.
+
+    Required rather than optional: a report that silently omits a source it could
+    not reach is worse than no report, because the omission is invisible.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    url: NormalisedUrl = Field(default_factory=NormalisedUrl)
+    outcome: AccessOutcome = AccessOutcome.ERROR
+    #: HTTP status, when there was one.
+    status: int | None = None
+    detail: str = ""
+    attempted_at: datetime = Field(default_factory=utc_now)
+    #: The Worker that tried, so a gap names who could not get the source.
+    worker: str = ""
+    #: ``True`` when the same request could plausibly succeed later.
+    retryable: bool = False
+
+    @property
+    def gap(self) -> UnknownValue:
+        """The failure as a reportable gap — never a silent absence."""
+
+        return UnknownValue(
+            reason=(UnknownReason.FAILED if self.outcome
+                    is not AccessOutcome.REFUSED else UnknownReason.OUT_OF_SCOPE),
+            determined_by=self.worker or "research",
+            detail=(f"{self.url.original or 'a source'} was not read "
+                    f"({self.outcome.value}"
+                    + (f" {self.status}" if self.status is not None else "")
+                    + (f"): {self.detail[:120]}" if self.detail else ""))[:200])
+
+    def describe(self) -> str:
+        return (f"{self.url.labelled or 'source'}: {self.outcome.value}"
+                + (f" ({self.status})" if self.status is not None else ""))
+
+
+class SourceObservation(StrictModel):
+    """One thing one source said, quoted exactly.
+
+    The excerpt is not a summary: it is the span of the page the statement rests
+    on, and :meth:`excerpt_verified` proves it was in the text we fetched.  That is
+    what makes "record exact supporting excerpts" checkable rather than aspirational.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    #: Content-addressed: the same quote from the same page has the same id, which
+    #: is what lets a claim cite an observation before the list is assembled.
+    id: str = ""
+    url: NormalisedUrl = Field(default_factory=NormalisedUrl)
+    #: What the source said, in one sentence, drawn only from ``excerpt``.
+    statement: str = Field(min_length=1)
+    excerpt: str = ""
+    title: str = ""
+    publisher: str = ""
+    #: When the source says it was published — ``None`` when it does not say.
+    published_at: datetime | None = None
+    #: When *we* fetched it.  Never conflated with ``published_at``.
+    retrieved_at: datetime = Field(default_factory=utc_now)
+    grade: SourceGrade = SourceGrade.UNKNOWN
+    #: ``http.fetch``, ``browser.use``, ``archive.search``, ``document.extract``, …
+    tool: str = ""
+    status: int | None = None
+    #: Where the excerpt sits in the fetched text, when it was found.
+    excerpt_offset: int | None = None
+    #: The digest of the fetched body, so a later reader can prove it is the same.
+    content_sha256: str = ""
+    #: The page said when it was updated, which is not when it was published.
+    updated_at: datetime | None = None
+
+    @field_validator("statement", "excerpt")
+    @classmethod
+    def _clean(cls, value: str) -> str:
+        return " ".join(str(value or "").split())
+
+    @model_validator(mode="after")
+    def _identify(self) -> "SourceObservation":
+        if not self.id:
+            object.__setattr__(self, "id", content_id(
+                "obs", self.url.canonical, self.statement, self.excerpt))
+        return self
+
+    @property
+    def dated(self) -> bool:
+        return self.published_at is not None
+
+    @property
+    def age_days(self) -> float | None:
+        """How long before retrieval the source says it was published."""
+
+        if self.published_at is None:
+            return None
+        delta = self.retrieved_at - self.published_at
+        return round(delta.total_seconds() / 86_400.0, 1)
+
+    def excerpt_in(self, text: str) -> bool:
+        """Whether ``excerpt`` literally occurs in ``text``.
+
+        Whitespace-insensitive, because an HTML page's line breaks are not part of
+        what it said — but nothing else is forgiven: a paraphrase fails.
+        """
+
+        needle = " ".join((self.excerpt or "").split()).lower()
+        haystack = " ".join((text or "").split()).lower()
+        if not needle:
+            return False
+        return needle in haystack
+
+    def locate_in(self, text: str) -> int | None:
+        """Where the excerpt starts in ``text``, or ``None`` if it is not there."""
+
+        needle = " ".join((self.excerpt or "").split()).lower()
+        haystack = " ".join((text or "").split()).lower()
+        index = haystack.find(needle) if needle else -1
+        return None if index < 0 else index
+
+    @property
+    def traceable(self) -> bool:
+        """Whether a reader could find this again: a URL, a quote, and a fetch time."""
+
+        return bool(self.url.canonical and self.excerpt.strip() and self.retrieved_at)
+
+    def describe(self) -> str:
+        when = (self.published_at.date().isoformat() if self.published_at
+                else "undated")
+        return (f"{self.url.labelled or 'source'} [{self.grade.value}, {when}, "
+                f"fetched {self.retrieved_at.date().isoformat()}] {self.statement[:80]}")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialised for a report, with the derived facts the reader needs."""
+
+        return {**self.model_dump(mode="json"),
+                "traceable": self.traceable, "dated": self.dated,
+                "describe": self.describe(), "url": {**self.url.model_dump(mode="json"),
+                                                     "labelled": self.url.labelled,
+                                                     "key": self.url.key}}
+
+
+class Contradiction(StrictModel):
+    """Two sources that disagree about a claim, recorded with both sides.
+
+    Recorded rather than resolved: picking the one that suits the narrative is the
+    failure mode this field exists to prevent.  A contradiction is also evidence —
+    of the disagreement, which is itself a finding.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    claim: str = Field(min_length=8)
+    #: The two (or more) observations that cannot both be true.
+    left: str = Field(min_length=1)
+    right: str = Field(min_length=1)
+    #: What exactly they disagree about, in one phrase.
+    about: str = ""
+    #: When the disagreement is explained by time (a later fix), say so here.
+    reconciled_by: str = ""
+
+    @property
+    def reconciled(self) -> bool:
+        return bool(self.reconciled_by.strip())
+
+    def gap(self, *, worker: str = "") -> UnknownValue:
+        return UnknownValue(
+            reason=UnknownReason.UNKNOWN, determined_by=worker or "research",
+            detail=(f"sources disagree about '{self.claim[:80]}': {self.left[:40]} vs "
+                    f"{self.right[:40]}" + (f" ({self.reconciled_by[:60]})"
+                                            if self.reconciled else ""))[:200])
+
+    def describe(self) -> str:
+        return (f"{self.left[:40]} ↔ {self.right[:40]} on '{self.claim[:60]}'"
+                + (" (reconciled)" if self.reconciled else ""))
+
+
+class ResearchClaim(StrictModel):
+    """A statement a research Worker wants the mission to rely on.
+
+    The four fields that make it checkable are ``support`` (ids of observations),
+    ``corroboration`` (who else says so), ``material`` (does it matter) and
+    ``status`` (is it safe to publish).  Status is *derived*: :func:`assess_claim`
+    computes it from the evidence, so a Worker cannot declare its own claim
+    supported.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str = ""
+    claim: str = Field(min_length=8)
+    #: Ids of the :class:`SourceObservation` objects that support it.
+    support: list[str] = Field(default_factory=list)
+    #: Ids of observations that disagree with it.
+    contradicts: list[str] = Field(default_factory=list)
+    #: Whether the mission's answer depends on it.  A material claim needs a
+    #: retrievable source; an incidental one may be omitted.
+    material: bool = True
+    confidence: Confidence = Confidence.UNKNOWN
+    status: ClaimStatus = ClaimStatus.UNSUPPORTED
+    #: Why it has that status, quotable in a report.
+    basis: str = ""
+    recorded_by: str = ""
+
+    @field_validator("claim")
+    @classmethod
+    def _clean(cls, value: str) -> str:
+        text = " ".join(str(value or "").split())
+        if len(text) < 8:
+            raise ValueError("a claim must be a sentence, not a label")
+        return text
+
+    @model_validator(mode="after")
+    def _identify(self) -> "ResearchClaim":
+        if not self.id:
+            object.__setattr__(self, "id", content_id("claim", self.claim))
+        return self
+
+    @property
+    def publishable(self) -> bool:
+        return self.status in {ClaimStatus.SUPPORTED, ClaimStatus.CORROBORATED,
+                               ClaimStatus.CONTRADICTED}
+
+    @property
+    def labelled(self) -> str:
+        """The claim as it should appear in a report, with its status."""
+
+        if self.status is ClaimStatus.SUPPORTED:
+            return self.claim
+        if self.status is ClaimStatus.CORROBORATED:
+            return f"{self.claim} [corroborated by independent sources]"
+        if self.status is ClaimStatus.CONTRADICTED:
+            return f"{self.claim} [sources disagree — see contradictions]"
+        if self.status is ClaimStatus.SINGLE_SOURCE:
+            return f"{self.claim} [single source, not corroborated]"
+        if self.status is ClaimStatus.SNIPPET_ONLY:
+            return f"{self.claim} [UNSUPPORTED: search snippet only]"
+        return f"{self.claim} [UNSUPPORTED: no retrievable source]"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self.model_dump(mode="json"), "publishable": self.publishable,
+                "labelled": self.labelled}
+
+
+class ResearchReport(StrictModel):
+    """What a research Worker hands back: claims, the sources behind them, and gaps.
+
+    The three lists are the point.  ``observations`` is everything quotable,
+    ``failures`` is everything we could not read, and ``contradictions`` is
+    everything that disagrees — a report is only complete when all three are.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    worker_id: str = ""
+    subagent_id: str = ""
+    objective: str = ""
+    observations: list[SourceObservation] = Field(default_factory=list)
+    claims: list[ResearchClaim] = Field(default_factory=list)
+    failures: list[AccessFailure] = Field(default_factory=list)
+    contradictions: list[Contradiction] = Field(default_factory=list)
+    #: Searches performed, so a reader can see what was *not* found.
+    queries: list[str] = Field(default_factory=list)
+    started_at: datetime = Field(default_factory=utc_now)
+    finished_at: datetime | None = None
+    #: Set by :func:`audit_web_report`; ``None`` before an audit has run.
+    audit: ReportAudit | None = None
+
+    @property
+    def by_id(self) -> dict[str, SourceObservation]:
+        return {observation.id: observation for observation in self.observations}
+
+    @property
+    def graded(self) -> list[SourceGrade]:
+        return [observation.grade for observation in self.observations]
+
+    @property
+    def gaps(self) -> list[UnknownValue]:
+        """Every gap this report knows about: failures and contradictions."""
+
+        return ([failure.gap for failure in self.failures]
+                + [item.gap(worker=self.worker_id) for item in self.contradictions])
+
+    @property
+    def undated(self) -> list[SourceObservation]:
+        return [observation for observation in self.observations
+                if not observation.dated]
+
+    @property
+    def snippet_only(self) -> list[SourceObservation]:
+        return [observation for observation in self.observations
+                if observation.grade is SourceGrade.SEARCH_RESULT]
+
+    def describe(self) -> str:
+        return (f"{self.worker_id or 'research'}: {len(self.observations)} observation(s) "
+                f"from {len({item.url.canonical for item in self.observations})} source(s), "
+                f"{len(self.claims)} claim(s), {len(self.failures)} access failure(s), "
+                f"{len(self.contradictions)} contradiction(s)")
+
+
+
+
+class SourceAssessment(StrictModel):
+    """The verdict on one claim, computed from its evidence rather than asserted."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    claim_id: str = ""
+    claim: str = ""
+    status: ClaimStatus = ClaimStatus.UNSUPPORTED
+    supporting: list[str] = Field(default_factory=list)
+    #: One id per independent origin: the corroboration count that matters.
+    independent_origins: list[str] = Field(default_factory=list)
+    contradicting: list[str] = Field(default_factory=list)
+    best_grade: SourceGrade = SourceGrade.UNKNOWN
+    #: Supporting observations whose excerpt really did occur in the fetched text.
+    verified_excerpts: int = 0
+    #: Supporting observations with no publication date — reported, not fatal.
+    undated: int = 0
+    basis: str = ""
+
+    @property
+    def corroborated(self) -> bool:
+        return self.status is ClaimStatus.CORROBORATED
+
+
+def _origin_key(observation: SourceObservation) -> str:
+    """The origin an observation belongs to, for corroboration counting.
+
+    The registrable domain *and* the publisher: two pages on one site are one
+    origin even if their paths differ, and an archive copy is not an origin of its
+    own — it is a copy of the page it archived.
+    """
+
+    host = observation.url.domain or observation.url.host
+    if host == "web.archive.org":
+        # An archive URL embeds the original in its path; credit the original.
+        match = re.search(r"/https?://([^/]+)", observation.url.path or "")
+        if match:
+            host = _registrable_domain(match.group(1))
+    return (host or observation.publisher or observation.title or observation.id).lower()
+
+
+def grade_for_observation(observation: SourceObservation,
+                          rules: Sequence[SourceGradeRule] = SOURCE_GRADE_RULES
+                          ) -> SourceObservation:
+    """Return the observation with its ``grade`` set from its URL.
+
+    The grade is *assigned*, not accepted: whatever a Worker claims about its own
+    source is replaced by what the rule table says the host is.
+    """
+
+    grade = grade_for(observation.url, rules=rules)
+    return observation.model_copy(update={"grade": grade})
+
+
+def assess_claim(claim: ResearchClaim, report: ResearchReport, *,
+                 rules: Sequence[SourceGradeRule] = SOURCE_GRADE_RULES,
+                 corroboration_threshold: int = 2) -> SourceAssessment:
+    """Decide what one claim is entitled to say.
+
+    The rules, in order:
+
+    *   no supporting observation at all → ``unsupported``;
+    *   only search-result support → ``snippet-only``, which is never publishable;
+    *   observations that contradict it → ``contradicted`` (still reportable: the
+        disagreement is the finding);
+    *   support from two independent origins of at least secondary grade →
+        ``corroborated``;
+    *   one primary source → ``supported``;
+    *   anything else → ``single-source``, which is reportable *with its label*.
+    """
+
+    known = report.by_id
+    supporting = [known[item] for item in claim.support if item in known]
+    contradicting = [known[item] for item in claim.contradicts if item in known]
+    graded = [grade_for_observation(item, rules) for item in supporting]
+    origins = list(dict.fromkeys(_origin_key(item) for item in graded))
+    strong = [item for item in graded if item.grade.rank >= SourceGrade.SECONDARY.rank]
+    strong_origins = list(dict.fromkeys(_origin_key(item) for item in strong))
+    best = max((item.grade for item in graded), key=lambda grade: grade.rank,
+               default=SourceGrade.UNKNOWN)
+    verified = len([item for item in graded if item.excerpt.strip()])
+    undated = len([item for item in graded if not item.dated])
+
+    if contradiction := [item for item in contradicting if item.url.canonical]:
+        status = ClaimStatus.CONTRADICTED
+        basis = (f"{len(contradiction)} source(s) disagree with it; both sides are "
+                 f"recorded rather than one being chosen")
+    elif not supporting:
+        status, basis = ClaimStatus.UNSUPPORTED, "no observation supports it"
+    elif not [item for item in graded if item.grade.citable]:
+        status = ClaimStatus.SNIPPET_ONLY
+        basis = ("the only support is a search result or an ungraded host, which is a "
+                 "pointer to a source rather than a source")
+    elif len(strong_origins) >= corroboration_threshold:
+        status = ClaimStatus.CORROBORATED
+        basis = (f"{len(strong_origins)} independent origin(s) of at least secondary "
+                 f"grade support it: {', '.join(strong_origins[:3])}")
+    elif best is SourceGrade.PRIMARY:
+        status = ClaimStatus.SUPPORTED
+        basis = f"a primary source ({graded[0].url.labelled}) supports it"
+    else:
+        status = ClaimStatus.SINGLE_SOURCE
+        basis = (f"one {best.value} source supports it; not independently corroborated")
+
+    return SourceAssessment(
+        claim_id=claim.id, claim=claim.claim, status=status,
+        supporting=[item.id for item in supporting],
+        independent_origins=origins, contradicting=[item.id for item in contradicting],
+        best_grade=best, verified_excerpts=verified, undated=undated,
+        basis=(basis + (f"; {undated} supporting source(s) carry no publication date"
+                        if undated else ""))[:300])
+
+
+class ReportAudit(StrictModel):
+    """The audit of a finished report: what was labelled, what was dropped, and why."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    worker_id: str = ""
+    claims: int = 0
+    supported: int = 0
+    corroborated: int = 0
+    contradicted: int = 0
+    single_source: int = 0
+    unsupported: int = 0
+    snippet_only: int = 0
+    #: Claims dropped because they were material and had nothing behind them.
+    omitted: list[str] = Field(default_factory=list)
+    #: Claims kept but explicitly labelled as unsupported.
+    labelled: list[str] = Field(default_factory=list)
+    #: Material claims that pass the acceptance criterion.
+    material_claims: int = 0
+    material_sourced: int = 0
+    failures: int = 0
+    undated_sources: int = 0
+    search_snippets: int = 0
+    contradictions: int = 0
+    #: The exact wording of the criterion, and whether the report meets it.
+    criterion: str = (
+        "every material web claim has at least one retrievable source reference, "
+        "and unsupported claims are labelled or omitted")
+    accepted: bool = True
+    notes: list[str] = Field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self.model_dump(mode="json"), "coverage": self.coverage,
+                "describe": self.describe()}
+
+    @property
+    def coverage(self) -> float:
+        if not self.material_claims:
+            return 1.0
+        return round(self.material_sourced / self.material_claims, 3)
+
+    def describe(self) -> str:
+        return (f"{self.claims} claim(s): {self.corroborated} corroborated, "
+                f"{self.supported} supported, {self.single_source} single-source, "
+                f"{self.contradicted} contradicted, {self.unsupported + self.snippet_only} "
+                f"labelled or omitted · material sourced {self.material_sourced}/"
+                f"{self.material_claims} ({self.coverage:.0%})")
+
+
+def audit_web_report(report: ResearchReport, *,
+                     rules: Sequence[SourceGradeRule] = SOURCE_GRADE_RULES,
+                     drop_unsupported: bool = True) -> ResearchReport:
+    """Apply the acceptance criterion to a finished report.
+
+    Every claim is re-assessed from its evidence (a Worker's own ``status`` is
+    ignored), then:
+
+    *   a **material** claim with nothing retrievable behind it is *omitted* from
+        the claims list and recorded in ``audit.omitted`` — unless
+        ``drop_unsupported`` is false, in which case it is kept and labelled;
+    *   an **incidental** claim is kept and labelled, because dropping a caveat is
+        as misleading as dropping a finding;
+    *   every source is re-graded from its host, so a Worker cannot promote its own
+        source by saying so;
+    *   undated sources, search-only support and access failures are counted so the
+        report's own limitations section can state them.
+
+    The returned report carries the audit in ``audit``; nothing is silently changed
+    without a note.
+    """
+
+    graded = [grade_for_observation(item, rules) for item in report.observations]
+    working = report.model_copy(update={"observations": graded})
+    known = working.by_id
+    kept: list[ResearchClaim] = []
+    assessments: list[SourceAssessment] = []
+    omitted: list[str] = []
+    labelled: list[str] = []
+    counts = {status: 0 for status in ClaimStatus}
+    material_claims = material_sourced = 0
+
+    for claim in working.claims:
+        assessment = assess_claim(claim, working, rules=rules)
+        assessments.append(assessment)
+        status = assessment.status
+        counts[status] += 1
+        updated = claim.model_copy(update={"status": status, "basis": assessment.basis,
+                                           "confidence": _confidence_for(status, claim)})
+        retrievable = any(item in known for item in claim.support) and status.reportable
+        if claim.material:
+            material_claims += 1
+            if retrievable:
+                material_sourced += 1
+        if status.reportable:
+            kept.append(updated)
+            if status is ClaimStatus.SINGLE_SOURCE:
+                labelled.append(claim.claim)
+        elif claim.material and drop_unsupported:
+            omitted.append(claim.claim)
+        else:
+            kept.append(updated)
+            labelled.append(claim.claim)
+
+    # A claim the evidence marks as contradicted gets an entry carrying both sides,
+    # unless the Worker already recorded one.  It is never resolved by choosing.
+    contradictions = list(working.contradictions)
+    by_claim = {item.claim: item for item in assessments}
+    for claim in kept:
+        if claim.status is not ClaimStatus.CONTRADICTED:
+            continue
+        if any(item.claim == claim.claim for item in contradictions):
+            continue
+        assessment = by_claim.get(claim.claim)
+        sides = (assessment.contradicting if assessment else []) or claim.contradicts
+        contradictions.append(Contradiction(
+            claim=claim.claim,
+            left=sides[0] if sides else "a source",
+            right=(claim.support[0] if claim.support else "another source"),
+            about="the sources cannot both be right"))
+
+    notes: list[str] = []
+    if omitted:
+        notes.append(f"{len(omitted)} material claim(s) were omitted for want of a "
+                     f"retrievable source")
+    if labelled:
+        notes.append(f"{len(labelled)} claim(s) were kept with an explicit label")
+    if working.failures:
+        notes.append(f"{len(working.failures)} source(s) could not be read and are "
+                     f"reported as gaps")
+    if working.snippet_only:
+        notes.append(f"{len(working.snippet_only)} search snippet(s) are recorded as "
+                     f"pointers, never as proof")
+    if working.undated:
+        notes.append(f"{len(working.undated)} source(s) state no publication date; the "
+                     f"retrieval date is reported instead of being used as one")
+
+    audit = ReportAudit(
+        worker_id=working.worker_id, claims=len(report.claims),
+        supported=counts[ClaimStatus.SUPPORTED],
+        corroborated=counts[ClaimStatus.CORROBORATED],
+        contradicted=counts[ClaimStatus.CONTRADICTED],
+        single_source=counts[ClaimStatus.SINGLE_SOURCE],
+        unsupported=counts[ClaimStatus.UNSUPPORTED],
+        snippet_only=counts[ClaimStatus.SNIPPET_ONLY],
+        omitted=omitted, labelled=labelled, material_claims=material_claims,
+        material_sourced=material_sourced, failures=len(working.failures),
+        undated_sources=len(working.undated), search_snippets=len(working.snippet_only),
+        contradictions=len(contradictions), notes=notes,
+        accepted=(material_sourced == material_claims
+                  and not [item for item in kept
+                           if item.material and not item.publishable]))
+    return working.model_copy(update={"claims": kept, "contradictions": contradictions,
+                                      "audit": audit})
+
+
+def assessment_of(claim: ResearchClaim,
+                  assessments: Sequence[SourceAssessment]) -> SourceAssessment:
+    """The assessment for ``claim`` from a list, or an empty one."""
+
+    return next((item for item in assessments if item.claim_id == claim.id),
+                SourceAssessment(claim_id=claim.id, claim=claim.claim))
+
+
+def _confidence_for(status: ClaimStatus, claim: ResearchClaim) -> Confidence:
+    """Confidence follows the evidence, not the claim's own opinion."""
+
+    if status is ClaimStatus.CORROBORATED:
+        return Confidence.HIGH
+    if status is ClaimStatus.SUPPORTED:
+        return Confidence.MEDIUM
+    if status in {ClaimStatus.SINGLE_SOURCE, ClaimStatus.CONTRADICTED}:
+        return Confidence.LOW
+    return Confidence.UNKNOWN
+
+
+
+
+# -- collecting: what reaches a report, and in what order -------------------
+
+
+class PageDrop(StrictModel):
+    """One page a collector saw and did not turn into a source, with the reason.
+
+    Deliberately not an error: a search result page that is a snippet, a mirror of
+    a page already read, or an off-scope link is *expected*.  Recording it is what
+    keeps "we read N pages" from being a vague claim.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    url: NormalisedUrl = Field(default_factory=NormalisedUrl)
+    reason: str = Field(min_length=1)
+    #: The source that pointed at it (a search page, a link list), when there is one.
+    found_on: str = ""
+
+    def describe(self) -> str:
+        return f"{self.url.labelled or self.url.original[:60]}: {self.reason}"
+
+
+def harvest_results(raw: Sequence[Any], *,
+                    scope: "Scope | None" = None,
+                    seen: Iterable[str] = (),
+                    rules: Sequence[SourceGradeRule] = SOURCE_GRADE_RULES,
+                    merge_schemes: bool = True
+                    ) -> tuple[list[tuple[NormalisedUrl, SourceGrade]], list[PageDrop]]:
+    """Normalise, deduplicate and grade a list of search results or links.
+
+    The deduplication is the point: the same document appears once with a campaign
+    parameter, once with a fragment, once through a shortener and once in an
+    archive.  Four "sources" that are one page would inflate corroboration, so they
+    collapse to one — and the copies are reported as drops rather than forgotten.
+    """
+
+    accepted: list[tuple[NormalisedUrl, SourceGrade]] = []
+    drops: list[PageDrop] = []
+    existing = {_harvest_key(normalise_url(item), merge_schemes) for item in seen}
+    for item in raw:
+        if isinstance(item, NormalisedUrl):
+            url, extra = item, {}
+        elif isinstance(item, Mapping):
+            url = normalise_url(str(item.get("url") or ""))
+            extra = dict(item)
+        else:
+            url, extra = normalise_url(str(item)), {}
+        if not url.canonical:
+            drops.append(PageDrop(url=url, reason="not a URL"))
+            continue
+        if url.shortener:
+            drops.append(PageDrop(url=url, reason="a shortener link: the destination "
+                                                   "is not in the URL",
+                                  found_on=str(extra.get("found_on") or "")))
+            continue
+        key = _harvest_key(url, merge_schemes)
+        if key in existing:
+            drops.append(PageDrop(url=url, reason="a duplicate of a source already "
+                                                   "collected",
+                                  found_on=str(extra.get("found_on") or "")))
+            continue
+        if scope is not None and not scope.covers(url.original):
+            drops.append(PageDrop(url=url, reason="outside the mission scope",
+                                  found_on=str(extra.get("found_on") or "")))
+            continue
+        if extra.get("snippet") and not extra.get("has_full_text", False):
+            # A search result with no fetched body is a pointer, whatever it says.
+            accepted.append((url, SourceGrade.SEARCH_RESULT))
+            existing.add(key)
+            continue
+        existing.add(key)
+        accepted.append((url, grade_for(url, rules=rules)))
+    # Strongest first: the collector reads primary sources before commentary on them.
+    accepted.sort(key=lambda pair: -pair[1].rank)
+    return accepted, drops
+
+
+def _harvest_key(url: NormalisedUrl, merge_schemes: bool) -> str:
+    """The deduplication key: ``http`` and ``https`` are one document.
+
+    The *reference* keeps the scheme it was found with — an http citation is a fact
+    about the source — but a collector that treats the http and https forms of one
+    page as two sources would manufacture corroboration out of a redirect.
+    """
+
+    if not merge_schemes:
+        return url.key
+    return re.sub(r"^https?://", "//", url.key)
+
+
+class SearchResult(StrictModel):
+    """One result as a search engine returned it — a snippet, not a source."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    url: NormalisedUrl = Field(default_factory=NormalisedUrl)
+    title: str = ""
+    snippet: str = ""
+    rank: int = 0
+    #: The query that produced it, so a report can say how it was found.
+    query: str = ""
+    #: Whether the collector then fetched the page.  A result that was not fetched
+    #: can never become an observation — only a pointer.
+    fetched: bool = False
+    grade: SourceGrade = SourceGrade.SEARCH_RESULT
+
+    @property
+    def is_pointer(self) -> bool:
+        return not self.fetched
+
+    def describe(self) -> str:
+        return (f"#{self.rank} {self.url.labelled} "
+                f"({'page fetched' if self.fetched else 'snippet only'})")
+
+
+#: Query words that make a search ask for a *source*, not for a discussion of one.
+_PRIMARY_SOURCE_TERMS: tuple[str, ...] = (
+    "advisory", "security bulletin", "release notes", "changelog", "cve",
+    "vendor", "official", "documentation", "erratum", "patch notes", "commit",
+)
+
+#: Site operators for the engines that support them, in priority order.
+PRIMARY_SITE_HINTS: dict[str, str] = {
+    "advisory": "site:github.com OR site:nvd.nist.gov OR site:cve.org",
+    "release": "site:github.com",
+    "record": "site:nvd.nist.gov",
+}
+
+
+def primary_first_queries(subject: str, *, limit: int = 3) -> list[str]:
+    """Queries that look for the *document*, primary sources first.
+
+    A Worker that searches only ``"<subject> vulnerability"`` finds commentary.  So
+    the prepared queries lead with the wording primary sources use — advisory,
+    release notes, CVE — and the generic one comes last, only if there is room.
+    """
+
+    subject = " ".join(str(subject or "").split())[:120]
+    if not subject:
+        return []
+    prepared = [
+        f"{subject} advisory OR security bulletin",
+        f"{subject} release notes changelog fix",
+        f"{subject} CVE record site:nvd.nist.gov OR site:cve.org",
+        f"{subject} official documentation",
+    ]
+    queries = prepared[:max(1, limit)]
+    if len(queries) < limit:
+        queries.append(f"{subject} explained")
+    return list(dict.fromkeys(queries))
+
+
+class ResearchPage(StrictModel):
+    """A page that *was* fetched: the text we can quote from, and its metadata."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    url: NormalisedUrl = Field(default_factory=NormalisedUrl)
+    text: str = ""
+    title: str = ""
+    publisher: str = ""
+    published_at: datetime | None = None
+    updated_at: datetime | None = None
+    status: int | None = None
+    tool: str = "http.fetch"
+    #: The sha256 of the body as fetched, so a quote can be tied to this text later.
+    content_sha256: str = ""
+    #: Publication dates the page stated, in the words it used — never inferred.
+    date_evidence: str = ""
+
+    @model_validator(mode="after")
+    def _hash(self) -> "ResearchPage":
+        if not self.content_sha256 and self.text:
+            object.__setattr__(self, "content_sha256",
+                               hashlib.sha256(self.text.encode("utf-8", "replace")).hexdigest())
+        return self
+
+    @property
+    def graded(self) -> SourceGrade:
+        return grade_for(self.url)
+
+
+#: Month names, for the dates pages actually print.  A date we cannot read is
+#: reported as absent rather than parsed into something plausible.
+_MONTHS: dict[str, int] = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9, "oct": 10,
+    "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+
+#: The element names that mean "published", as against "updated" or "copyright".
+_PUBLISHED_KEYS: tuple[str, ...] = (
+    "article:published_time", "datepublished", "date-published", "publishdate",
+    "pubdate", "published_time", "publication_date", "og:published_time", "dc.date.issued",
+)
+_UPDATED_KEYS: tuple[str, ...] = (
+    "article:modified_time", "datemodified", "date-modified", "last-modified",
+    "updated_time", "modified_date", "og:updated_time",
+)
+
+
+def _scrub_markers(text: str, keys: Sequence[str]) -> str:
+    """``text`` with each marker and its value blanked out, preserving offsets.
+
+    Used so a *modification* date cannot be found again by the printed-date fallback
+    and reported as a publication date: the words are still there, but not where the
+    scanner looks.
+    """
+
+    scrubbed = text
+    lowered = text.lower()
+    for key in keys:
+        start = 0
+        while True:
+            index = lowered.find(key, start)
+            if index < 0:
+                break
+            end = min(len(scrubbed), index + 160)
+            scrubbed = scrubbed[:index] + re.sub(r"[^\n]", " ", scrubbed[index:end]) \
+                + scrubbed[end:]
+            start = end
+    return scrubbed
+
+
+def published_at_from(text: str, *, since: datetime | None = None) -> tuple[datetime | None, str]:
+    """The publication date a page states, and the words it used.
+
+    Looks for a machine-readable marker first (``article:published_time``,
+    ``datePublished``, ``pubdate``) and only then for a printed date.  Never falls
+    back to "now": a page with no stated date is undated, which the report says
+    explicitly.  Returns ``(None, "")`` when nothing dated is found.
+
+    Two things are refused rather than reported: a date in the future (a template
+    artefact, not a fact) and a *modification* date offered as a publication date —
+    the modification markers are blanked before the printed-date scan, so a page
+    that says only "last updated" is undated as to publication.
+    """
+
+    blob = text or ""
+    reference = since or utc_now()
+    lowered = blob.lower()
+    for key in _PUBLISHED_KEYS:
+        index = lowered.find(key)
+        if index < 0:
+            continue
+        window = blob[index:index + 160]
+        stamp, raw = _parse_iso(window, since=reference, published=True)
+        if stamp is not None:
+            return stamp, f"{key}: {raw}"
+    blob = _scrub_markers(blob, _UPDATED_KEYS)
+    match = re.search(r"\b(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}:\d{2}(?::\d{2})?))?", blob)
+    if match:
+        stamp, raw = _parse_iso(match.group(0), since=reference, published=True)
+        if stamp is not None:
+            return stamp, f"printed date: {raw}"
+    match = re.search(r"\b(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})\b", blob)
+    if match:
+        day, month, year = match.groups()
+        number = _MONTHS.get(month.lower())
+        if number:
+            try:
+                stamp = datetime(int(year), number, int(day), tzinfo=timezone.utc)
+            except ValueError:
+                return None, ""
+            if stamp <= reference:
+                return stamp, f"printed date: {match.group(0)}"
+    return None, ""
+
+
+def _parse_iso(window: str, *, since: datetime | None,
+               published: bool) -> tuple[datetime | None, str]:
+    """One ISO-ish timestamp out of a window of text, or nothing."""
+
+    match = re.search(r"(\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?"
+                      r"(?:Z|[+-]\d{2}:?\d{2})?)", window)
+    if not match:
+        return None, ""
+    raw = match.group(1)
+    try:
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None, ""
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    stamp = stamp.astimezone(timezone.utc)
+    if published and since is not None and stamp > since:
+        # A "publication date" in the future is a template artefact, not a fact.
+        return None, ""
+    return stamp, raw
+
+
+def updated_at_from(text: str, *, since: datetime | None = None) -> tuple[datetime | None, str]:
+    """The *modification* date a page states, kept separate from publication."""
+
+    lowered = (text or "").lower()
+    for key in _UPDATED_KEYS:
+        index = lowered.find(key)
+        if index < 0:
+            continue
+        stamp, raw = _parse_iso(text[index:index + 160], since=since, published=False)
+        if stamp is not None:
+            return stamp, f"{key}: {raw}"
+    return None, ""
+
+
+def observations_from_pages(pages: Sequence[ResearchPage], *,
+                            worker: str = "", rules: Sequence[SourceGradeRule] = SOURCE_GRADE_RULES,
+                            now: datetime | None = None) -> list[SourceObservation]:
+    """Turn fetched pages into observations — one quotable sentence each.
+
+    Every observation keeps the page's own text so :meth:`SourceObservation.excerpt_in`
+    can be checked, and carries both dates.  A page whose text says nothing usable
+    still yields an observation of what it *is* ("the page was fetched and states
+    its title"), rather than vanishing.
+    """
+
+    stamp = now or utc_now()
+    produced: list[SourceObservation] = []
+    for page in pages:
+        published, date_evidence = (page.published_at, page.date_evidence) \
+            if page.published_at is not None else published_at_from(page.text, since=stamp)
+        updated, _ = (page.updated_at, "") if page.updated_at is not None else \
+            updated_at_from(page.text, since=stamp)
+        sentence, offset = best_excerpt(page.text)
+        if not sentence:
+            sentence = f"{page.title or page.url.labelled} was fetched and carried no readable text"
+            offset = None
+        produced.append(SourceObservation(
+            url=page.url, statement=sentence[:400], excerpt=sentence[:400],
+            title=page.title[:200], publisher=(page.publisher or page.url.domain)[:120],
+            published_at=published, retrieved_at=stamp,
+            grade=grade_for(page.url, rules=rules), tool=page.tool,
+            status=page.status, excerpt_offset=offset,
+            content_sha256=page.content_sha256, updated_at=updated))
+    return produced
+
+
+def best_excerpt(text: str, *, max_chars: int = 240) -> tuple[str, int | None]:
+    """The most quotable sentence in a page, and where it starts.
+
+    "Quotable" means informative and self-contained: a sentence with a verb and
+    some length, not a navigation label.  Nothing is invented — the returned string
+    is a contiguous span of ``text`` after whitespace normalisation.
+    """
+
+    collapsed = " ".join((text or "").split())
+    if not collapsed:
+        return "", None
+    sentences = re.split(r"(?<=[.!?])\s+", collapsed)
+    choice, offset, cursor = "", None, 0
+    for sentence in sentences:
+        position = collapsed.find(sentence, cursor)
+        cursor = position + len(sentence) if position >= 0 else cursor
+        candidate = sentence.strip()
+        if len(candidate) < 40 or len(candidate.split()) < 6:
+            continue
+        if candidate.count(" ") < 4:
+            continue
+        if not re.search(r"[A-Za-z]{3,}", candidate):
+            continue
+        if position < 0:
+            continue
+        choice, offset = candidate[:max_chars], position
+        break
+    if not choice:
+        fallback = collapsed[:max_chars]
+        return fallback, 0 if fallback else None
+    return choice, offset
+
+
+
+
+# -- teaching the Worker, and checking what it did -------------------------
+
+
+class ResearchRule(str, Enum):
+    """The six behaviours a research Worker is required to show."""
+
+    PRIMARY_FIRST = "primary-first"          # look for first-party documents first
+    CORROBORATE = "corroborate"              # two independent sources for material claims
+    EXACT_EXCERPT = "exact-excerpt"          # quote, never paraphrase
+    DATES_SEPARATE = "dates-separate"         # publication ≠ retrieval
+    NO_SNIPPET_PROOF = "no-snippet-proof"     # a search result is a pointer
+    REPORT_FAILURES = "report-failures"       # access failures and contradictions are data
+
+
+#: One line per rule: what a Worker is told, and what the reviewer checks.  Kept as
+#: data because the prompt, the review and the report's own checklist all read it —
+#: a rule that is written down once cannot drift between the three.
+RESEARCH_RULES: dict[ResearchRule, str] = {
+    ResearchRule.PRIMARY_FIRST: (
+        "Prefer primary sources: the vendor's own advisory, release notes, CVE record "
+        "or standard. Use commentary to explain a primary source, never instead of one."),
+    ResearchRule.CORROBORATE: (
+        "Corroborate every material claim. Two independent origins — different "
+        "registrable domains — are corroboration; two pages on one site are not."),
+    ResearchRule.EXACT_EXCERPT: (
+        "Quote the exact span you rely on, word for word, and nothing you cannot quote. "
+        "A paraphrase is not an excerpt: it will be rejected."),
+    ResearchRule.DATES_SEPARATE: (
+        "Report the publication date the source states and the date you retrieved it as "
+        "separate facts. If the page states no publication date, say so; never use the "
+        "retrieval time as one."),
+    ResearchRule.NO_SNIPPET_PROOF: (
+        "A search result is a pointer, never proof. Open the page and quote it, or "
+        "mark the claim unsupported."),
+    ResearchRule.REPORT_FAILURES: (
+        "Report every source you could not read, with the reason, and every source that "
+        "contradicts another. A gap is a finding; silence is a defect."),
+}
+
+
+class ResearchBrief(StrictModel):
+    """Exactly what a research Worker is told to do, and what it is checked against.
+
+    The brief is generated, not authored: the rules come from :data:`RESEARCH_RULES`,
+    the queries from :func:`primary_first_queries`, and the grade table from
+    :data:`SOURCE_GRADE_RULES`.  A caller can add a subject and a limit; it cannot
+    remove a rule.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    subject: str = Field(min_length=3)
+    queries: list[str] = Field(default_factory=list)
+    rules: list[ResearchRule] = Field(default_factory=list)
+    #: Whether the Worker may report a claim supported by one source.
+    allow_single_source: bool = True
+    #: How many independent origins a *material* claim needs.
+    corroboration_threshold: int = Field(default=2, ge=1, le=5)
+    #: Ceilings, so a brief cannot ask for an unbounded crawl.
+    max_sources: int = Field(default=8, ge=1, le=50)
+    max_queries: int = Field(default=3, ge=1, le=10)
+
+    @classmethod
+    def for_subject(cls, subject: str, **overrides: Any) -> "ResearchBrief":
+        """A brief for ``subject``: fixed rules, prepared queries, optional narrowing.
+
+        A caller may narrow the brief — fewer queries, a different corroboration
+        threshold, a subset of the rules — but may not add a field: the model forbids
+        extras, and the rules default to all six.
+        """
+
+        limits = {key: value for key, value in overrides.items() if value is not None}
+        max_queries = int(limits.get("max_queries", 3))
+        limits.setdefault("rules", list(ResearchRule))
+        limits.setdefault("queries", primary_first_queries(subject, limit=max_queries))
+        return cls(subject=" ".join(str(subject).split())[:160], **limits)
+
+    @property
+    def checklist(self) -> list[str]:
+        return [f"{rule.value}: {RESEARCH_RULES[rule]}" for rule in self.rules]
+
+    def system_prompt(self) -> str:
+        """The research contract, appended to whatever the task prompt already says."""
+
+        lines = "\n".join(f"- {text}" for text in self.checklist)
+        return (
+            "SOURCE-AWARE WEB RESEARCH\n"
+            f"Subject: {self.subject}\n"
+            f"Prepared queries (primary sources first): "
+            f"{'; '.join(self.queries) or 'none prepared'}\n"
+            "Rules, all mandatory:\n"
+            f"{lines}\n"
+            f"- Read at most {self.max_sources} page(s); a claim needs at least one "
+            f"retrievable source reference, and a material claim needs "
+            f"{self.corroboration_threshold} independent origin(s) to be called "
+            f"corroborated.\n"
+            "- Return claims, the observations that support them (with exact excerpts), "
+            "access failures and contradictions. Do not return prose."
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self.model_dump(mode="json"), "checklist": self.checklist,
+                "prompt": self.system_prompt()}
+
+
+class ResearchFinding(StrictModel):
+    """One thing the reviewer noticed about a report."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    rule: ResearchRule | None = None
+    detail: str = Field(min_length=1)
+    #: Blocking findings must be fixed before the Worker may pass.
+    blocking: bool = True
+
+    def describe(self) -> str:
+        return f"{'✘' if self.blocking else '·'} {self.detail[:160]}"
+
+
+class ResearchReview(StrictModel):
+    """The reviewer's verdict on one report, in the shape the flow already uses."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    worker_id: str = ""
+    approved: bool = False
+    findings: list[ResearchFinding] = Field(default_factory=list)
+    #: Rules the report actually demonstrated.
+    satisfied: list[ResearchRule] = Field(default_factory=list)
+    #: Rules it broke.
+    violated: list[ResearchRule] = Field(default_factory=list)
+    #: Rules this brief asked for.  ``None`` means "all six".
+    checked: list[ResearchRule] = Field(default_factory=list)
+    claim_coverage: float = 0.0
+    guidance: str = ""
+
+    @property
+    def blocking(self) -> list[ResearchFinding]:
+        return [item for item in self.findings if item.blocking]
+
+    def describe(self) -> str:
+        state = "approved" if self.approved else "revise"
+        return (f"{self.worker_id or 'research'}: {state} · "
+                f"{len(self.satisfied)}/{len(self.satisfied) + len(self.violated)} rule(s) "
+                f"satisfied · coverage {self.claim_coverage:.0%}")
+
+
+def research_review(report: ResearchReport, *,
+                    brief: ResearchBrief | None = None) -> ResearchReview:
+    """Check a report against the six rules, and say which were broken.
+
+    This is the mechanical half of "teach research Workers": the prompt asks for the
+    behaviour, and this proves it.  Every blocking finding names the rule and cites
+    the offending claim, observation or failure, so a retry has something to act on.
+    """
+
+    findings: list[ResearchFinding] = []
+    satisfied: list[ResearchRule] = []
+    violated: list[ResearchRule] = []
+    known = report.by_id
+    threshold = brief.corroboration_threshold if brief else 2
+
+    # 1. exact excerpts: every observation that supports a claim must quote its page.
+    unsupported_quotes = []
+    for claim in report.claims:
+        for identifier in claim.support:
+            observation = known.get(identifier)
+            if observation is None:
+                unsupported_quotes.append(f"{claim.claim[:50]} cites unknown observation "
+                                          f"{identifier}")
+            elif not observation.excerpt.strip():
+                unsupported_quotes.append(f"{claim.claim[:50]} rests on an observation "
+                                          f"with no excerpt")
+            elif observation.excerpt == observation.statement and len(observation.excerpt) < 20:
+                unsupported_quotes.append(f"{claim.claim[:50]} rests on a quote too short "
+                                          f"to be evidence")
+    if unsupported_quotes:
+        violated.append(ResearchRule.EXACT_EXCERPT)
+        findings.append(ResearchFinding(rule=ResearchRule.EXACT_EXCERPT,
+                                        detail=unsupported_quotes[0]))
+    else:
+        satisfied.append(ResearchRule.EXACT_EXCERPT)
+
+    # 2. search snippets are never proof.
+    snippet_claims = [claim for claim in report.claims
+                      if claim.support and all(
+                          known.get(item) is not None
+                          and known[item].grade is SourceGrade.SEARCH_RESULT
+                          for item in claim.support)]
+    if snippet_claims:
+        violated.append(ResearchRule.NO_SNIPPET_PROOF)
+        findings.append(ResearchFinding(
+            rule=ResearchRule.NO_SNIPPET_PROOF,
+            detail=f"{snippet_claims[0].claim[:70]} is supported only by a search "
+                   f"result; open the page and quote it"))
+    else:
+        satisfied.append(ResearchRule.NO_SNIPPET_PROOF)
+
+    # 3. publication and retrieval are not the same field.
+    borrowed_dates = [claim for claim in report.claims
+                      if any(known.get(item) is not None
+                             and known[item].published_at is not None
+                             and known[item].published_at == known[item].retrieved_at
+                             for item in claim.support)]
+    if borrowed_dates:
+        violated.append(ResearchRule.DATES_SEPARATE)
+        findings.append(ResearchFinding(
+            rule=ResearchRule.DATES_SEPARATE,
+            detail=f"{borrowed_dates[0].claim[:60]} cites a source whose publication "
+                   f"date is its retrieval date; that is a fetch time used as a date"))
+    else:
+        satisfied.append(ResearchRule.DATES_SEPARATE)
+
+    # 4. primary sources are preferred where a primary source exists.
+    graded = [item for item in report.observations if item.grade.citable]
+    if graded and not any(item.grade is SourceGrade.PRIMARY for item in graded):
+        findings.append(ResearchFinding(
+            rule=ResearchRule.PRIMARY_FIRST, blocking=False,
+            detail="no primary source was collected; every source is commentary"))
+        violated.append(ResearchRule.PRIMARY_FIRST)
+    else:
+        satisfied.append(ResearchRule.PRIMARY_FIRST)
+
+    # 5. material claims are corroborated, or labelled.
+    audited = report if report.audit is not None else audit_web_report(report)
+    thin = [claim for claim in (audited.claims if audited.claims else report.claims)
+            if claim.material and claim.status is ClaimStatus.SINGLE_SOURCE
+            and threshold > 1]
+    if thin:
+        findings.append(ResearchFinding(
+            rule=ResearchRule.CORROBORATE, blocking=False,
+            detail=f"{thin[0].claim[:70]} rests on one source; it is labelled, not "
+                   f"called corroborated"))
+        violated.append(ResearchRule.CORROBORATE)
+    else:
+        satisfied.append(ResearchRule.CORROBORATE)
+
+    # 6. failures and contradictions are reported, not omitted.
+    if report.failures:
+        satisfied.append(ResearchRule.REPORT_FAILURES)
+        unreported = [claim for claim in report.claims
+                      if claim.contradicts and not any(
+                          item.claim == claim.claim for item in report.contradictions)]
+        if unreported:
+            violated.append(ResearchRule.REPORT_FAILURES)
+            findings.append(ResearchFinding(
+                rule=ResearchRule.REPORT_FAILURES,
+                detail=f"{unreported[0].claim[:60]} has a contradicting source that was "
+                       f"not written up as a contradiction"))
+    elif any(claim.contradicts for claim in report.claims):
+        violated.append(ResearchRule.REPORT_FAILURES)
+        findings.append(ResearchFinding(
+            rule=ResearchRule.REPORT_FAILURES,
+            detail="a claim lists a contradicting source, but no contradiction was "
+                   "recorded for it"))
+    else:
+        satisfied.append(ResearchRule.REPORT_FAILURES)
+
+    # 7. the acceptance criterion itself.
+    audit = audited.audit or ReportAudit(worker_id=report.worker_id)
+    if not audit.accepted:
+        findings.append(ResearchFinding(
+            detail=(f"{audit.material_sourced}/{audit.material_claims} material claim(s) "
+                    f"have a retrievable source; the rest must be labelled or omitted")))
+    coverage = audit.coverage
+    # Only the rules this brief asked for count towards approval: a brief that waives
+    # corroboration should not be failed for the lack of it.
+    checked = list(brief.rules) if brief is not None else list(ResearchRule)
+    blocking = [item for item in findings if item.blocking
+                and (item.rule is None or item.rule in checked)]
+    approved = not blocking
+    violated = [rule for rule in dict.fromkeys(violated) if rule in checked]
+    satisfied = [rule for rule in dict.fromkeys(satisfied)
+                 if rule in checked and rule not in violated]
+    guidance = ("the report meets the source-aware contract" if approved
+                else _guidance_for(blocking))
+    return ResearchReview(
+        worker_id=report.worker_id, approved=approved, findings=findings,
+        satisfied=satisfied, violated=violated, checked=checked,
+        claim_coverage=coverage, guidance=guidance)
+
+
+_GUIDANCE: dict[ResearchRule, str] = {
+    ResearchRule.PRIMARY_FIRST: "read the vendor's advisory, release notes or CVE record "
+                                "before the commentary on it",
+    ResearchRule.CORROBORATE: "find an independent second origin — a different "
+                              "registrable domain — before calling a claim corroborated",
+    ResearchRule.EXACT_EXCERPT: "quote the exact sentence you rely on, word for word, for "
+                                "every claim",
+    ResearchRule.DATES_SEPARATE: "report the source's stated publication date separately "
+                                 "from the date you fetched it",
+    ResearchRule.NO_SNIPPET_PROOF: "open the page a snippet came from and quote it, or mark "
+                                   "the claim unsupported",
+    ResearchRule.REPORT_FAILURES: "write up the sources you could not read, and every "
+                                  "source that contradicts another",
+}
+
+
+def _guidance_for(findings: Sequence["ResearchFinding"]) -> str:
+    """The retry instruction: the remedy for the first thing that blocked the pass."""
+
+    if not findings:
+        return "re-run the unit and return only sourced rows"
+    named = next((item for item in findings if item.rule is not None), None)
+    if named is not None:
+        return _GUIDANCE.get(named.rule, named.detail)          # type: ignore[arg-type]
+    return ("label every claim you cannot source, or drop it: a material claim needs at "
+            "least one retrievable source reference")
+
+
+def report_from_payload(payload: Mapping[str, Any]) -> ResearchReport | None:
+    """The research report inside a Worker outcome's payload, if there is one."""
+
+    raw = payload.get("research_report") if isinstance(payload, Mapping) else None
+    if not raw:
+        return None
+    try:
+        return ResearchReport.model_validate(raw)
+    except Exception:
+        return None
+
+
+def evidence_from_report(report: ResearchReport, *,
+                         worker: str = "") -> list[EvidenceItem]:
+    """Turn an audited report into the mission's evidence items.
+
+    One observation per *observable* :class:`SourceObservation`, carrying the exact
+    excerpt, both dates, the normalised URL beside the original, and the grade in
+    its tags — so what reaches synthesis is already provenance-complete.  A source
+    that could not be read becomes a gap-bearing evidence item rather than nothing.
+    """
+
+    produced: list[EvidenceItem] = []
+    for observation in report.observations:
+        source = SourceReference(
+            kind=(SourceKind.SEARCH_ENGINE
+                  if observation.grade is SourceGrade.SEARCH_RESULT
+                  else SourceKind.PUBLIC_WEB),
+            url=observation.url.original or None,
+            title=observation.title[:200] or None,
+            publisher=observation.publisher[:120] or None,
+            published_at=observation.published_at,
+            retrieved_at=observation.retrieved_at,
+            retrieval_method=RetrievalMethod.HTTP,
+            http_status=observation.status,
+            content_hash=(HashRecord(algorithm="sha256", value=observation.content_sha256,
+                                     size_bytes=len(observation.excerpt))
+                          if observation.content_sha256 else None),
+            excerpt=observation.excerpt[:160] or None,
+            access_note=(f"normalised from {observation.url.original}"
+                         if observation.url.changed else None),
+        )
+        produced.append(EvidenceItem(
+            kind=EvidenceKind.OBSERVATION, statement=observation.statement,
+            sources=[source], confidence=Confidence.LOW,
+            confidence_basis=(f"one {observation.grade.value} source, quoted exactly; "
+                              f"published "
+                              + (observation.published_at.date().isoformat()
+                                 if observation.published_at else "date not stated")
+                              + f", retrieved {observation.retrieved_at.date().isoformat()}"),
+            collected_by=worker or report.worker_id or observation.tool,
+            tags=["research", observation.grade.value, observation.tool]))
+    for failure in report.failures:
+        produced.append(EvidenceItem(
+            kind=EvidenceKind.OBSERVATION,
+            statement=(f"{failure.url.labelled or 'a source'} could not be read "
+                       f"({failure.outcome.value})"
+                       + (f": {failure.detail[:120]}" if failure.detail else "")),
+            sources=[SourceReference(kind=SourceKind.PUBLIC_WEB,
+                                     url=failure.url.original or None,
+                                     title=None, retrieved_at=failure.attempted_at,
+                                     retrieval_method=RetrievalMethod.UNKNOWN,
+                                     http_status=failure.status,
+                                     missing=failure.gap)],
+            confidence=Confidence.UNKNOWN,
+            confidence_basis="the source was attempted and failed; nothing was read",
+            collected_by=worker or report.worker_id, tags=["research", "access-failure"]))
+    return produced
+
+
+
+
+# -- the scripted mission the self-test and the demo share ------------------
+
+#: Four pages about one fabricated advisory: a first-party bulletin, the CVE
+#: record, independent commentary, and a search page that only has snippets.  Two
+#: of them agree with the claim, one of them contradicts it, and one source will
+#: refuse to be read — which is exactly the material the checks need.
+_RESEARCH_PAGES: dict[str, dict[str, str]] = {
+    "https://example.com/advisory-2026-01": {
+        "title": "Advisory 2026-01 — header parsing",
+        "publisher": "example.com",
+        "text": ("Advisory 2026-01 was published on 2026-02-03. The proxy component "
+                 "fixed a header parsing flaw in version 4.2.1. Operators should "
+                 "upgrade to 4.2.1 or later. The advisory credits an external reporter."),
+    },
+    "https://nvd.nist.gov/vuln/detail/CVE-2026-1417": {
+        "title": "CVE-2026-1417",
+        "publisher": "NIST",
+        "text": ("CVE-2026-1417 records a header parsing flaw fixed in the 4.2.1 "
+                 "release of the proxy component. The record was published on "
+                 "2026-02-05 and references the vendor advisory."),
+    },
+    "https://theregister.com/2026/02/06/proxy-flaw": {
+        "title": "Proxy flaw fixed quietly",
+        "publisher": "The Register",
+        "text": ("The proxy component shipped a fix for a header parsing flaw in "
+                 "version 4.3.0, the vendor's release notes suggest, a fortnight after "
+                 "the advisory was published."),
+    },
+    "https://www.google.com/search?q=example.com+proxy+flaw": {
+        "title": "example.com proxy flaw — search",
+        "publisher": "Google",
+        "text": ("example.com proxy flaw fixed in 4.2.1. example.com advisory 2026-01 "
+                 "header parsing. Upgrade guide and release notes for the proxy."),
+    },
+}
+
+
+def research_demo_scope() -> "Scope":
+    """The hosts the scripted research mission may read."""
+
+    return Scope(entries=[ScopeEntry(pattern=host) for host in
+                          ("example.com", "nvd.nist.gov", "theregister.com", "google.com")])
+
+
+def research_demo_pages() -> list[ResearchPage]:
+    """The fetched pages, normalised and graded, as a collector would hand them over."""
+
+    return [ResearchPage(url=normalise_url(url), title=data["title"],
+                         publisher=data["publisher"], text=data["text"],
+                         status=200)
+            for url, data in _RESEARCH_PAGES.items()]
+
+
+def research_demo_report() -> ResearchReport:
+    """One Worker's report: sourced claims, a contradiction, a failure and a snippet.
+
+    Deliberately imperfect.  One claim is well sourced (two independent origins), one
+    rests on a single primary source, one is supported only by a search page, and one
+    has nothing behind it at all — so the audit has something to label and something
+    to omit, and the demo shows the difference.
+    """
+
+    observations = observations_from_pages(research_demo_pages(), worker="w-advisory")
+    by_host = {observation.url.host: observation for observation in observations}
+    advisory = by_host["example.com"]
+    record = by_host["nvd.nist.gov"]
+    press = by_host["theregister.com"]
+    search = by_host["www.google.com"] if "www.google.com" in by_host else by_host["google.com"]
+    return ResearchReport(
+        worker_id="w-advisory", subagent_id="sa-exposure",
+        objective="establish which version fixed the header parsing flaw",
+        observations=observations,
+        queries=primary_first_queries("example.com proxy header parsing flaw"),
+        claims=[
+            ResearchClaim(claim="the header parsing flaw was fixed in version 4.2.1",
+                          support=[advisory.id, record.id]),
+            ResearchClaim(claim="the advisory credited an external reporter",
+                          support=[advisory.id]),
+            ResearchClaim(claim="the fix was shipped without a public advisory",
+                          support=[advisory.id], contradicts=[press.id]),
+            ResearchClaim(claim="the flaw affects every release before 5.0",
+                          support=[search.id]),
+            ResearchClaim(claim="an unlisted fifth component is also affected", support=[]),
+        ],
+        failures=[
+            AccessFailure(url=normalise_url("https://example.com/downloads/proxy.tar.gz"),
+                          outcome=AccessOutcome.BLOCKED, status=403,
+                          detail="the server refused the request; downloads are outside "
+                                 "this mission's policy",
+                          worker="w-advisory", retryable=False),
+            AccessFailure(url=normalise_url("https://nvd.nist.gov/api/cve/CVE-2026-1417"),
+                          outcome=AccessOutcome.RATE_LIMITED, status=429,
+                          detail="rate limited after 3 requests",
+                          worker="w-advisory", retryable=True),
+        ],
+        contradictions=[
+            Contradiction(
+                claim="the fix was shipped without a public advisory",
+                left="the advisory states it was published on 2026-02-03",
+                right="commentary says the fix arrived quietly in 4.3.0",
+                about="whether the fix was announced",
+                reconciled_by="the two sources describe different releases"),
+        ],
+        finished_at=utc_now())
+
+
+def research_demo() -> dict[str, Any]:
+    """The scripted report, audited and reviewed, plus what never became a source."""
+
+    scope = research_demo_scope()
+    brief = ResearchBrief.for_subject("example.com proxy header parsing flaw")
+    raw_results = [
+        {"url": "https://www.google.com/search?q=example.com+proxy+flaw", "snippet": "a result"},
+        {"url": "https://example.com/advisory-2026-01?utm_source=twitter", "has_full_text": True},
+        {"url": "https://bit.ly/proxyfix"},
+        {"url": "https://evil.example.org/scrape", "has_full_text": True},
+        {"url": "http://example.com./advisory-2026-01/#section-2", "has_full_text": True},
+        {"url": "https://nvd.nist.gov/vuln/detail/CVE-2026-1417", "has_full_text": True},
+        {"url": "https://theregister.com/2026/02/06/proxy-flaw", "has_full_text": True},
+    ]
+    harvested, drops = harvest_results(raw_results, scope=scope)
+    report = audit_web_report(research_demo_report())
+    review = research_review(report, brief=brief)
+    evidence = evidence_from_report(report)
+    return {
+        "brief": brief.to_dict(),
+        "harvested": [{"url": url.labelled, "canonical": url.canonical,
+                       "grade": grade.value, "changed": url.changed,
+                       "original": url.original}
+                      for url, grade in harvested],
+        "drops": [drop.describe() for drop in drops],
+        "normalisations": [normalise_url(item).describe() for item in
+                           ("https://WWW.Example.com:443/a/b/?utm_source=x&id=7#frag",
+                            "http://example.com", "https://theregister.com/x/?ref=tw")],
+        "report": report.model_dump(mode="json"),
+        "audit": report.audit.to_dict() if report.audit else {},
+        "review": review.model_dump(mode="json"),
+        "claims": [claim.to_dict() for claim in report.claims],
+        "observation": report.observations[0].to_dict(),
+        "evidence": len(evidence),
+        "gaps": [gap.model_dump(mode="json") for gap in report.gaps],
+        "queries": brief.queries,
+    }
+
+
+def render_research_demo(payload: Mapping[str, Any]) -> Group:
+    """The demo on screen: what was collected, what was said, and what was labelled."""
+
+    collection = Table(title="collection — normalised, deduplicated, graded",
+                       title_justify="left", box=None, pad_edge=False)
+    collection.add_column("source", overflow="fold")
+    collection.add_column("grade", no_wrap=True)
+    collection.add_column("normalised", overflow="fold")
+    for item in payload["harvested"]:
+        collection.add_row(escape(item["url"]), escape(item["grade"]),
+                           escape(item["canonical"] if item["changed"] else "—"))
+    for item in payload["drops"]:
+        collection.add_row(escape(item[:70]), "[dim]dropped[/dim]", "[dim]—[/dim]")
+
+    claims = Table(title="claims — what each one is entitled to say",
+                   title_justify="left", box=None, pad_edge=False)
+    claims.add_column("claim", overflow="fold")
+    claims.add_column("status", no_wrap=True)
+    claims.add_column("basis", overflow="fold")
+    for item in payload["claims"]:
+        colour = {"corroborated": "green", "supported": "green",
+                  "contradicted": "yellow", "single-source": "yellow"}.get(
+                      item["status"], "red")
+        claims.add_row(escape(item["claim"][:70]),
+                       f"[{colour}]{escape(item['status'])}[/{colour}]",
+                       escape(item["basis"][:88]))
+
+    audit = payload["audit"]
+    review = payload["review"]
+    summary = Text(
+        f"\n{audit.get('claims', 0)} claim(s) · material sourced "
+        f"{audit.get('material_sourced', 0)}/{audit.get('material_claims', 0)} "
+        f"({audit.get('coverage', 0):.0%}) · {len(audit.get('omitted') or [])} omitted · "
+        f"{len(audit.get('labelled') or [])} labelled\n"
+        f"{audit.get('failures', 0)} access failure(s) · "
+        f"{audit.get('contradictions', 0)} contradiction(s) · "
+        f"{audit.get('undated_sources', 0)} undated source(s) · "
+        f"{audit.get('search_snippets', 0)} snippet(s)\n"
+        f"reviewer: {review.get('approved') and 'approved' or 'revise'} — "
+        f"{review.get('guidance', '')[:110]}", style="dim")
+    return Group(collection, Text(""), claims, summary)
+
+
+def render_research_report(payload: Mapping[str, Any]) -> Group:
+    """One audited report on screen: its observations, its claims and its gaps."""
+
+    rows: list[Any] = []
+    observations = Table(title="observations — quoted, dated, graded",
+                         title_justify="left", box=None, pad_edge=False)
+    observations.add_column("source", overflow="fold")
+    observations.add_column("grade", no_wrap=True)
+    observations.add_column("published", no_wrap=True)
+    observations.add_column("excerpt", overflow="fold")
+    for item in payload["report"].get("observations", []):
+        url = item.get("url") or {}
+        observations.add_row(escape(url.get("labelled") or url.get("original", "")),
+                             escape(item.get("grade", "")),
+                             escape((item.get("published_at") or "undated")[:10]),
+                             escape((item.get("excerpt") or "")[:70]))
+    rows.append(observations)
+
+    claims = Table(title="claims", title_justify="left", box=None, pad_edge=False)
+    claims.add_column("status", no_wrap=True)
+    claims.add_column("claim", overflow="fold")
+    for item in payload["claims"]:
+        claims.add_row(escape(item["status"]), escape(item["labelled"][:100]))
+    rows.append(claims)
+
+    if payload["gaps"]:
+        rows.append(Text("\ngaps reported:", style="dim"))
+        for gap in payload["gaps"][:6]:
+            rows.append(Text(f"  · {gap.get('detail', '')[:110]}", style="dim"))
+    rows.append(Text(f"\n{payload['audit'].get('describe', '')}", style="dim"))
+    return Group(*rows)
+
+
+class ResearchRunner(DeterministicRunner):
+    """The deterministic runner, except its first Worker files a research report.
+
+    The report is the scripted one: two well-sourced claims, one snippet-only claim
+    and one with nothing behind it.  Wrapping the ordinary runner keeps the demo's
+    flow identical to a real mission — the only difference is what the Worker
+    returned, which is exactly what the source-aware review is for.
+    """
+
+    def __init__(self, *, report: ResearchReport | None = None, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.report = report or research_demo_report()
+        self.attached: list[str] = []
+
+    def run_worker(self, subagent: FlowSubagent, worker: FlowWorker, *,
+                   attempt: int, guidance: str = "") -> WorkerOutcome:
+        outcome = super().run_worker(subagent, worker, attempt=attempt, guidance=guidance)
+        if self.attached or outcome.failed:
+            return outcome
+        self.attached.append(worker.id)
+        report = self.report.model_copy(update={"worker_id": worker.id,
+                                               "subagent_id": subagent.id})
+        payload = dict(outcome.payload)
+        payload["research_report"] = json.loads(model_to_json(report))
+        return outcome.model_copy(update={"payload": payload})
+
+
+def render_research_self_test(checks: Sequence[Any]) -> Any:
+    table = Table(title="research self-test", title_justify="left", box=None, pad_edge=False)
+    table.add_column("", width=2)
+    table.add_column("check", no_wrap=True)
+    table.add_column("detail", overflow="fold")
+    for check in checks:
+        glyph, colour = ("✔", "green") if check.ok else ("✘", "red")
+        table.add_row(f"[{colour}]{glyph}[/{colour}]", escape(check.name),
+                      escape(check.detail))
+    return table
+
+
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 29b. Proving the research behaviour: sources, dates, quotes, and the audit
+# ══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True)
+class ResearchCheck:
+    """One claim about source-aware research, and the evidence for it."""
+
+    name: str
+    ok: bool
+    detail: str = ""
+
+
+def run_research_self_test() -> list[ResearchCheck]:
+    """Prove the acceptance criterion, and the five behaviours behind it.
+
+    The criterion is *every material web claim has at least one retrievable source
+    reference, and unsupported claims are labelled or omitted*; the checks below
+    test it directly, then test that each rule which makes it possible is enforced
+    mechanically rather than requested politely.
+    """
+
+    checks: list[ResearchCheck] = []
+
+    def add(name: str, ok: bool, detail: Any = "") -> None:
+        checks.append(ResearchCheck(name=name, ok=bool(ok), detail=str(detail)[:150]))
+
+    brief = ResearchBrief.for_subject("example.com proxy header parsing flaw")
+    scope = research_demo_scope()
+
+    # ---- 1. the vocabulary -------------------------------------------------
+    add("six research rules are defined", len(ResearchRule) == 6)
+    add("every rule has text", all(RESEARCH_RULES.get(rule) for rule in ResearchRule))
+    add("the brief carries every rule", set(ResearchRule) <= set(brief.rules), len(brief.rules))
+    add("the brief's checklist is quotable", all(":" in line for line in brief.checklist))
+    add("the brief prepares primary-first queries",
+        len(brief.queries) == 3 and "advisory" in brief.queries[0].lower(), brief.queries[:1])
+    add("the generic query comes last",
+        all("advisory" in query or "release notes" in query or "CVE" in query
+            or "documentation" in query for query in brief.queries))
+    add("a brief cannot be extended with an unknown field", not _constructs(
+        ResearchBrief, subject="x y z", escalate=True))
+    add("a brief is immutable", _immutable(brief))
+    add("the prompt states both dates must be separate",
+        "separate facts" in brief.system_prompt())
+    add("the prompt forbids snippet-as-proof",
+        "pointer" in brief.system_prompt().lower())
+
+    # ---- 2. URL normalisation preserves the original -----------------------
+    messy = normalise_url("https://WWW.Example.com:443/a/b/?utm_source=x&id=7#frag")
+    add("normalisation strips the fragment and tracking parameters",
+        messy.canonical == "https://example.com/a/b?id=7", messy.canonical)
+    add("normalisation preserves the original string", messy.original.startswith("https://WWW"))
+    add("normalisation explains itself", len(messy.normalisations) >= 3,
+        messy.normalisations)
+    add("normalisation keeps a meaningful query parameter", "id=7" in messy.canonical)
+    add("http is not silently promoted to https",
+        normalise_url("http://example.com/a").canonical.startswith("http://"))
+    add("the path keeps its case", normalise_url("https://example.com/A").path == "/A")
+    add("a shortener is flagged as one", normalise_url("https://bit.ly/x").shortener)
+    add("an archive URL is graded as a copy",
+        grade_for("https://web.archive.org/web/2026/https://example.com/")
+        is SourceGrade.TERTIARY)
+    add("the registrable domain ignores a subdomain",
+        normalise_url("https://news.example.co.uk/a").domain == "example.co.uk")
+    add("two links to one page compare equal",
+        normalise_url("https://example.com/a/?utm_campaign=z").key
+        == normalise_url("https://example.com/a").key)
+    add("the same document over http and https is one source after harvesting",
+        len(harvest_results([{"url": "https://example.com/a", "has_full_text": True},
+                             {"url": "http://example.com/a", "has_full_text": True}],
+                            scope=scope)[0]) == 1)
+
+    # ---- 3. grading, and snippets -----------------------------------------
+    add("a first-party bulletin grades primary",
+        grade_for("https://example.com/advisory") is SourceGrade.PRIMARY)
+    add("a CVE record grades primary",
+        grade_for("https://nvd.nist.gov/vuln/detail/CVE-2026-1") is SourceGrade.PRIMARY)
+    add("independent reporting grades secondary",
+        grade_for("https://theregister.com/x") is SourceGrade.SECONDARY)
+    add("an unvetted host grades unknown",
+        grade_for("https://unknown-host.test/page") is SourceGrade.UNKNOWN)
+    add("a search engine grades as a search result",
+        grade_for("https://google.com/search?q=x") is SourceGrade.SEARCH_RESULT)
+    add("a search result is not citable", not SourceGrade.SEARCH_RESULT.citable)
+    add("a primary source outranks commentary",
+        SourceGrade.PRIMARY.rank > SourceGrade.SECONDARY.rank > SourceGrade.TERTIARY.rank)
+    harvested, drops = harvest_results(
+        [{"url": "https://google.com/search?q=x", "snippet": "a claim"},
+         {"url": "https://example.com/a", "has_full_text": True},
+         {"url": "https://bit.ly/x"}, {"url": "https://evil.example.org/x"}],
+        scope=scope)
+    add("a snippet is kept as a pointer", any(grade is SourceGrade.SEARCH_RESULT
+                                              for _url, grade in harvested))
+    add("a shortener is dropped, not followed",
+        any("shortener" in drop.reason for drop in drops))
+    add("an off-scope result is dropped",
+        any("scope" in drop.reason for drop in drops))
+    add("primary sources are harvested first",
+        harvested[0][1].rank >= harvested[-1][1].rank, [g.value for _u, g in harvested])
+
+    # ---- 4. exact excerpts -------------------------------------------------
+    page = research_demo_pages()[0]
+    observations = observations_from_pages([page])
+    add("an observation quotes its page", observations[0].excerpt_in(page.text))
+    add("the quote is located in the page", observations[0].excerpt_offset is not None)
+    add("a paraphrase does not verify",
+        not observations[0].model_copy(
+            update={"excerpt": "the vendor says it fixed things"}).excerpt_in(page.text))
+    add("an observation is traceable", observations[0].traceable)
+    add("an observation records the body digest",
+        len(observations[0].content_sha256) == 64)
+    add("an excerpt is a contiguous span, not a summary",
+        best_excerpt(page.text)[0] in " ".join(page.text.split()))
+    add("a page with no text still yields an observation",
+        len(observations_from_pages([ResearchPage(url=normalise_url(
+            "https://example.com/empty"), title="Empty", text="")])) == 1)
+
+    # ---- 5. publication is not retrieval -----------------------------------
+    dated = observations[0]
+    add("the two dates are separate fields",
+        dated.published_at is not None and dated.retrieved_at is not None
+        and dated.published_at != dated.retrieved_at)
+    add("the publication date came from the page",
+        dated.published_at.date().isoformat() == "2026-02-03", dated.published_at)
+    add("the retrieval date is today-ish",
+        abs((utc_now() - dated.retrieved_at).total_seconds()) < 120)
+    undated = observations_from_pages([ResearchPage(
+        url=normalise_url("https://example.com/nodate"), title="No date",
+        text="This page says a great many things about the proxy and none of them "
+             "include when it was written down or published anywhere.")])[0]
+    add("a page that states no date is reported undated", not undated.dated)
+    add("an undated page does not borrow the fetch time",
+        undated.published_at is None and undated.retrieved_at is not None)
+    add("a future date is not accepted as a publication date",
+        published_at_from("article:published_time 2099-01-01T00:00:00Z")[0] is None)
+    add("a modification date is not used as a publication date",
+        updated_at_from("article:modified_time 2026-03-01T00:00:00Z")[0] is not None
+        and published_at_from("article:modified_time 2026-03-01T00:00:00Z")[0] is None)
+
+    # ---- 6. corroboration and the audit ------------------------------------
+    report = research_demo_report()
+    audited = audit_web_report(report)
+    by_claim = {claim.claim: claim for claim in audited.claims}
+    strong = by_claim.get("the header parsing flaw was fixed in version 4.2.1")
+    add("two independent origins corroborate a claim",
+        strong is not None and strong.status is ClaimStatus.CORROBORATED,
+        strong.status if strong else None)
+    add("the corroborated claim is labelled as such",
+        strong is not None and "corroborated" in strong.labelled.lower())
+    single = by_claim.get("the advisory credited an external reporter")
+    add("one primary source supports a claim without claiming corroboration",
+        single is not None and single.status is ClaimStatus.SUPPORTED, single.status)
+    contradicted = by_claim.get("the fix was shipped without a public advisory")
+    add("a contradicted claim is reported rather than resolved",
+        contradicted is not None and contradicted.status is ClaimStatus.CONTRADICTED)
+    add("the contradiction carries both sides",
+        any(item.claim == "the fix was shipped without a public advisory"
+            for item in audited.contradictions))
+    add("a snippet-only claim is omitted, not published",
+        not any("every release before 5.0" in claim.claim for claim in audited.claims))
+    add("the omitted claim is recorded in the audit",
+        any("every release before 5.0" in claim for claim in audited.audit.omitted),
+        audited.audit.omitted[:1])
+    add("a claim with no source at all is omitted",
+        not any("fifth component" in claim.claim for claim in audited.claims))
+    add("the audit states the acceptance criterion",
+        "retrievable source reference" in audited.audit.criterion)
+    add("the audit's verdict is honest about the shortfall",
+        audited.audit.accepted is False and audited.audit.coverage < 1.0,
+        audited.audit.coverage)
+    add("access failures are reported as gaps",
+        len(audited.gaps) >= 2 and all(gap.detail for gap in audited.gaps))
+    add("a rate-limited failure is marked retryable",
+        any(failure.retryable for failure in audited.failures))
+    add("the audit counts the failures it saw",
+        audited.audit.failures == len(audited.failures))
+
+    # every published material claim has a retrievable reference
+    published = [claim for claim in audited.claims if claim.material]
+    add("every published material claim has a retrievable source",
+        all(claim.support for claim in published), len(published))
+    add("no published claim rests only on a search result",
+        all(not all((audited.by_id.get(item) is not None
+                     and audited.by_id[item].grade is SourceGrade.SEARCH_RESULT)
+                    for item in claim.support) for claim in published))
+
+    # ---- 7. the reviewer ---------------------------------------------------
+    review = research_review(audited, brief=brief)
+    add("the reviewer rejects a report with an unsourced material claim",
+        review.approved is False and review.blocking, review.describe())
+    add("the reviewer names the rule it broke",
+        any(finding.blocking for finding in review.findings))
+    add("the reviewer tells the Worker what to do next", bool(review.guidance))
+    add("the reviewer measures coverage", 0.0 <= review.claim_coverage <= 1.0,
+        review.claim_coverage)
+    clean = audit_web_report(ResearchReport(
+        worker_id="w-clean", observations=observations_from_pages(research_demo_pages()[:3]),
+        claims=[ResearchClaim(claim="the header parsing flaw was fixed in 4.2.1",
+                              support=[item.id for item in
+                                       observations_from_pages(research_demo_pages()[:2])])]))
+    clean_review = research_review(clean, brief=brief)
+    add("the reviewer approves a fully sourced report", clean_review.approved,
+        clean_review.describe())
+    add("a waived rule is not enforced",
+        research_review(audited, brief=ResearchBrief.for_subject(
+            "example.com flaw", rules=[ResearchRule.PRIMARY_FIRST]))
+        .checked == [ResearchRule.PRIMARY_FIRST])
+    fake = audit_web_report(ResearchReport(
+        worker_id="w-fake", observations=observations_from_pages(research_demo_pages()),
+        claims=[ResearchClaim(claim="a claim citing an observation that does not exist",
+                             support=["obs-not-a-real-id"])]))
+    add("a claim citing an unknown observation is refused by the reviewer",
+        not research_review(fake, brief=brief).approved)
+    add("a fabricated observation id cannot become support",
+        not fake.claims or all(item.status is ClaimStatus.UNSUPPORTED for item in fake.claims))
+
+    # ---- 8. a Worker cannot promote its own source -------------------------
+    promoted = SourceObservation(
+        url=normalise_url("https://unknown-host.test/x"), statement="a claim",
+        excerpt="a claim", grade=SourceGrade.PRIMARY)
+    regraded = audit_web_report(ResearchReport(
+        worker_id="w-promote", observations=[promoted],
+        claims=[ResearchClaim(claim="a claim resting on an unvetted host",
+                              support=[promoted.id])]))
+    add("a source cannot self-declare primary",
+        regraded.observations[0].grade is SourceGrade.UNKNOWN,
+        regraded.observations[0].grade)
+    add("a claim on an unvetted host is not publishable",
+        all(item.status is ClaimStatus.UNSUPPORTED for item in regraded.claims))
+
+    # ---- 9. evidence carries the provenance -------------------------------
+    items = evidence_from_report(audited, worker="w-advisory")
+    web = [item for item in items if "access-failure" not in item.tags]
+    add("every observation becomes evidence", len(web) == len(audited.observations),
+        len(web))
+    add("the evidence keeps the exact excerpt",
+        all(item.sources[0].excerpt for item in web))
+    add("the evidence keeps both dates",
+        all(item.sources[0].retrieved_at for item in web)
+        and any(item.sources[0].published_at for item in web))
+    add("the evidence records the grade in its tags",
+        all(any(tag in {grade.value for grade in SourceGrade} for tag in item.tags)
+            for item in web))
+    failures = [item for item in items if "access-failure" in item.tags]
+    add("an access failure becomes evidence with a gap",
+        failures and failures[0].sources[0].missing is not None)
+    add("the evidence cites the original URL, not only the normalised one",
+        all(item.sources[0].url for item in web))
+
+    # ---- 10. the flow applies it ------------------------------------------
+    context = _selftest_context("exposure")
+    flow = HierarchicalFlow(context=context,
+                            subagents=flow_units_for(context, "exposure"),
+                            runner=DeterministicRunner(scope=context.scope_entries))
+    flow.build()
+    worker = flow.subagents[0].workers[0]
+    add("the flow prepares a brief per Worker",
+        flow.research_brief(worker).rules == list(ResearchRule))
+    add("the brief is stable for the same Worker",
+        flow.research_brief(worker) is flow.research_brief(worker))
+    add("research-first is on by default", FlowPolicy().research_first is True)
+    add("research-first can be switched off",
+        FlowPolicy(research_first=False).research_first is False)
+    result = flow.run()
+    add("the flow's result reports the research audit",
+        "workers" in result.research and "audits" in result.research,
+        sorted(result.research))
+    add("a run with no research reports audits nothing",
+        result.research.get("workers") == 0, result.research.get("workers"))
+
+    # a Worker that *does* file a report: the audit and the review must both run
+    research_flow = HierarchicalFlow(
+        context=context, subagents=flow_units_for(context, "exposure"),
+        runner=ResearchRunner(scope=context.scope_entries))
+    research_flow.build()
+    researched = research_flow.run()
+    add("a Worker's research report is audited by the flow",
+        researched.research.get("workers", 0) >= 1, researched.research.get("workers"))
+    audited_some = researched.research.get("audits") or {}
+    add("the audit travels with the result",
+        bool(audited_some) and all("material_claims" in audit
+                                   for audit in audited_some.values()),
+        list(audited_some)[:2])
+    add("the flow counts what the audits found",
+        researched.research.get("material_claims", 0) > 0,
+        researched.research.get("material_claims"))
+    add("an unsourced material claim keeps the report from being approved",
+        researched.research.get("approved", 0) < researched.research.get("workers", 1),
+        f"approved={researched.research.get('approved')} of "
+        f"{researched.research.get('workers')}")
+    skipped = HierarchicalFlow(
+        context=context, subagents=flow_units_for(context, "exposure"),
+        runner=ResearchRunner(scope=context.scope_entries),
+        policy=FlowPolicy(research_first=False)).build().run()
+    add("with research-first off the report is not audited",
+        skipped.research.get("workers", 0) == 0, skipped.research.get("workers"))
+    # The review instruction is what a retry acts on, so it has to be carried by the
+    # graph's verdict — a source finding that only reached the audit would be advice
+    # nobody read.
+    reviewed = [item for item in researched.trace if item.get("stage") == "worker-review"]
+    add("a source-aware rejection shows in the graph's review stage",
+        any("revise" in str(item.get("detail", "")) for item in reviewed),
+        [item.get("detail") for item in reviewed][:2])
+    add("the rejected Worker was retried, not passed",
+        any("attempt 2" in str(item.get("detail", "")) for item in reviewed),
+        [item.get("detail") for item in reviewed])
+    add("the retried Worker's reports are all still audited",
+        researched.research.get("workers") == 1)
+
+    # ---- 11. the source text carries the rules ----------------------------
+    span = _source_section("# 29. Source-aware web research", "# 29b. Proving the research")
+    for name, violation in (
+        ("the research section never treats a snippet as a source", "snippet_is_evidence"),
+        ("the research section never writes retrieved_at into published_at",
+         "published_at=self.retrieved_at"),
+        ("the research section never parses a date from the current time",
+         "published_at=utc_now()"),
+        ("the research section never follows a shortener", "follow_shortener"),
+    ):
+        _source_check(name, violation, section="# 29. Source-aware web research",
+                      end="# 29b. Proving the research", add=add)
+    add("the research section has no HTTP client of its own",
+        bool(span) and "import httpx" not in span and "requests.get" not in span)
+    return checks
+
+
+
+
+@app.command("research", help="Source-aware web research: primary sources, exact quotes, honest gaps.")
+def research_command(
+    self_test: bool = typer.Option(False, "--self-test",
+                                   help="Prove the source-aware contract offline."),
+    demo: bool = typer.Option(False, "--demo",
+                              help="Audit a scripted report: what is corroborated, labelled, omitted."),
+    subject: str | None = typer.Option(None, "--subject", "-s",
+                                       help="What the Worker must establish.", show_default=False),
+    url: list[str] = typer.Option([], "--url",
+                                  help="A page to treat as fetched and quote from."),
+    scope_entry: list[str] = typer.Option([], "--scope", help="Approved host(s). Repeatable."),
+    normalize: list[str] = typer.Option([], "--normalize",
+                                        help="Normalise these URLs and show the result."),
+    limit: int = typer.Option(3, "--limit", help="Prepared queries."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Teach the research Workers what a claim is allowed to stand on."""
+
+    console = get_console()
+
+    if self_test:
+        checks = run_research_self_test()
+        failures = [check for check in checks if not check.ok]
+        if as_json:
+            _emit(json.dumps({"ok": not failures,
+                              "checks": [asdict(check) for check in checks]}, indent=2))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        console.print()
+        console.print(render_research_self_test(checks))
+        colour = "green" if not failures else "red"
+        console.print(f"\n[{colour}]{len(checks) - len(failures)} passed[/] · "
+                      f"{len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    if demo:
+        payload = research_demo()
+        if as_json:
+            _emit(json.dumps(payload, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(render_research_demo(payload))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    if normalize:
+        rows: list[dict[str, Any]] = []
+        for item in normalize:
+            normalised = normalise_url(item)
+            rows.append({"original": normalised.original,
+                         "canonical": normalised.canonical,
+                         "changed": normalised.changed,
+                         "grade": grade_for(normalised).value,
+                         "normalisations": normalised.normalisations})
+        if as_json:
+            _emit(json.dumps({"normalised": rows}, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        table = Table(title="url normalisation", title_justify="left", box=None,
+                      pad_edge=False)
+        table.add_column("original", overflow="fold")
+        table.add_column("canonical", overflow="fold")
+        table.add_column("grade", no_wrap=True)
+        table.add_column("removed", overflow="fold")
+        for row in rows:
+            table.add_row(escape(row["original"]), escape(row["canonical"]),
+                          escape(row["grade"]), escape(", ".join(row["normalisations"]) or "—"))
+        console.print(table)
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    if not subject:
+        console.print("[red]✘[/red] name a subject with --subject, or use --demo/"
+                      "--self-test/--normalize")
+        raise typer.Exit(ExitCode.USAGE)
+
+    try:
+        brief = ResearchBrief.for_subject(subject, max_queries=limit)
+    except Exception as exc:                     # a subject too short to research
+        console.print(f"[red]✘[/red] the subject is not usable: {escape(str(exc)[:120])}")
+        raise typer.Exit(ExitCode.USAGE) from None
+    scope = (Scope(entries=[ScopeEntry(pattern=entry) for entry in scope_entry])
+             if scope_entry else None)
+    pages: list[ResearchPage] = []
+    for item in url:
+        if scope is not None and not scope.covers(item):
+            console.print(f"[red]✘[/red] {escape(item[:100])} is outside the authorised "
+                          f"scope; it was not fetched")
+            raise typer.Exit(ExitCode.USAGE)
+        # No network here: a page given on the command line is quoted as provided, and
+        # its text is whatever the operator pasted alongside it.
+        pages.append(ResearchPage(url=normalise_url(item), title=item.rsplit("/", 1)[-1],
+                                  text="", status=None))
+    report = ResearchReport(worker_id="cli", objective=subject,
+                            observations=observations_from_pages(pages),
+                            queries=brief.queries)
+    audited = audit_web_report(report)
+    review = research_review(audited, brief=brief)
+    payload = {"brief": brief.to_dict(), "report": json.loads(model_to_json(audited)),
+               "audit": audited.audit.to_dict() if audited.audit else {},
+               "review": json.loads(model_to_json(review)),
+               "claims": [claim.to_dict() for claim in audited.claims],
+               "gaps": [gap.model_dump(mode="json") for gap in audited.gaps]}
+    if as_json:
+        _emit(json.dumps(payload, indent=2, default=str))
+        raise typer.Exit(ExitCode.OK)
+    console.print()
+    console.print(render_research_report(payload))
+    console.print()
+    raise typer.Exit(ExitCode.OK)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 30. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 

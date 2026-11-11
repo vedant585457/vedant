@@ -19,6 +19,7 @@ python vedant_osint.py sched --self-test      # bounded queues, deadlines, licen
 python vedant_osint.py resume --self-test     # checkpointing and resumable missions
 python vedant_osint.py router --self-test     # the controlled capability router
 python vedant_osint.py browser --self-test    # browser research, guaranteed closure
+python vedant_osint.py research --self-test   # source-aware web research
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -550,6 +551,49 @@ python vedant_osint.py flow --demo exposure --browser                        # t
   text and the errors all reach the router's evidence, so "the page did not load"
   becomes a reported finding instead of an empty result.
 
+## Source-aware web research
+
+Reading a page is not the same as being entitled to report it. Research Workers
+get a `ResearchBrief` — six fixed rules plus primary-first queries — and what
+they return is audited before it can reach synthesis.
+
+```bash
+python vedant_osint.py research --self-test     # 96 source-aware checks, offline
+python vedant_osint.py research --demo          # what is corroborated, labelled, omitted
+python vedant_osint.py research --normalize "https://WWW.Example.com:443/a/?utm_source=x"
+python vedant_osint.py research --subject "example.com proxy flaw" --url https://example.com/a
+```
+
+- **Primary sources first.** Every source is graded from its *host* by a fixed
+  rule table — first-party advisories, CVE records and standards are `primary`;
+  independent reporting is `secondary`; aggregators and archives `tertiary`; a
+  search engine is `search-result` and never citable. The grade is *assigned*,
+  not accepted, so a Worker cannot promote its own source.
+- **Corroboration counts origins, not pages.** Two observations on one
+  registrable domain are one origin, and an archive copy is a copy of the page it
+  archived. A material claim needs two independent origins to be called
+  `corroborated`; with one, it is published as `single-source` and labelled.
+- **Quotes are checked, not trusted.** Every observation carries the exact span
+  it rests on, located in the fetched text — a paraphrase fails, a fabricated
+  quote cannot be cited, and the body's sha256 travels with it.
+- **Publication is not retrieval.** `published_at` comes from the page's own
+  markers or printed date — never from the fetch time, never from a *modified*
+  marker, never from a date in the future. A page that states nothing is reported
+  `undated` rather than backfilled.
+- **URL normalisation preserves the original.** Tracking parameters, fragments,
+  default ports, `www.` and alternate views are dropped for *comparison*; the
+  citation keeps the original string and every normalisation is listed. Shortener
+  links are dropped rather than followed, and `http`/`https` forms of one page
+  count as one source so a redirect cannot manufacture corroboration.
+- **Failures and contradictions are reported.** An unreadable source becomes an
+  `AccessFailure` and a gap; a disagreement becomes a `Contradiction` carrying
+  both sides — plus a note when the difference is explained by time.
+- **The criterion is a pass, not a hope.** `audit_web_report` re-assesses each
+  claim from its evidence and then *labels or omits* anything with nothing
+  retrievable behind it. `flow` runs that audit and the six-rule review on every
+  research report (`research_first`, on by default) and sends a failing Worker
+  back with the remedy.
+
 ## Status
 
 | Phase | Scope | State |
@@ -558,7 +602,7 @@ python vedant_osint.py flow --demo exposure --browser                        # t
 | 2 | Contracts — settings, `doctor`, preflight, models, state, renderer, lifecycle, resilience, model adapter | ✅ done |
 | 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control) |
 | 4 | Browser — browser-use / Playwright sessions and capture | 🟡 started (policy, scope, capture, guarded closure, agent mode) |
-| 5 | Collection — passive OSINT sources, artefact hashing | ⬜ |
+| 5 | Collection — passive OSINT sources, artefact hashing | 🟡 started (source-aware web research: grading, corroboration, dates, audit) |
 | 6 | Synthesis — cross-source correlation and reporting | ⬜ |
 | 7 | Operations — resume, budgets, audit trail, hardening | 🟡 started (checkpoints, resumable missions, capability router, budgets) |
 
