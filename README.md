@@ -30,6 +30,7 @@ python vedant_osint.py aggregate --self-test # reviewed work only, and never ear
 python vedant_osint.py review-master --self-test # five lenses, five ways to stop
 python vedant_osint.py loops --self-test      # repeated work, blocked lines, saturation
 python vedant_osint.py synthesis --self-test  # a report that cannot outrun its evidence
+python vedant_osint.py report --self-test     # Markdown, JSON and a bounded summary
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -1015,6 +1016,45 @@ python vedant_osint.py synthesis --demo                   # one claim, three evi
 python vedant_osint.py synthesis --reports mission.json   # assemble the document
 ```
 
+## Output formats
+
+A finished mission is written three ways, and they cannot disagree: Markdown for a person,
+JSON for a machine, and a bounded terminal summary for the screen. All three are views of
+one `MissionDossier` assembled from the reviewed record, so a fact that is not in the JSON
+is not in the Markdown either — the JSON is the authority and the other two are renderings.
+
+```
+python vedant_osint.py report --self-test                    # the four output clauses
+python vedant_osint.py report --demo                         # one mission, three formats
+python vedant_osint.py flow --demo exposure --json > m.json
+python vedant_osint.py report --mission m.json --out-dir out/ # writes m.md and m.json
+python vedant_osint.py report --reports mission.json -o "…"   # no graph run needed
+python vedant_osint.py report --mission m.json --summary      # screen only
+```
+
+- **Reports open correctly.** The Markdown is a real document: one title, twenty sections
+  in reading order, pipe tables whose rows are padded and whose cells escape `|`, and text
+  that cannot start a Markdown construct — an evidence statement is quoted input, and
+  quoted input must not be able to rewrite the report's structure.
+- **The JSON validates against the report model.** `MissionDossier.load` re-parses every
+  written record and refuses one that has drifted (`format_version`, a missing report, a
+  finding with no citation), and `MissionDossier.json_schema()` publishes the contract. A
+  file that is merely well-formed JSON is not a mission record.
+- **The terminal output stays concise.** The summary answers six questions and stops: what
+  was asked, what was found, how sure, what is missing, what it cost, why it ended. It has
+  a line budget and a width budget, both checked, and it never prints the evidence table.
+- **The sections behind the answer are sections.** Source register (one row per origin,
+  with its digest or an explicit "not hashed"), evidence table (every item, its weight, and
+  which findings cite it — uncited items are listed rather than removed), agent and task
+  execution (every Worker that ran, including runtime and follow-up Workers the plan never
+  knew about), errors, retry history (with a computed "changed / repeated" column), time
+  usage (both clocks, reconciled), and the stopping reason.
+- **Hashes and custody survive.** Every forensic artefact reaches the chain-of-custody
+  sheet with its algorithm and digest, who handled it, how, when, whether it was preserved
+  and its custody events. An artefact with no digest, or one that was only read, is listed
+  with that fact rather than omitted: a table that only showed the well-preserved artefact
+  would be the one thing a forensic report must not be.
+
 ## Status
 
 | Phase | Scope | State |
@@ -1024,7 +1064,7 @@ python vedant_osint.py synthesis --reports mission.json   # assemble the documen
 | 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control, Worker outcome contract, Subagent quality review, targeted Worker retasking, Subagent aggregation with bounded runtime Workers, Master review with bounded replanning, loop detection with strategy change, blocked lines and saturation stops, evidence-based Master synthesis with cited findings and calibrated confidence) |
 | 4 | Browser — browser-use / Playwright sessions and capture | 🟡 started (policy, scope, capture, guarded closure, agent mode) |
 | 5 | Collection — passive OSINT sources, artefact hashing | 🟡 started (source-aware web research; safe document/page extraction with injection defence; read-only artifact manifests, hashing and access ledger) |
-| 6 | Synthesis — cross-source correlation and reporting | 🟡 started (deterministic timelines, explained indicator correlation, content de-duplication, the evidence-based Master report with citations and calibrated confidence) |
+| 6 | Synthesis — cross-source correlation and reporting | 🟡 started (deterministic timelines, explained indicator correlation, content de-duplication, the evidence-based Master report with citations and calibrated confidence, Markdown/JSON/terminal output formats with a source register, execution summary and chain of custody) |
 | 7 | Operations — resume, budgets, audit trail, hardening | 🟡 started (checkpoints, resumable missions, capability router, budgets) |
 
 ## Install

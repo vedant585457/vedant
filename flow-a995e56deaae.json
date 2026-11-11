@@ -1,0 +1,613 @@
+{
+  "schema_version": 1,
+  "mission_id": "flow-a995e56deaae",
+  "objective": "map the publicly documented exposure of example.com and rank the advisory-backed risks",
+  "generated_at": "2026-11-11T10:32:58.279892Z",
+  "format_version": "argus-dossier/1",
+  "report": {
+    "mission_id": "flow-a995e56deaae",
+    "objective": "map the publicly documented exposure of example.com and rank the advisory-backed risks",
+    "question": "the published advisories name the affected component",
+    "generated_at": "2026-11-11T10:28:33.379330Z",
+    "sections": [
+      {
+        "kind": "executive-summary",
+        "title": "Executive summary",
+        "body": "5 reviewed finding(s) bear on: map the publicly documented exposure of example.com and rank the advisory-backed risks. None of them is corroborated by a second independent origin, so every finding below carries the band it earned. 1 explanation(s) remain open; this document does not claim that it has excluded the others. Confidence: low.",
+        "evidence_ids": [
+          "ev-c759a5e97a06",
+          "ev-5a152a290231",
+          "ev-7a78d9ac296e",
+          "ev-b54e5ec0f860",
+          "ev-631b08366592"
+        ],
+        "item_ids": []
+      },
+      {
+        "kind": "scope-and-methods",
+        "title": "Scope and methods",
+        "body": "Objective: map the publicly documented exposure of example.com and rank the advisory-backed risks\nThe question this mission set out to answer: the published advisories name the affected component\nSources reviewed: published-advisories (3 item(s)); dns-and-archive (3 item(s))\nMethods: every Worker result was judged on seven quality dimensions (\u00a734) before it could be forwarded, retried attempts were re-tasked with a specific correction (\u00a735), each Subagent reconciled duplicates and preserved disagreements (\u00a736), the Master reviewed the report set with five lenses and a bounded loop (\u00a737, \u00a738), and this synthesis cites only evidence that survived all four.\nEvidence base: 5 reviewed item(s) from 5 independent origin(s).",
+        "evidence_ids": [
+          "ev-c759a5e97a06",
+          "ev-5a152a290231",
+          "ev-7a78d9ac296e",
+          "ev-b54e5ec0f860",
+          "ev-631b08366592"
+        ],
+        "item_ids": []
+      },
+      {
+        "kind": "key-findings",
+        "title": "Key findings",
+        "body": "Each finding below is a reviewed evidence item, restated without embellishment. Confidence is derived from the number of independent origins behind it and capped by its epistemic kind.",
+        "evidence_ids": [
+          "ev-c759a5e97a06",
+          "ev-5a152a290231",
+          "ev-7a78d9ac296e",
+          "ev-b54e5ec0f860",
+          "ev-631b08366592"
+        ],
+        "item_ids": [
+          "kf-f73fb812d3",
+          "kf-a93c5576e8",
+          "kf-eb1453ad68",
+          "kf-68bbcb19cc",
+          "kf-09229ef0bc"
+        ]
+      },
+      {
+        "kind": "indicators",
+        "title": "Corroborated indicators",
+        "body": "No claim was corroborated by a second independent origin, so the mission reports none. Every finding above is single-source and says so.",
+        "evidence_ids": [],
+        "item_ids": []
+      },
+      {
+        "kind": "hypotheses",
+        "title": "Competing hypotheses",
+        "body": "1 explanation(s) were tested; 1 remain possible. A hypothesis the mission could not test is listed as untested rather than omitted.",
+        "evidence_ids": [
+          "ev-5a152a290231"
+        ],
+        "item_ids": [
+          "the published advisories name the affected compo"
+        ]
+      },
+      {
+        "kind": "contradictions",
+        "title": "Contradictions",
+        "body": "No two reviewed items make the same claim with opposite polarity, so the mission records no contradiction. Silence here is a finding: nothing the mission collected conflicts with anything else it collected.",
+        "evidence_ids": [],
+        "item_ids": []
+      },
+      {
+        "kind": "confidence",
+        "title": "Confidence levels",
+        "body": "Mission confidence: low.\nBasis: the weakest of 5 finding(s) sets the level: single-source (1 origin(s)), because the answer cannot be stronger than the claim it depends on\nBands: single-source 5, corroborated 0, well-corroborated 0\nBand rules: one independent origin is single-source; two are corroborated; three or more are well-corroborated. An allegation is capped at corroborated \u2014 a third party repeating a claim does not establish it \u2014 and an inference is capped at corroborated, because reasoning over good evidence is still reasoning.",
+        "evidence_ids": [
+          "ev-c759a5e97a06",
+          "ev-5a152a290231",
+          "ev-7a78d9ac296e",
+          "ev-b54e5ec0f860",
+          "ev-631b08366592"
+        ],
+        "item_ids": []
+      },
+      {
+        "kind": "gaps",
+        "title": "Evidence gaps",
+        "body": "The mission closed every gap it opened. That is a claim about the questions it asked, not about the target: questions it did not think to ask are not in this list.",
+        "evidence_ids": [],
+        "item_ids": []
+      },
+      {
+        "kind": "limitations",
+        "title": "Limitations",
+        "body": "\u2014 the deterministic runner does not contact the target",
+        "evidence_ids": [],
+        "item_ids": []
+      },
+      {
+        "kind": "next-steps",
+        "title": "Recommended next steps",
+        "body": "1 step(s), each naming what it settles and why it is lawful. None requires touching a system or contacting a person.",
+        "evidence_ids": [],
+        "item_ids": [
+          "gap-1"
+        ]
+      }
+    ],
+    "findings": [
+      {
+        "id": "kf-f73fb812d3",
+        "statement": "advisory-reader: each advisory has a version or an explicit unknown",
+        "evidence_ids": [
+          "ev-c759a5e97a06"
+        ],
+        "kind": "observation",
+        "band": "single-source",
+        "confidence": "low",
+        "confidence_basis": "1 independent origin(s) state this claim; band single-source",
+        "origins": 1,
+        "falsifier": "a first-party record contradicting it, or a second independent origin failing to reproduce it",
+        "subject": ""
+      },
+      {
+        "id": "kf-a93c5576e8",
+        "statement": "gap-gap-567041: the result addresses: the published advisories name the affected component",
+        "evidence_ids": [
+          "ev-5a152a290231"
+        ],
+        "kind": "observation",
+        "band": "single-source",
+        "confidence": "low",
+        "confidence_basis": "1 independent origin(s) state this claim; band single-source",
+        "origins": 1,
+        "falsifier": "a first-party record contradicting it, or a second independent origin failing to reproduce it",
+        "subject": ""
+      },
+      {
+        "id": "kf-eb1453ad68",
+        "statement": "follow-up-flw-5b6f40: at least one reviewed observation addresses: each documented risk cites a first-party advisory",
+        "evidence_ids": [
+          "ev-7a78d9ac296e"
+        ],
+        "kind": "observation",
+        "band": "single-source",
+        "confidence": "low",
+        "confidence_basis": "1 independent origin(s) state this claim; band single-source",
+        "origins": 1,
+        "falsifier": "a first-party record contradicting it, or a second independent origin failing to reproduce it",
+        "subject": ""
+      },
+      {
+        "id": "kf-68bbcb19cc",
+        "statement": "dns-collector: every record type has a value or an unknown",
+        "evidence_ids": [
+          "ev-b54e5ec0f860"
+        ],
+        "kind": "observation",
+        "band": "single-source",
+        "confidence": "low",
+        "confidence_basis": "1 independent origin(s) state this claim; band single-source",
+        "origins": 1,
+        "falsifier": "a first-party record contradicting it, or a second independent origin failing to reproduce it",
+        "subject": ""
+      },
+      {
+        "id": "kf-09229ef0bc",
+        "statement": "archive-collector: snapshot list captured with dates",
+        "evidence_ids": [
+          "ev-631b08366592"
+        ],
+        "kind": "observation",
+        "band": "single-source",
+        "confidence": "low",
+        "confidence_basis": "1 independent origin(s) state this claim; band single-source",
+        "origins": 1,
+        "falsifier": "a first-party record contradicting it, or a second independent origin failing to reproduce it",
+        "subject": ""
+      }
+    ],
+    "indicators": [],
+    "hypotheses": [
+      {
+        "statement": "the published advisories name the affected component",
+        "status": "supported",
+        "evidence_ids": [
+          "ev-5a152a290231",
+          "ev-5a152a290231"
+        ],
+        "competes_with": "the benign explanation: the same observations are consistent with configuration drift or a shared provider, and no evidence here excludes it",
+        "test": "a first-party record that directly addresses question 1, dated and independently reproducible: the published advisories name the affected component"
+      }
+    ],
+    "conflicts": [],
+    "gaps": [],
+    "limitations": [
+      "the deterministic runner does not contact the target"
+    ],
+    "next_steps": [
+      {
+        "action": "re-run the same passive checks after the target publishes its next advisory, so a change in the record is distinguishable from a change in the collection",
+        "addresses": "gap-1",
+        "basis": "the same scope and method the mission already used (example.com)",
+        "within_scope": true,
+        "authorised": true,
+        "passive": true,
+        "value": "low"
+      }
+    ],
+    "confidence": "low",
+    "confidence_basis": "the weakest of 5 finding(s) sets the level: single-source (1 origin(s)), because the answer cannot be stronger than the claim it depends on",
+    "uncertainty_statement": "This report states only what reviewed evidence supports: every key finding cites the evidence ids behind it, confidence is derived from independent origins and capped by epistemic kind, contradictions are preserved rather than settled, and no attribution of conduct or identity is made. Nothing outside the gaps and limitations sections should be read as established.",
+    "cited_ids": [
+      "ev-5a152a290231",
+      "ev-631b08366592",
+      "ev-7a78d9ac296e",
+      "ev-b54e5ec0f860",
+      "ev-c759a5e97a06"
+    ],
+    "origins": [
+      "advisory-reader \u2014 published-advisories",
+      "archive-collector \u2014 dns-and-archive",
+      "dns-collector \u2014 dns-and-archive",
+      "follow-up-flw-5b6f40 \u2014 published-advisories",
+      "gap-gap-567041 \u2014 published-advisories"
+    ],
+    "aggregate_basis": {
+      "stage": "master-synthesize",
+      "expected": [
+        "sa-7adc0f884bde",
+        "sa-4de82fcd5ca6"
+      ],
+      "received": [
+        "sa-7adc0f884bde",
+        "sa-4de82fcd5ca6"
+      ],
+      "missing": []
+    },
+    "withheld": []
+  },
+  "execution": {
+    "mission_id": "flow-a995e56deaae",
+    "objective": "map the publicly documented exposure of example.com and rank the advisory-backed risks",
+    "mode": "passive",
+    "scope": [],
+    "subagents": 2,
+    "workers": 6,
+    "attempts": 6,
+    "retries": 0,
+    "evidence": 6,
+    "findings": 5,
+    "tasks": [
+      {
+        "id": "sa-7adc0f884bde",
+        "kind": "subagent",
+        "role": "published-advisories",
+        "objective": "read first-party advisories affecting example.com's stack and record versions fixed",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 3,
+        "seconds": 0.057,
+        "origin": "planned",
+        "note": "ready"
+      },
+      {
+        "id": "wrk-7fa8d41b476a",
+        "kind": "worker",
+        "role": "wrk-7fa8d41b476a (pass)",
+        "objective": "",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 1,
+        "seconds": 0.05,
+        "origin": "planned",
+        "note": ""
+      },
+      {
+        "id": "wrk-60aa16261035",
+        "kind": "worker",
+        "role": "wrk-60aa16261035 (pass)",
+        "objective": "",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 1,
+        "seconds": 0.05,
+        "origin": "planned",
+        "note": ""
+      },
+      {
+        "id": "wrk-03581617fd6c",
+        "kind": "worker",
+        "role": "wrk-03581617fd6c (pass)",
+        "objective": "",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 1,
+        "seconds": 0.053,
+        "origin": "planned",
+        "note": ""
+      },
+      {
+        "id": "sa-4de82fcd5ca6",
+        "kind": "subagent",
+        "role": "dns-and-archive",
+        "objective": "enumerate published DNS records and archive snapshots for example.com",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 3,
+        "seconds": 0.113,
+        "origin": "planned",
+        "note": "ready"
+      },
+      {
+        "id": "wrk-e9cfb6efebac",
+        "kind": "worker",
+        "role": "wrk-e9cfb6efebac (pass)",
+        "objective": "",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 1,
+        "seconds": 0.051,
+        "origin": "planned",
+        "note": ""
+      },
+      {
+        "id": "wrk-d9962bee6734",
+        "kind": "worker",
+        "role": "wrk-d9962bee6734 (pass)",
+        "objective": "",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 1,
+        "seconds": 0.052,
+        "origin": "planned",
+        "note": ""
+      },
+      {
+        "id": "wrk-ac9fe515391b",
+        "kind": "worker",
+        "role": "wrk-ac9fe515391b (pass)",
+        "objective": "",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 1,
+        "seconds": 0.05,
+        "origin": "planned",
+        "note": ""
+      }
+    ],
+    "errors": [],
+    "retries_history": [],
+    "follow_ups": [],
+    "adopted": [],
+    "withheld": [],
+    "time": {
+      "total_seconds": 0.303,
+      "critical_path_seconds": 0.301,
+      "ledger_origin_seconds": 0.355,
+      "per_unit_seconds": {
+        "wrk-03581617fd6c": 0.053,
+        "wrk-60aa16261035": 0.05,
+        "wrk-7fa8d41b476a": 0.05,
+        "wrk-ac9fe515391b": 0.05,
+        "wrk-d9962bee6734": 0.052,
+        "wrk-e9cfb6efebac": 0.051
+      },
+      "stages": [
+        [
+          "planning",
+          0.003
+        ],
+        [
+          "subagent planning",
+          0.002
+        ],
+        [
+          "worker execution",
+          0.052
+        ],
+        [
+          "worker review",
+          0.002
+        ],
+        [
+          "reconciliation",
+          0.174
+        ],
+        [
+          "master review",
+          0.002
+        ],
+        [
+          "follow-up planning",
+          0.066
+        ],
+        [
+          "synthesis",
+          0.0
+        ]
+      ],
+      "events": 42,
+      "workers": 0,
+      "attempts": 6,
+      "max_concurrency": 0,
+      "parallelism_note": "stage windows are differences between the first appearance of each stage in the ledger, not instrumented unit durations, so overlapping stages share their window rather than summing to the total. The ledger's zero is when the flow was built, 0.355s before its first event; the run's own clock starts when it is invoked, which is why the two totals differ."
+    },
+    "stopping": {
+      "stopped": false,
+      "condition": "none",
+      "reason": "the mission ran every unit it planned and the master closed it without recording a bound, which the trace supports and this line states",
+      "kind": "not stated",
+      "reviews": 0,
+      "rounds": 0,
+      "bounds": [],
+      "blocked_lines": [],
+      "foregone": [],
+      "statement": "the mission finished: the mission ran every unit it planned and the master closed it without recording a bound, which the trace supports and this line states. The bound that ended it is on the record, so a reader can tell a finished mission from a stopped one."
+    }
+  },
+  "sources": [
+    {
+      "id": "src-3eb5bada85fd",
+      "kind": "local-artifact",
+      "locator": "example.com",
+      "title": "advisory-reader \u2014 published-advisories",
+      "publisher": "",
+      "retrieved_at": "2026-11-11T10:28:33.134899Z",
+      "method": "local-read",
+      "http_status": null,
+      "digest": "",
+      "digest_complete": false,
+      "items": 5,
+      "evidence_ids": [
+        "ev-c759a5e97a06",
+        "ev-5a152a290231",
+        "ev-7a78d9ac296e",
+        "ev-b54e5ec0f860",
+        "ev-631b08366592"
+      ]
+    }
+  ],
+  "evidence": [
+    {
+      "id": "ev-5a152a290231",
+      "kind": "observation",
+      "statement": "gap-gap-567041: the result addresses: the published advisories name the affected component",
+      "confidence": "low",
+      "sources": [
+        "example.com"
+      ],
+      "supports": [],
+      "contradicts": [],
+      "collected_by": "wrk-60aa16261035",
+      "task_id": "",
+      "observed_at": "2026-11-11T10:28:33.194214Z",
+      "digest": "",
+      "custody_id": "",
+      "cited_by": [
+        "kf-a93c5576e8"
+      ],
+      "corrected": false
+    },
+    {
+      "id": "ev-5a152a290231",
+      "kind": "observation",
+      "statement": "gap-gap-567041: the result addresses: the published advisories name the affected component",
+      "confidence": "low",
+      "sources": [
+        "example.com"
+      ],
+      "supports": [],
+      "contradicts": [],
+      "collected_by": "wrk-ac9fe515391b",
+      "task_id": "",
+      "observed_at": "2026-11-11T10:28:33.308315Z",
+      "digest": "",
+      "custody_id": "",
+      "cited_by": [
+        "kf-a93c5576e8"
+      ],
+      "corrected": false
+    },
+    {
+      "id": "ev-631b08366592",
+      "kind": "observation",
+      "statement": "archive-collector: snapshot list captured with dates",
+      "confidence": "low",
+      "sources": [
+        "example.com"
+      ],
+      "supports": [],
+      "contradicts": [],
+      "collected_by": "wrk-d9962bee6734",
+      "task_id": "",
+      "observed_at": "2026-11-11T10:28:33.253370Z",
+      "digest": "",
+      "custody_id": "",
+      "cited_by": [
+        "kf-09229ef0bc"
+      ],
+      "corrected": false
+    },
+    {
+      "id": "ev-7a78d9ac296e",
+      "kind": "observation",
+      "statement": "follow-up-flw-5b6f40: at least one reviewed observation addresses: each documented risk cites a first-party advisory",
+      "confidence": "low",
+      "sources": [
+        "example.com"
+      ],
+      "supports": [],
+      "contradicts": [],
+      "collected_by": "wrk-03581617fd6c",
+      "task_id": "",
+      "observed_at": "2026-11-11T10:28:33.370052Z",
+      "digest": "",
+      "custody_id": "",
+      "cited_by": [
+        "kf-eb1453ad68"
+      ],
+      "corrected": false
+    },
+    {
+      "id": "ev-b54e5ec0f860",
+      "kind": "observation",
+      "statement": "dns-collector: every record type has a value or an unknown",
+      "confidence": "low",
+      "sources": [
+        "example.com"
+      ],
+      "supports": [],
+      "contradicts": [],
+      "collected_by": "wrk-e9cfb6efebac",
+      "task_id": "",
+      "observed_at": "2026-11-11T10:28:33.251504Z",
+      "digest": "",
+      "custody_id": "",
+      "cited_by": [
+        "kf-68bbcb19cc"
+      ],
+      "corrected": false
+    },
+    {
+      "id": "ev-c759a5e97a06",
+      "kind": "observation",
+      "statement": "advisory-reader: each advisory has a version or an explicit unknown",
+      "confidence": "low",
+      "sources": [
+        "example.com"
+      ],
+      "supports": [],
+      "contradicts": [],
+      "collected_by": "wrk-7fa8d41b476a",
+      "task_id": "",
+      "observed_at": "2026-11-11T10:28:33.134899Z",
+      "digest": "",
+      "custody_id": "",
+      "cited_by": [
+        "kf-f73fb812d3"
+      ],
+      "corrected": false
+    }
+  ],
+  "custody": [
+    {
+      "evidence_id": "ev-c759a5e97a06",
+      "custody_id": "",
+      "artefact": "example.com",
+      "algorithm": "",
+      "digest": "",
+      "digest_complete": false,
+      "collected_by": "wrk-7fa8d41b476a",
+      "collected_at": "2026-11-11T10:28:33.135049Z",
+      "method": "local-read",
+      "original_location": "example.com",
+      "storage_location": "",
+      "write_protected": false,
+      "read_only_verified": false,
+      "preserved": false,
+      "status": "not-assessed",
+      "events": [],
+      "gaps": [
+        "no custody record was made for this artefact: the digest alone does not establish who handled it or whether it was preserved"
+      ]
+    }
+  ],
+  "acceptance": {
+    "markdown_complete": true,
+    "json_round_trips": true,
+    "summary_concise": true,
+    "custody_preserved": true,
+    "errors": []
+  }
+}

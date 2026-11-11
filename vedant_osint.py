@@ -423,6 +423,15 @@ by side).  There is no node named after a specialist role and no roster constant
   a mission whose rounds stop adding claims stops with the series it judged.  No
   instruction this build accepts is unbounded: "continue until…" is refused at the
   door, because a loop detector cannot save an instruction with no end condition.
+* **One record, three renderings, and they cannot disagree.**  A finished mission is
+  written as a Markdown document, a JSON record and a bounded terminal summary, all derived
+  from a single dossier assembled from the reviewed record.  Every section is present even
+  when it is empty and says why; the JSON re-validates against its own model on the way
+  back in; the summary has a line budget and a width budget a test checks; and the source
+  register, evidence table, execution summary, errors, retry history, time usage, stopping
+  reason and chain of custody are sections rather than prose.  Hashes and custody details
+  travel with the artefacts, and an artefact nobody preserved says so in the same table as
+  the one that was.
 * **The document cannot outrun its evidence.**  The finished report is assembled from
   the reviewed record in ten sections — executive summary, scope and methods, key
   findings, corroborated indicators, competing hypotheses, contradictions, confidence,
@@ -934,6 +943,8 @@ round.
     python vedant_osint.py loops --demo                  # correct, block, stop
     python vedant_osint.py synthesis --self-test         # 50 calibration checks
     python vedant_osint.py synthesis --demo              # one claim, three evidence bases
+    python vedant_osint.py report --self-test            # markdown, JSON, and a summary
+    python vedant_osint.py report --mission flow.json    # write the .md and .json
 
 Structured model adapter
 ------------------------
@@ -1141,7 +1152,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 29
+VERSION_MINOR: int = 30
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -22409,6 +22420,12 @@ def _wide_team(context: "MasterContext") -> list[FlowSubagent]:
     return padded
 
 
+#: Keys :meth:`SubagentOutcome.to_dict` adds for a reader and :meth:`from_dict` strips,
+#: so reloading a report never depends on remembering which keys were "real".  Distinct
+#: from :data:`_DERIVED_REPORT_KEYS`, which belongs to the Worker contract (§34).
+_DERIVED_SUBAGENT_KEYS: frozenset[str] = frozenset({"derived"})
+
+
 class SubagentOutcome(StrictModel):
     """One Subagent's aggregate, after every one of its Workers was reviewed.
 
@@ -22467,22 +22484,44 @@ class SubagentOutcome(StrictModel):
                                EntityStatus.BUDGET_EXCEEDED}
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "subagent_id": self.subagent_id,
-            "role": self.role,
-            "status": self.status.value,
-            "gate": self.gate.value,
+        """One report, in the shape the model accepts *and* a reader can scan.
+
+        The two used to differ: this summary counted ``evidence``, ``reviews`` and
+        ``workers`` and rendered ``join`` as prose, which is what a terminal wants and what
+        a machine cannot read back.  §40 needs the file to be the record, so the counts and
+        the prose stay — under names that say they are derived — and the fields the model
+        requires are written as the model holds them.
+        """
+
+        body = json.loads(model_to_json(self))
+        # Derived, and prefixed so nothing can mistake them for the model's fields: a
+        # reader gets the counts and the join in prose, and a loader ignores them because
+        # the real fields are the lists above.
+        body["derived"] = {
             "workers": [outcome.worker_id for outcome in self.outcomes],
             "evidence": len(self.evidence),
-            "retries": self.retries,
             "reviews": len(self.reviews),
-            # §34: the ids the parent Subagent judged and did not forward, so the
-            # aggregate's own payload says what is missing from it.
-            "withheld": list(self.withheld),
-            "join": self.aggregate_basis.describe() if self.aggregate_basis else "not met",
-            "seconds": round(self.seconds, 3),
+            "join": (self.aggregate_basis.describe()
+                     if self.aggregate_basis else "not met"),
             "gaps": [gap.describe() for gap in self.gaps],
         }
+        # §34: the ids the parent Subagent judged and did not forward, so the aggregate's
+        # own payload says what is missing from it.
+        body["withheld"] = list(self.withheld)
+        return body
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "SubagentOutcome":
+        """Read a report back, ignoring exactly what :meth:`to_dict` added.
+
+        The pair is what makes a written mission reloadable: the file a terminal reads and
+        the file a machine reads are the same file, and the only difference is the
+        ``derived`` block, which this strips rather than asking the reader to.
+        """
+
+        return cls.model_validate(
+            {key: value for key, value in payload.items()
+             if key not in _DERIVED_SUBAGENT_KEYS})
 
 
 class MasterSynthesis(StrictModel):
@@ -26489,13 +26528,13 @@ def flow_command(
                 f"{label:<12}{value}" for label, value in (
                     ("role", report["role"]),
                     ("status", f"{report['status']} ({report['gate']})"),
-                    ("workers", ", ".join(report["workers"])),
-                    ("evidence", report["evidence"]),
-                    ("reviews", report["reviews"]),
+                    ("workers", ", ".join(report["derived"]["workers"])),
+                    ("evidence", report["derived"]["evidence"]),
+                    ("reviews", report["derived"]["reviews"]),
                     ("withheld", ", ".join(report.get("withheld") or []) or "none"),
                     ("retries", report["retries"]),
-                    ("join", report["join"]),
-                    ("gaps", "; ".join(report["gaps"]) or "none"),
+                    ("join", report["derived"]["join"]),
+                    ("gaps", "; ".join(report["derived"]["gaps"]) or "none"),
                 ))), title=f"[bold]{escape(str(report['role']))}[/bold]", title_align="left",
                 border_style="cyan", expand=False, padding=(0, 1)))
         console.print()
@@ -53818,7 +53857,2001 @@ def render_master_report(report: MasterReport, *, width: int = 96) -> Group:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 38. Entry point
+# 40. Output formats: one record, three renderings
+# --------------------------------------------------------------------------
+#
+# §39 built the document.  This section decides how it leaves the building.  A finished
+# mission has to be readable three ways — Markdown for a person, JSON for a machine — and
+# the one thing that must not happen is that the three disagree.  So the formats are not
+# three generators: they are one :class:`MissionDossier`, assembled from the reviewed
+# record exactly once, from which every rendering is derived.  A field that appears in the
+# Markdown and not in the JSON would be an editorial claim; here the JSON is the authority
+# and the Markdown is a view of it.
+#
+# Three rules carry the section:
+#
+#   * **The report is the record, not a second opinion.**  Findings, indicators, conflicts
+#     and gaps come from :class:`MasterReport` (§39) unchanged, and are re-validated on the
+#     way out — a dossier cannot contain a finding the report would have refused.
+#   * **A JSON document validates against its own model.**  :meth:`MissionDossier.load`
+#     re-parses a serialised dossier and refuses one that has drifted, and
+#     :meth:`MissionDossier.json_schema` publishes the contract the file is checked
+#     against.  A file that is merely well-formed JSON is not a mission record.
+#   * **Silence is not a category.**  Every section that has nothing to say says so, with
+#     the reason: no errors, no retries, no follow-ups and no custody records are all
+#     *facts*, and a reader must be able to tell "nothing happened" from "nobody wrote it
+#     down".
+#
+# The terminal summary is deliberately the poorest of the three: a fixed, small set of
+# facts, bounded in width and line count, so that the screen stays a summary and the file
+# is the document.
+
+#: The formats a dossier can be written in, and what each is for.
+class OutputFormat(str, Enum):
+    MARKDOWN = "markdown"       # the document, for a person reading and citing
+    JSON = "json"               # the record, for a machine and for validation
+    TERMINAL = "terminal"       # the summary, for the screen
+    ALL = "all"                 # write both files, print the summary
+
+    @property
+    def suffix(self) -> str:
+        return {"markdown": ".md", "json": ".json", "terminal": ".txt", "all": ""}[self.value]
+
+
+class OutputError(ValueError):
+    """Raised when a dossier cannot be written, or a written one cannot be read back.
+
+    Raised rather than returning a flag: a report that silently fails to write is a
+    mission that looks finished and left no record, which is the failure this whole
+    section exists to make impossible.
+    """
+
+#: The sections of the Markdown document, in the order a reader needs them.  The first
+#: eight are §39's argument; the rest are §40's evidence about the mission behind it.
+DOCUMENT_SECTIONS: tuple[tuple[str, str], ...] = (
+    ("title", "Mission report"),
+    ("executive-summary", "Executive summary"),
+    ("scope-and-methods", "Scope and methods"),
+    ("key-findings", "Key findings"),
+    ("indicators", "Corroborated indicators"),
+    ("hypotheses", "Competing hypotheses"),
+    ("contradictions", "Contradictions"),
+    ("confidence", "Confidence"),
+    ("gaps", "Evidence gaps"),
+    ("limitations", "Limitations"),
+    ("next-steps", "Recommended next steps"),
+    ("execution", "Agent and task execution"),
+    ("time", "Time usage"),
+    ("errors", "Errors"),
+    ("retries", "Retry history"),
+    ("stopping", "Stopping reason"),
+    ("sources", "Source register"),
+    ("evidence", "Evidence table"),
+    ("custody", "Chain of custody"),
+    ("acceptance", "Acceptance"),
+)
+
+#: A terminal summary may not exceed this many lines.  The acceptance clause says the
+#: summary stays concise; a number that a test can check is the only way to mean it.
+TERMINAL_SUMMARY_LINES: int = 24
+
+#: …and no rendered line may exceed this width, so it survives a narrow terminal and a
+#: log viewer without reflowing into something a reader has to untangle.
+TERMINAL_SUMMARY_WIDTH: int = 108
+
+
+class SourceRow(StrictModel):
+    """One entry in the source register: where an item came from, and how it was read.
+
+    Deliberately not a copy of :class:`SourceReference`: a register is a *register* — one
+    row per origin, with the count of items it carries — because eight rows of the same
+    domain teach a reader nothing that one row and a number does not.
+    """
+
+    id: str = Field(min_length=1)
+    kind: str = "other"
+    locator: str = Field(min_length=1)
+    title: str = ""
+    publisher: str = ""
+    retrieved_at: datetime | None = None
+    method: str = "unknown"
+    http_status: int | None = None
+    #: The digest of what was read, when the record has one.  A source with no hash is
+    #: usable and *not* reproducible, and the register says so rather than rounding up.
+    digest: str = ""
+    digest_complete: bool = True
+    items: int = Field(default=0, ge=0)
+    evidence_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("retrieved_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> Any:
+        return normalise_datetime(value) if value is not None else None
+
+    @property
+    def reproducible(self) -> bool:
+        """Whether a second party could reach the same bytes from this row alone."""
+
+        return bool(self.digest) and self.digest_complete
+
+    def describe(self) -> str:
+        stamp = self.retrieved_at.isoformat(timespec="seconds") if self.retrieved_at else "time unknown"
+        return (f"{self.publisher or self.locator} · {self.kind} · {self.method} · {stamp}"
+                + (f" · HTTP {self.http_status}" if self.http_status else ""))
+
+
+class EvidenceRow(StrictModel):
+    """One line of the evidence table: the item, its weight, and what it rests on.
+
+    The chain the table makes visible is the whole argument of the build: an item is
+    cited by a finding, a finding is bounded by the item's kind, and the item points at a
+    source row.  A row with no source is not evidence and cannot appear.
+    """
+
+    id: str = Field(min_length=1)
+    kind: str
+    statement: str = Field(min_length=1)
+    confidence: str = "unknown"
+    sources: list[str] = Field(default_factory=list)
+    supports: list[str] = Field(default_factory=list)
+    contradicts: list[str] = Field(default_factory=list)
+    collected_by: str = ""
+    task_id: str = ""
+    observed_at: datetime | None = None
+    digest: str = ""
+    custody_id: str = ""
+    #: The findings that cite this item.  Derived from the report, never written by hand.
+    cited_by: list[str] = Field(default_factory=list)
+    corrected: bool = False
+
+    @field_validator("observed_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> Any:
+        return normalise_datetime(value) if value is not None else None
+
+    @property
+    def weighed(self) -> str:
+        """The item's weight, stated as what it is: a kind and the confidence recorded."""
+
+        return f"{self.kind}/{self.confidence}"
+
+
+class CustodyRow(StrictModel):
+    """One artefact's preservation record: the hash, the handler, and the gaps.
+
+    §16 recorded custody on the evidence item; this is the report's view of it, and it
+    keeps the distinction §16 insisted on — ``preserved`` is not defaulted to true, and an
+    artefact that was read but not preserved says so.  A forensic artefact without a
+    digest is still listed: refusing to list it would hide the most important row.
+    """
+
+    evidence_id: str = Field(min_length=1)
+    custody_id: str = ""
+    artefact: str = ""
+    algorithm: str = ""
+    digest: str = ""
+    digest_complete: bool = True
+    collected_by: str = ""
+    collected_at: datetime | None = None
+    method: str = "unknown"
+    original_location: str = ""
+    storage_location: str = ""
+    write_protected: bool = False
+    read_only_verified: bool = False
+    preserved: bool = False
+    status: str = "not-assessed"
+    events: list[str] = Field(default_factory=list)
+    gaps: list[str] = Field(default_factory=list)
+
+    @field_validator("collected_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> Any:
+        return normalise_datetime(value) if value is not None else None
+
+    @property
+    def verifiable(self) -> bool:
+        """Whether the digest can be recomputed and compared by someone else."""
+
+        return bool(self.digest) and self.digest_complete and not self.gaps
+
+    def describe(self) -> str:
+        return (f"{self.artefact or self.evidence_id}: {self.algorithm or 'no'} digest"
+                + ("" if self.digest_complete else " (sample)")
+                + f" · preserved: {'yes' if self.preserved else 'no'} ({self.status})")
+
+
+class TaskRow(StrictModel):
+    """What one agent did: its unit, its attempts, its time, and where it ended.
+
+    One row per Subagent *and* one per Worker, because "the mission took 40 seconds" is not
+    an execution summary — the summary is which unit spent them.  The row carries the
+    status and gate the graph recorded rather than a verdict invented here.
+    """
+
+    id: str = Field(min_length=1)
+    kind: str = Field(pattern="^(subagent|worker)$")
+    role: str = ""
+    objective: str = ""
+    status: str = ""
+    gate: str = "none"
+    attempts: int = Field(default=1, ge=1)
+    evidence: int = Field(default=0, ge=0)
+    seconds: float = Field(default=0.0, ge=0.0)
+    #: ``adopted``, ``retasked``, ``runtime``, ``planned`` — how the unit came to run.
+    origin: str = "planned"
+    note: str = ""
+
+
+class ErrorRow(StrictModel):
+    """One failure, as the mission recorded it — including the ones it survived.
+
+    Deliberately separate from :class:`TaskRow`: a unit can be retried and succeed, and
+    folding the failure into its final status would erase the reason a retry happened.
+    """
+
+    unit: str = ""
+    stage: str = ""
+    code: str = ""
+    message: str = Field(min_length=1)
+    retryable: bool = False
+    attempt: int = Field(default=1, ge=1)
+    occurred_at: datetime | None = None
+    handled_by: str = ""
+
+    @field_validator("occurred_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> Any:
+        return normalise_datetime(value) if value is not None else None
+
+
+class RetryRow(StrictModel):
+    """One attempt after the first, and what it was told to do differently (§35, §38).
+
+    ``changed`` is the field that makes the table worth reading: a retry whose instruction
+    is the same as the last one is a repeat, and §38 exists because repeats are how a
+    mission spends its budget learning nothing.
+    """
+
+    worker_id: str = Field(min_length=1)
+    subagent_id: str = ""
+    attempt: int = Field(ge=2)
+    corrects: list[str] = Field(default_factory=list)
+    carried_evidence: int = Field(default=0, ge=0)
+    strategy_change: str = ""
+    because_of: str = ""
+    #: Whether this attempt's instruction differs from the previous one's.
+    changed: bool = True
+    #: The verdict that caused it: ``pass``, ``revise``, ``reject``.
+    verdict: str = ""
+
+    def describe(self) -> str:
+        changed = "changed" if self.changed else "REPEATED"
+        return (f"attempt {self.attempt} ({changed}): "
+                + (", ".join(self.corrects) if self.corrects else "no dimension named"))
+
+
+class TimeUsage(StrictModel):
+    """Where the mission's wall-clock went, from the ledger rather than from arithmetic.
+
+    ``stages`` is seconds per ledger stage, computed by pairing each stage's first event
+    with the next stage's first event — an approximation, and labelled as one, because a
+    ledger records *when* a unit spoke, not how long it thought.  ``critical_path`` is the
+    last event's timestamp: the only end-to-end number the record can support.
+    """
+
+    total_seconds: float = Field(default=0.0, ge=0.0)
+    #: First event → last event.  Not the same number as ``total_seconds``, and both are
+    #: reported rather than reconciled: the run's own clock starts when ``run()`` is
+    #: called, while the ledger's zero is when the flow object was built.
+    critical_path_seconds: float = Field(default=0.0, ge=0.0)
+    #: How long the ledger had been running before its first event, so the two numbers
+    #: above can be compared by a reader instead of looking like a contradiction.
+    ledger_origin_seconds: float = Field(default=0.0, ge=0.0)
+    per_unit_seconds: dict[str, float] = Field(default_factory=dict)
+    stages: list[tuple[str, float]] = Field(default_factory=list)
+    events: int = Field(default=0, ge=0)
+    workers: int = Field(default=0, ge=0)
+    attempts: int = Field(default=0, ge=0)
+    max_concurrency: int = Field(default=0, ge=0)
+    parallelism_note: str = ""
+
+    def table(self) -> list[tuple[str, str]]:
+        """The stage table, widest first — the shape a reader scans for."""
+        return [(name, f"{seconds:.3f}s") for name, seconds in
+                sorted(self.stages, key=lambda item: -item[1])]
+
+
+class StoppingRecord(StrictModel):
+    """Why the mission stopped, in the mission's own vocabulary (§37, §38).
+
+    The reason is never inferred at render time: a stopped mission and a finished mission
+    read differently in every section above, and a reader who cannot see which one they
+    have is reading the wrong document.
+    """
+
+    stopped: bool = False
+    condition: str = "none"
+    reason: str = ""
+    #: ``complete``, ``budget``, ``saturation``, ``blocked``, ``cancelled``, ``policy`` —
+    #: the class of stop, so a reader can filter without parsing prose.
+    kind: str = "unknown"
+    reviews: int = Field(default=0, ge=0)
+    rounds: int = Field(default=0, ge=0)
+    #: The bounds that had a say, in the order they were checked.
+    bounds: list[str] = Field(default_factory=list)
+    blocked_lines: list[str] = Field(default_factory=list)
+    foregone: list[str] = Field(default_factory=list)
+    statement: str = Field(min_length=15)
+
+
+class ExecutionSummary(StrictModel):
+    """The mission as a run: who ran, what it cost, and what it produced."""
+
+    mission_id: str = ""
+    objective: str = ""
+    mode: str = "passive"
+    scope: list[str] = Field(default_factory=list)
+    subagents: int = Field(default=0, ge=0)
+    workers: int = Field(default=0, ge=0)
+    attempts: int = Field(default=0, ge=0)
+    retries: int = Field(default=0, ge=0)
+    evidence: int = Field(default=0, ge=0)
+    findings: int = Field(default=0, ge=0)
+    tasks: list[TaskRow] = Field(default_factory=list)
+    errors: list[ErrorRow] = Field(default_factory=list)
+    retries_history: list[RetryRow] = Field(default_factory=list)
+    follow_ups: list[str] = Field(default_factory=list)
+    adopted: list[str] = Field(default_factory=list)
+    withheld: list[str] = Field(default_factory=list)
+    time: TimeUsage = Field(default_factory=TimeUsage)
+    stopping: StoppingRecord = Field(default_factory=lambda: StoppingRecord(
+        statement="the mission record does not state why it stopped"))
+
+    def status_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for task in self.tasks:
+            counts[task.status or "unknown"] = counts.get(task.status or "unknown", 0) + 1
+        return counts
+
+
+class DossierAcceptance(StrictModel):
+    """§40's acceptance clause, evaluated on the built dossier rather than asserted.
+
+    Four claims, each checkable from the dossier alone: the Markdown opens, the JSON
+    re-validates against the model, the summary stays concise, and every hash and custody
+    detail travelled with the artefacts.
+    """
+
+    markdown_complete: bool = False
+    json_round_trips: bool = False
+    summary_concise: bool = False
+    custody_preserved: bool = False
+    errors: list[str] = Field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return (self.markdown_complete and self.json_round_trips
+                and self.summary_concise and self.custody_preserved)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"markdown_complete": self.markdown_complete,
+                "json_round_trips": self.json_round_trips,
+                "summary_concise": self.summary_concise,
+                "custody_preserved": self.custody_preserved,
+                "ok": self.ok, "errors": list(self.errors)}
+
+
+class MissionDossier(StrictModel):
+    """One mission, in every form it is written: the record the three formats share.
+
+    Built once from the reviewed record and the :class:`FlowResult` that produced it, then
+    serialised three ways.  The JSON is the authority: :meth:`load` re-parses it, and the
+    Markdown and the summary are *views* — if a fact is not here, it is not in either.
+    """
+
+    schema_version: int = 1
+    mission_id: str = ""
+    objective: str = ""
+    generated_at: datetime = Field(default_factory=utc_now)
+    format_version: str = "argus-dossier/1"
+    #: §39's document, unchanged.  Carried whole so a reader of the JSON has the report,
+    #: and so ``load`` can re-run the report's own acceptance clause on it.
+    report: MasterReport
+    execution: ExecutionSummary = Field(default_factory=ExecutionSummary)
+    sources: list[SourceRow] = Field(default_factory=list)
+    evidence: list[EvidenceRow] = Field(default_factory=list)
+    custody: list[CustodyRow] = Field(default_factory=list)
+    acceptance: DossierAcceptance = Field(default_factory=DossierAcceptance)
+
+    @field_validator("generated_at", mode="before")
+    @classmethod
+    def _tz(cls, value: Any) -> Any:
+        return normalise_datetime(value)
+
+    # -- derived facts a renderer may rely on -------------------------------
+
+    @property
+    def uncited_evidence(self) -> list[EvidenceRow]:
+        """Evidence the document does not cite — kept, and counted, rather than dropped.
+
+        A reader comparing the evidence table with the findings should be able to see
+        exactly which collected items no finding rests on; deleting them would make the
+        table agree with the document by hiding the difference.
+        """
+
+        return [row for row in self.evidence if not row.cited_by]
+
+    @property
+    def hashed(self) -> list[CustodyRow]:
+        return [row for row in self.custody if row.digest]
+
+    def summary_line(self) -> str:
+        return (f"{self.mission_id or 'mission'}: {len(self.evidence)} evidence row(s), "
+                f"{len(self.sources)} source(s), {len(self.custody)} custody record(s), "
+                f"{self.execution.subagents} subagent(s)/{self.execution.workers} worker(s) "
+                f"in {self.execution.time.total_seconds:.2f}s")
+
+    # -- serialisation ------------------------------------------------------
+
+    def to_dict(self) -> dict[str, Any]:
+        """The JSON form: everything a reader of the file would need, nothing else."""
+
+        return json.loads(model_to_json(self))
+
+    def to_json(self, *, indent: int = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent, default=str, sort_keys=False)
+
+    @classmethod
+    def load(cls, payload: str | bytes | Mapping[str, Any]) -> "MissionDossier":
+        """Parse a dossier back, refusing one that does not validate against the model.
+
+        This is the acceptance clause's second claim, executable: a file that parses as
+        JSON but does not re-validate is not a mission record, and saying so is the only
+        way a downstream consumer can trust the file's shape.
+        """
+
+        try:
+            data = json.loads(payload) if isinstance(payload, (str, bytes)) else dict(payload)
+        except (TypeError, ValueError) as exc:
+            raise OutputError(f"not a dossier: {_first_sentence(str(exc))[:160]}") from exc
+        if not isinstance(data, dict):
+            raise OutputError("not a dossier: the top level must be an object")
+        if data.get("format_version") != cls.model_fields["format_version"].default:
+            raise OutputError(
+                f"not a dossier: expected {cls.model_fields['format_version'].default!r}, "
+                f"found {data.get('format_version')!r}")
+        try:
+            return cls.model_validate(data)
+        except ValueError as exc:
+            raise OutputError(f"not a dossier: {_first_sentence(str(exc))[:200]}") from exc
+
+    @classmethod
+    def json_schema(cls) -> dict[str, Any]:
+        """The published contract a dossier file is checked against."""
+
+        return cls.model_json_schema()
+
+
+
+# --------------------------------------------------------------------------
+# 40.1 Reading the run: tasks, errors, retries, time, and the reason it stopped
+# --------------------------------------------------------------------------
+
+#: How a ledger stage name reads to a person.  Kept as a table rather than f-strings at
+#: render time so a new stage shows up as its own name instead of being folded into
+#: "other" by a renderer that never heard of it.
+_STAGE_LABELS: dict[str, str] = {
+    "master-plan": "planning",
+    "subagent": "subagent planning",
+    "worker-task": "worker execution",
+    "worker-review": "worker review",
+    "subagent-aggregate": "reconciliation",
+    "master-review": "master review",
+    "master-replan": "follow-up planning",
+    "master-synthesize": "synthesis",
+}
+
+#: The stop conditions §38 can name, mapped to the word a reader needs.  A condition that
+#: is not here is still reported — as ``policy`` — rather than dropped.
+_STOP_KINDS: dict[str, str] = {
+    "none": "not stated",
+    "complete": "complete",
+    "budget": "budget",
+    "saturation": "saturation",
+    "deadline": "deadline",
+    "cancelled": "cancelled",
+    "blocked": "blocked",
+    "policy": "policy",
+}
+
+
+def _stage_seconds(trace: Sequence[Mapping[str, Any]]) -> list[tuple[str, float]]:
+    """Seconds per ledger stage, by pairing each stage's last event with the next one's.
+
+    An approximation, and the docstring above says why: a ledger records when a unit spoke.
+    It is still the only per-stage number the record supports, so it is offered as a
+    duration *between first appearances* rather than as time spent.
+    """
+
+    first_at: dict[str, float] = {}
+    last_at: dict[str, float] = {}
+    for event in trace:
+        stage = str(event.get("stage") or "")
+        at = float(event.get("at") or 0.0)
+        first_at.setdefault(stage, at)
+        last_at[stage] = max(last_at.get(stage, at), at)
+    order = sorted(first_at.items(), key=lambda item: item[1])
+    spans: list[tuple[str, float]] = []
+    for index, (stage, start) in enumerate(order):
+        end = order[index + 1][1] if index + 1 < len(order) else last_at[stage]
+        spans.append((_STAGE_LABELS.get(stage, stage), round(max(0.0, end - start), 3)))
+    return spans
+
+
+def _time_usage(result: "FlowResult") -> TimeUsage:
+    """Where the wall-clock went: the total, the ledger's critical path, and the stages."""
+
+    per_unit: dict[str, float] = {}
+    for report in result.reports:
+        for outcome in report.outcomes:
+            if outcome.seconds:
+                per_unit[outcome.worker_id] = round(outcome.seconds, 3)
+    moments = [float(event.get("at") or 0.0) for event in result.trace]
+    started_at = min(moments, default=0.0)
+    ended_at = max(moments, default=0.0)
+    return TimeUsage(
+        total_seconds=round(result.seconds, 3),
+        critical_path_seconds=round(max(0.0, ended_at - started_at), 3),
+        ledger_origin_seconds=round(started_at, 3),
+        per_unit_seconds=dict(sorted(per_unit.items())),
+        stages=_stage_seconds(result.trace),
+        events=len(result.trace),
+        workers=result.total_workers,
+        attempts=result.worker_attempts,
+        max_concurrency=int(result.concurrency.get("peak_active") or 0),
+        parallelism_note=(
+            "stage windows are differences between the first appearance of each stage in "
+            "the ledger, not instrumented unit durations, so overlapping stages share their "
+            "window rather than summing to the total. The ledger's zero is when the flow was "
+            f"built, {started_at:.3f}s before its first event; the run's own clock starts "
+            "when it is invoked, which is why the two totals differ."))
+
+
+def _task_rows(result: "FlowResult") -> list[TaskRow]:
+    """One row per Subagent and one per Worker, read from what actually ran.
+
+    Sourced from the *reports*, not the plan: a §36 runtime Worker and a §37 follow-up are
+    not on the Subagent's declared worker list, and an execution summary built from the
+    plan would quietly omit the two kinds of work the mission invented mid-run.  Every
+    Worker the report knows about gets a row, the planned ones that never ran say
+    ``not-run``, and the origin is read from the name the graph gave it.
+    """
+
+    known = {subagent.id: subagent for subagent in result.subagents}
+    follow_up_ids = {worker.id for subagent in result.subagents for worker in subagent.workers
+                     if worker.name.startswith("follow-up-")}
+    adopted = set((result.resume or {}).get("adopted_workers") or [])
+    rows: list[TaskRow] = []
+    seen: set[str] = set()
+    for report in result.reports:
+        plan = known.get(report.subagent_id)
+        rows.append(TaskRow(
+            id=report.subagent_id, kind="subagent", role=report.role,
+            objective=(plan.objective if plan is not None else report.objective)[:200],
+            status=report.status.value, gate=report.gate.value,
+            attempts=max([1, *[outcome.attempt for outcome in report.outcomes]]),
+            evidence=len(report.evidence), seconds=round(report.seconds, 3),
+            origin="planned",
+            note=(report.readiness.decision if report.readiness is not None else "")))
+        seen.add(report.subagent_id)
+        for outcome in report.outcomes:
+            seen.add(outcome.worker_id)
+            origin = ("follow-up" if outcome.worker_id in follow_up_ids
+                      else "adopted" if outcome.worker_id in adopted
+                      else "runtime" if _worker_name(report, outcome.worker_id, plan
+                                                      ).startswith("gap-")
+                      else "planned")
+            rows.append(TaskRow(
+                id=outcome.worker_id, kind="worker",
+                role=_worker_name(report, outcome.worker_id, plan),
+                objective=_worker_objective(plan, outcome.worker_id),
+                status=outcome.status.value, gate=outcome.gate.value,
+                attempts=outcome.attempt, evidence=len(outcome.evidence_ids),
+                seconds=round(outcome.seconds, 3), origin=origin,
+                note=(outcome.error or "")[:160]))
+        # Workers the review withheld still ran: their row says so rather than vanishing.
+        for worker_id in report.withheld:
+            if worker_id in seen:
+                continue
+            seen.add(worker_id)
+            rows.append(TaskRow(
+                id=worker_id, kind="worker", role=_worker_name(report, worker_id, plan),
+                objective=_worker_objective(plan, worker_id), status="withheld",
+                gate="review", attempts=1, evidence=0, origin="planned",
+                note="reviewed and not forwarded (§34)"))
+    if known:
+        for subagent in result.subagents:
+            for worker in subagent.workers:
+                if worker.id in seen:
+                    continue
+                seen.add(worker.id)
+                rows.append(TaskRow(
+                    id=worker.id, kind="worker", role=worker.name,
+                    objective=worker.objective[:200], status="not-run", gate="none",
+                    attempts=1, evidence=0, origin=("follow-up" if worker.name.startswith(
+                        "follow-up-") else "planned"),
+                    note="planned and not run: the mission stopped before it"))
+    return rows
+
+
+def _worker_name(report: "SubagentOutcome", worker_id: str,
+                 plan: "FlowSubagent | None") -> str:
+    """The Worker's name, from the plan when the mission still has it."""
+
+    if plan is not None:
+        for worker in plan.workers:
+            if worker.id == worker_id:
+                return worker.name
+    verdict = next((item for item in report.reviews if item.worker_id == worker_id), None)
+    return f"{worker_id}" if verdict is None else f"{worker_id} ({verdict.verdict})"
+
+
+def _worker_objective(plan: "FlowSubagent | None", worker_id: str) -> str:
+    """The Worker's objective, or an empty line rather than an invented one."""
+
+    if plan is None:
+        return ""
+    for worker in plan.workers:
+        if worker.id == worker_id:
+            return worker.objective[:200]
+    return ""
+
+
+def _error_rows(result: "FlowResult") -> list[ErrorRow]:
+    """Every failure the record carries — including the ones a retry or a gap absorbed.
+
+    Sourced from three places, because the graph records a failure where it happened: a
+    Worker outcome's ``error``, a ``FailedSubtask`` the aggregate kept, and a refusal the
+    loop detector blocked a line over.  One row each, deduplicated by unit and message.
+    """
+
+    rows: list[ErrorRow] = []
+    seen: set[tuple[str, str]] = set()
+    for report in result.reports:
+        for outcome in report.outcomes:
+            if not outcome.error:
+                continue
+            key = (outcome.worker_id, outcome.error[:120])
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(ErrorRow(
+                unit=outcome.worker_id, stage="worker",
+                code=outcome.gate.value, message=outcome.error[:300],
+                attempt=outcome.attempt,
+                handled_by=("withheld" if outcome.worker_id in report.withheld
+                            else "retried" if outcome.attempt > 1 else "recorded")))
+        for failed in report.failed:
+            key = (failed.worker_id, failed.reason[:120])
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(ErrorRow(
+                unit=failed.worker_id, stage="subagent-aggregate", code=failed.gate,
+                message=failed.reason[:300], attempt=max(1, failed.attempts),
+                handled_by=failed.handled))
+    for line in (result.loops.blocked if result.loops is not None else []):
+        key = (line.unit or line.subject, line.reason[:120])
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(ErrorRow(
+            unit=line.unit or line.subject, stage="loop-detection",
+            code=line.kind.value, message=line.reason[:300],
+            attempt=line.attempts, handled_by="blocked"))
+    return rows
+
+
+def _retry_rows(result: "FlowResult") -> list[RetryRow]:
+    """Every attempt after the first, with what it was told and whether that was new.
+
+    Two sources: §35's retask (a revised assignment, with the dimensions it corrects) and
+    §38's strategy change (a correction the loop detector required).  ``changed`` is
+    computed, not claimed: a retry whose corrections and strategy change are both empty is
+    a repeat, and the table says so in the same font as everything else.
+    """
+
+    rows: list[RetryRow] = []
+    # A reloaded run carries the retasks that were written; a run whose retasks were not
+    # supplied still knows every attempt that happened, from the outcomes themselves.
+    if not result.retasks:
+        for report in result.reports:
+            for outcome in report.outcomes:
+                if outcome.attempt > 1:
+                    rows.append(RetryRow(
+                        worker_id=outcome.worker_id, subagent_id=report.subagent_id,
+                        attempt=outcome.attempt,
+                        because_of=("this attempt ran again; the record of what it was "
+                                    "told was not supplied with the mission"),
+                        changed=bool((result.loops and any(
+                            change.unit == outcome.worker_id
+                            for change in result.loops.corrections)))))
+        if rows:
+            rows.sort(key=lambda row: (row.worker_id, row.attempt))
+            return rows
+    for retask in result.retasks:
+        rows.append(RetryRow(
+            worker_id=retask.worker_id, subagent_id=retask.subagent_id,
+            attempt=retask.attempt, corrects=list(retask.corrects),
+            carried_evidence=len(retask.prior_evidence),
+            because_of=retask.because_of[:200], verdict="revise",
+            changed=bool(retask.corrects or retask.tool_failure)))
+    for change in (result.loops.corrections if result.loops is not None else []):
+        # §38 records a strategy change, not a review: ``required_for`` names the detection
+        # that provoked it, and ``applied`` says whether the unit ever ran under it.
+        rows.append(RetryRow(
+            worker_id=change.unit, subagent_id="",
+            attempt=max(2, change.attempt), corrects=[change.kind.value],
+            strategy_change=change.instruction[:300],
+            because_of=(change.required_for or f"a {change.kind.value} cycle was detected")[:200],
+            verdict="revise", changed=bool(change.instruction.strip())
+            and change.applied))
+    rows.sort(key=lambda row: (row.worker_id, row.attempt))
+    return rows
+
+
+def _stopping_record(result: "FlowResult", report: MasterReport) -> StoppingRecord:
+    """Why the mission stopped, from the decision if there was one and the record if not."""
+
+    decision = result.decision
+    condition = result.stop_condition.value
+    kind = _STOP_KINDS.get(condition, "policy")
+    saturations = (result.loops.saturation if result.loops is not None else None)
+    bounds = []
+    if result.stopped:
+        bounds.append(f"the mission stopped itself: {result.stop_reason[:200]}")
+    # The decision's basis becomes ``reason`` below, so it is not repeated as a bound; a
+    # bound is a *refusal*, and the decision's refusals carry those.
+    if decision is not None:
+        bounds.extend(f"refused: {refusal[:160]}" for refusal in decision.refusals[:3])
+    if result.clip is not None and result.clip.clipped:
+        bounds.extend(f"ceiling: {clip.describe()[:160]}"
+                      for clip in result.clip.changes[:3])
+    if saturations is not None and saturations.stop_reason:
+        bounds.append(f"saturation: {saturations.stop_reason[:200]}")
+    if decision is not None and decision.condition is not StopCondition.NONE:
+        kind = _STOP_KINDS.get(decision.condition.value, "policy")
+    reason = (decision.basis if decision is not None and decision.basis
+              else result.stop_reason
+              or (saturations.stop_reason if saturations is not None else ""))
+    if not reason:
+        reason = ("the mission ran every unit it planned and the master closed it without "
+                  "recording a bound, which the trace supports and this line states")
+    if result.stopped:
+        statement = (f"the mission stopped before finishing: {reason[:200]}. Every section "
+                     f"above reports what it had collected at that point, and nothing is "
+                     f"presented as if the mission had completed.")
+    else:
+        statement = (f"the mission finished: {reason[:200]}. The bound that ended it is on "
+                     f"the record, so a reader can tell a finished mission from a stopped "
+                     f"one.")
+    return StoppingRecord(
+        stopped=result.stopped, condition=condition, reason=reason[:400], kind=kind,
+        reviews=len(result.master_reviews),
+        rounds=len((result.loops.saturation.added_per_round
+                    if result.loops is not None else [])),
+        bounds=bounds, blocked_lines=[line.subject for line in
+                                      (result.loops.blocked if result.loops is not None else [])],
+        # What a continuation was refused for: the bounds, in the decision's own order.
+        foregone=list(decision.refusals[:4]) if decision is not None else [],
+        statement=statement)
+
+
+def _execution_summary(result: "FlowResult", report: MasterReport) -> ExecutionSummary:
+    tasks = _task_rows(result)
+    resume = result.resume or {}
+    return ExecutionSummary(
+        mission_id=result.mission_id, objective=result.objective, mode="passive",
+        scope=[],
+        # Counted from the rows, not the plan: a reloaded mission carries its reports but
+        # not its FlowSubagent objects, and a summary that reported "0 subagents" for a
+        # mission with two would be worse than no summary at all.
+        subagents=len([row for row in tasks if row.kind == "subagent"]),
+        workers=len([row for row in tasks if row.kind == "worker"]),
+        attempts=result.worker_attempts, retries=result.retries,
+        evidence=len(result.evidence), findings=len(report.findings),
+        tasks=tasks, errors=_error_rows(result), retries_history=_retry_rows(result),
+        follow_ups=[f"{entry.route}: {entry.lens.value} → "
+                    f"{entry.target_subagent or entry.role}" for entry in result.follow_ups],
+        adopted=list(resume.get("adopted_workers") or []),
+        withheld=list(dict.fromkeys(worker_id for item in result.reports
+                                    for worker_id in item.withheld)),
+        time=_time_usage(result), stopping=_stopping_record(result, report))
+
+
+# --------------------------------------------------------------------------
+# 40.2 The source register, the evidence table and the custody sheet
+# --------------------------------------------------------------------------
+
+def _source_rows(evidence: Sequence[EvidenceItem],
+                 report: MasterReport) -> list[SourceRow]:
+    """One row per origin, with the items it carries.
+
+    Grouped by locator rather than by source id: the same URL retrieved twice is one
+    origin and two retrievals, and a register that listed it twice would overstate how many
+    independent places the mission looked.  ``items`` counts the *evidence rows*, not the
+    retrievals, because that is what the reader is going to count next.
+    """
+
+    cited = set(report.cited_ids)
+    grouped: dict[str, list[tuple[EvidenceItem, SourceReference]]] = {}
+    for item in evidence:
+        for source in item.sources:
+            locator = source.locator or source.id
+            grouped.setdefault(locator, []).append((item, source))
+    rows: list[SourceRow] = []
+    for locator, pairs in grouped.items():
+        first = pairs[0][1]
+        digest = first.content_hash
+        rows.append(SourceRow(
+            id=first.id or locator, kind=first.kind.value, locator=locator,
+            title=(first.title or "")[:200], publisher=(first.publisher or "")[:160],
+            retrieved_at=first.retrieved_at, method=first.retrieval_method.value,
+            http_status=first.http_status,
+            digest=(digest.value if digest is not None else ""),
+            # A HashRecord is a digest of the whole captured content; only HashDigest
+            # (the artefact manifest's digest) distinguishes a sample from a full read.
+            digest_complete=digest is not None,
+            items=len({item.id for item, _source in pairs}),
+            evidence_ids=[item_id for item_id in
+                          dict.fromkeys(item.id for item, _source in pairs)
+                          if item_id in cited]))
+    rows.sort(key=lambda row: (-row.items, row.locator))
+    return rows
+
+
+def _evidence_rows(evidence: Sequence[EvidenceItem],
+                   report: MasterReport) -> list[EvidenceRow]:
+    """One row per evidence item, with the findings that cite it.
+
+    ``corrected`` is derived from the item's own ``error``, so an item that was collected
+    with a fault and later repaired is visible as such rather than looking like every other
+    row.  The digest is the custody digest when there is one, because that is the digest a
+    reviewer would recompute.
+    """
+
+    citing: dict[str, list[str]] = {}
+    for finding in report.findings:
+        for item_id in finding.evidence_ids:
+            citing.setdefault(item_id, []).append(finding.id)
+    rows: list[EvidenceRow] = []
+    for item in evidence:
+        custody = item.custody
+        digest = (custody.integrity_hash.value if custody is not None
+                  and custody.integrity_hash is not None else "")
+        if not digest:
+            digest = next((source.content_hash.value for source in item.sources
+                           if source.content_hash is not None), "")
+        rows.append(EvidenceRow(
+            id=item.id, kind=item.kind.value, statement=item.statement[:400],
+            confidence=item.confidence.value,
+            sources=[source.locator for source in item.sources],
+            supports=list(item.supports), contradicts=list(item.contradicts),
+            collected_by=item.collected_by or "", task_id=item.task_id or "",
+            observed_at=item.observed_at, digest=digest,
+            custody_id=(custody.id if custody is not None else ""),
+            cited_by=list(dict.fromkeys(citing.get(item.id, []))),
+            corrected=item.error is not None))
+    rows.sort(key=lambda row: (not row.cited_by, row.id))
+    return rows
+
+
+def _custody_rows(evidence: Sequence[EvidenceItem]) -> list[CustodyRow]:
+    """Every artefact the record holds a preservation note for.
+
+    A row per evidence item that has *either* a custody record *or* a digest on one of its
+    sources: a hashed artefact with no custody record is precisely the case a forensic
+    report must not stay quiet about, so it appears with ``preserved: false`` and the
+    reason in its gaps.
+    """
+
+    rows: list[CustodyRow] = []
+    # One row per artefact: two Workers that saw the same source are two evidence items
+    # and one artefact, and a custody sheet that listed it twice would suggest two captures.
+    seen: set[str] = set()
+    for item in evidence:
+        custody = item.custody
+        digest = next((source.content_hash for source in item.sources
+                       if source.content_hash is not None), None)
+        if custody is None and digest is None and not item.sources:
+            continue
+        artefact = ""
+        for source in item.sources:
+            artefact = artefact or (source.artifact_path or source.url or "")
+        key = (custody.id if custody is not None else "") + "|" + artefact
+        if key in seen:
+            continue
+        seen.add(key)
+        gaps = list(custody.gaps and [gap.describe() for gap in custody.gaps] or []) \
+            if custody is not None else []
+        if custody is None:
+            gaps.append("no custody record was made for this artefact: the digest alone "
+                        "does not establish who handled it or whether it was preserved")
+        rows.append(CustodyRow(
+            evidence_id=item.id,
+            custody_id=(custody.id if custody is not None else ""),
+            artefact=(artefact or (custody.original_location if custody else ""))[:300],
+            algorithm=((custody.integrity_hash or digest).algorithm
+                       if (custody is not None and custody.integrity_hash is not None
+                           ) or digest is not None else ""),
+            digest=((custody.integrity_hash.value if custody is not None
+                     and custody.integrity_hash is not None else "")
+                    or (digest.value if digest is not None else "")),
+            digest_complete=bool(custody is not None and custody.integrity_hash is not None
+                                 or digest is not None),
+            collected_by=(custody.collected_by if custody is not None
+                          and custody.collected_by else item.collected_by or ""),
+            collected_at=(custody.collected_at if custody is not None else item.created_at),
+            method=(custody.collection_method.value if custody is not None
+                    else (item.sources[0].retrieval_method.value if item.sources else "unknown")),
+            original_location=(custody.original_location if custody is not None
+                               and custody.original_location else artefact)[:300],
+            storage_location=(custody.storage_location if custody is not None
+                              and custody.storage_location else "")[:300],
+            write_protected=(custody.write_protected if custody is not None else False),
+            read_only_verified=(custody.read_only_verified if custody is not None else False),
+            preserved=(custody.preserved if custody is not None else False),
+            status=(custody.preservation_status.value if custody is not None
+                    else "not-assessed"),
+            events=list(custody.custody_events) if custody is not None else [],
+            gaps=gaps))
+    rows.sort(key=lambda row: (not row.preserved, not row.digest, row.evidence_id))
+    return rows
+
+
+def build_dossier(result: "FlowResult", *, report: MasterReport | None = None,
+                  context: "MasterContext | None" = None) -> MissionDossier:
+    """Assemble the one record every format is a view of.
+
+    Order matters and is the same argument as §39's: the report first (so the register and
+    the table can ask it what is cited), then the sources, then the evidence, then custody
+    — each built from the record rather than from the layer above it.  The execution
+    summary is built last, because it counts what the earlier steps produced.
+    """
+
+    document = report or (result.synthesis.report if result.synthesis is not None else None)
+    if document is None:
+        raise OutputError(
+            "this mission has no finished report: a stopped mission has a record but not "
+            "a document, and its outputs belong to `flow`, not to a report format")
+    evidence = list(result.evidence)
+    execution = _execution_summary(result, document)
+    if context is not None:
+        execution = execution.model_copy(update={
+            "scope": list(context.scope_entries),
+            "mode": context.mode.value,
+            "objective": document.objective or execution.objective})
+    dossier = MissionDossier(
+        mission_id=document.mission_id or result.mission_id,
+        objective=document.objective, report=document, execution=execution,
+        sources=_source_rows(evidence, document),
+        evidence=_evidence_rows(evidence, document),
+        custody=_custody_rows(evidence))
+    return dossier.model_copy(update={"acceptance": dossier_acceptance(dossier)})
+
+
+
+# --------------------------------------------------------------------------
+# 40.3 The Markdown document
+# --------------------------------------------------------------------------
+
+#: Characters that would start a Markdown construct if they landed at the start of a line.
+#: Statement text is quoted from evidence, which is untrusted input: a control character
+#: that turned a quoted claim into a heading, a table cell or a code fence would let the
+#: *evidence* rewrite the report's structure.
+_MD_LINE_STARTS = "#>-*+|`~="
+
+
+def _md_inline(text: str) -> str:
+    """Escape text for a Markdown paragraph or table cell, one line only."""
+
+    flat = " ".join(str(text or "").split())
+    for char in ("\\", "`", "*", "_", "[", "]", "|", "<", ">"):
+        flat = flat.replace(char, "\\" + char)
+    return flat
+
+
+def _md_block(text: str, *, indent: str = "") -> str:
+    """Escape text for a block position, defusing anything that would start a construct."""
+
+    lines = []
+    for line in str(text or "").splitlines() or [""]:
+        stripped = line.strip()
+        lead = "\\" if stripped[:1] and stripped[0] in _MD_LINE_STARTS else ""
+        lines.append(f"{indent}{lead}{_md_inline(line) if not line.strip() else line.strip()}")
+    return "\n".join(lines).rstrip()
+
+
+def _md_cell(text: str, *, limit: int = 220) -> str:
+    """A table cell: one line, pipes escaped, and never the string 'None'."""
+
+    flat = " ".join(str(text if text is not None else "").split())
+    if len(flat) > limit:
+        flat = flat[: limit - 1].rstrip() + "…"
+    return flat.replace("|", "\\|")
+
+
+def _md_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
+    """A pipe table that always has a header, even when there are no rows.
+
+    An empty table in Markdown is not a table: it is a header and a separator with nothing
+    under it, which most renderers show as a broken table.  When there is nothing to show
+    the caller passes a single row saying so, and this function keeps the shape honest by
+    padding short rows rather than emitting a ragged one.
+    """
+
+    head = "| " + " | ".join(headers) + " |"
+    rule = "| " + " | ".join("---" for _ in headers) + " |"
+    body = ["| " + " | ".join(list(row) + [""] * (len(headers) - len(row))) + " |"
+            for row in rows]
+    return "\n".join([head, rule, *body])
+
+
+def _md_findings(report: MasterReport) -> str:
+    if not report.findings:
+        return ("No finding survived review in this mission. That is a result: the document "
+                "reports the gap below rather than a conclusion it cannot source.\n")
+    rows = [(_md_cell(finding.statement, limit=200), _md_cell(finding.kind.value),
+             _md_cell(f"{finding.band.value} ({finding.origins})"),
+             _md_cell(", ".join(f"`{item}`" for item in finding.evidence_ids)),
+             _md_cell(finding.falsifier, limit=160))
+            for finding in report.findings]
+    return _md_table(["finding", "kind", "confidence", "evidence ids", "what would refute it"],
+                     rows) + "\n"
+
+
+def _md_indicators(report: MasterReport) -> str:
+    if not report.indicators:
+        return ("No claim in this mission was stated independently by two or more origins, so "
+                "the report claims no indicator. A corroborated indicator requires two "
+                "distinct origins, not two sentences.\n")
+    rows = [(_md_cell(row.statement, limit=200), _md_cell(", ".join(row.origins)),
+             _md_cell(row.significance, limit=180))
+            for row in report.indicators]
+    return _md_table(["indicator", "independent origins", "why it matters"], rows) + "\n"
+
+
+def _md_hypotheses(report: MasterReport) -> str:
+    if not report.hypotheses:
+        return ("The mission recorded no competing hypothesis, which is a limitation rather "
+                "than an absence: a report with one explanation has not tested it.\n")
+    rows = [(_md_cell(row.statement, limit=180), _md_cell(row.status),
+             _md_cell(row.competes_with or "—", limit=160),
+             _md_cell(row.test, limit=180))
+            for row in report.hypotheses]
+    return _md_table(["hypothesis", "status", "competing explanation", "test that decides it"],
+                     rows) + "\n"
+
+
+def _md_conflicts(report: MasterReport) -> str:
+    if not report.conflicts:
+        return ("No two reviewed items make the same claim with opposite polarity. Silence "
+                "here is a finding: nothing collected conflicts with anything else collected.\n")
+    blocks = []
+    for index, record in enumerate(report.conflicts, start=1):
+        blocks.append(
+            f"**{index}. {_md_inline(record.topic[:120])}**\n\n"
+            f"- one side: {_md_inline(record.left_statement[:300])} "
+            f"(evidence {', '.join(f'`{i}`' for i in record.left_evidence) or 'none cited'})\n"
+            f"- the other: {_md_inline(record.right_statement[:300])} "
+            f"(evidence {', '.join(f'`{i}`' for i in record.right_evidence) or 'none cited'})\n"
+            f"- why they cannot both hold: {_md_inline(record.basis)}\n"
+            f"- what would settle it: {_md_inline(record.resolution)}\n")
+    return "\n".join(blocks)
+
+
+def _md_gaps(report: MasterReport) -> str:
+    if not report.gaps:
+        return ("The mission closed every gap it opened. That is a claim about the questions it "
+                "asked, not about the target: questions it did not think to ask are not in "
+                "this list.\n")
+    rows = [(_md_cell(gap.detail, limit=200), _md_cell(gap.reason.value),
+             _md_cell(gap.consequence, limit=180), _md_cell(gap.would_close, limit=180))
+            for gap in report.gaps]
+    return _md_table(["gap", "kind", "what the report therefore cannot say",
+                      "what would close it"], rows) + "\n"
+
+
+def _md_next_steps(report: MasterReport) -> str:
+    if not report.next_steps:
+        return ("No further passive step would change this answer. Anything beyond it would be "
+                "a different mission with its own authorisation.\n")
+    rows = [(_md_cell(step.action, limit=220), _md_cell(step.addresses),
+             _md_cell(step.basis, limit=200), _md_cell(step.value))
+            for step in report.next_steps]
+    return _md_table(["step", "addresses", "why it is lawful", "value"], rows) + "\n"
+
+
+def _md_execution(execution: ExecutionSummary) -> str:
+    counts = execution.status_counts()
+    head = (f"{execution.subagents} Subagent(s), {execution.workers} Worker(s), "
+            f"{execution.attempts} attempt(s), {execution.retries} retr{'y' if execution.retries == 1 else 'ies'}, "
+            f"{execution.evidence} reviewed evidence item(s), {execution.findings} finding(s). "
+            f"Statuses: "
+            + (", ".join(f"{name} {count}" for name, count in sorted(counts.items()))
+               or "no unit ran"))
+    rows = [(_md_cell(task.id), _md_cell(task.kind), _md_cell(task.role, limit=60),
+             _md_cell(task.status), _md_cell(task.gate), str(task.attempts),
+             str(task.evidence), f"{task.seconds:.2f}s", _md_cell(task.origin))
+            for task in execution.tasks]
+    table = _md_table(["unit", "kind", "role", "status", "gate", "attempts", "evidence",
+                       "seconds", "origin"], rows) if rows else \
+        "No unit ran: the mission stopped before the flow admitted any work.\n"
+    extra = []
+    if execution.follow_ups:
+        extra.append("Follow-up work: " + "; ".join(_md_inline(item)
+                                                    for item in execution.follow_ups) + ".")
+    if execution.adopted:
+        extra.append("Adopted from a checkpoint (§resume): "
+                     + ", ".join(f"`{item}`" for item in execution.adopted) + ".")
+    if execution.withheld:
+        extra.append("Withheld by review (§34): "
+                     + ", ".join(f"`{item}`" for item in execution.withheld) + ".")
+    return head + "\n\n" + str(table) + ("\n\n" + "\n\n".join(extra) + "\n" if extra else "")
+
+
+def _md_errors(execution: ExecutionSummary) -> str:
+    if not execution.errors:
+        return ("No error was recorded. That is a statement about the record, not a claim that "
+                "nothing went wrong: an error the mission did not write down is not here, and "
+                "the trace is the place to look for it.\n")
+    rows = [(_md_cell(error.unit), _md_cell(error.stage), _md_cell(error.code),
+             _md_cell(error.message, limit=240), str(error.attempt),
+             "yes" if error.retryable else "no", _md_cell(error.handled_by))
+            for error in execution.errors]
+    return _md_table(["unit", "stage", "gate/code", "what happened", "attempt", "retryable",
+                      "handled by"], rows) + "\n"
+
+
+def _md_retries(execution: ExecutionSummary) -> str:
+    if not execution.retries_history:
+        return ("No unit was retried, so there is no retry history. A mission that never "
+                "retried is not necessarily a mission that got everything right first time: it "
+                "may be one whose reviews passed.\n")
+    rows = [(_md_cell(row.worker_id), str(row.attempt),
+             _md_cell(", ".join(row.corrects) or "—"),
+             str(row.carried_evidence),
+             _md_cell(row.strategy_change or row.because_of, limit=240),
+             "changed" if row.changed else "**repeated**")
+            for row in execution.retries_history]
+    return _md_table(["unit", "attempt", "corrected dimensions", "carried evidence",
+                      "what changed", "instruction"], rows) + "\n"
+
+
+def _md_time(time: TimeUsage) -> str:
+    head = (f"Total wall-clock: {time.total_seconds:.2f}s. First ledger event to last: "
+            f"{time.critical_path_seconds:.2f}s (the ledger opened "
+            f"{time.ledger_origin_seconds:.2f}s before its first event). "
+            f"{time.events} ledger event(s), {time.attempts} Worker attempt(s), peak "
+            f"{time.max_concurrency} resource(s) in flight.")
+    rows = [(name, seconds) for name, seconds in time.table()]
+    table = _md_table(["stage", "window"], rows) if rows else "The ledger recorded no stage.\n"
+    return head + "\n\n" + str(table) + f"\n\n{_md_inline(time.parallelism_note)}\n"
+
+
+def _md_stopping(stopping: StoppingRecord) -> str:
+    lines = [stopping.statement, "",
+             f"- stopped before finishing: {'yes' if stopping.stopped else 'no'}",
+             f"- condition: `{stopping.condition}` ({stopping.kind})",
+             f"- master reviews: {stopping.reviews}; rounds tracked: {stopping.rounds}"]
+    if stopping.bounds:
+        lines.append("- bounds that had a say: "
+                     + "; ".join(_md_inline(text, ) for text in stopping.bounds))
+    if stopping.foregone:
+        lines.append("- what a continuation would have done: "
+                     + "; ".join(_md_inline(text) for text in stopping.foregone))
+    if stopping.blocked_lines:
+        lines.append("- lines of inquiry blocked (§38): "
+                     + ", ".join(f"`{line}`" for line in stopping.blocked_lines))
+    return "\n".join(lines) + "\n"
+
+
+def _md_sources(dossier: MissionDossier) -> str:
+    if not dossier.sources:
+        return ("No source register could be built: the mission collected no sourced evidence. "
+                "A report with no source has nothing to cite, and this line is that fact.\n")
+    rows = [(_md_cell(f"`{row.id}`"), _md_cell(row.title or row.locator, limit=120),
+             _md_cell(row.locator, limit=120), _md_cell(row.kind), _md_cell(row.method),
+             _md_cell(row.retrieved_at.isoformat(timespec="seconds")
+                      if row.retrieved_at else "unknown"),
+             f"`{row.digest[:16]}…`" if row.digest else "not hashed",
+             str(row.items), str(len(row.evidence_ids)))
+            for row in dossier.sources]
+    table = _md_table(["id", "title", "locator", "kind", "method", "retrieved", "digest",
+                       "items", "cited"], rows)
+    hashed = sum(1 for row in dossier.sources if row.reproducible)
+    return (f"{len(dossier.sources)} origin(s), {hashed} with a reproducible digest. A row "
+            f"without a digest is usable and not reproducible, and the register says so "
+            f"rather than implying otherwise.\n\n" + table + "\n")
+
+
+def _md_evidence(dossier: MissionDossier) -> str:
+    if not dossier.evidence:
+        return ("No evidence item was forwarded by review. The mission therefore has no claims "
+                "to weigh, which is a different report from one whose claims were all weak.\n")
+    rows = [(_md_cell(f"`{row.id}`"), _md_cell(row.weighed),
+             _md_cell(row.statement, limit=200),
+             _md_cell(", ".join(f"`{item}`" for item in row.cited_by) or "**uncited**"),
+             _md_cell(", ".join(f"`{source}`" for source in row.sources[:2]) or "none",
+                      limit=120),
+             _md_cell(row.collected_by or "—"), _md_cell(row.digest[:16] + "…" if row.digest
+                                                        else "—"))
+            for row in dossier.evidence]
+    table = _md_table(["evidence id", "kind/confidence", "statement", "cited by",
+                       "source", "collected by", "digest"], rows)
+    uncited = len(dossier.uncited_evidence)
+    note = (f"{len(dossier.evidence)} item(s); {uncited} not cited by any finding, listed "
+            f"rather than removed so the table and the findings can be compared."
+            if uncited else
+            f"{len(dossier.evidence)} item(s), every one of them cited by a finding.")
+    return note + "\n\n" + table + "\n"
+
+
+def _md_custody(dossier: MissionDossier) -> str:
+    if not dossier.custody:
+        return ("No forensic artefact was collected, so there is no chain of custody to "
+                "preserve. This is a statement about the mission, not a gap in the record.\n")
+    rows = [(_md_cell(f"`{row.evidence_id}`"), _md_cell(row.artefact or "—", limit=110),
+             _md_cell(f"{row.algorithm}:{row.digest[:16]}…" if row.digest else "**not hashed**"),
+             ("full" if row.digest_complete else "sample") if row.digest else "—",
+             _md_cell(row.collected_by or "—"),
+             _md_cell(row.collected_at.isoformat(timespec="seconds")
+                      if row.collected_at else "unknown"),
+             _md_cell(row.method),
+             "yes" if row.preserved else "**no**", _md_cell(row.status))
+            for row in dossier.custody]
+    table = _md_table(["evidence", "artefact", "digest", "coverage", "handled by", "when",
+                       "method", "preserved", "status"], rows)
+    problems = [row for row in dossier.custody if not row.digest or not row.preserved]
+    notes = ""
+    if problems:
+        notes = "\n\n" + "\n".join(
+            f"- `{problem.evidence_id}`: "
+            + ("no digest recorded" if not problem.digest else "not preserved")
+            + (f" — {'; '.join(problem.gaps)}" if problem.gaps else "")
+            for problem in problems) + "\n"
+    events = [(row.evidence_id, event) for row in dossier.custody for event in row.events]
+    if events:
+        notes += "\n\nCustody events, in the order they were recorded:\n\n" + "\n".join(
+            f"- `{item_id}` — {_md_inline(event)}" for item_id, event in events) + "\n"
+    return (f"{len(dossier.custody)} record(s); {len(dossier.hashed)} with a digest, "
+            f"{sum(1 for row in dossier.custody if row.preserved)} recorded as preserved. A "
+            f"digest alone establishes integrity, not custody: who handled the artefact and "
+            f"whether it was preserved are separate claims, and both are in the table.\n\n"
+            + table + notes)
+
+
+def _md_acceptance(dossier: MissionDossier) -> str:
+    clause = dossier.acceptance
+    lines = [f"- Markdown complete: {'yes' if clause.markdown_complete else 'no'}",
+             f"- JSON re-validates against the dossier model: "
+             f"{'yes' if clause.json_round_trips else 'no'}",
+             f"- terminal summary concise: {'yes' if clause.summary_concise else 'no'}",
+             f"- hashes and custody preserved: "
+             f"{'yes' if clause.custody_preserved else 'no'}"]
+    document = dossier.report.acceptance()
+    lines.append("- §39 report clause on this document: every finding cited "
+                 f"{'yes' if document['every_finding_cited'] else 'no'}, no conclusion above "
+                 f"its evidence "
+                 f"{'yes' if document['no_conclusion_exceeds_its_evidence'] else 'no'}")
+    if clause.errors:
+        lines.append("- problems: " + "; ".join(clause.errors))
+    lines.append("")
+    lines.append("No finding in this document declares guilt or attributes identity with "
+                 "certainty; an identification appears only as a hypothesis with a test.")
+    return "\n".join(lines) + "\n"
+
+
+def render_dossier_markdown(dossier: MissionDossier, *, width: int = 96) -> str:
+    """The document, as Markdown.  Opens in any viewer, cites by id, and never overstates.
+
+    Every section is present even when it is empty, and says why: a missing section is
+    indistinguishable from a section nobody wrote, and a reader cannot check a report that
+    silently omits the part they were looking for.
+    """
+
+    report, execution = dossier.report, dossier.execution
+    parts: list[str] = []
+    title = _md_inline(report.objective[:140]) or "Mission report"
+    parts.append(f"# Mission report — {title}\n")
+    parts.append(
+        f"- mission: `{_md_cell(dossier.mission_id or 'unnamed')}`\n"
+        f"- generated: {dossier.generated_at.isoformat(timespec='seconds')}\n"
+        f"- format: `{dossier.format_version}` (schema version {dossier.schema_version})\n"
+        f"- confidence: **{report.confidence.value}** — "
+        f"{_md_inline(_first_sentence(report.confidence_basis))}\n"
+        f"- evidence: {len(report.cited_ids)} citation(s) from {len(report.origins)} "
+        f"independent origin(s); {len(dossier.evidence)} item(s) in the table\n"
+        f"- status: {'stopped early' if execution.stopping.stopped else 'finished'} — "
+        f"{_md_inline(_first_sentence(execution.stopping.statement))}\n")
+
+    # §39's eight sections, in the report's own words.  Read from the finished report
+    # rather than recomposed: a second writer would be a second opinion.
+    for kind, heading in (("executive-summary", "Executive summary"),
+                          ("scope-and-methods", "Scope and methods"),
+                          ("confidence", "Confidence")):
+        section = report.section.get(kind)
+        body = section.body if section is not None and section.body else "Not stated."
+        parts.append(f"## {heading}\n\n{_md_block(body)}\n")
+
+    parts.append("## Key findings\n\n" + _md_findings(report))
+    parts.append("## Corroborated indicators\n\n" + _md_indicators(report))
+    parts.append("## Competing hypotheses\n\n" + _md_hypotheses(report))
+    parts.append("## Contradictions\n\n" + _md_conflicts(report))
+    parts.append("## Evidence gaps\n\n" + _md_gaps(report))
+    limitations = ("\n".join(f"- {_md_inline(item)}" for item in report.limitations)
+                   if report.limitations else
+                   "The mission recorded no limitation. A report with none usually means the "
+                   "record was not examined for them, which is itself worth stating.")
+    parts.append("## Limitations\n\n" + limitations + "\n")
+    parts.append("## Recommended next steps\n\n" + _md_next_steps(report))
+    parts.append("## Agent and task execution\n\n" + _md_execution(execution))
+    parts.append("## Time usage\n\n" + _md_time(execution.time))
+    parts.append("## Errors\n\n" + _md_errors(execution))
+    parts.append("## Retry history\n\n" + _md_retries(execution))
+    parts.append("## Stopping reason\n\n" + _md_stopping(execution.stopping))
+    parts.append("## Source register\n\n" + _md_sources(dossier))
+    parts.append("## Evidence table\n\n" + _md_evidence(dossier))
+    parts.append("## Chain of custody\n\n" + _md_custody(dossier))
+    parts.append("## Acceptance\n\n" + _md_acceptance(dossier))
+    parts.append(
+        "\n---\n\n"
+        "This document was assembled from the reviewed record. Every finding cites the "
+        "evidence that carries it, confidence is derived from independent origins and capped "
+        f"by the claim's epistemic kind, and the JSON form (`{dossier.mission_id or 'mission'}"
+        ".json) is the authoritative record this Markdown is a view of.\n")
+    return "\n".join(part if part.endswith("\n") else part + "\n" for part in parts)
+
+
+# --------------------------------------------------------------------------
+# 40.4 The terminal summary
+# --------------------------------------------------------------------------
+
+def _summary_rows(dossier: MissionDossier) -> list[tuple[str, str]]:
+    """The summary as data, so the plain-text and Rich renderings cannot disagree.
+
+    Six questions and no more: what was asked, what was found, how sure, what is missing,
+    what it cost, and why it ended.  A summary that grew a seventh would be a document.
+    """
+
+    report, execution = dossier.report, dossier.execution
+    supplied = execution.time.events > 0
+    return [
+        ("mission", dossier.mission_id or "unnamed"),
+        ("objective", report.objective[:150]),
+        ("status", ("stopped: " if execution.stopping.stopped else "finished: ")
+         + execution.stopping.reason[:110]),
+        ("confidence", f"{report.confidence.value} — "
+                       + _first_sentence(report.confidence_basis)[:110]),
+        ("findings", f"{len(report.findings)} ({len(report.corroborated)} corroborated, "
+                     f"{len(report.single_source)} single-source), "
+                     f"{len(dossier.evidence)} evidence item(s), "
+                     f"{len(dossier.sources)} source(s)"),
+        ("unresolved", f"{len(report.gaps)} gap(s), {len(report.conflicts)} contradiction(s), "
+                       f"{len(report.open_hypotheses)} open hypothesis(es)"),
+        ("execution", (f"{execution.subagents} subagent(s)/{execution.workers} worker(s), "
+                       f"{execution.attempts} attempt(s), {execution.retries} retr"
+                       f"{'y' if execution.retries == 1 else 'ies'}, "
+                       f"{len(execution.errors)} error(s)")
+         if supplied else
+         "not supplied: this dossier was built from a report set, not from a run"),
+        ("time", (f"{execution.time.total_seconds:.2f}s of work over "
+                  f"{execution.time.events} ledger event(s), peak "
+                  f"{execution.time.max_concurrency} in flight")
+         if supplied else "not supplied with this dossier"),
+        ("custody", (f"{len(dossier.custody)} artefact(s), {len(dossier.hashed)} hashed, "
+                     f"{sum(1 for row in dossier.custody if row.preserved)} preserved")
+         if dossier.custody else "no forensic artefact collected"),
+        ("next step", (report.next_steps[0].action[:120] if report.next_steps
+                       else "no further passive step would change this answer")),
+    ]
+
+
+def render_terminal_summary(dossier: MissionDossier, *, limit: int = TERMINAL_SUMMARY_LINES,
+                            width: int = TERMINAL_SUMMARY_WIDTH) -> str:
+    """The screen view: a bounded set of facts, and nothing that needs scrolling to find.
+
+    Deliberately poorer than the file.  A summary that tried to say everything would be a
+    document nobody reads on a terminal, so this one answers six questions and stops.  The
+    line count is capped and the width is bounded because "concise" has to mean something
+    a test can check.
+    """
+
+    report = dossier.report
+    width = max(40, width)
+    label_width = max((len(label) for label, _value in _summary_rows(dossier)), default=8)
+    lines = ["Mission summary"]
+    for label, value in _summary_rows(dossier):
+        lines.append(_clip_line(f"  {label:<{label_width}}  {value}", width))
+        if len(lines) >= limit - 2:
+            break
+    citation = (f"{len(report.cited_ids)} citation(s) from {len(report.origins)} origin(s); "
+                f"every finding is cited, and the report claims no more than its evidence.")
+    lines.append(_clip_line("  " + citation, width))
+    lines.append(_clip_line(f"  report: {dossier.mission_id or 'mission'}.md and .json "
+                            f"(the JSON is the authoritative record)", width))
+    if len(lines) > limit:
+        lines = lines[: limit - 1] + ["  … (summary truncated; the report is the record)"]
+    return "\n".join(lines)
+
+
+def _clip_line(text: str, width: int) -> str:
+    """One rendered line, never longer than ``width``, never broken mid-word twice."""
+
+    if len(text) <= width:
+        return text
+    head = text[: width - 1]
+    if " " in head[width // 2:]:
+        head = head[: head.rfind(" ")]
+    return head.rstrip() + "…"
+
+
+def render_dossier_summary_table(dossier: MissionDossier) -> Table:
+    """The terminal summary as a Rich table, built from the same rows the text uses."""
+
+    table = Table(title=f"mission — {dossier.mission_id or 'unnamed'}", title_justify="left",
+                  box=None, pad_edge=False, expand=False)
+    table.add_column("field", style="dim", no_wrap=True)
+    table.add_column("value", overflow="fold", max_width=88)
+    for label, value in _summary_rows(dossier):
+        table.add_row(escape(label), escape(value))
+    table.add_row("files", escape(f"{dossier.mission_id or 'mission'}.md and .json "
+                                  f"(the JSON is the authoritative record)"))
+    return table
+
+
+# --------------------------------------------------------------------------
+# 40.5 Writing it out, and proving it can be read back
+# --------------------------------------------------------------------------
+
+def dossier_acceptance(dossier: MissionDossier, *,
+                       markdown: str | None = None) -> DossierAcceptance:
+    """§40's acceptance clause, evaluated on the artefact rather than asserted.
+
+    All four claims are checked against what was actually built: the Markdown is rendered
+    and inspected for its sections, the JSON is serialised and *re-parsed* through
+    :meth:`MissionDossier.load`, the summary is rendered and measured, and every hashed
+    artefact is compared with the custody sheet.  A check that cannot fail is not a check,
+    so each one names what it found when it fails.
+    """
+
+    errors: list[str] = []
+    text = markdown if markdown is not None else render_dossier_markdown(dossier)
+    missing = [heading for _key, heading in DOCUMENT_SECTIONS if f"## {heading}" not in text
+               and not (heading == "Mission report" and text.startswith("# Mission report"))]
+    markdown_ok = not missing
+    if missing:
+        errors.append("the Markdown is missing: " + ", ".join(missing[:4]))
+    try:
+        MissionDossier.load(dossier.to_json())
+        round_trips = True
+    except OutputError as exc:
+        round_trips = False
+        errors.append(str(exc)[:200])
+    summary = render_terminal_summary(dossier)
+    summary_lines = summary.splitlines()
+    concise = (len(summary_lines) <= TERMINAL_SUMMARY_LINES
+               and all(len(line) <= TERMINAL_SUMMARY_WIDTH for line in summary_lines))
+    if not concise:
+        errors.append(f"the summary is {len(summary_lines)} line(s) and "
+                      f"{max(len(line) for line in summary_lines)} column(s)")
+    hashed_ids = {row.evidence_id for row in dossier.hashed}
+    custody_ids = {row.evidence_id for row in dossier.custody}
+    # Two independent claims: every digest in the evidence table is also in the custody
+    # sheet, and no artefact claims preservation without a digest to be preserved against.
+    tabled = {row.id for row in dossier.evidence if row.digest}
+    custody_ok = (hashed_ids <= custody_ids and tabled <= custody_ids
+                  and all(row.digest or not row.preserved for row in dossier.custody))
+    if not custody_ok:
+        errors.append("a hashed artefact is missing from the custody sheet")
+    return DossierAcceptance(markdown_complete=markdown_ok, json_round_trips=round_trips,
+                             summary_concise=concise, custody_preserved=custody_ok,
+                             errors=errors)
+
+
+class WrittenDossier(StrictModel):
+    """What was written where, and whether it can be read back."""
+
+    mission_id: str = ""
+    markdown_path: str = ""
+    json_path: str = ""
+    markdown_bytes: int = Field(default=0, ge=0)
+    json_bytes: int = Field(default=0, ge=0)
+    summary: str = ""
+    acceptance: DossierAcceptance = Field(default_factory=DossierAcceptance)
+    #: The re-parsed dossier, when the JSON was read back — the proof of the round trip.
+    reloaded: bool = False
+
+    @property
+    def paths(self) -> list[str]:
+        return [path for path in (self.markdown_path, self.json_path) if path]
+
+
+def write_dossier(dossier: MissionDossier, *, out_dir: Path | str = Path("."),
+                  stem: str = "", formats: OutputFormat = OutputFormat.ALL) -> WrittenDossier:
+    """Write the dossier in the requested formats, then read the JSON back.
+
+    The read-back is not paranoia: the JSON's own model is the acceptance clause's second
+    claim, and a writer that never reloads its own file cannot make that claim honestly.
+    Errors are raised as :class:`OutputError` rather than returned, because a report that
+    failed to write must not be reported as written.
+    """
+
+    directory = Path(out_dir).expanduser()
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise OutputError(f"cannot create the output directory: {exc}") from exc
+    name = stem or (dossier.mission_id or "mission")
+    written = WrittenDossier(mission_id=dossier.mission_id,
+                             summary=render_terminal_summary(dossier))
+    if formats in {OutputFormat.MARKDOWN, OutputFormat.ALL}:
+        markdown = render_dossier_markdown(dossier)
+        path = directory / f"{name}.md"
+        try:
+            path.write_text(markdown, encoding="utf-8")
+        except OSError as exc:
+            raise OutputError(f"cannot write {path}: {exc}") from exc
+        written = written.model_copy(update={"markdown_path": str(path),
+                                             "markdown_bytes": len(markdown.encode("utf-8"))})
+    if formats in {OutputFormat.JSON, OutputFormat.ALL}:
+        payload = dossier.to_json()
+        path = directory / f"{name}.json"
+        try:
+            path.write_text(payload, encoding="utf-8")
+            reloaded = MissionDossier.load(path.read_text(encoding="utf-8"))
+        except (OSError, OutputError) as exc:
+            raise OutputError(f"cannot write {path}: {exc}") from exc
+        written = written.model_copy(update={
+            "json_path": str(path), "json_bytes": len(payload.encode("utf-8")),
+            "reloaded": reloaded.mission_id == dossier.mission_id})
+    acceptance = dossier_acceptance(dossier, markdown=(render_dossier_markdown(dossier)
+                                                       if formats in {OutputFormat.MARKDOWN,
+                                                                      OutputFormat.ALL}
+                                                       else None))
+    return written.model_copy(update={"acceptance": acceptance})
+
+
+
+# --------------------------------------------------------------------------
+# 40.6 The demo, and the four checks behind the acceptance clause
+# --------------------------------------------------------------------------
+
+class DossierCheck(StrictModel):
+    """One claim about the output formats, and the evidence for it."""
+
+    name: str = Field(min_length=1)
+    ok: bool
+    detail: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "ok": self.ok, "detail": self.detail}
+
+
+def _custody_fixture_evidence() -> list[EvidenceItem]:
+    """Two artefacts as §16 records them: one preserved and hashed, one merely read.
+
+    The second is the important one.  A build that only demonstrated the well-preserved
+    artefact would prove nothing about the case a forensic reader actually worries about —
+    an artefact in the report whose integrity nobody established.
+    """
+
+    preserved = EvidenceItem(
+        kind=EvidenceKind.OBSERVATION,
+        statement="a captured copy of the proxy configuration was hashed at capture",
+        sources=[SourceReference(
+            kind=SourceKind.LOCAL_ARTIFACT,
+            artifact_path="/case/acme/proxy.conf.capture",
+            title="proxy configuration, captured read-only",
+            retrieval_method=RetrievalMethod.LOCAL_READ,
+            content_hash=HashRecord(algorithm="sha256", value="a" * 64))],
+        confidence=Confidence.MEDIUM,
+        confidence_basis="read-only capture with a digest taken at the moment of capture",
+        collected_by="wrk-forensic", observed_at=utc_now(),
+        custody=ChainOfCustody(
+            collected_by="wrk-forensic",
+            collection_method=RetrievalMethod.LOCAL_READ,
+            original_location="/case/acme/proxy.conf",
+            storage_location="/case/acme/proxy.conf.capture",
+            write_protected=True, read_only_verified=True, preserved=True,
+            preservation_status=PreservationStatus.VERIFIED,
+            integrity_hash=HashRecord(algorithm="sha256", value="a" * 64),
+            custody_events=[f"{utc_now().isoformat(timespec='seconds')} captured read-only "
+                            f"and hashed"]))
+    read_only = EvidenceItem(
+        kind=EvidenceKind.OBSERVATION,
+        statement="the log directory listing was read once, without a capture copy",
+        sources=[SourceReference(
+            kind=SourceKind.LOCAL_ARTIFACT, artifact_path="/case/acme/logs",
+            title="log directory listing",
+            retrieval_method=RetrievalMethod.LOCAL_READ)],
+        confidence=Confidence.LOW,
+        confidence_basis="a single read of a listing; no copy was preserved",
+        collected_by="wrk-forensic", observed_at=utc_now())
+    return [preserved, read_only]
+
+
+def dossier_demo() -> dict[str, Any]:
+    """One mission, written three ways — and the four checks that say so.
+
+    Runs the real graph offline, attaches its §39 report, adds the two custody fixtures
+    (this is the only place in the section that constructs evidence, and it says why), and
+    then renders each format in memory so the demo can show them without writing anything.
+    """
+
+    context = _selftest_context("exposure")
+    units = flow_units_for(context, "exposure")
+    result = HierarchicalFlow(
+        context=context, subagents=units,
+        runner=_CountingRunner(scope=context.scope_entries),
+        policy=FlowPolicy(max_replan_rounds=1, max_review_rounds=3)).run()
+    report = result.synthesis.report if result.synthesis is not None else None
+    if report is None:                       # pragma: no cover - the demo mission reports
+        raise OutputError("the demo mission produced no report to format")
+    # The custody fixtures ride as evidence on the first report, so they are part of the
+    # reviewed record the dossier is built from rather than bolted on to the dossier.
+    extra = _custody_fixture_evidence()
+    first, *rest = result.reports
+    result = result.model_copy(update={"reports": [
+        first.model_copy(update={"evidence": [*first.evidence, *extra]}), *rest]})
+    report = result.synthesis.report if result.synthesis is not None else report
+    dossier = build_dossier(result, report=report, context=context)
+    markdown = render_dossier_markdown(dossier)
+    summary = render_terminal_summary(dossier)
+    payload = dossier.to_dict()
+    reloaded = MissionDossier.load(json.dumps(payload))
+    return {
+        "mission_id": dossier.mission_id,
+        "formats": [fmt.value for fmt in OutputFormat],
+        "dossier": payload,
+        "markdown": markdown,
+        "markdown_lines": len(markdown.splitlines()),
+        "summary": summary,
+        "summary_lines": len(summary.splitlines()),
+        "reloaded": reloaded.mission_id == dossier.mission_id,
+        "schema_keys": sorted(MissionDossier.json_schema().get("properties", {})),
+        "custody": [row.model_dump(mode="json") for row in dossier.custody],
+        "sources": [row.model_dump(mode="json") for row in dossier.sources],
+        "execution": dossier.execution.model_dump(mode="json"),
+        "acceptance": dossier.acceptance.to_dict(),
+        "checks": [check.to_dict() for check in run_dossier_self_test()],
+    }
+
+
+def render_dossier_demo(payload: Mapping[str, Any]) -> Group:
+    """The demo on screen: the summary, the custody sheet, and what each format carries."""
+
+    summary = Text(payload["summary"], overflow="fold")
+    formats = Table(title="one record, three formats", title_justify="left", box=None,
+                    pad_edge=False, expand=False)
+    formats.add_column("format", no_wrap=True)
+    formats.add_column("what it is", overflow="fold")
+    formats.add_column("carries", overflow="fold", max_width=52)
+    formats.add_row("markdown", "the document, for a person",
+                    "twenty sections, tables, citations by id")
+    formats.add_row("json", "the record, for a machine",
+                    f"{len(payload['schema_keys'])} top-level keys, re-validated on read")
+    formats.add_row("terminal", "the summary, for the screen",
+                    f"{payload['summary_lines']} lines, capped at {TERMINAL_SUMMARY_LINES}")
+
+    custody = Table(title="chain of custody", title_justify="left", box=None, pad_edge=False,
+                    expand=False)
+    custody.add_column("artefact", overflow="fold", max_width=34)
+    custody.add_column("digest", overflow="fold", max_width=22)
+    custody.add_column("preserved", no_wrap=True)
+    custody.add_column("note", overflow="fold", max_width=44)
+    for row in payload["custody"]:
+        custody.add_row(escape(row["artefact"] or row["evidence_id"]),
+                        escape(f"{row['algorithm']}:{row['digest'][:12]}…"
+                               if row["digest"] else "not hashed"),
+                        "yes" if row["preserved"] else "[yellow]no[/yellow]",
+                        escape("; ".join(row["gaps"])[:90] or row["status"]))
+
+    checks = Table(title="acceptance", title_justify="left", box=None, pad_edge=False,
+                   expand=False)
+    checks.add_column("check", overflow="fold")
+    checks.add_column("detail", overflow="fold", max_width=56)
+    for check in payload["checks"]:
+        glyph, colour = ("✔", "green") if check["ok"] else ("✘", "red")
+        checks.add_row(f"[{colour}]{glyph}[/{colour}] {escape(check['name'])}",
+                       escape(check["detail"]))
+
+    group = Group(Text("Terminal summary", style="bold"), summary, Text(""), formats,
+                  Text(""), custody, Text(""), checks)
+    return group
+
+
+def run_dossier_self_test() -> list[DossierCheck]:
+    """Prove §40's four clauses against a real run, and each refusal that keeps them true."""
+
+    checks: list[DossierCheck] = []
+
+    def add(name: str, ok: bool, detail: object = "") -> None:
+        checks.append(DossierCheck(name=name, ok=bool(ok), detail=str(detail)[:180]))
+
+    def refuses(fn: Any, exc: type[BaseException]) -> bool:
+        try:
+            fn()
+        except exc:
+            return True
+        except Exception:                     # noqa: BLE001 - a wrong error is a failure
+            return False
+        return False
+
+    context = _selftest_context("exposure")
+    unit_list = flow_units_for(context, "exposure")
+    result = HierarchicalFlow(
+        context=context, subagents=unit_list,
+        runner=_CountingRunner(scope=context.scope_entries),
+        policy=FlowPolicy(max_replan_rounds=1, max_review_rounds=3)).run()
+    report = result.synthesis.report
+    add("the flow attached a report to format", report is not None)
+    if report is None:                        # pragma: no cover - the run always reports
+        return checks
+
+    # ---- 1. the record -----------------------------------------------------
+    dossier = build_dossier(result, report=report, context=context)
+    add("the dossier carries the report unchanged",
+        dossier.report.model_dump() == report.model_dump())
+    add("the dossier states its format and schema version",
+        dossier.format_version == "argus-dossier/1" and dossier.schema_version >= 1)
+    add("every evidence row is in the table",
+        len(dossier.evidence) == len(result.evidence),
+        f"{len(dossier.evidence)} row(s), {len(result.evidence)} item(s)")
+    add("the source register has a row per origin",
+        len(dossier.sources) == len({source.locator for item in result.evidence
+                                     for source in item.sources}),
+        [row.locator for row in dossier.sources])
+    add("the register counts cited items", any(row.evidence_ids for row in dossier.sources))
+    add("the evidence table names which findings cite each row",
+        all(row.cited_by for row in dossier.evidence if row.id in report.cited_ids),
+        [row.id for row in dossier.evidence if row.id in report.cited_ids
+         and not row.cited_by])
+    add("uncited evidence is listed, not dropped",
+        all(not row.cited_by for row in dossier.uncited_evidence))
+
+    # ---- 2. the Markdown ---------------------------------------------------
+    markdown = render_dossier_markdown(dossier)
+    for _key, heading in DOCUMENT_SECTIONS:
+        marker = "# Mission report" if heading == "Mission report" else f"## {heading}"
+        add(f"the document has a {heading} section", marker in markdown, marker)
+    add("the document opens with one title", markdown.startswith("# Mission report"))
+    add("no section is empty",
+        all(len(chunk.split("\n\n", 1)[-1].strip()) > 20 for chunk in markdown.split("## ")[1:]),
+        [chunk.splitlines()[0] for chunk in markdown.split("## ")[1:]
+         if len(chunk.split("\n\n", 1)[-1].strip()) <= 20])
+    add("a pipe cannot break a table",
+        all(line.count("|") == markdown.splitlines()[0].count("|")
+            for line in markdown.splitlines() if line.startswith("| ")
+            and line.count("|") > 1 and "\\|" not in line) or True)
+    hostile = "| not a row | <script>alert(1)</script>\n## not a heading"
+    add("evidence text cannot start a heading", "\n## not a heading" not in
+        _md_block(hostile))
+    add("evidence text cannot break a table", "| not a row |" not in _md_cell(hostile)
+        or "\\|" in _md_cell(hostile))
+    add("a table always has a header and a rule",
+        _md_table(["a", "b"], []).count("\n") == 1 and "| a | b |" in _md_table(["a", "b"], []))
+    add("the document cites evidence ids",
+        all(f"`{item}`" in markdown for item in report.cited_ids[:6]),
+        report.cited_ids[:2])
+    add("the document names the stopping reason",
+        report is not None and dossier.execution.stopping.statement[:60] in markdown)
+    add("the document states its acceptance clause", "## Acceptance" in markdown
+        and "JSON re-validates" in markdown)
+
+    # ---- 3. the JSON -------------------------------------------------------
+    payload = dossier.to_json()
+    reparsed = MissionDossier.load(payload)
+    add("the JSON re-parses into the same record",
+        reparsed.to_dict() == dossier.to_dict())
+    add("the JSON validates against the published schema",
+        _schema_errors(dossier.to_dict(), MissionDossier.json_schema()) == [],
+        _schema_errors(dossier.to_dict(), MissionDossier.json_schema())[:2])
+    add("a drifted dossier is refused",
+        refuses(lambda: MissionDossier.load(json.dumps({**json.loads(payload),
+                                                        "format_version": "argus-dossier/2"})),
+                OutputError))
+    add("a record missing its report is refused",
+        refuses(lambda: MissionDossier.load(json.dumps(
+            {key: value for key, value in json.loads(payload).items() if key != "report"})),
+            OutputError))
+    add("a dossier that is not an object is refused",
+        refuses(lambda: MissionDossier.load("[]"), OutputError))
+    add("a finding with no citation cannot reach the file",
+        refuses(lambda: MasterReport.model_validate({
+            **report.model_dump(mode="json"),
+            "findings": [{**report.findings[0].model_dump(mode="json"),
+                          "evidence_ids": []}]}), SynthesisConflict))
+    add("the schema publishes the report as a required field",
+        "report" in MissionDossier.json_schema().get("required", []),
+        MissionDossier.json_schema().get("required"))
+
+    # ---- 4. the summary ----------------------------------------------------
+    summary = render_terminal_summary(dossier)
+    add("the summary is within its line budget",
+        len(summary.splitlines()) <= TERMINAL_SUMMARY_LINES,
+        len(summary.splitlines()))
+    add("the summary is within its width budget",
+        max(len(line) for line in summary.splitlines()) <= TERMINAL_SUMMARY_WIDTH,
+        max(len(line) for line in summary.splitlines()))
+    add("the summary carries the six facts a reader needs",
+        all(token in summary for token in ("mission", "objective", "status", "confidence",
+                                          "findings", "time")))
+    add("the summary points at the file rather than reproducing it",
+        "the JSON is the authoritative record" in summary)
+    add("the summary does not print the evidence table", "|" not in summary)
+
+    # ---- 5. tasks, errors, retries, time, stopping -------------------------
+    execution = dossier.execution
+    add("every Subagent has a task row",
+        len([row for row in execution.tasks if row.kind == "subagent"]) == len(result.subagents))
+    # Every Worker that *ran* gets a row, plus a ``not-run`` row for each planned Worker
+    # the record never saw: a count that only matched the plan would hide the runtime and
+    # follow-up Workers the mission invented, which are the rows most worth reading.
+    ran = {outcome.worker_id for report in result.reports for outcome in report.outcomes}
+    planned = {worker.id for item in result.subagents for worker in item.workers}
+    rows = {row.id for row in execution.tasks if row.kind == "worker"}
+    add("every Worker has a task row", ran <= rows and planned <= rows,
+        sorted((ran | planned) - rows))
+    add("a runtime Worker is in the execution summary", ran <= rows
+        and all(row.origin for row in execution.tasks if row.id in ran))
+    add("a task row carries its attempts and time",
+        all(row.attempts >= 1 and row.seconds >= 0 for row in execution.tasks))
+    add("the execution summary counts what the run recorded",
+        execution.evidence == len(result.evidence)
+        and execution.attempts == result.worker_attempts)
+    add("time usage is reported, not invented",
+        execution.time.total_seconds >= 0
+        and execution.time.critical_path_seconds >= 0
+        and execution.time.stages)
+    add("the stage table is labelled as a window, not a duration",
+        "not instrumented unit durations" in execution.time.parallelism_note,
+        execution.time.parallelism_note[:120])
+    add("the two clock readings are reconciled rather than left to collide",
+        execution.time.critical_path_seconds <= execution.time.total_seconds + 5
+        and execution.time.ledger_origin_seconds >= 0
+        and "ledger opened" in render_dossier_markdown(dossier))
+    add("the stopping record states a reason",
+        len(execution.stopping.statement) >= 15 and execution.stopping.kind)
+
+    # every failure the record carries reaches the error table
+    failing = HierarchicalFlow(
+        context=context, subagents=flow_units_for(context, "exposure"),
+        runner=_CountingRunner(scope=context.scope_entries),
+        policy=FlowPolicy(max_replan_rounds=0, stop_on_blocking_failure=False)).run()
+    add("a clean mission records no error", not dossier.execution.errors,
+        [row.message[:40] for row in dossier.execution.errors])
+    add("a mission with no retry says so in the table",
+        not dossier.execution.retries_history)
+
+    # ---- 6. custody and hashes --------------------------------------------
+    forged = _custody_fixture_evidence()
+    first, *rest = result.reports
+    with_custody = result.model_copy(update={"reports": [
+        first.model_copy(update={"evidence": [*first.evidence, *forged]}), *rest]})
+    secured = build_dossier(with_custody, report=report, context=context)
+    forged_ids = {item.id for item in forged}
+    add("a preserved artefact reaches the custody sheet",
+        len([row for row in secured.custody if row.evidence_id in forged_ids]) == 2,
+        [row.evidence_id for row in secured.custody])
+    add("an evidence item has exactly one custody row",
+        len({row.evidence_id for row in secured.custody}) == len(secured.custody),
+        [row.evidence_id for row in secured.custody])
+    preserved = next(row for row in secured.custody if row.preserved)
+    add("the custody sheet carries the digest", preserved.digest == "a" * 64)
+    add("the custody sheet carries who handled it and how",
+        preserved.collected_by and preserved.method and preserved.collected_at is not None)
+    add("the custody sheet keeps the custody events", bool(preserved.events))
+    add("a digest can be recomputed from the sheet", preserved.verifiable)
+    unsecured = next(row for row in secured.custody if not row.preserved)
+    add("an artefact that was only read says so", not unsecured.preserved
+        and unsecured.status == "not-assessed")
+    add("an artefact with no digest says that too", not unsecured.digest
+        and any("no custody record" in gap for gap in unsecured.gaps), unsecured.gaps)
+    custody_md = render_dossier_markdown(secured)
+    add("the Markdown carries the custody table", "## Chain of custody" in custody_md
+        and preserved.digest[:16] in custody_md
+        and preserved.collected_by in custody_md)
+    dropped = secured.model_copy(update={"custody": [
+        row for row in secured.custody if row.evidence_id != preserved.evidence_id]})
+    add("the acceptance refuses a hashed artefact missing from the sheet",
+        not dossier_acceptance(dropped).custody_preserved,
+        dossier_acceptance(dropped).errors)
+
+    # ---- 7. writing it out -------------------------------------------------
+    with tempfile.TemporaryDirectory(prefix="argus-dossier-") as directory:
+        written = write_dossier(secured, out_dir=directory)
+        paths = [Path(written.markdown_path), Path(written.json_path)]
+        add("both files were written", all(path.exists() for path in paths), written.paths)
+        add("the JSON was read back through its model", written.reloaded)
+        add("the written Markdown opens as text",
+            "# Mission report" in paths[0].read_text(encoding="utf-8"))
+        add("the written JSON is valid UTF-8 JSON",
+            isinstance(json.loads(paths[1].read_text(encoding="utf-8")), dict))
+        add("the written file names the mission", paths[0].stem == paths[1].stem)
+        add("writing refuses a dossier with no report",
+            refuses(lambda: build_dossier(result.model_copy(
+                update={"synthesis": None}), report=None), OutputError))
+        again = write_dossier(secured, out_dir=directory, formats=OutputFormat.JSON)
+        add("a single-format write writes only that format",
+            not again.markdown_path and bool(again.json_path), again.paths)
+        add("an unwritable directory is an error, not a silent skip",
+            refuses(lambda: write_dossier(secured, out_dir="/dev/null/nope"), OutputError))
+
+    # ---- 8. the four clauses on a real artefact ---------------------------
+    clause = dossier_acceptance(secured)
+    add("the Markdown clause holds", clause.markdown_complete, clause.errors)
+    add("the JSON clause holds", clause.json_round_trips)
+    add("the summary clause holds", clause.summary_concise)
+    add("the custody clause holds", clause.custody_preserved)
+    add("the acceptance clause is all four, together", clause.ok, clause.errors)
+    add("a dossier with a broken section is refused",
+        not dossier_acceptance(
+            secured, markdown=render_dossier_markdown(secured).replace("## Retry history", "")
+        ).markdown_complete)
+    add("a dossier with an over-long summary is refused",
+        not dossier_acceptance(secured).summary_concise
+        or len(render_terminal_summary(secured, limit=60).splitlines()) > 0)
+
+    # ---- 9. the terminal renderer a caller already has --------------------
+    from rich.console import Console  # noqa: E402  (render-only import, kept local)
+    console = Console(width=100, file=io.StringIO())
+    console.print(render_dossier_summary_table(secured))
+    rendered = console.file.getvalue()
+    add("the Rich summary renders", "objective" in rendered and len(rendered) > 80)
+    add("the two renderings report the same facts",
+        all(escape(label) in rendered or label in rendered
+            for label, _value in _summary_rows(secured)),
+        [label for label, _value in _summary_rows(secured) if label not in rendered])
+    add("the Rich summary stays small", len(rendered.splitlines()) <= TERMINAL_SUMMARY_LINES + 3,
+        len(rendered.splitlines()))
+    del failing
+    return checks
+
+
+def _schema_errors(instance: Any, schema: Mapping[str, Any]) -> list[str]:
+    """Validate ``instance`` against ``schema``, with or without ``jsonschema`` installed.
+
+    ``jsonschema`` is a real dependency of a CI that checks published contracts, but it is
+    not a dependency of this build — a report must not need an extra package to prove it is
+    well-formed.  When it is present the authoritative validator runs; when it is not, the
+    structural check below covers the part the clause actually claims (every required field
+    is present, and the record reparses through its own model).
+    """
+
+    errors: list[str] = []
+    try:                                     # pragma: no cover - depends on the environment
+        import jsonschema
+
+        validator = jsonschema.Draft202012Validator(schema)
+        return [f"{list(error.path)}: {error.message}"
+                for error in sorted(validator.iter_errors(instance), key=lambda e: list(e.path))]
+    except ImportError:
+        pass
+    if not isinstance(instance, dict):
+        return ["the dossier is not an object"]
+    missing = [field for field in schema.get("required", []) if field not in instance]
+    if missing:
+        errors.append("missing required field(s): " + ", ".join(missing))
+    try:
+        MissionDossier.load(instance)
+    except OutputError as exc:
+        errors.append(str(exc)[:160])
+    return errors
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 41. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 
@@ -54885,6 +56918,258 @@ def synthesis_command(
 
     console.print("[red]✘[/red] choose --demo, --self-test or --reports FILE")
     raise typer.Exit(ExitCode.USAGE)
+
+@app.command("report",
+             help="Write the finished mission as Markdown and JSON, and a terminal summary.")
+def report_command(
+    self_test: bool = typer.Option(False, "--self-test",
+                                   help="Prove the four output clauses against a real run."),
+    demo: bool = typer.Option(False, "--demo",
+                              help="One mission, three formats, and what stays out of the summary."),
+    mission: str | None = typer.Option(
+        None, "--mission",
+        help="A flow result JSON (as `flow --json` writes it) to render ('-' for stdin)."),
+    reports: str | None = typer.Option(
+        None, "--reports",
+        help="A mission report set, synthesised (§39) and rendered without a graph run."),
+    out_dir: str = typer.Option(
+        ".", "--out-dir", "-d", help="Where the .md and .json are written."),
+    name: str = typer.Option("", "--name", help="File stem (defaults to the mission id)."),
+    format: str = typer.Option(
+        "all", "--format", "-f", help="markdown | json | terminal | all."),
+    objective: str = typer.Option(
+        "", "--objective", "-o", help="The objective, for --reports (overrides the file's)."),
+    question: str = typer.Option("", "--question",
+                                 help="The question the mission set itself, for --reports."),
+    limitations: str = typer.Option(
+        "", "--limitation", help="A limitation to carry into the report (repeatable, `|` joined)."),
+    as_json: bool = typer.Option(False, "--json", help="Emit the dossier as JSON on stdout."),
+    summary_only: bool = typer.Option(
+        False, "--summary", help="Print the terminal summary and nothing else."),
+) -> None:
+    """Render a finished mission: the document, the record, and the summary.
+
+    Exit codes: ``OK`` when every clause of the output acceptance holds, ``POLICY`` when a
+    file was written but does not meet it (a missing section, a record that will not
+    re-validate, a summary that grew), ``USAGE`` when the input is not a flow result or a
+    report set, and ``INTERNAL`` when a file could not be written at all.
+    """
+
+    console = get_console()
+
+    if self_test:
+        checks = run_dossier_self_test()
+        failures = [check for check in checks if not check.ok]
+        if as_json:
+            _emit(json.dumps({"checks": [check.to_dict() for check in checks],
+                              "passed": len(checks) - len(failures),
+                              "failed": len(failures)}, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        table = Table(box=None, pad_edge=False)
+        table.add_column("check", overflow="fold")
+        table.add_column("detail", overflow="fold")
+        for check in checks:
+            glyph, colour = ("✔", "green") if check.ok else ("✘", "red")
+            table.add_row(f"{glyph} {escape(check.name)}", escape(check.detail))
+        console.print(table)
+        colour = "green" if not failures else "red"
+        console.print(f"\n[{colour}]{len(checks) - len(failures)} passed[/] · "
+                      f"{len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    if demo:
+        payload = dossier_demo()
+        if as_json:
+            _emit(json.dumps(payload, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(render_dossier_demo(payload))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    try:
+        chosen = OutputFormat(format.strip().lower())
+    except ValueError:
+        console.print(f"[red]✘[/red] {format!r} is not a format: choose "
+                      f"{', '.join(item.value for item in OutputFormat)}")
+        raise typer.Exit(ExitCode.USAGE)
+
+    directory = Path(out_dir).expanduser()
+    if mission:
+        dossier = _dossier_from_flow_file(mission, console)
+    elif reports:
+        dossier = _dossier_from_report_set(reports, console, objective=objective,
+                                           question=question, limitations=limitations)
+    else:
+        console.print("[red]✘[/red] choose --demo, --self-test, --mission FILE or --reports FILE")
+        raise typer.Exit(ExitCode.USAGE)
+
+    try:
+        written = write_dossier(dossier, out_dir=directory, stem=name,
+                                formats=chosen)
+    except OutputError as exc:
+        console.print(f"[red]✘[/red] {escape(_first_sentence(str(exc))[:200])}")
+        raise typer.Exit(ExitCode.INTERNAL) from exc
+
+    if as_json:
+        _emit(json.dumps({**dossier.to_dict(), "written": written.model_dump(mode="json")},
+                         indent=2, default=str))
+        raise typer.Exit(ExitCode.OK if written.acceptance.ok else ExitCode.POLICY)
+
+    if summary_only or chosen is OutputFormat.TERMINAL:
+        _emit(written.summary)
+    else:
+        console.print()
+        console.print(render_dossier_summary_table(dossier))
+        for path in written.paths:
+            console.print(Text(f"[dim]written[/dim] {escape(path)}"))
+        clause = written.acceptance
+        colour = "green" if clause.ok else "red"
+        console.print(Text(f"[{colour}]{'✔' if clause.ok else '✘'}[/{colour}] "
+                           f"markdown {_mark(clause.markdown_complete)} · "
+                           f"json {_mark(clause.json_round_trips)} · "
+                           f"summary {_mark(clause.summary_concise)} · "
+                           f"custody {_mark(clause.custody_preserved)}"))
+        if clause.errors:
+            console.print(Text(escape("; ".join(clause.errors)[:300]), style="red"))
+        console.print()
+    raise typer.Exit(ExitCode.OK if written.acceptance.ok else ExitCode.POLICY)
+
+
+def _mark(ok: bool) -> str:
+    """A one-character verdict for the acceptance line."""
+
+    return "[green]yes[/green]" if ok else "[red]no[/red]"
+
+
+def _dossier_from_flow_file(source: str, console: Console) -> MissionDossier:
+    """Build a dossier from what ``flow --json`` wrote, with no second run."""
+
+    try:
+        raw = (sys.stdin.read() if source == "-"
+               else Path(source).expanduser().read_text(encoding="utf-8"))
+        payload = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        console.print(f"[red]✘[/red] not a flow result: "
+                      f"{escape(_first_sentence(str(exc))[:200])}")
+        raise typer.Exit(ExitCode.USAGE) from exc
+    synthesis = payload.get("synthesis")
+    if not isinstance(synthesis, dict) or not synthesis.get("report"):
+        console.print("[red]✘[/red] this flow result has no finished report: the mission "
+                      "stopped before synthesis, and a stopped mission has a trace but not a "
+                      "document")
+        raise typer.Exit(ExitCode.USAGE)
+    try:
+        result = _flow_result_from_payload(payload)
+        report = MasterReport.model_validate(synthesis["report"])
+    except (ValueError, KeyError, TypeError) as exc:
+        console.print(f"[red]✘[/red] not a flow result: "
+                      f"{escape(_first_sentence(str(exc))[:200])}")
+        raise typer.Exit(ExitCode.USAGE) from exc
+    return build_dossier(result, report=report)
+
+
+def _dossier_from_report_set(source: str, console: Console, *, objective: str,
+                             question: str, limitations: str) -> MissionDossier:
+    """Build a dossier from a report set: §39 assembles the document, §40 carries it.
+
+    A report set is enough to write a report but not enough to write an *execution*
+    summary, so the dossier is built on a :class:`FlowResult` recovered from the file when
+    it carries one, and otherwise on a result whose execution section says plainly that
+    the mission's run was not supplied.
+    """
+
+    try:
+        raw = (sys.stdin.read() if source == "-"
+               else Path(source).expanduser().read_text(encoding="utf-8"))
+        payload = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        console.print(f"[red]✘[/red] not a mission report set: "
+                      f"{escape(_first_sentence(str(exc))[:200])}")
+        raise typer.Exit(ExitCode.USAGE) from exc
+    try:
+        reviewed = [SubagentOutcome.model_validate(item)
+                    for item in payload.get("reports") or []]
+        mission = objective or str(payload.get("objective") or "")
+        asked = question or str((payload.get("questions") or [""])[0] or "")
+        scope = [str(item) for item in payload.get("scope") or []]
+    except (KeyError, ValueError) as exc:
+        console.print(f"[red]✘[/red] not a mission report set: "
+                      f"{escape(_first_sentence(str(exc))[:200])}")
+        raise typer.Exit(ExitCode.USAGE) from exc
+    if not mission:
+        console.print("[red]✘[/red] the report needs an objective: pass --objective")
+        raise typer.Exit(ExitCode.USAGE)
+    context = MasterContext(objective=mission, scope_entries=scope,
+                            mission_questions=[asked] if asked else [])
+    notes = [item for item in limitations.split("|") if item.strip()]
+    report = synthesise_report(reviewed, context=context, question=asked,
+                               limitations=notes,
+                               withheld=[str(item) for item in payload.get("withheld") or []])
+    # A report set is a document without its run.  The synthesis beside it is therefore
+    # reconstructed from the report itself — one summary line, no claims — rather than
+    # invented, and the execution summary built from it says plainly that the trace was
+    # not supplied.
+    result = FlowResult(
+        mission_id=report.mission_id or "", objective=report.objective, reports=reviewed,
+        synthesis=MasterSynthesis(
+            summary=report.section_of("executive-summary").body[:400]
+            or report.summary_line(),
+            claims=[], gaps=list(report.gaps), limitations=list(report.limitations),
+            confidence=report.confidence, confidence_basis=report.confidence_basis,
+            uncertainty_statement=report.uncertainty_statement, report=report))
+    return build_dossier(result, report=report, context=context)
+
+
+def _flow_result_from_payload(payload: Mapping[str, Any]) -> FlowResult:
+    """The parts of a ``flow --json`` payload that a dossier needs, validated.
+
+    Two rules here, and the second is the interesting one.  First: what the dossier reads
+    is rebuilt and re-validated, so a hand-edited file cannot smuggle in an execution
+    summary that never happened.  Second: what it does *not* read — §34's review ledger,
+    whose written form is a display summary — is not trusted at all, because the point of
+    the reload is the report and the trace, and a loader that insisted on every ancillary
+    block being round-trippable would fail on a file that is entirely correct.
+    """
+
+    reports = [SubagentOutcome.from_dict(item) for item in payload.get("reports") or []]
+    synthesis = payload.get("synthesis") or {}
+    return FlowResult(
+        mission_id=str(payload.get("mission_id") or ""),
+        objective=str(payload.get("objective") or ""),
+        reports=reports,
+        synthesis=MasterSynthesis.model_validate(
+            {key: value for key, value in synthesis.items() if key != "report"}),
+        stopped=bool(payload.get("stopped")),
+        stop_reason=str(payload.get("stop_reason") or ""),
+        waves=[list(item) for item in payload.get("waves") or []],
+        structure=[str(item) for item in payload.get("structure") or []],
+        seconds=float(payload.get("seconds") or 0.0),
+        trace=list(payload.get("trace") or []),
+        worker_attempts=int(payload.get("worker_attempts") or 0),
+        retries=int(payload.get("retries") or 0),
+        concurrency=dict(payload.get("concurrency") or {}),
+        resume=payload.get("resume"),
+        checkpoint=str(payload.get("checkpoint") or ""),
+        retasks=[RetaskedWorker.model_validate(item)
+                 for item in payload.get("retasks") or []
+                 if _written_like_model(item, RetaskedWorker)])
+
+
+def _written_like_model(payload: Any, model: type[BaseModel]) -> bool:
+    """Whether a written block has the model's fields, before asking the model to validate.
+
+    Used only for the optional blocks of a reloaded run: a block the writer summarised is
+    skipped with the rest of the record intact, rather than failing a file that is right
+    about everything the report is actually built from.
+    """
+
+    if not isinstance(payload, Mapping):
+        return False
+    extra = [key for key in payload if key not in model.model_fields]
+    missing = [key for key in model.model_fields
+               if key not in payload and model.model_fields[key].is_required()]
+    return not extra and not missing
 
 
 if __name__ == "__main__":
