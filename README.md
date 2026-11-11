@@ -17,6 +17,7 @@ python vedant_osint.py workers --self-test    # runtime Worker specifications
 python vedant_osint.py flow --self-test       # LangGraph execution flow
 python vedant_osint.py sched --self-test      # bounded queues, deadlines, licences
 python vedant_osint.py resume --self-test     # checkpointing and resumable missions
+python vedant_osint.py router --self-test     # the controlled capability router
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -462,6 +463,50 @@ python vedant_osint.py flow --demo exposure --checkpoint --redo      # do it aga
   records the failure and the mission carries on; losing durability is bad,
   losing the run is worse.
 
+## The controlled capability router
+
+A Worker never touches the world directly. It asks for one of **nine**
+capabilities — public-web research, browser interaction, document extraction,
+local artefact inspection, metadata analysis, hashing, timeline construction,
+correlation, synthesis — at a named target. The router either performs it and
+returns evidence, or refuses with a structured explanation and moves on.
+
+```bash
+python vedant_osint.py router --demo         # seven attempts, six refused
+python vedant_osint.py router --self-test    # 98 boundary checks, offline
+python vedant_osint.py router --demo --json  # grants, attempts, dispatch
+```
+
+- **The vocabulary is closed.** `Capability` is nine values and `TOOL_REGISTRY`
+  is a fixed table binding each tool to one of them. `shell.exec`, `worker.spawn`
+  or anything else is refused as `unknown-capability`: the router executes
+  nothing and has no field for a command line, so no Worker reaches a process.
+  A URL that legitimately contains `&` is not mistaken for a shell command, and
+  a *literal* command line is refused however it is dressed up.
+- **The grant is derived, never granted.** `grant_for_worker` reads the Worker's
+  own declared tools and produces the only capabilities it can hold;
+  `CapabilityGrant` is frozen, so nothing can add one at runtime. A request for a
+  tool the Worker was not assigned is `not-granted`, and a capability its
+  assignment does not name is `not-granted` before any handler is reached.
+- **Scope cannot be widened from inside.** A target is checked against the
+  mission's `Scope` for hosts and against the approved roots for files, both
+  *before* any effect. A symlink out of an approved root, a sibling directory, a
+  `..` traversal or `/etc/shadow` is `path-not-approved`; `evil.example.org` is
+  `out-of-scope`. An offline mission refuses a network capability as
+  `network-off` even when the grant holds it.
+- **Admission has an order, and it is the order of the reasons a Worker sees.**
+  Shell refusal → capability in the closed set → held by the grant → tool bound,
+  assigned and installed → network switch → path or scope → budget. A refusal
+  consumes no budget, and it never runs part of a request.
+- **Derived capabilities cannot import the world.** Correlation and synthesis
+  may cite only evidence *this* mission already produced — an invented id is
+  `out-of-scope` — and their revisions live in a `DerivationJournal` a rejected
+  review can roll back.
+- **A refusal is visible, not silent.** The router keeps every refusal, turns it
+  into an `UnknownValue` gap, and the flow asks the router before taking a
+  concurrency slot: a Worker with nothing it may do is reported as blocked
+  instead of consuming capacity a working Worker needs.
+
 ## Status
 
 | Phase | Scope | State |
@@ -472,7 +517,7 @@ python vedant_osint.py flow --demo exposure --checkpoint --redo      # do it aga
 | 4 | Browser — browser-use / Playwright sessions and capture | ⬜ |
 | 5 | Collection — passive OSINT sources, artefact hashing | ⬜ |
 | 6 | Synthesis — cross-source correlation and reporting | ⬜ |
-| 7 | Operations — resume, budgets, audit trail, hardening | 🟡 started (checkpoints, resumable missions, budgets) |
+| 7 | Operations — resume, budgets, audit trail, hardening | 🟡 started (checkpoints, resumable missions, capability router, budgets) |
 
 ## Install
 

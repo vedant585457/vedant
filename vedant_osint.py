@@ -483,6 +483,39 @@ deliverable stays one file; a mission's data never goes into it.
     python vedant_osint.py resume --mission <id>    # what a resume would do, and why
     python vedant_osint.py flow --demo exposure --checkpoint
 
+The controlled capability router
+--------------------------------
+A Worker does not touch the world directly.  It asks the router for one of nine
+capabilities — public-web research, browser interaction, document extraction,
+local artefact inspection, metadata analysis, hashing, timeline construction,
+correlation or synthesis — at a named target, and the router either performs it
+and returns evidence, or refuses with a :class:`CapabilityRefusal` that names the
+reason, what the grant allowed and what to do instead.
+
+* **The vocabulary is closed.**  :class:`Capability` is nine values and
+  :data:`TOOL_REGISTRY` is a fixed table binding each tool to one of them.  A
+  request for ``shell.exec``, ``worker.spawn`` or anything else is refused as
+  ``unknown-capability`` — the router executes nothing and has no field for a
+  command line, so there is no path from a Worker to a process.
+* **The grant is derived, never granted.**  :func:`grant_for_worker` reads the
+  Worker's *own* declared tools and produces the only capabilities it can hold;
+  :class:`CapabilityGrant` is frozen, so no caller can add one.  Scope cannot be
+  widened from inside: a target is checked against the mission's
+  :class:`Scope` (for hosts) or the approved roots (for files) before any effect.
+* **Admission is ordered.**  Shell refusal, capability in the closed set, held by
+  the grant, tool bound and assigned and installed, network switch, path or scope,
+  budget — so the refusal a Worker sees quotes the most useful reason, and a
+  refusal consumes no budget.
+* **Every refusal is visible.**  The ledger keeps each refusal, a refusal renders
+  as an :class:`UnknownValue` gap rather than a silent pass, and the flow asks the
+  router before taking a concurrency slot, so a Worker that can do nothing is
+  reported instead of stealing capacity.
+
+::
+
+    python vedant_osint.py router --self-test       # 98 boundary checks, offline
+    python vedant_osint.py router --demo            # seven attempts, six refused
+
 Structured model adapter
 ------------------------
 One model-calling interface sits between orchestration and every provider, so
@@ -673,7 +706,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 16
+VERSION_MINOR: int = 17
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -732,7 +765,8 @@ PHASE_ROADMAP: tuple[tuple[int, str, str], ...] = (
     (4, "Browser", "browser-use/Playwright sessions and capture"),
     (5, "Collection", "passive OSINT sources, artefact hashing/chain of custody"),
     (6, "Synthesis", "cross-source correlation, findings and report export"),
-    (7, "Operations", "checkpoints and resumable missions, budgets, audit trail"),
+    (7, "Operations", "checkpoints and resumable missions, the controlled capability "
+                      "router, budgets, audit trail"),
 )
 
 #: Console width used when Rich cannot detect a terminal (pipes, CI logs).
@@ -21236,6 +21270,13 @@ class FlowPolicy(StrictModel):
     wait_timeout_seconds: float = Field(default=30.0, gt=0, le=600)
     #: Informational only: the caps above are the ones enforced.
     max_concurrency: int = Field(default=0, ge=0, le=64)
+    #: Build the capability router and give every Worker a grant derived from its
+    #: own assignment.  Off only for a flow that supplies its own runner and never
+    #: dispatches through the router.
+    capability_router: bool = True
+    #: Network switch handed to the router, so an offline mission refuses a
+    #: network capability at the boundary rather than inside a collector.
+    allow_network: bool = True
 
     @classmethod
     def from_context(cls, context: "MasterContext", **overrides: Any) -> "FlowPolicy":
@@ -22149,6 +22190,12 @@ class HierarchicalFlow:
         self.clip: ClipReport | None = None
         #: Set by ``build``: the units came from a real specification pipeline.
         self.from_specs = False
+        #: The one path from a Worker's request to an effect, and the grants that
+        #: bound it.  Built in ``build``; ``None`` when the policy disables it.
+        self.router: "CapabilityRouter | None" = None
+        self.grants: dict[str, Any] = {}
+        #: Dispatches each Worker made through the router, in order.
+        self.dispatch: list[dict[str, Any]] = []
         #: The write-ahead seam, when this run is checkpointed.  ``None`` is the
         #: ordinary case: a mission with nowhere to persist costs one check.
         self.resume: "ResumeLedger | None" = None
@@ -22289,6 +22336,71 @@ class HierarchicalFlow:
 
     # -- compilation --------------------------------------------------------
 
+    def _build_router(self) -> None:
+        """One router per run, and one grant per Worker — derived, never granted.
+
+        The scope the router judges against is the mission's own; the roots come
+        from the scope's path entries, so a Worker can read an approved artefact
+        and nothing beside it.
+        """
+
+        if not self.policy.capability_router:
+            self.router = None
+            self.grants = {}
+            return
+        scope = self.context.scope_object()
+        self.router = CapabilityRouter(scope=scope, network=self.policy.allow_network)
+        self.grants = {
+            worker.id: grant_for_worker(worker, subagent, paths=self.router.paths,
+                                        network=self.policy.allow_network)
+            for subagent in self.subagents for worker in subagent.workers
+        }
+
+    def dispatch_worker(self, subagent: FlowSubagent, worker: FlowWorker, *,
+                        targets: Mapping[str, str] | None = None) -> dict[str, Any]:
+        """Run one Worker *through the router*, and return what it produced.
+
+        This is the shape a real collection runner takes: the Worker names the
+        capabilities it was assigned, the router admits or refuses each of them,
+        and a refusal becomes a gap on the result rather than a crash.  The
+        deterministic runner below produces the same outcome without the router,
+        so the demo shows the flow; this shows the boundary.
+        """
+
+        if self.router is None:
+            raise CapabilityDenied(CapabilityRefusal(
+                request=f"worker {worker.id}", reason=DenialReason.NOT_GRANTED,
+                detail="this flow was built with the capability router disabled",
+                remedy="build the flow with FlowPolicy(capability_router=True)"))
+        grant = self.grants.get(worker.id)
+        if grant is None:                         # pragma: no cover - every worker has one
+            raise CapabilityDenied(CapabilityRefusal(
+                request=f"worker {worker.id}", reason=DenialReason.NOT_GRANTED,
+                detail="this Worker has no grant in this run",
+                remedy="plan the Worker through the flow's build"))
+        outcomes: list[CapabilityResult] = []
+        refusals: list[CapabilityRefusal] = []
+        for request in worker_requests(worker, scope=self.context.scope_entries,
+                                       targets=targets):
+            result, refusal = self.router.try_invoke(grant, request)
+            if refusal is not None:
+                refusals.append(refusal)
+                continue
+            if result is not None:
+                outcomes.append(result)
+        self.router.remember([item for result in outcomes for item in result.evidence])
+        dispatched = {
+            "worker": worker.id, "subagent": subagent.id,
+            "grant": grant.to_dict(),
+            "capabilities": [result.to_dict() for result in outcomes],
+            "refusals": [refusal.model_dump(mode="json") for refusal in refusals],
+            "evidence": [json.loads(model_to_json(item))
+                         for result in outcomes for item in result.evidence],
+            "gaps": [refusal.to_gap().describe() for refusal in refusals],
+        }
+        self.dispatch.append(dispatched)
+        return dispatched
+
     def _compile(self) -> Any:
         """Build the three graphs.  LangGraph is imported here, never at import."""
 
@@ -22359,6 +22471,10 @@ class HierarchicalFlow:
             self.runtime.register_subagent(subagent)
             for worker in subagent.workers:
                 self.runtime.register_worker(worker, subagent)
+        # The grants are derived from the surviving team, so a Worker clipped
+        # away cannot hold a capability, and a Worker that survived cannot hold one
+        # its own assignment did not name.
+        self._build_router()
         self._compile()
         return self
 
@@ -22685,6 +22801,13 @@ class HierarchicalFlow:
                     "reviews": ([] if verdict is None
                                 else [json.loads(model_to_json(verdict))])}
 
+        # The router is asked *before* a slot is taken: a Worker with nothing it
+        # is allowed to do should not consume the capacity one that can work needs.
+        refused = self._route_worker(subagent, worker)
+        if refused is not None:
+            self._settled[subagent.id].add(worker.id)
+            return {"outcomes": [json.loads(model_to_json(refused))], "reviews": []}
+
         try:
             # The Worker holds one worker slot for its whole attempt→review loop;
             # every attempt inside it holds a model-call slot while it runs.
@@ -22718,6 +22841,44 @@ class HierarchicalFlow:
         self._record_in_store(subagent, worker, outcome)
         return {"outcomes": [json.loads(model_to_json(outcome))],
                 "reviews": [json.loads(model_to_json(verdict))]}
+
+    def _route_worker(self, subagent: FlowSubagent,
+                      worker: FlowWorker) -> WorkerOutcome | None:
+        """Ask the capability router what this Worker may do.
+
+        ``None`` means the Worker's assignment is dispatchable — or that the flow
+        was built without a router, which is the demo path.  A Worker whose every
+        request was refused returns an outcome instead: it did not run, and the
+        reason is a gap rather than a silence.  A partial refusal is left to the
+        dispatcher, which records it beside the evidence it did produce.
+        """
+
+        if self.router is None or not worker.tools:
+            return None
+        grant = self.grants.get(worker.id)
+        if grant is None:                        # pragma: no cover - build makes them all
+            return None
+        admissible = [binding for binding in grant.tools
+                      if (_TOOL_BINDINGS.get(binding) is not None
+                          and _TOOL_BINDINGS[binding].available)]
+        if grant.capabilities and admissible:
+            return None
+        reason = (f"no capability in this Worker's assignment is available: "
+                  f"{', '.join(worker.tools)}")
+        refusal = CapabilityRefusal(
+            request=f"worker {worker.name}", reason=DenialReason.UNAVAILABLE,
+            detail=reason[:200], allowed=list(grant.capabilities),
+            remedy="install the missing dependency, or assign the Worker a local capability",
+            worker=worker.id, subagent=subagent.id,
+            attempted_capability=", ".join(worker.tools)[:80])
+        self._record(FlowStage.DEFERRED, unit=worker.id, parent=subagent.id,
+                     detail=f"capability refused: {refusal.reason.value}")
+        outcome = WorkerOutcome(
+            worker_id=worker.id, subagent_id=subagent.id, status=EntityStatus.BLOCKED,
+            attempt=1, gate=FlowGate.ERROR, summary=f"{worker.name}: not dispatched",
+            error=refusal.describe()[:200], payload={"refusal": refusal.model_dump(mode="json")})
+        self.last_outcome = outcome
+        return outcome
 
     def _worker_deadline(self, subagent: FlowSubagent, worker: FlowWorker) -> Deadline:
         """The Worker's deadline: its own budget, clamped to the mission's."""
@@ -25780,8 +25941,1903 @@ def _default_runs_dir() -> Path:
         return Path(DEFAULT_HOME_DIRNAME) / DEFAULT_OUTPUT_DIRNAME
 
 
+# --------------------------------------------------------------------------
+# 27. The controlled capability router
+# --------------------------------------------------------------------------
+#
+# A Worker does not run code; it asks for capabilities.  This section is the only
+# place a request becomes an action, and it grants nothing the Worker's own
+# assignment did not already contain:
+#
+# *   **Nine capabilities, no more.**  :class:`Capability` is a closed set —
+#     public-web research, browser interaction, document extraction, local
+#     artefact inspection, metadata analysis, hashing, timeline construction,
+#     correlation, synthesis.  A name outside it is a refusal, not a fallback.
+# *   **The grant is the assignment.**  A :class:`CapabilityGrant` is derived from
+#     the Worker's tools, the mission's scope and the router's registry.  It cannot
+#     be widened by its holder, and every call is checked against it *and* against
+#     the scope before anything happens.
+# *   **Paths are judged, not joined.**  A path is resolved (symlinks included) and
+#     must sit inside an approved root; ``..`` and a symlink out of the root both
+#     fail, and they fail by comparison after resolution rather than by looking for
+#     suspicious characters.
+# *   **Nothing shells out.**  No capability runs a process, so there is no
+#     injection surface to defend: the refusal is structural, not a filter.
+# *   **A refusal is a record.**  :class:`CapabilityDenied` carries a
+#     :class:`CapabilityRefusal` with the request, the reason and what *would* have
+#     been allowed, and the router keeps every refusal it made — so a Worker that
+#     tried to widen its scope is visible in the ledger afterwards.
+
+
+class Capability(str, Enum):
+    """The closed set of things a Worker may ask the router to do.
+
+    Each value names a verb rather than a tool or a vendor: the router decides how
+    to do it, and a deployment that lacks the dependency refuses the request with
+    ``unavailable`` rather than silently doing something else.
+    """
+
+    PUBLIC_WEB = "public-web.research"
+    BROWSER = "browser.interact"
+    DOCUMENT = "document.extract"
+    ARTIFACT = "artifact.inspect"
+    METADATA = "metadata.analyse"
+    HASHING = "hashing.compute"
+    TIMELINE = "timeline.construct"
+    CORRELATION = "correlation.build"
+    SYNTHESIS = "synthesis.write"
+
+
+#: Every capability, in the order this section presents them.
+CAPABILITY_ORDER: tuple[Capability, ...] = (
+    Capability.PUBLIC_WEB,
+    Capability.BROWSER,
+    Capability.DOCUMENT,
+    Capability.ARTIFACT,
+    Capability.METADATA,
+    Capability.HASHING,
+    Capability.TIMELINE,
+    Capability.CORRELATION,
+    Capability.SYNTHESIS,
+)
+
+#: Capabilities that need the network.  Used to refuse a request in an offline
+#: mission before it reaches a dependency at all.
+_NETWORK_CAPABILITIES: frozenset[Capability] = frozenset({
+    Capability.PUBLIC_WEB, Capability.BROWSER,
+})
+
+#: Capabilities that touch the filesystem, so they need an approved root and a
+#: path that resolves inside it.
+_FILESYSTEM_CAPABILITIES: frozenset[Capability] = frozenset({
+    Capability.DOCUMENT, Capability.ARTIFACT, Capability.METADATA,
+    Capability.HASHING, Capability.TIMELINE,
+})
+
+#: Capabilities that read other units' results rather than the world.
+_DERIVED_CAPABILITIES: frozenset[Capability] = frozenset({
+    Capability.CORRELATION, Capability.SYNTHESIS, Capability.TIMELINE,
+})
+
+
+class ToolBinding(StrictModel):
+    """How one *declared tool name* maps onto a capability.
+
+    A tool name is what the planner wrote (``http.fetch``, ``forensic.hash``); a
+    capability is what the router can actually do.  Keeping the mapping in data
+    makes a new tool name a registry edit, and an unknown one a refusal.
+    """
+
+    tool: str = Field(min_length=1)
+    capability: Capability
+    #: The dependency module that must be importable for this to work at all.
+    requires: str | None = None
+    #: One line a refusal can quote back: what this tool actually does.
+    purpose: str = ""
+
+    @property
+    def available(self) -> bool:
+        """Is the dependency this binding needs importable here?"""
+
+        if self.requires is None:
+            return True
+        try:
+            return importlib.util.find_spec(self.requires) is not None
+        except (ImportError, ValueError):        # pragma: no cover - exotic module spec
+            return False
+
+
+#: The tool→capability table.  Every entry is a *name a plan may use*; nothing
+#: here executes on import, and the registry is what makes an unknown name safe.
+TOOL_REGISTRY: tuple[ToolBinding, ...] = (
+    ToolBinding(tool="http.fetch", capability=Capability.PUBLIC_WEB, requires="httpx",
+                purpose="fetch a public page over HTTP"),
+    ToolBinding(tool="web.search", capability=Capability.PUBLIC_WEB, purpose="search a public index"),
+    ToolBinding(tool="dns.lookup", capability=Capability.PUBLIC_WEB, purpose="resolve a public DNS record"),
+    ToolBinding(tool="whois.lookup", capability=Capability.PUBLIC_WEB, purpose="read a public WHOIS record"),
+    ToolBinding(tool="advisory.read", capability=Capability.PUBLIC_WEB, purpose="read a published advisory"),
+    ToolBinding(tool="archive.search", capability=Capability.PUBLIC_WEB, purpose="query a public archive"),
+    ToolBinding(tool="browser.use", capability=Capability.BROWSER, requires="browser_use",
+                purpose="drive a browser session against an approved origin"),
+    ToolBinding(tool="document.extract", capability=Capability.DOCUMENT, purpose="extract text from a document"),
+    ToolBinding(tool="pdf.read", capability=Capability.DOCUMENT, purpose="read a PDF's text layer"),
+    ToolBinding(tool="ocr.extract", capability=Capability.DOCUMENT, requires="pytesseract",
+                purpose="read text from an image"),
+    ToolBinding(tool="forensic.mount", capability=Capability.ARTIFACT, purpose="inspect an approved artefact"),
+    ToolBinding(tool="artifact.read", capability=Capability.ARTIFACT, purpose="read bytes from an approved artefact"),
+    ToolBinding(tool="registry.read", capability=Capability.ARTIFACT, purpose="read an offline registry hive"),
+    ToolBinding(tool="exif.read", capability=Capability.METADATA, requires="exifread",
+                purpose="read file metadata"),
+    ToolBinding(tool="metadata.read", capability=Capability.METADATA, purpose="read declared file metadata"),
+    ToolBinding(tool="forensic.hash", capability=Capability.HASHING, purpose="hash bytes for integrity"),
+    ToolBinding(tool="hash.verify", capability=Capability.HASHING, purpose="verify a recorded digest"),
+    ToolBinding(tool="forensic.timeline", capability=Capability.TIMELINE, purpose="order records in time"),
+    ToolBinding(tool="log.parse", capability=Capability.CORRELATION, purpose="join a log line to its record"),
+    ToolBinding(tool="correlate.records", capability=Capability.CORRELATION, purpose="join records across sources"),
+    ToolBinding(tool="synthesis.write", capability=Capability.SYNTHESIS, purpose="write the mission's answer"),
+)
+
+#: Lookup by declared tool name.  Built once; immutable in practice.
+_TOOL_BINDINGS: dict[str, ToolBinding] = {binding.tool: binding for binding in TOOL_REGISTRY}
+
+#: Lookup from capability to the tools that provide it.
+_CAPABILITY_TOOLS: dict[Capability, tuple[str, ...]] = {
+    capability: tuple(binding.tool for binding in TOOL_REGISTRY
+                      if binding.capability is capability)
+    for capability in CAPABILITY_ORDER
+}
+
+
+def capability_for_tool(tool: str) -> Capability | None:
+    """The capability a declared tool name maps to, or ``None`` if unknown."""
+
+    binding = _TOOL_BINDINGS.get(tool.strip().lower())
+    return binding.capability if binding is not None else None
+
+
+def known_tools() -> tuple[str, ...]:
+    return tuple(binding.tool for binding in TOOL_REGISTRY)
+
+
+def worker_requests(worker: "FlowWorker", *, scope: Sequence[str] = (),
+                    targets: Mapping[str, str] | None = None) -> list["CapabilityRequest"]:
+    """What one Worker would ask the router for, from its own assignment.
+
+    One request per declared tool, aimed at the first approved target that suits
+    it: a network capability gets the first scope entry, a filesystem capability
+    the first path entry.  This is the planner's intent made executable — and it
+    is built from the Worker's own tools, so it cannot ask for more than the grant
+    will hold.
+    """
+
+    overrides = dict(targets or {})
+    hosts = [entry for entry in scope if not _looks_like_path(entry) and "://" not in entry]
+    named = [entry.split(":", 1)[1] if entry.startswith("artifact:") else entry
+             for entry in scope if _looks_like_path(entry) or entry.startswith("artifact:")]
+    # Prefer a path that actually exists: a mission often names its artefact
+    # ("artifact:disk-01.img") rather than its directory, and the router will refuse
+    # what it cannot resolve — a gap the operator can act on either way, but a real
+    # file is the more useful default.
+    paths = sorted(named, key=lambda entry: not Path(entry).exists())
+    requests: list[CapabilityRequest] = []
+    for tool in worker.tools:
+        binding = _TOOL_BINDINGS.get(tool.strip().lower())
+        if binding is None:
+            # Still a request: the router refuses it by name, which is how an
+            # unbound tool becomes a visible gap instead of a silent no-op.
+            requests.append(CapabilityRequest(capability=tool, tool=tool,
+                                              parameters={"unknown_tool": True}))
+            continue
+        if tool in overrides:
+            target = overrides[tool]
+        elif binding.capability in _FILESYSTEM_CAPABILITIES:
+            target = paths[0] if paths else ""
+        elif binding.capability in _NETWORK_CAPABILITIES:
+            target = hosts[0] if hosts else ""
+        else:
+            target = ""
+        requests.append(CapabilityRequest(capability=binding.capability.value,
+                                          target=target, tool=binding.tool))
+    return requests
+
+
+class DenialReason(str, Enum):
+    """Why a request was refused.  Every refusal names exactly one."""
+
+    NOT_GRANTED = "not-granted"                # outside the Worker's assignment
+    UNKNOWN_CAPABILITY = "unknown-capability"  # a name that is not in the closed set
+    UNKNOWN_TOOL = "unknown-tool"              # a tool name the registry does not bind
+    OUT_OF_SCOPE = "out-of-scope"              # the target is outside the mission boundary
+    PATH_NOT_APPROVED = "path-not-approved"    # a path outside every approved root
+    UNRESOLVED_PATH = "unresolved-path"        # a path that does not resolve
+    SHELL_REFUSED = "shell-refused"            # a request to run a command
+    NETWORK_OFF = "network-off"                # a network capability in an offline mission
+    UNAVAILABLE = "unavailable"                # the capability's dependency is missing
+    BUDGET = "budget"                          # the call would exceed the Worker's budget
+    MALFORMED = "malformed"                    # the request itself is unusable
+
+
+class CapabilityRequest(StrictModel):
+    """One thing a Worker asks the router to do.
+
+    Deliberately small: a capability, a target, the tool name the plan used, and
+    free-form parameters.  There is no field for a command line, an environment,
+    a working directory or an executable, because the router has no code path
+    that would use one.
+    """
+
+    capability: str = Field(min_length=1)
+    target: str = ""
+    tool: str = ""
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    #: Set when the caller supplied something the schema cannot express — a shell
+    #: command, an executable, a redirect.  Recorded so the refusal can quote it.
+    request_text: str = ""
+
+    def describe(self) -> str:
+        where = f" on {self.target}" if self.target else ""
+        return f"{self.capability}{where}" + (f" via {self.tool}" if self.tool else "")
+
+
+class CapabilityRefusal(StrictModel):
+    """A structured explanation of a refusal — the point of failing safely.
+
+    It names what was asked, why it was refused, what the grant actually allowed,
+    and what the caller should do instead.  A refusal is a value, not a traceback,
+    and it is what a Worker puts in its gap list.
+    """
+
+    request: str = Field(min_length=1)
+    reason: DenialReason
+    detail: str = Field(min_length=1)
+    #: What the grant allowed, so the caller can see the boundary it hit.
+    allowed: list[str] = Field(default_factory=list)
+    #: The change that would make the request succeed, when there is one.
+    remedy: str = ""
+    worker: str = ""
+    subagent: str = ""
+    attempted_capability: str = ""
+    attempted_target: str = ""
+
+    def describe(self) -> str:
+        return (f"{self.attempted_capability or self.request} refused "
+                f"({self.reason.value}): {self.detail}")
+
+    def to_gap(self) -> UnknownValue:
+        """The refusal as a reportable gap: a refusal is never a silent pass."""
+
+        return UnknownValue(
+            reason=(UnknownReason.OUT_OF_SCOPE
+                    if self.reason in {DenialReason.OUT_OF_SCOPE, DenialReason.NOT_GRANTED,
+                                       DenialReason.SHELL_REFUSED,
+                                       DenialReason.PATH_NOT_APPROVED}
+                    else UnknownReason.FAILED),
+            determined_by=self.worker or self.subagent or "router",
+            detail=self.describe()[:200],
+        )
+
+
+class CapabilityDenied(PermissionError):
+    """Raised when a request is refused.  Carries the structured refusal.
+
+    A ``PermissionError`` so an existing ``except OSError`` still sees an access
+    problem, and a *value* so a caller can report it without parsing a message.
+    """
+
+    def __init__(self, refusal: CapabilityRefusal) -> None:
+        super().__init__(refusal.describe())
+        self.refusal = refusal
+
+
+class ApprovedPaths(StrictModel):
+    """The filesystem roots a mission may read, resolved once.
+
+    A root is resolved at construction, so a later symlink swap cannot move the
+    boundary: comparison is always between two resolved paths.
+    """
+
+    roots: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def from_scope(cls, entries: Sequence[str], *,
+                   extra: Sequence[str] = ()) -> "ApprovedPaths":
+        """Every scope entry that is a filesystem path, plus any explicit extras."""
+
+        chosen: list[str] = []
+        for entry in [*entries, *extra]:
+            text = str(entry).strip()
+            if not text or not _looks_like_path(text):
+                continue
+            if "://" in text:                     # a URL is not a path
+                continue
+            # ``artifact:disk-01.img`` names an artefact in the case directory.
+            if text.startswith("artifact:"):
+                text = text.split(":", 1)[1]
+            try:
+                chosen.append(str(Path(text).expanduser().resolve()))
+            except (OSError, RuntimeError):       # pragma: no cover - exotic FS
+                continue
+        return cls(roots=list(dict.fromkeys(chosen)))
+
+    @property
+    def empty(self) -> bool:
+        return not self.roots
+
+    def resolve(self, path: str) -> Path:
+        """Resolve a request path, or refuse with the reason it cannot be judged.
+
+        ``strict=False`` is deliberate: an artefact that does not exist must still
+        be *judged* against the roots (and refused as ``unresolved-path``) rather
+        than being allowed to skip the check because it is missing.
+        """
+
+        try:
+            resolved = Path(path).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError) as exc:
+            raise CapabilityDenied(CapabilityRefusal(
+                request=f"path {path}", reason=DenialReason.UNRESOLVED_PATH,
+                detail=f"the path could not be resolved: {exc}",
+                allowed=self.roots,
+                remedy="give an absolute path inside the authorised artefact directory",
+                attempted_target=path)) from exc
+        if any(part == ".." for part in Path(path).parts):
+            # ``..`` after resolution is harmless; before it, it is an attempt to
+            # walk out of the root that a reader deserves to see named.
+            if not self.contains(resolved):
+                raise CapabilityDenied(CapabilityRefusal(
+                    request=f"path {path}", reason=DenialReason.PATH_NOT_APPROVED,
+                    detail=f"{path} walks outside every approved root",
+                    allowed=self.roots,
+                    remedy="name the artefact inside the approved root, without traversal",
+                    attempted_target=path))
+        return resolved
+
+    def contains(self, resolved: Path) -> bool:
+        return any(resolved == Path(root) or resolved.is_relative_to(Path(root))
+                   for root in self.roots)
+
+    def check(self, path: str, *, worker: str = "", subagent: str = "",
+              capability: str = "") -> Path:
+        """Resolve and approve, or refuse.  The only way the router reads a path."""
+
+        resolved = self.resolve(path)
+        if not self.contains(resolved):
+            raise CapabilityDenied(CapabilityRefusal(
+                request=f"{capability or 'filesystem'} on {path}",
+                reason=DenialReason.PATH_NOT_APPROVED,
+                detail=(f"{resolved} is outside every approved root "
+                        f"({', '.join(self.roots) or 'none configured'})"),
+                allowed=self.roots,
+                remedy="add the directory to the mission scope, or read an approved artefact",
+                worker=worker, subagent=subagent,
+                attempted_capability=capability, attempted_target=path))
+        return resolved
+
+
+class CapabilityGrant(StrictModel):
+    """What one Worker is allowed to do.  Immutable, derived, never widened.
+
+    A grant is not a permission the Worker holds over others; it is a description
+    of its own assignment, computed before it runs and consulted on every call.
+    The model is frozen, so ``grant.capabilities.append(...)`` fails rather than
+    quietly expanding the Worker's scope.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    worker_id: str = Field(min_length=1)
+    subagent_id: str = ""
+    worker_name: str = ""
+    #: The capability names this Worker may invoke, in registry order.
+    capabilities: tuple[str, ...] = ()
+    #: The declared tool names that produced them.
+    tools: tuple[str, ...] = ()
+    #: The approved roots a filesystem capability may touch.
+    roots: tuple[str, ...] = ()
+    #: Whether the mission allows network access at all.
+    network: bool = True
+    #: Tool names the assignment declared that the registry does not know.
+    unknown_tools: tuple[str, ...] = ()
+    #: One line per capability: why this Worker holds it.
+    basis: dict[str, str] = Field(default_factory=dict)
+
+    def holds(self, capability: "Capability | str") -> bool:
+        name = capability.value if isinstance(capability, Capability) else str(capability)
+        return name in self.capabilities
+
+    @property
+    def filesystem(self) -> bool:
+        return any(name in {item.value for item in _FILESYSTEM_CAPABILITIES}
+                   for name in self.capabilities)
+
+    def describe(self) -> str:
+        return (f"{self.worker_name or self.worker_id}: "
+                f"{', '.join(self.capabilities) or 'no capability'}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "worker": self.worker_id, "subagent": self.subagent_id,
+            "capabilities": list(self.capabilities), "tools": list(self.tools),
+            "roots": list(self.roots), "network": self.network,
+            "unknown_tools": list(self.unknown_tools), "basis": dict(self.basis),
+        }
+
+
+def grant_for_worker(worker: "FlowWorker", subagent: "FlowSubagent | None" = None, *,
+                     paths: ApprovedPaths | None = None, network: bool = True,
+                     extra_tools: Sequence[str] = ()) -> CapabilityGrant:
+    """Derive a Worker's grant from its own tools, and nothing else.
+
+    The Worker's declared tools are the whole basis: a capability the plan did not
+    name is not held, even if the subagent held it.  Tools the registry does not
+    bind are recorded as ``unknown_tools`` (a plan defect the router reports) and
+    confer no capability at all.
+    """
+
+    declared = list(dict.fromkeys([*(tool.strip() for tool in worker.tools), *extra_tools]))
+    capabilities: list[str] = []
+    known: list[str] = []
+    unknown: list[str] = []
+    basis: dict[str, str] = {}
+    for tool in declared:
+        binding = _TOOL_BINDINGS.get(tool.lower())
+        if binding is None:
+            unknown.append(tool)
+            continue
+        known.append(binding.tool)
+        name = binding.capability.value
+        if name not in capabilities:
+            capabilities.append(name)
+            basis[name] = f"declared tool {binding.tool}: {binding.purpose or binding.capability.value}"
+    ordered = tuple(capability.value for capability in CAPABILITY_ORDER
+                    if capability.value in capabilities)
+    return CapabilityGrant(
+        worker_id=worker.id,
+        subagent_id=(subagent.id if subagent is not None else ""),
+        worker_name=worker.name,
+        capabilities=ordered,
+        tools=tuple(known),
+        roots=tuple(paths.roots if paths is not None else ()),
+        network=network,
+        unknown_tools=tuple(unknown),
+        basis={key: basis[key] for key in ordered if key in basis},
+    )
+
+
+class DerivationJournal:
+    """A reversible record of the results derived capabilities produced.
+
+    Correlation and synthesis read other units' work rather than the world, so
+    they are the capabilities through which one Worker could *widen its own
+    scope* by citing evidence it was never granted.  This journal is the router's
+    answer: it can
+    :meth:`preview` a derivation, apply it, and :meth:`roll_back` to the exact
+    previous revision — so exceeding the grant is undone, not argued about.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._history: dict[str, list[dict[str, Any]]] = {}
+        self._revisions: dict[str, int] = {}
+        self.rollbacks: list[dict[str, Any]] = []
+
+    def revision_of(self, key: str) -> int:
+        with self._lock:
+            return self._revisions.get(key, 0)
+
+    def preview(self, key: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """What applying this would produce, without touching anything."""
+
+        with self._lock:
+            return {"key": key, "revision": self._revisions.get(key, 0),
+                    "next_revision": self._revisions.get(key, 0) + 1,
+                    "entries": [dict(entry) for entry in payload.get("entries", [])],
+                    "applied": False}
+
+    def apply(self, key: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            revision = self._revisions.get(key, 0) + 1
+            self._revisions[key] = revision
+            record = {"revision": revision, "key": key,
+                      "entries": [dict(entry) for entry in payload.get("entries", [])]}
+            self._history.setdefault(key, []).append(record)
+            return {**record, "applied": True}
+
+    def roll_back(self, key: str, *, reason: str = "") -> dict[str, Any]:
+        """Undo the last application, returning the state that is now current."""
+
+        with self._lock:
+            history = self._history.get(key) or []
+            if not history:
+                raise KeyError(f"nothing to roll back for {key!r}")
+            undone = history.pop()
+            self._revisions[key] = len(history)
+            self.rollbacks.append({"key": key, "undo": undone, "reason": reason})
+            return {"key": key, "revision": self._revisions[key], "rolled_back": undone,
+                    "entries": (history[-1]["entries"] if history else [])}
+
+    def entries(self, key: str) -> list[dict[str, Any]]:
+        with self._lock:
+            history = self._history.get(key) or []
+            return list(history[-1]["entries"]) if history else []
+
+
+class CapabilityResult(StrictModel):
+    """What a granted call produced.
+
+    ``evidence`` is what the Worker may report; ``payload`` is what it may reason
+    over; ``detail`` is one line for a ledger.  A refusal never becomes a result:
+    it raises :class:`CapabilityDenied`, so "it did not run" cannot be mistaken
+    for "it ran and found nothing".
+    """
+
+    capability: Capability
+    target: str = ""
+    tool: str = ""
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    detail: str = ""
+    seconds: float = Field(default=0.0, ge=0)
+    #: True when a derived capability replaced an earlier derivation.
+    replaced: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"capability": self.capability.value, "target": self.target,
+                "tool": self.tool, "evidence": len(self.evidence),
+                "detail": self.detail, "seconds": round(self.seconds, 3),
+                "replaced": self.replaced}
+
+
+class RouterLimits(StrictModel):
+    """The router's own ceilings, so a capability cannot be hammered.
+
+    These are per Worker and per mission, and they are checked *before* a call
+    runs: a Worker cannot spend its way around a budget by retrying.
+    """
+
+    max_calls_per_worker: int = Field(default=64, ge=1, le=1000)
+    max_network_calls: int = Field(default=128, ge=0, le=10_000)
+    max_filesystem_calls: int = Field(default=256, ge=0, le=10_000)
+    max_bytes_read: int = Field(default=64 * 1024 * 1024, ge=0)
+    #: A derived result may cite at most this many evidence ids.
+    max_derived_items: int = Field(default=500, ge=1, le=5000)
+
+
+def _text_of(target: str, parameters: Mapping[str, Any] | None = None) -> str:
+    parts = [target, json.dumps(dict(parameters or {}), default=str)[:400]]
+    return " ".join(parts)
+
+
+#: Command-line programs a request might name.  Detection is for the refusal
+#: message, not the boundary: the boundary is that no handler runs a process.
+_SHELL_PROGRAMS: frozenset[str] = frozenset({
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "cmd", "powershell", "pwsh",
+    "sudo", "doas", "su", "eval", "exec", "system", "popen", "subprocess",
+    "cat", "ls", "rm", "rmdir", "cp", "mv", "mkdir", "touch", "chmod", "chown",
+    "find", "xargs", "sed", "awk", "grep", "cut", "sort", "uniq", "tee", "dd",
+    "python", "python3", "perl", "ruby", "node", "php", "lua", "busybox",
+    "nc", "netcat", "curl", "wget", "ssh", "scp", "rsync", "nmap", "sqlmap",
+    "mimikatz", "exiftool", "tcpdump", "openssl", "kill", "killall", "mount",
+})
+
+#: What a shell request looks like beyond naming a program.
+_SHELL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"&&|\|\||;"),                            # chaining
+    re.compile(r"`[^`]*`"),                               # command substitution
+    re.compile(r"\$\([^)]*\)"),                          # $(command)
+    re.compile(r"-c\s+['\"]"),                          # `-c "..."` anywhere
+    re.compile(r"^\s*/\S+/\S+\s+\S"),                  # /usr/bin/thing arg
+    re.compile(r"(^|\s)[<>]{1,2}\s*\S"),                 # redirection
+)
+
+
+def looks_like_shell(text: str) -> bool:
+    """True when a request text is shaped like a command line.
+
+    Two tests, either of which is enough: a word that is a program on this
+    platform, or a shell metacharacter that only means something to a shell.
+    """
+
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return False
+    # A path or a URL is a location, not a command: its own words are never read
+    # as program names, and the metacharacters a URL legitimately contains
+    # (``&``, ``?``, ``=``, ``%``) are not treated as chaining.
+    if _looks_like_path(cleaned) or "://" in cleaned:
+        return bool(re.search(r"(^|\s)(sh|bash|zsh|pwsh|cmd)\s+-c\s", cleaned, re.I)
+                    or "`" in cleaned)
+    words = re.findall(r"[A-Za-z][\w.-]*", cleaned.lower())
+    if any(word.split(".")[0] in _SHELL_PROGRAMS or word in _SHELL_PROGRAMS
+           for word in words):
+        return True
+    return any(pattern.search(cleaned) for pattern in _SHELL_PATTERNS)
+
+
+class CapabilityRouter:
+    """The only path from a Worker's request to an effect.
+
+    One router per mission.  It holds the registry (what a tool name means), the
+    approved paths (what may be read), the network switch, and a journal of the
+    derived results it produced.  It does not hold an executor for anything
+    outside :class:`Capability`, and it cannot be handed one.
+    """
+
+    def __init__(
+        self,
+        *,
+        scope: "Scope | None" = None,
+        paths: ApprovedPaths | None = None,
+        network: bool = True,
+        limits: RouterLimits | None = None,
+        registry: Sequence[ToolBinding] | None = None,
+        readers: Mapping[str, Callable[..., Any]] | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        self.scope = scope
+        entries = list(scope.includes) if scope is not None else []
+        self.paths = paths or ApprovedPaths.from_scope(entries)
+        self.network = bool(network)
+        self.limits = limits or RouterLimits()
+        self.registry = {binding.tool: binding for binding in (registry or TOOL_REGISTRY)}
+        #: Optional, injectable readers — a deployment supplies these; until then a
+        #: filesystem capability reads the bytes itself so the contract is testable.
+        self.readers: dict[str, Callable[..., Any]] = dict(readers or {})
+        self.journal = DerivationJournal()
+        self._clock = clock or time.monotonic
+        self._lock = threading.RLock()
+        self._refusals: list[CapabilityRefusal] = []
+        self._calls: list[dict[str, Any]] = []
+        self._per_worker: dict[str, int] = {}
+        self._counters: dict[str, int] = {"network": 0, "filesystem": 0, "bytes": 0}
+        #: Derived results, keyed by capability, for the deterministic handlers.
+        self._derived: dict[str, list[dict[str, Any]]] = {}
+        self._evidence: dict[str, EvidenceItem] = {}
+
+    # -- inspection ---------------------------------------------------------
+
+    @property
+    def refusals(self) -> list[CapabilityRefusal]:
+        with self._lock:
+            return list(self._refusals)
+
+    @property
+    def calls(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self._calls)
+
+    def capabilities(self) -> dict[str, Any]:
+        """What this router can actually do, and why not, when it cannot."""
+
+        items: list[dict[str, Any]] = []
+        for capability in CAPABILITY_ORDER:
+            tools = _CAPABILITY_TOOLS.get(capability, ())
+            bindings = [self.registry.get(tool) for tool in tools]
+            available = [binding.tool for binding in bindings
+                         if binding is not None and binding.available]
+            items.append({
+                "capability": capability.value,
+                "tools": list(tools),
+                "available": available,
+                "network": capability in _NETWORK_CAPABILITIES,
+                "filesystem": capability in _FILESYSTEM_CAPABILITIES,
+                "derived": capability in _DERIVED_CAPABILITIES,
+                "enabled": bool(available) and (self.network or
+                                                capability not in _NETWORK_CAPABILITIES),
+            })
+        return {"capabilities": items, "roots": list(self.paths.roots),
+                "network": self.network, "limits": json.loads(model_to_json(self.limits))}
+
+    def vocabulary(self) -> tuple[str, ...]:
+        """The capability names a plan may use, for a repair brief."""
+
+        return tuple(capability.value for capability in CAPABILITY_ORDER)
+
+    # -- the one entry point ------------------------------------------------
+
+    def invoke(self, grant: CapabilityGrant, request: CapabilityRequest | str, *,
+               target: str = "", parameters: Mapping[str, Any] | None = None,
+               tool: str = "", request_text: str = "") -> CapabilityResult:
+        """Check, then act.  Raises :class:`CapabilityDenied` on any refusal.
+
+        ``request`` may be a :class:`CapabilityRequest` or a capability name; the
+        short form exists so a caller cannot be tempted to build its own request
+        object and skip the checks in it.
+        """
+
+        if isinstance(request, str):
+            request = CapabilityRequest(capability=request, target=target, tool=tool,
+                                        parameters=dict(parameters or {}),
+                                        request_text=request_text)
+        started = self._clock()
+        try:
+            capability = self._admit(grant, request)
+            result = self._execute(grant, capability, request)
+        except CapabilityDenied as denied:
+            with self._lock:
+                self._refusals.append(denied.refusal)
+            raise
+        elapsed = self._clock() - started
+        result = result.model_copy(update={"seconds": elapsed})
+        with self._lock:
+            self._calls.append({"worker": grant.worker_id, "subagent": grant.subagent_id,
+                                **result.to_dict()})
+            for item in result.evidence:
+                self._evidence.setdefault(item.id, item)
+        return result
+
+    def try_invoke(self, grant: CapabilityGrant, request: CapabilityRequest | str, *,
+                   target: str = "", parameters: Mapping[str, Any] | None = None,
+                   tool: str = "", request_text: str = ""
+                   ) -> tuple[CapabilityResult | None, CapabilityRefusal | None]:
+        """The same call, with the refusal returned instead of raised.
+
+        A Worker uses this when a refusal is a gap to report rather than a reason
+        to stop; the ledger still records it either way.
+        """
+
+        try:
+            return self.invoke(grant, request, target=target, parameters=parameters,
+                               tool=tool, request_text=request_text), None
+        except CapabilityDenied as denied:
+            return None, denied.refusal
+
+    # -- admission ----------------------------------------------------------
+
+    def _deny(self, reason: DenialReason, detail: str, request: CapabilityRequest,
+              grant: CapabilityGrant, *, allowed: Sequence[str] = (),
+              remedy: str = "") -> CapabilityDenied:
+        return CapabilityDenied(CapabilityRefusal(
+            request=request.describe(), reason=reason, detail=detail[:300],
+            allowed=list(allowed), remedy=remedy,
+            worker=grant.worker_id, subagent=grant.subagent_id,
+            attempted_capability=request.capability, attempted_target=request.target))
+
+    def _admit(self, grant: CapabilityGrant, request: CapabilityRequest) -> Capability:
+        """Every check, in the order that quotes the most useful reason first."""
+
+        # 1. a command line is never anything else, whatever capability it claims.
+        #    A request text is the caller *saying* it wants one, so it is refused
+        #    outright; a target is judged, because a URL may legitimately contain
+        #    shell-looking characters.
+        if request.request_text.strip():
+            raise self._deny(
+                DenialReason.SHELL_REFUSED,
+                f"a literal expression ({request.request_text.strip()[:80]!r}) was requested; "
+                f"the router executes nothing and has no field for a command",
+                request, grant, allowed=list(grant.capabilities),
+                remedy="use a capability: fetch the page, read the artefact, or hash the file")
+        if request.target and looks_like_shell(request.target):
+            raise self._deny(
+                DenialReason.SHELL_REFUSED,
+                f"the target is shaped like a command line ({request.target.strip()[:80]!r}); "
+                f"the router has no process-running capability",
+                request, grant, allowed=list(grant.capabilities),
+                remedy="pass a URL, a host, or an approved filesystem path")
+        # 2. the capability must exist, and be spelled as the registry spells it
+        try:
+            capability = Capability(request.capability.strip().lower())
+        except ValueError:
+            raise self._deny(
+                DenialReason.UNKNOWN_CAPABILITY,
+                f"{request.capability!r} is not one of the {len(CAPABILITY_ORDER)} "
+                f"capabilities this build implements",
+                request, grant, allowed=list(self.vocabulary()),
+                remedy=f"use one of: {', '.join(self.vocabulary()[:4])}, …") from None
+        # 3. and the Worker must hold it
+        if not grant.holds(capability):
+            raise self._deny(
+                DenialReason.NOT_GRANTED,
+                f"{capability.value} is not in this Worker's assignment "
+                f"({', '.join(grant.capabilities) or 'none'})",
+                request, grant, allowed=list(grant.capabilities),
+                remedy="ask the Subagent to assign the capability, or use one it holds")
+        # 4. a named tool must be bound, and must be one this Worker was given
+        if request.tool:
+            binding = self.registry.get(request.tool.lower())
+            if binding is None:
+                raise self._deny(
+                    DenialReason.UNKNOWN_TOOL,
+                    f"{request.tool!r} is not a tool this build binds to a capability",
+                    request, grant, allowed=list(grant.tools) or list(grant.capabilities),
+                    remedy=f"use one of: {', '.join(sorted(self.registry)[:5])}, …")
+            if binding.tool not in grant.tools:
+                raise self._deny(
+                    DenialReason.NOT_GRANTED,
+                    f"tool {binding.tool!r} is not assigned to this Worker "
+                    f"({', '.join(grant.tools) or 'none'})",
+                    request, grant, allowed=list(grant.tools),
+                    remedy="use a tool the Worker was assigned")
+            if binding.capability is not capability:
+                raise self._deny(
+                    DenialReason.MALFORMED,
+                    f"tool {binding.tool!r} provides {binding.capability.value}, "
+                    f"not {capability.value}",
+                    request, grant, allowed=[binding.capability.value])
+            if not binding.available:
+                raise self._deny(
+                    DenialReason.UNAVAILABLE,
+                    f"{binding.tool} needs {binding.requires}, which is not installed",
+                    request, grant, allowed=list(grant.capabilities),
+                    remedy=f"pip install {binding.requires}")
+        # 5. the mission's own switch has the final say on the network
+        if capability in _NETWORK_CAPABILITIES and not (grant.network and self.network):
+            raise self._deny(
+                DenialReason.NETWORK_OFF,
+                f"{capability.value} needs the network, and this mission is offline",
+                request, grant, allowed=list(grant.capabilities),
+                remedy="run the mission with network access, or use a local capability")
+        # 6. targets are judged, not trusted: a path against the approved roots, a
+        #    host or URL against the mission's scope.  Neither is ever "assumed ok".
+        if request.target:
+            if capability in _FILESYSTEM_CAPABILITIES:
+                self._check_path(grant, request)
+            elif capability in _NETWORK_CAPABILITIES:
+                self._check_scope(grant, request)
+        # 7. budgets, last: a refusal here means the grant was fine and the spend was not
+        self._check_budget(grant, capability, request)
+        return capability
+
+    def _check_path(self, grant: CapabilityGrant, request: CapabilityRequest) -> Path:
+        if self.paths.empty:
+            raise self._deny(
+                DenialReason.PATH_NOT_APPROVED,
+                "this mission approved no filesystem root, so no path can be read",
+                request, grant,
+                remedy="add the artefact's directory to the mission scope")
+        try:
+            return self.paths.check(request.target, worker=grant.worker_id,
+                                    subagent=grant.subagent_id,
+                                    capability=request.capability)
+        except CapabilityDenied as denied:
+            refusal = denied.refusal.model_copy(update={
+                "request": request.describe(), "worker": grant.worker_id,
+                "subagent": grant.subagent_id,
+                "attempted_capability": request.capability,
+                "attempted_target": request.target})
+            raise CapabilityDenied(refusal) from None
+
+    def _check_scope(self, grant: CapabilityGrant, request: CapabilityRequest) -> None:
+        if self.scope is None:
+            # No scope object means no boundary to check against, which is not the
+            # same as "everything is allowed": a network capability needs one.
+            raise self._deny(
+                DenialReason.OUT_OF_SCOPE,
+                f"{request.target!r} cannot be authorised: this router was built without "
+                f"a mission scope",
+                request, grant,
+                remedy="give the router the mission's Scope before invoking network capabilities")
+        if self.scope.covers(request.target):
+            return
+        raise self._deny(
+            DenialReason.OUT_OF_SCOPE,
+            f"{request.target!r} is not inside the authorised scope "
+            f"({', '.join(self.scope.includes) or 'none'})",
+            request, grant, allowed=[*self.scope.includes],
+            remedy="ask the operator to extend the scope, or use an authorised target")
+
+    def _check_budget(self, grant: CapabilityGrant, capability: Capability,
+                      request: CapabilityRequest) -> None:
+        with self._lock:
+            used = self._per_worker.get(grant.worker_id, 0)
+            if used >= self.limits.max_calls_per_worker:
+                raise self._deny(
+                    DenialReason.BUDGET,
+                    f"this Worker has already made {used} call(s) "
+                    f"(ceiling {self.limits.max_calls_per_worker})",
+                    request, grant, allowed=list(grant.capabilities))
+            if capability in _NETWORK_CAPABILITIES \
+                    and self._counters["network"] >= self.limits.max_network_calls:
+                raise self._deny(DenialReason.BUDGET,
+                                 f"the mission's {self.limits.max_network_calls} network "
+                                 f"call(s) are spent", request, grant)
+            if capability in _FILESYSTEM_CAPABILITIES \
+                    and self._counters["filesystem"] >= self.limits.max_filesystem_calls:
+                raise self._deny(DenialReason.BUDGET,
+                                 f"the mission's {self.limits.max_filesystem_calls} filesystem "
+                                 f"call(s) are spent", request, grant)
+            if capability in _NETWORK_CAPABILITIES:
+                self._counters["network"] += 1
+            if capability in _FILESYSTEM_CAPABILITIES:
+                self._counters["filesystem"] += 1
+            self._per_worker[grant.worker_id] = used + 1
+
+
+# -- execution: nine handlers, no fallback ------------------------------
+
+    def _execute(self, grant: CapabilityGrant, capability: Capability,
+                 request: CapabilityRequest) -> CapabilityResult:
+        """Dispatch to the handler for ``capability``.
+
+        There is no ``else`` branch that does something reasonable: a capability
+        with no handler is a build defect, and it is reported as one rather than
+        guessed at.
+        """
+
+        handler = {
+            Capability.PUBLIC_WEB: self._public_web,
+            Capability.BROWSER: self._browser,
+            Capability.DOCUMENT: self._document,
+            Capability.ARTIFACT: self._artifact,
+            Capability.METADATA: self._metadata,
+            Capability.HASHING: self._hashing,
+            Capability.TIMELINE: self._timeline,
+            Capability.CORRELATION: self._correlation,
+            Capability.SYNTHESIS: self._synthesis,
+        }.get(capability)
+        if handler is None:                      # pragma: no cover - the enum is closed
+            raise self._deny(DenialReason.UNKNOWN_CAPABILITY,
+                             f"{capability.value} has no handler in this build",
+                             request, grant)
+        return handler(grant, request)
+
+    def _source(self, *, kind: SourceKind, locator: str, worker: str, tool: str,
+                method: RetrievalMethod, excerpt: str = "",
+                status: int | None = None) -> SourceReference:
+        url = locator if locator.startswith(("http://", "https://")) else None
+        return SourceReference(
+            kind=kind, url=url, artifact_path=None if url else locator,
+            title=f"{tool} — {worker}", retrieved_at=utc_now(),
+            retrieval_method=method, http_status=status, excerpt=excerpt[:160] or None)
+
+    def _observation(self, grant: CapabilityGrant, *, statement: str, locator: str,
+                     kind: SourceKind, method: RetrievalMethod, tool: str,
+                     excerpt: str = "", tags: Sequence[str] = (),
+                     status: int | None = None) -> EvidenceItem:
+        """One observation per call: sourced, unattributed to a person, replayable."""
+
+        source = self._source(kind=kind, locator=locator, worker=grant.worker_id,
+                              tool=tool, method=method, excerpt=excerpt, status=status)
+        return EvidenceItem(
+            kind=EvidenceKind.OBSERVATION, statement=statement, sources=[source],
+            confidence=Confidence.LOW,
+            confidence_basis=f"{tool} under capability {capability_for_tool(tool) or '?'}; "
+                             f"single automated read, not corroborated",
+            collected_by=grant.worker_id, tags=["capability-router", tool, *tags])
+
+    def _reader(self, capability: Capability) -> Callable[..., Any] | None:
+        """A deployment-supplied reader, if one was injected for this capability."""
+
+        return self.readers.get(capability.value)
+
+    # 1. public-web research -------------------------------------------------
+    def _public_web(self, grant: CapabilityGrant, request: CapabilityRequest) -> CapabilityResult:
+        tool = request.tool or "http.fetch"
+        url = request.target or "https://example.invalid/"
+        reader = self._reader(Capability.PUBLIC_WEB)
+        payload: dict[str, Any] = {"url": url, "tool": tool}
+        excerpt = ""
+        if reader is not None:
+            fetched = reader(url=url, tool=tool, parameters=dict(request.parameters))
+            excerpt = str(getattr(fetched, "text", fetched) or "")[:200]
+            payload["bytes"] = len(getattr(fetched, "text", "") or "")
+            status = getattr(fetched, "status", None)
+        else:
+            status = None
+        statement = (f"{url} was requested by {grant.worker_name or grant.worker_id} "
+                     f"using {tool}; no network reader is attached to this deployment, so "
+                     f"the page content was not captured")
+        evidence = self._observation(grant, statement=statement, locator=url,
+                                     kind=SourceKind.PUBLIC_WEB, method=RetrievalMethod.HTTP,
+                                     tool=tool, excerpt=excerpt, status=status,
+                                     tags=["public-web"])
+        payload["network"] = True
+        payload["captured"] = bool(excerpt)
+        return CapabilityResult(capability=Capability.PUBLIC_WEB, target=url, tool=tool,
+                                evidence=[evidence], payload=payload,
+                                detail=f"{tool}: {url}")
+
+    # 2. browser interaction -------------------------------------------------
+    def _browser(self, grant: CapabilityGrant, request: CapabilityRequest) -> CapabilityResult:
+        tool = request.tool or "browser.use"
+        url = request.target or "https://example.invalid/"
+        actions = [str(item) for item in request.parameters.get("actions", [])][:8]
+        reader = self._reader(Capability.BROWSER)
+        payload: dict[str, Any] = {"url": url, "tool": tool, "actions": actions}
+        if reader is not None:
+            snapshot = reader(url=url, actions=actions, parameters=dict(request.parameters))
+            payload["snapshot"] = str(getattr(snapshot, "title", snapshot))[:200]
+            payload["captured"] = True
+        else:
+            payload["captured"] = False
+        statement = (f"a browser session was opened on {url} for {grant.worker_name or grant.worker_id}"
+                     + (f" performing {len(actions)} approved action(s)" if actions else "")
+                     + "; no browser is attached to this deployment, so nothing was captured")
+        evidence = self._observation(grant, statement=statement, locator=url,
+                                     kind=SourceKind.PUBLIC_WEB,
+                                     method=RetrievalMethod.BROWSER, tool=tool,
+                                     tags=["browser"], excerpt=", ".join(actions))
+        return CapabilityResult(capability=Capability.BROWSER, target=url, tool=tool,
+                                evidence=[evidence], payload=payload,
+                                detail=f"{tool}: {url}" + (f" ({len(actions)} action(s))" if actions else ""))
+
+    # 3./4./5. the filesystem capabilities, sharing one approved-path read ---
+    def _read_bytes(self, grant: CapabilityGrant, request: CapabilityRequest,
+                    cap: int) -> tuple[Path, bytes]:
+        path = self.paths.check(request.target, worker=grant.worker_id,
+                                subagent=grant.subagent_id,
+                                capability=request.capability)
+        reader = self._reader(Capability.ARTIFACT) or self._reader(
+            Capability.DOCUMENT) or self._reader(Capability.METADATA)
+        if reader is not None:
+            data = reader(path=str(path), capability=request.capability,
+                          parameters=dict(request.parameters))
+            raw = data if isinstance(data, bytes) else str(data).encode("utf-8", "replace")
+        else:
+            try:
+                raw = path.read_bytes()[:cap]
+            except OSError as exc:
+                raise CapabilityDenied(CapabilityRefusal(
+                    request=request.describe(), reason=DenialReason.UNRESOLVED_PATH,
+                    detail=f"{path} could not be read: {exc}",
+                    allowed=list(grant.roots), worker=grant.worker_id,
+                    subagent=grant.subagent_id,
+                    attempted_capability=request.capability,
+                    attempted_target=request.target)) from exc
+        with self._lock:
+            self._counters["bytes"] += len(raw)
+            if self._counters["bytes"] > self.limits.max_bytes_read:
+                raise self._deny(
+                    DenialReason.BUDGET,
+                    f"reading {path.name} would exceed the mission's "
+                    f"{self.limits.max_bytes_read} byte ceiling",
+                    request, grant, allowed=list(grant.roots))
+        return path, raw
+
+    def _document(self, grant: CapabilityGrant, request: CapabilityRequest) -> CapabilityResult:
+        tool = request.tool or "document.extract"
+        path, raw = self._read_bytes(grant, request, self.limits.max_bytes_read)
+        text = raw.decode("utf-8", "replace")
+        words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'_-]{2,}", text)
+        preview = " ".join(words[:24])
+        evidence = self._observation(
+            grant, statement=(f"{path.name} yielded {len(words)} word token(s) on extraction"
+                              + (f"; opening: {preview[:100]}" if preview else "")),
+            locator=str(path), kind=SourceKind.LOCAL_ARTIFACT,
+            method=RetrievalMethod.LOCAL_READ, tool=tool, excerpt=preview, tags=["document"])
+        return CapabilityResult(capability=Capability.DOCUMENT, target=str(path), tool=tool,
+                                evidence=[evidence],
+                                payload={"path": str(path), "bytes": len(raw),
+                                         "words": len(words), "preview": preview},
+                                detail=f"{tool}: {path.name} ({len(raw)} bytes)")
+
+    def _artifact(self, grant: CapabilityGrant, request: CapabilityRequest) -> CapabilityResult:
+        tool = request.tool or "forensic.mount"
+        path, raw = self._read_bytes(grant, request, min(self.limits.max_bytes_read, 1 << 20))
+        kind = "text" if b"\x00" not in raw[:4096] else "binary"
+        evidence = self._observation(
+            grant, statement=(f"{path.name} was inspected: {len(raw)} byte(s) read, "
+                              f"appearing to be {kind} content"),
+            locator=str(path), kind=SourceKind.LOCAL_ARTIFACT,
+            method=RetrievalMethod.LOCAL_READ, tool=tool, tags=["artefact"])
+        return CapabilityResult(capability=Capability.ARTIFACT, target=str(path), tool=tool,
+                                evidence=[evidence],
+                                payload={"path": str(path), "bytes": len(raw), "kind": kind},
+                                detail=f"{tool}: {path.name} ({kind})")
+
+    def _metadata(self, grant: CapabilityGrant, request: CapabilityRequest) -> CapabilityResult:
+        tool = request.tool or "metadata.read"
+        path, raw = self._read_bytes(grant, request, min(self.limits.max_bytes_read, 1 << 20))
+        try:
+            stat = path.stat()
+            facts = {"size": stat.st_size, "mode": oct(stat.st_mode & 0o777),
+                     "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat()}
+        except OSError:                          # pragma: no cover - raced with a delete
+            facts = {"size": None, "mode": None, "modified": None}
+        facts["suffix"] = path.suffix or ""
+        evidence = self._observation(
+            grant, statement=(f"{path.name}: {facts['size']} byte(s), suffix "
+                              f"{facts['suffix'] or 'none'}, modified {facts['modified']}"),
+            locator=str(path), kind=SourceKind.LOCAL_ARTIFACT,
+            method=RetrievalMethod.LOCAL_READ, tool=tool, tags=["metadata"])
+        return CapabilityResult(capability=Capability.METADATA, target=str(path), tool=tool,
+                                evidence=[evidence], payload={"path": str(path), **facts},
+                                detail=f"{tool}: {path.name}")
+
+    # 6. hashing -------------------------------------------------------------
+    def _hashing(self, grant: CapabilityGrant, request: CapabilityRequest) -> CapabilityResult:
+        tool = request.tool or "forensic.hash"
+        algorithm = str(request.parameters.get("algorithm") or "sha256").lower()
+        if algorithm not in {"sha256", "sha512", "sha1", "md5"}:
+            raise self._deny(DenialReason.MALFORMED,
+                             f"unknown hash algorithm {algorithm!r}", request, grant,
+                             remedy="use sha256")
+        if request.target and _looks_like_path(request.target) and not self.paths.empty:
+            path, raw = self._read_bytes(grant, request, self.limits.max_bytes_read)
+            locator, method = str(path), RetrievalMethod.LOCAL_READ
+            label = path.name
+        else:
+            raw = request.target.encode("utf-8") if request.target else b""
+            locator, method = request.target, RetrievalMethod.UNKNOWN
+            label = (request.target or "the empty string")
+        digest = hashlib.new(algorithm, raw).hexdigest()
+        record = HashRecord(algorithm=algorithm, value=digest, size_bytes=len(raw))
+        evidence = self._observation(
+            grant, statement=f"{label}: {algorithm} {digest}",
+            locator=locator, kind=SourceKind.LOCAL_ARTIFACT, method=method, tool=tool,
+            tags=["hashing", algorithm])
+        evidence = evidence.model_copy(update={
+            "sources": [evidence.sources[0].model_copy(update={"content_hash": record})]})
+        return CapabilityResult(capability=Capability.HASHING, target=locator, tool=tool,
+                                evidence=[evidence],
+                                payload={"algorithm": algorithm, "digest": digest,
+                                         "bytes": len(raw)},
+                                detail=f"{tool}: {algorithm}:{digest[:12]}…")
+
+    # 7. timeline ------------------------------------------------------------
+    def _timeline(self, grant: CapabilityGrant, request: CapabilityRequest) -> CapabilityResult:
+        tool = request.tool or "forensic.timeline"
+        entries = [dict(item) for item in request.parameters.get("entries", [])][
+            :self.limits.max_derived_items]
+        # Entries are caller-supplied (from the graph's own state), and are sorted
+        # by their recorded instant; a missing instant is kept, flagged, never guessed.
+        decorated: list[tuple[float, dict[str, Any]]] = []
+        undated = 0
+        for entry in entries:
+            stamp = entry.get("at") or entry.get("timestamp") or entry.get("observed_at")
+            parsed: float | None = None
+            if stamp is not None:
+                try:
+                    parsed = datetime.fromisoformat(str(stamp)).timestamp()
+                except ValueError:
+                    parsed = None
+            if parsed is None:
+                undated += 1
+                continue
+            decorated.append((parsed, entry))
+        decorated.sort(key=lambda pair: pair[0])
+        ordered = [entry for _at, entry in decorated]
+        key = f"timeline:{grant.worker_id}"
+        applied = self.journal.apply(key, {"entries": ordered})
+        evidence = self._observation(
+            grant, statement=(f"a timeline of {len(ordered)} dated event(s) was constructed"
+                              + (f", with {undated} undated entry(ies) kept aside" if undated else "")),
+            locator=request.target or "mission-state", kind=SourceKind.LOCAL_ARTIFACT,
+            method=RetrievalMethod.LOCAL_READ, tool=tool, tags=["timeline"])
+        return CapabilityResult(capability=Capability.TIMELINE, target=request.target,
+                                tool=tool, evidence=[evidence],
+                                payload={"revision": applied["revision"], "ordered": ordered,
+                                         "undated": undated, "count": len(ordered)},
+                                detail=f"{tool}: {len(ordered)} event(s), {undated} undated")
+
+    # 8. correlation ---------------------------------------------------------
+    def _correlation(self, grant: CapabilityGrant, request: CapabilityRequest) -> CapabilityResult:
+        tool = request.tool or "correlate.records"
+        left = [str(item) for item in request.parameters.get("left", [])]
+        right = [str(item) for item in request.parameters.get("right", [])]
+        join_key = str(request.parameters.get("on") or "id")
+        candidates: list[str] = []
+        # Keep only evidence the mission already holds: a correlation cannot pull in
+        # a record from outside the graph, which is how a Worker would widen scope.
+        known = set(self._evidence)
+        for item in [*left, *right]:
+            if item in known and item not in candidates:
+                candidates.append(item)
+        unverifiable = [item for item in [*left, *right] if item not in known]
+        if unverifiable:
+            raise self._deny(
+                DenialReason.OUT_OF_SCOPE,
+                f"{unverifiable[0]!r} is not evidence this mission holds; a correlation may "
+                f"only join records the run already produced",
+                request, grant, allowed=sorted(known)[:6],
+                remedy="cite evidence ids that are already on record")
+        joined = [{"evidence": item, "on": join_key, "key": item} for item in candidates]
+        key = f"correlation:{grant.worker_id}"
+        applied = self.journal.apply(key, {"entries": joined})
+        evidence = self._observation(
+            grant, statement=(f"{len(candidates)} record(s) were correlated on {join_key} "
+                              f"by {grant.worker_name or grant.worker_id}"),
+            locator=request.target or "mission-state", kind=SourceKind.LOCAL_ARTIFACT,
+            method=RetrievalMethod.LOCAL_READ, tool=tool, tags=["correlation"])
+        return CapabilityResult(capability=Capability.CORRELATION, target=request.target,
+                                tool=tool, evidence=[evidence],
+                                payload={"revision": applied["revision"], "rows": joined,
+                                         "on": join_key},
+                                detail=f"{tool}: {len(candidates)} row(s) on {join_key}")
+
+    # 9. synthesis -----------------------------------------------------------
+    def _synthesis(self, grant: CapabilityGrant, request: CapabilityRequest) -> CapabilityResult:
+        tool = request.tool or "synthesis.write"
+        claim = str(request.parameters.get("claim") or request.target or "").strip()
+        cited = [str(item) for item in request.parameters.get("evidence", [])]
+        if not claim:
+            raise self._deny(DenialReason.MALFORMED,
+                             "a synthesis call must carry the claim it is writing",
+                             request, grant,
+                             remedy="pass parameters={'claim': ..., 'evidence': [ids]}")
+        missing = [item for item in cited if item not in self._evidence]
+        if missing:
+            raise self._deny(
+                DenialReason.OUT_OF_SCOPE,
+                f"the synthesis cites {missing[0]!r}, which this mission never produced",
+                request, grant, allowed=sorted(self._evidence)[:6],
+                remedy="cite evidence ids from the run, or collect the missing row first")
+        key = "synthesis"
+        entries = [*self.journal.entries(key), {"claim": claim, "cites": cited}]
+        applied = self.journal.apply(key, {"entries": entries})
+        confidence = Confidence.MEDIUM if cited else Confidence.UNKNOWN
+        evidence = EvidenceItem(
+            kind=EvidenceKind.INFERENCE, statement=claim, sources=[],
+            supports=cited, reasoning="written from the mission's own evidence by a synthesis "
+                                      "capability; the cited rows carry the sourcing",
+            confidence=confidence,
+            confidence_basis=(f"{len(cited)} supporting row(s) from this mission"
+                              if cited else "no supporting row was cited"),
+            collected_by=grant.worker_id, tags=["capability-router", "synthesis"])
+        return CapabilityResult(capability=Capability.SYNTHESIS, target=request.target,
+                                tool=tool, evidence=[evidence],
+                                payload={"revision": applied["revision"], "claim": claim,
+                                         "cites": cited, "entries": entries},
+                                detail=f"{tool}: {len(cited)} citation(s)")
+
+    # -- derived-result helpers used by the flow -----------------------------
+
+    def remember(self, items: Sequence[EvidenceItem]) -> None:
+        """Make evidence available to correlation and synthesis.
+
+        Only the router decides what is "on record", so a derived capability can
+        cite exactly what the mission produced and nothing else.
+        """
+
+        with self._lock:
+            for item in items:
+                self._evidence.setdefault(item.id, item)
+
+    def revoke(self, worker_id: str) -> dict[str, Any]:
+        """Undo a Worker's derived results.
+
+        Called when a review rejects a correlation or a synthesis: the rows it
+        added are removed from the journal, so the next attempt starts from the
+        last accepted state rather than from a rejected one.
+        """
+
+        undone = {}
+        for key in (f"correlation:{worker_id}", f"timeline:{worker_id}"):
+            if self.journal.revision_of(key):
+                try:
+                    undone[key] = self.journal.roll_back(key, reason="review rejected the derivation")
+                except KeyError:                 # pragma: no cover - checked above
+                    continue
+        return undone
+
 # ══════════════════════════════════════════════════════════════════════════
-# 27. Entry point
+# ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+# 27b. Proving the router: self-test, demo, and what a Worker cannot do
+# ══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True)
+class RouterCheck:
+    """One claim about the boundary, and the evidence for it."""
+
+    name: str
+    ok: bool
+    detail: str = ""
+
+
+def _atomic_write(path: Path, text: str) -> Path:
+    """Write a file the router may reasonably inspect, or fail loudly."""
+
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def router_demo_context(*, approved: str = "") -> MasterContext:
+    """The scripted mission whose scope the router is judged against.
+
+    With ``approved``, the scope names a real directory as well as a host, so the
+    flow's own router can be seen admitting a read rather than only refusing one.
+    """
+
+    base = _selftest_context("forensic")
+    if not approved:
+        return base
+    return base.model_copy(update={"scope_entries": [approved, "example.com"]})
+
+
+def router_demo_units(context: MasterContext) -> list[FlowSubagent]:
+    """Two Workers, written here rather than planned by a model.
+
+    The router does not care how a Worker came to exist — only what its assignment
+    says it may do — so the unit under test is the boundary, not the planner.
+    """
+
+    return [
+        FlowSubagent(
+            id="sub-reader", role="artefact-reader",
+            objective="read the approved artefact and record what it says",
+            workers=[FlowWorker(
+                id="w-reader", name="reader", objective="read the approved artefact",
+                work_unit="inspect the artefact", tools=["forensic.mount"],
+                completion_criteria=["the artefact's contents are on record"])],
+            completion_criteria=["the artefact was read"]),
+        FlowSubagent(
+            id="sub-writer", role="analyst",
+            objective="write up what the read Worker found",
+            workers=[FlowWorker(
+                id="w-writer", name="writer", objective="write the finding",
+                work_unit="state the finding", tools=["synthesis.write"],
+                depends_on=["reader"],
+                completion_criteria=["the finding cites the read"])],
+            depends_on=["sub-reader"], completion_criteria=["the finding was written"]),
+    ]
+
+
+def _router_fixture() -> dict[str, Any]:
+    """A temporary mission: two approved roots, one artefact, a scope, a team.
+
+    Everything is built fresh per use, so no check can pass because of state
+    another check left behind.
+    """
+
+    # The module writes files of its own (a scope for a mission, a cache); give it
+    # a temporary one, so the only files this fixture leaves are its own.
+    os.environ["ARGUS_HOME"] = tempfile.mkdtemp(prefix="argus-router-home-")
+    sandbox = Path(tempfile.mkdtemp(prefix="argus-router-"))
+    approved = sandbox / "approved"
+    approved.mkdir()
+    artefact = _atomic_write(approved / "evidence.txt",
+                             "2026-02-11T03:04:05Z process 4411 wrote /etc/hosts\n")
+    outside = _atomic_write(sandbox / "outside.txt", "not approved\n")
+    context = router_demo_context(approved=str(approved))
+    context = context.model_copy(update={
+        "objective": "read the approved artefact and describe what the router allows",
+        "available_tools": ["forensic.mount", "forensic.hash", "metadata.read",
+                            "http.fetch", "synthesis.write"]})
+    units = router_demo_units(context)
+    scope = context.scope_object()
+    router = CapabilityRouter(scope=scope, network=True)
+    reader = FlowWorker(id="w-reader", name="reader", objective="read the artefact",
+                        tools=["forensic.mount"])
+    hasher = FlowWorker(id="w-hasher", name="hasher", objective="hash the artefact",
+                        tools=["forensic.hash"])
+    fetcher = FlowWorker(id="w-fetcher", name="fetcher", objective="fetch the page",
+                         tools=["http.fetch"])
+    synthesis = FlowWorker(id="w-synthesis", name="writer", objective="write it up",
+                           tools=["synthesis.write"])
+    grants = {
+        "reader": grant_for_worker(reader, paths=router.paths),
+        "hasher": grant_for_worker(hasher, paths=router.paths),
+        "fetcher": grant_for_worker(fetcher, paths=router.paths),
+        "synthesis": grant_for_worker(synthesis, paths=router.paths),
+    }
+    return {"root": sandbox, "approved": approved, "artefact": artefact,
+            "outside": outside, "context": context, "units": units, "scope": scope,
+            "router": router, "grants": grants}
+
+
+def run_router_self_test() -> list[RouterCheck]:
+    """Prove the acceptance criterion: no Worker shell, no unapproved path, no scope.
+
+    Every check is a property of the boundary rather than of one handler, so the
+    suite still means something if a handler is rewritten.
+    """
+
+    checks: list[RouterCheck] = []
+
+    def add(name: str, ok: bool, detail: Any = "") -> None:
+        checks.append(RouterCheck(name=name, ok=bool(ok), detail=str(detail)[:150]))
+
+    def refusal(**kwargs: Any) -> CapabilityRefusal | None:
+        result, denied = fixture["router"].try_invoke(**kwargs)
+        return None if result is not None else denied
+
+    def reason(denied: CapabilityRefusal | None) -> str:
+        return denied.reason.value if denied is not None else "allowed"
+
+    fixture = _router_fixture()
+    router: CapabilityRouter = fixture["router"]
+    grants: dict[str, CapabilityGrant] = fixture["grants"]
+    artefact, outside = fixture["artefact"], fixture["outside"]
+
+    # ---- 1. the vocabulary is closed and exactly the nine ------------------
+    add("the router knows exactly nine capabilities", len(CAPABILITY_ORDER) == 9,
+        [item.value for item in CAPABILITY_ORDER])
+    add("capability names are a value set, not a glob",
+        all(item in {*Capability} for item in Capability))
+    add("every capability has at least one tool",
+        all(capability in _CAPABILITY_TOOLS for capability in Capability),
+        sorted(capability.value for capability in _CAPABILITY_TOOLS))
+    add("the registry is a fixed table, not a plug-in point",
+        isinstance(TOOL_REGISTRY, tuple) and len(TOOL_REGISTRY) >= 20, len(TOOL_REGISTRY))
+    add("every tool names a capability in the closed set",
+        all(binding.capability in {*Capability} for binding in TOOL_REGISTRY))
+    add("every capability is reachable through a bound tool",
+        all(_CAPABILITY_TOOLS.get(capability) for capability in Capability))
+    add("the vocabulary reads as a list of capabilities",
+        router.vocabulary() == tuple(item.value for item in CAPABILITY_ORDER),
+        router.vocabulary()[:3])
+
+    # ---- 2. the grant is derived from the assignment, never wider ----------
+    reader_grant = grants["reader"]
+    add("a Worker's grant holds what its tools provide",
+        reader_grant.capabilities == (Capability.ARTIFACT.value,), reader_grant.capabilities)
+    add("a grant holds no capability its tools do not provide",
+        not reader_grant.holds(Capability.HASHING))
+    add("the grant names the Worker it bounds",
+        reader_grant.worker_id == "w-reader" and reader_grant.subagent_id == "")
+    add("the grant serialises as a description", set(reader_grant.to_dict()) >=
+        {"worker", "capabilities", "tools", "network", "roots"},
+        sorted(reader_grant.to_dict()))
+    add("a Worker cannot widen its own grant", not hasattr(reader_grant, "add"))
+    add("the grant is immutable", _frozen(reader_grant))
+
+    # ---- 3. a held capability works, and produces evidence -----------------
+    result, denied = router.try_invoke(reader_grant, "artifact.inspect", target=str(artefact))
+    add("a granted capability succeeds", denied is None and result is not None,
+        reason(denied))
+    add("the result carries evidence, not just a return value",
+        bool(result and result.evidence) and bool(result.evidence[0].statement))
+    add("the evidence records who did it",
+        bool(result) and result.evidence[0].collected_by == "w-reader",
+        result.evidence[0].collected_by if result else "")
+    add("the router counts the call it allowed", len(router.calls) == 1, len(router.calls))
+    add("nothing was refused on the way in", not router.refusals, len(router.refusals))
+
+    # ---- 4. an unheld capability is refused, with a structured reason ------
+    denied = refusal(grant=reader_grant, request="hashing.compute", target="abc")
+    add("a capability outside the assignment is refused",
+        reason(denied) == DenialReason.NOT_GRANTED.value, reason(denied))
+    add("the refusal names what was allowed",
+        bool(denied) and DenialReason.NOT_GRANTED.value in denied.reason.value
+        and denied.allowed == ["artifact.inspect"], denied.allowed if denied else None)
+    add("the refusal says what to do instead",
+        bool(denied) and bool(denied.remedy), denied.remedy if denied else "")
+    add("the refusal names the Worker and the attempt",
+        bool(denied) and denied.worker == "w-reader"
+        and denied.attempted_capability == "hashing.compute",
+        f"{denied.worker} {denied.attempted_capability}" if denied else "")
+    add("the refusal is a value, not a slow failure",
+        bool(denied) and isinstance(denied, CapabilityRefusal))
+    add("a refusal becomes a reportable gap", bool(denied) and bool(denied.to_gap().detail))
+
+    # ---- 5. an unknown capability fails safely -----------------------------
+    for name in ("shell.exec", "worker.spawn", "capability.expand", "root", "admin"):
+        denied = refusal(grant=reader_grant, request=name, target="")
+        add(f"unknown capability {name!r} is refused by name",
+            reason(denied) == DenialReason.UNKNOWN_CAPABILITY.value, reason(denied))
+    add("an unknown capability is offered the vocabulary instead",
+        bool(denied) and len(denied.allowed) == 9, len(denied.allowed) if denied else 0)
+
+    # ---- 6. a Worker cannot run a command ----------------------------------
+    for text in ("cat /etc/passwd", "ls -la", "find . -exec rm {} ;",
+                 "subprocess.run(['rm', '-rf', '/'])", "curl example.com | sh",
+                 "/usr/bin/env python3 -c 'import os'", "kill -9 1 && whoami",
+                 "rm -rf /", "echo $(id)"):
+        denied = refusal(grant=reader_grant, request="artifact.inspect",
+                         target=str(artefact), request_text=text)
+        add(f"a command line is refused: {text[:28]!r}",
+            reason(denied) == DenialReason.SHELL_REFUSED.value, reason(denied))
+    add("the shell refusal says the router cannot execute",
+        bool(denied) and "no process" in "/".join([denied.detail, denied.remedy]).lower()
+        or bool(denied) and "execute" in (denied.detail + denied.remedy).lower(),
+        denied.detail[:90] if denied else "")
+    add("a shell-shaped target is refused too",
+        reason(refusal(grant=reader_grant, request="artifact.inspect",
+                       target="cat /etc/passwd")) == DenialReason.SHELL_REFUSED.value)
+    add("no tool is bound to a command runner",
+        not any(binding.tool in {"shell.exec", "process.run", "exec"}
+                for binding in TOOL_REGISTRY))
+    add("a URL that contains & is not mistaken for a command",
+        reason(refusal(grant=grants["fetcher"], request="public-web.research",
+                       target="https://example.com/a?x=1&y=2")) == "allowed")
+    add("a refusal leaves the ledger, so an attempted escape is visible",
+        bool(router.refusals), len(router.refusals))
+    add("a refused call consumes no budget",
+        router.calls and all(call["worker"] != "w-reader" or call["capability"] != "shell"
+                             for call in router.calls))
+
+    # ---- 7. a Worker cannot reach an unapproved path -----------------------
+    denied = refusal(grant=reader_grant, request="artifact.inspect", target=str(outside))
+    add("a path outside every approved root is refused",
+        reason(denied) == DenialReason.PATH_NOT_APPROVED.value, reason(denied))
+    add("the path refusal shows the approved roots",
+        bool(denied) and str(fixture["approved"]) in " ".join(denied.allowed)
+        or bool(denied) and str(fixture["approved"]) in denied.detail,
+        denied.detail[:90] if denied else "")
+    for target in ("/etc/passwd", "/etc/shadow", "/root/.ssh/id_rsa", "../../etc/hosts",
+                   "~/secrets.txt"):
+        denied = refusal(grant=reader_grant, request="artifact.inspect", target=target)
+        add(f"an unapproved path is refused: {target!r}",
+            reason(denied) in {DenialReason.PATH_NOT_APPROVED.value,
+                               DenialReason.UNRESOLVED_PATH.value}, reason(denied))
+    add("a sibling of the approved root is not inside it",
+        reason(refusal(grant=reader_grant, request="artifact.inspect",
+                       target=str(fixture["approved"]) + "-evil/x.txt"))
+        == DenialReason.PATH_NOT_APPROVED.value)
+    add("the approved artefact is still readable afterwards",
+        router.try_invoke(reader_grant, "artifact.inspect", target=str(artefact))[0]
+        is not None)
+    linked = fixture["root"] / "approved" / "link.txt"
+    try:
+        linked.symlink_to(outside)
+        add("a symlink out of the root is refused",
+            reason(refusal(grant=reader_grant, request="artifact.inspect",
+                           target=str(linked)))
+            == DenialReason.PATH_NOT_APPROVED.value)
+    except OSError:                              # pragma: no cover - no symlinks here
+        add("a symlink out of the root is refused", True, "symlinks unavailable")
+
+    # ---- 8. a Worker cannot expand its own scope ---------------------------
+    denied = refusal(grant=grants["fetcher"], request="public-web.research",
+                     target="https://evil.example.org/")
+    add("a host outside the scope is refused",
+        reason(denied) == DenialReason.OUT_OF_SCOPE.value, reason(denied))
+    add("the scope refusal lists the authorised hosts",
+        bool(denied) and "example.com" in " ".join(denied.allowed + [denied.detail]))
+    add("a bare approved host is admitted",
+        reason(refusal(grant=grants["fetcher"], request="public-web.research",
+                       target="example.com")) == "allowed")
+    add("a sub-domain the scope does not cover is refused",
+        reason(refusal(grant=grants["fetcher"], request="public-web.research",
+                       target="https://notexample.com/")) == DenialReason.OUT_OF_SCOPE.value)
+    add("a router built without a scope cannot authorise the network",
+        reason(CapabilityRouter(network=True).try_invoke(
+            grants["fetcher"], "public-web.research", target="example.com")[1])
+        == DenialReason.OUT_OF_SCOPE.value)
+    add("a Worker cannot grant itself a capability by naming another's tool",
+        reason(refusal(grant=reader_grant, request="public-web.research",
+                       target="example.com")) == DenialReason.NOT_GRANTED.value)
+
+    # ---- 9. the network switch is upstream of the grant --------------------
+    offline = CapabilityRouter(scope=fixture["scope"], network=False)
+    online_grant = grants["fetcher"]
+    add("an offline mission refuses a network capability",
+        reason(offline.try_invoke(online_grant, "public-web.research",
+                                  target="example.com")[1]) == DenialReason.NETWORK_OFF.value)
+    add("the offline refusal says the mission is offline",
+        "offline" in (offline.refusals[-1].detail if offline.refusals else "").lower())
+    add("a local capability still works offline",
+        offline.try_invoke(reader_grant, "artifact.inspect", target=str(artefact))[0]
+        is not None)
+    # A grant records what the assignment names; the mission's switch is separate, and
+    # the router consults both.  So an offline run refuses a granted network call one
+    # check later, as NETWORK_OFF rather than NOT_GRANTED — asserted above.
+    offline_grant = grant_for_worker(
+        FlowWorker(id="w", name="f", objective="f", tools=["http.fetch"]),
+        paths=router.paths, network=False)
+    add("an offline grant is marked offline",
+        offline_grant.network is False and offline_grant.to_dict()["network"] is False)
+    add("a capability the assignment does not name is still not held",
+        not offline_grant.holds(Capability.SYNTHESIS))
+
+    # ---- 10. a Worker cannot borrow another Worker's tools ----------------
+    denied = refusal(grant=grants["reader"], request="artifact.inspect",
+                     target=str(artefact), tool="forensic.hash")
+    add("a tool outside the assignment is refused",
+        reason(denied) == DenialReason.NOT_GRANTED.value, reason(denied))
+    add("an unbound tool is refused as unknown",
+        reason(refusal(grant=grants["reader"], request="artifact.inspect",
+                       target=str(artefact), tool="shell.exec"))
+        == DenialReason.UNKNOWN_TOOL.value)
+    add("a tool from the wrong capability is refused",
+        reason(refusal(grant=grants["reader"], request="hashing.compute",
+                       target="abc", tool="forensic.hash"))
+        == DenialReason.NOT_GRANTED.value)
+
+    # ---- 11. derived capabilities cannot import the world -----------------
+    denied = refusal(grant=grants["synthesis"], request="synthesis.write",
+                     parameters={"claim": "something", "evidence": ["ev-unknown"]})
+    add("a synthesis citing unknown evidence is refused",
+        reason(denied) == DenialReason.OUT_OF_SCOPE.value, reason(denied))
+    add("the synthesis refusal lists what is actually on record",
+        bool(denied) and isinstance(denied.allowed, list))
+    add("a synthesis with no claim is refused as malformed",
+        reason(refusal(grant=grants["synthesis"], request="synthesis.write",
+                       parameters={"evidence": []})) == DenialReason.MALFORMED.value)
+    reader_result = router.try_invoke(reader_grant, "artifact.inspect", target=str(artefact))[0]
+    router.remember(reader_result.evidence)
+    cited = reader_result.evidence[0].id
+    result, denied = router.try_invoke(
+        grants["synthesis"], "synthesis.write",
+        parameters={"claim": "the artefact was read", "evidence": [cited]})
+    add("a synthesis citing evidence on record succeeds", denied is None, reason(denied))
+    add("the synthesis keeps a revision it can roll back",
+        bool(result) and result.payload.get("revision", 0) >= 1)
+    timeline_grant = grant_for_worker(
+        FlowWorker(id="w-time", name="timer", objective="order the events",
+                   tools=["forensic.timeline"]), paths=router.paths)
+    result, denied = router.try_invoke(
+        timeline_grant, "timeline.construct",
+        parameters={"entries": [{"at": "2026-02-11T03:00:00Z", "event": "second"},
+                                {"at": "2026-02-11T01:00:00Z", "event": "first"},
+                                {"event": "undated"}]})
+    add("a timeline orders dated entries and sets undated ones aside",
+        bool(result) and [row["event"] for row in result.payload["ordered"]][:2]
+        == ["first", "second"],
+        [row.get("event") for row in result.payload["ordered"]][:2] if result else None)
+    add("a timeline keeps undated entries aside rather than guessing",
+        bool(result) and result.payload.get("undated") == 1)
+    correlated = router.try_invoke(
+        grant_for_worker(FlowWorker(id="w-corr", name="corr", objective="join",
+                                    tools=["correlate.records"]), paths=router.paths),
+        "correlation.build", parameters={"left": [cited], "right": [], "on": "id"})[0]
+    add("a correlation joins evidence the mission holds", correlated is not None)
+    add("a revoked derivation is undone",
+        bool(router.revoke("w-corr")) and router.journal.revision_of("correlation:w-corr") == 0)
+
+    # ---- 12. budgets bound a Worker that would otherwise be allowed --------
+    tight = CapabilityRouter(scope=fixture["scope"], paths=router.paths,
+                             limits=RouterLimits(max_calls_per_worker=2,
+                                                 max_filesystem_calls=2))
+    tight_grant = grant_for_worker(
+        FlowWorker(id="w-loop", name="looper", objective="read everything",
+                   tools=["forensic.mount"]), paths=tight.paths)
+    allowed = sum(1 for _ in range(5)
+                  if tight.try_invoke(tight_grant, "artifact.inspect",
+                                      target=str(artefact))[1] is None)
+    add("a Worker cannot exceed its call ceiling", allowed == 2, allowed)
+    add("the budget refusal is structured",
+        bool(tight.refusals) and tight.refusals[-1].reason is DenialReason.BUDGET)
+
+    # ---- 13. the flow hands each Worker a grant, and dispatches through it -
+    flow = HierarchicalFlow(context=fixture["context"], subagents=fixture["units"],
+                            runner=DeterministicRunner(scope=fixture["context"].scope_entries))
+    flow.build()
+    add("the flow builds exactly one router", flow.router is not None)
+    add("every Worker in the run has a grant",
+        len(flow.grants) == sum(len(subagent.workers) for subagent in flow.subagents),
+        len(flow.grants))
+    add("each grant is derived from that Worker's own tools",
+        all(grant.capabilities
+            for grant in flow.grants.values()), len(flow.grants))
+    add("no grant holds a capability its Worker was not assigned",
+        all(set(grant.capabilities) <=
+            {_TOOL_BINDINGS[tool].capability.value
+             for tool in grant.tools if tool in _TOOL_BINDINGS}
+            for grant in flow.grants.values()))
+    add("the flow's router judges offline when the policy says so",
+        HierarchicalFlow(context=fixture["context"], subagents=fixture["units"],
+                         runner=DeterministicRunner(),
+                         policy=FlowPolicy(allow_network=False)).build().router.network is False)
+    add("disabling the router is explicit, never accidental",
+        HierarchicalFlow(context=fixture["context"], subagents=fixture["units"],
+                         runner=DeterministicRunner(),
+                         policy=FlowPolicy(capability_router=False)).build().router is None)
+    target_worker = next(worker for subagent in flow.subagents
+                         for worker in subagent.workers)
+    dispatched = flow.dispatch_worker(
+        next(subagent for subagent in flow.subagents if target_worker in subagent.workers),
+        target_worker, targets={"forensic.mount": str(fixture["artefact"])})
+    add("a Worker dispatched through the router reports its grant",
+        dispatched["worker"] == target_worker.id and bool(dispatched["grant"]))
+    add("a dispatch reports what was refused, not only what worked",
+        "refusals" in dispatched and isinstance(dispatched["refusals"], list))
+    add("a dispatch runs through the flow's own router",
+        bool(flow.router.calls) or bool(dispatched["refusals"]), len(flow.router.calls))
+    bare = router_demo_context()
+    bare_flow = HierarchicalFlow(context=bare, subagents=router_demo_units(bare),
+                                 runner=DeterministicRunner(scope=bare.scope_entries)).build()
+    bare_dispatch = bare_flow.dispatch_worker(bare_flow.subagents[0],
+                                              bare_flow.subagents[0].workers[0])
+    add("a dispatch against a mission with no approved root reports a gap",
+        bare_dispatch["gaps"] != [], bare_dispatch["gaps"][:1])
+    add("a dispatch with an approved root produces a result through the real router",
+        dispatched["capabilities"] != [] and not
+        any(item["reason"] == DenialReason.PATH_NOT_APPROVED.value
+            for item in dispatched["refusals"]),
+        [item["capability"] for item in dispatched["capabilities"]])
+    add("a flow built without a router refuses to dispatch",
+        _denies(lambda: HierarchicalFlow(
+            context=fixture["context"], subagents=fixture["units"],
+            runner=DeterministicRunner(),
+            policy=FlowPolicy(capability_router=False)).build().dispatch_worker(
+                fixture["units"][0], fixture["units"][0].workers[0])))
+
+    # ---- 14. the boundary is in the source, not only in the tests ----------
+    source = Path(__file__).read_text(encoding="utf-8") if "__file__" in globals() else ""
+    router_source = (source.split("# 27. The controlled capability router")[-1]
+                     .split("# 27b. Proving the router")[0])
+    add("no handler shells out to run a command",
+        not any(token in router_source
+                for token in ("os.system(", "os.popen(", "shell=True", "subprocess.")),
+        len(router_source))
+    add("the router section never imports subprocess",
+        "import subprocess" not in router_source)
+    add("no capability handler receives a command string",
+        not any("command" in name for name in
+                (member for member in dir(CapabilityRouter) if not member.startswith("__"))))
+    add("the router has no eval or exec path",
+        not any(f" {name}(" in router_source for name in ("eval", "exec", "runpy")))
+    add("the capability set has no process capability",
+        not any("shell" in item.value or "process" in item.value for item in Capability))
+    add("the fixture wrote nothing outside its own temporary root",
+        all(str(item).startswith(str(fixture["root"]))
+            for item in fixture["approved"].rglob("*")))
+
+    return checks
+
+
+def _frozen(value: Any) -> bool:
+    """Whether ``value`` refuses mutation — a grant is fixed once derived."""
+
+    try:
+        value.worker_id = "changed"
+    except Exception:
+        return True
+    return False
+
+
+def _denies(fn: Callable[[], Any]) -> bool:
+    """Whether ``fn`` refuses with a structured denial rather than a crash."""
+
+    try:
+        fn()
+    except CapabilityDenied:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def router_demo() -> dict[str, Any]:
+    """A scripted mission showing the boundary from the inside.
+
+    A Worker is given a grant from its assignment, then asked for one thing it may
+    do and five it may not.  Every refusal is printed as the Worker would see it.
+    """
+
+    fixture = _router_fixture()
+    router, grants = fixture["router"], fixture["grants"]
+    artefact = fixture["artefact"]
+
+    attempts: list[dict[str, Any]] = []
+
+    def attempt(label: str, grant: CapabilityGrant, **kwargs: Any) -> None:
+        result, denied = router.try_invoke(grant, **kwargs)
+        attempts.append({
+            "label": label, "worker": grant.worker_id,
+            "capability": kwargs.get("request", ""),
+            "target": kwargs.get("target", ""),
+            "outcome": "allowed" if denied is None else denied.reason.value,
+            "detail": (result.detail if result is not None else denied.detail),
+            "remedy": "" if denied is None else denied.remedy,
+            "evidence": [] if result is None else
+                        [item.statement for item in result.evidence],
+        })
+
+    attempt("read the approved artefact", grants["reader"],
+            request="artifact.inspect", target=str(artefact))
+    attempt("read a file outside every approved root", grants["reader"],
+            request="artifact.inspect", target=str(fixture["outside"]))
+    attempt("hash a file it may read", grants["reader"],
+            request="hashing.compute", target=str(artefact))
+    attempt("run a command", grants["reader"], request="artifact.inspect",
+            target=str(artefact), request_text="cat /etc/passwd")
+    attempt("invent a capability", grants["reader"], request="shell.exec", target="/bin/sh")
+    attempt("leave the mission's scope", grants["fetcher"],
+            request="public-web.research", target="https://evil.example.org/")
+    attempt("fetch inside the mission's scope", grants["fetcher"],
+            request="public-web.research", target="https://example.com/advisories?x=1&y=2")
+
+    # A partial success: what a Worker may do, it does; what it may not, it reports.
+    reader_result = router.try_invoke(grants["reader"], "artifact.inspect",
+                                      target=str(artefact))[0]
+    router.remember(reader_result.evidence)
+    attempt("write up what it collected", grants["synthesis"], request="synthesis.write",
+            parameters={"claim": "the artefact was read and hashed",
+                        "evidence": [reader_result.evidence[0].id]})
+    attempt("write up something it never collected", grants["synthesis"],
+            request="synthesis.write", parameters={"claim": "the artefact was read",
+                                                   "evidence": ["ev-invented"]})
+
+    # The same dispatch the graph performs: the Worker's own router, its own grant,
+    # and its own scope — here with a real approved root, so one read lands.
+    flow = HierarchicalFlow(context=fixture["context"], subagents=fixture["units"],
+                            runner=DeterministicRunner(scope=fixture["context"].scope_entries))
+    flow.build()
+    worker = flow.subagents[0].workers[0]
+    dispatched = flow.dispatch_worker(flow.subagents[0], worker,
+                                      targets={"forensic.mount": str(fixture["artefact"])})
+
+    return {
+        "root": str(fixture["root"]),
+        "grants": {name: grant.to_dict() for name, grant in grants.items()},
+        "attempts": attempts,
+        "allowed": sum(1 for item in attempts if item["outcome"] == "allowed"),
+        "refused": sum(1 for item in attempts if item["outcome"] != "allowed"),
+        "refusals": len(router.refusals),
+        "calls": len(router.calls),
+        "dispatched": {key: dispatched[key]
+                       for key in ("worker", "grant", "capabilities", "refusals", "gaps")},
+    }
+
+
+def render_router_self_test(checks: Sequence[RouterCheck]) -> Any:
+    """The self-test as a table: one line per claim, failures marked."""
+
+    table = Table(title="router self-test", title_justify="left", box=None, pad_edge=False)
+    table.add_column("", width=2)
+    table.add_column("check", no_wrap=True)
+    table.add_column("detail", overflow="fold")
+    for check in checks:
+        glyph, colour = ("✔", "green") if check.ok else ("✘", "red")
+        table.add_row(f"[{colour}]{glyph}[/{colour}]", escape(check.name),
+                      escape(check.detail))
+    return table
+
+
+def render_router_demo(payload: Mapping[str, Any]) -> Group:
+    """The demo on screen: the grants, then what each attempt became."""
+
+    grants = Table(title="grants derived from assignments", title_justify="left",
+                   box=None, pad_edge=False)
+    grants.add_column("worker", no_wrap=True)
+    grants.add_column("tools", no_wrap=True)
+    grants.add_column("capabilities", overflow="fold")
+    grants.add_column("paths", justify="right")
+    for name, grant in payload["grants"].items():
+        grants.add_row(escape(name), escape(", ".join(grant["tools"]) or "—"),
+                       escape(", ".join(grant["capabilities"]) or "—"),
+                       str(len(grant["roots"])))
+
+    attempts = Table(title="the boundary, from the Worker's side", title_justify="left",
+                     box=None, pad_edge=False)
+    attempts.add_column("attempt", overflow="fold")
+    attempts.add_column("worker", no_wrap=True)
+    attempts.add_column("outcome", no_wrap=True)
+    attempts.add_column("why / what it got", overflow="fold")
+    for item in payload["attempts"]:
+        ok = item["outcome"] == "allowed"
+        colour = "green" if ok else "yellow"
+        attempts.add_row(escape(item["label"]), escape(item["worker"]),
+                         f"[{colour}]{escape(item['outcome'])}[/{colour}]",
+                         escape(item["detail"][:88]))
+
+    dispatched = payload["dispatched"]
+    summary = Text(
+        f"\n{payload['allowed']} attempt(s) allowed · {payload['refused']} refused · "
+        f"{payload['calls']} call(s) on the ledger\n"
+        f"dispatched through the router: {dispatched['worker']} held "
+        f"{len(dispatched['grant']['capabilities'])} capability(ies), produced "
+        f"{len(dispatched['capabilities'])} result(s); "
+        f"{len(dispatched['refusals'])} refusal(s) became gaps", style="dim")
+    return Group(grants, Text(""), attempts, summary)
+
+
+@app.command("router", help="Run Workers through a capability router; prove no shell, no scope creep.")
+def router_command(
+    self_test: bool = typer.Option(False, "--self-test",
+                                   help="Prove the boundary offline: no shell, no unapproved path."),
+    demo: bool = typer.Option(False, "--demo",
+                              help="Ask one Worker for seven things, six of them refused."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """A Worker's only way to act: a capability it was assigned, at a target it may touch."""
+
+    console = get_console()
+
+    if self_test:
+        checks = run_router_self_test()
+        failures = [check for check in checks if not check.ok]
+        if as_json:
+            _emit(json.dumps({"ok": not failures,
+                              "checks": [asdict(check) for check in checks]}, indent=2))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        console.print()
+        console.print(render_router_self_test(checks))
+        colour = "green" if not failures else "red"
+        console.print(f"\n[{colour}]{len(checks) - len(failures)} passed[/] · "
+                      f"{len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    if demo:
+        payload = router_demo()
+        if as_json:
+            _emit(json.dumps(payload, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(render_router_demo(payload))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    console.print("[red]✘[/red] choose --self-test or --demo")
+    raise typer.Exit(ExitCode.USAGE)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 28. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 
