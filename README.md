@@ -30,7 +30,7 @@ python vedant_osint.py aggregate --self-test # reviewed work only, and never ear
 python vedant_osint.py review-master --self-test # five lenses, five ways to stop
 python vedant_osint.py loops --self-test      # repeated work, blocked lines, saturation
 python vedant_osint.py synthesis --self-test  # a report that cannot outrun its evidence
-python vedant_osint.py report --self-test     # Markdown, JSON and a bounded summary
+python vedant_osint.py report --self-test     # Markdown, JSON and a bounded summary (91)
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -1024,7 +1024,7 @@ one `MissionDossier` assembled from the reviewed record, so a fact that is not i
 is not in the Markdown either — the JSON is the authority and the other two are renderings.
 
 ```
-python vedant_osint.py report --self-test                    # the four output clauses
+python vedant_osint.py report --self-test                    # 91 checks: the four output clauses
 python vedant_osint.py report --demo                         # one mission, three formats
 python vedant_osint.py flow --demo exposure --json > m.json
 python vedant_osint.py report --mission m.json --out-dir out/ # writes m.md and m.json

@@ -54446,14 +54446,11 @@ def _task_rows(result: "FlowResult") -> list[TaskRow]:
         seen.add(report.subagent_id)
         for outcome in report.outcomes:
             seen.add(outcome.worker_id)
-            origin = ("follow-up" if outcome.worker_id in follow_up_ids
-                      else "adopted" if outcome.worker_id in adopted
-                      else "runtime" if _worker_name(report, outcome.worker_id, plan
-                                                      ).startswith("gap-")
-                      else "planned")
+            name = _worker_name(report, outcome.worker_id, plan)
+            origin = _worker_origin(report, outcome, name, plan=plan,
+                                    follow_up_ids=follow_up_ids, adopted=adopted)
             rows.append(TaskRow(
-                id=outcome.worker_id, kind="worker",
-                role=_worker_name(report, outcome.worker_id, plan),
+                id=outcome.worker_id, kind="worker", role=name,
                 objective=_worker_objective(plan, outcome.worker_id),
                 status=outcome.status.value, gate=outcome.gate.value,
                 attempts=outcome.attempt, evidence=len(outcome.evidence_ids),
@@ -54486,14 +54483,52 @@ def _task_rows(result: "FlowResult") -> list[TaskRow]:
 
 def _worker_name(report: "SubagentOutcome", worker_id: str,
                  plan: "FlowSubagent | None") -> str:
-    """The Worker's name, from the plan when the mission still has it."""
+    """The Worker's name: from the plan, else from the reviewed result the report carries.
+
+    A reloaded mission has no :class:`FlowSubagent` objects, but its reports carry the
+    reviewed Worker reports — which name the Worker.  Only a Worker nobody described falls
+    back to its id, and the row then says so rather than presenting an id as a name.
+    """
 
     if plan is not None:
         for worker in plan.workers:
             if worker.id == worker_id:
                 return worker.name
-    verdict = next((item for item in report.reviews if item.worker_id == worker_id), None)
-    return f"{worker_id}" if verdict is None else f"{worker_id} ({verdict.verdict})"
+    for outcome in report.outcomes:
+        if outcome.worker_id != worker_id:
+            continue
+        payload = outcome.payload or {}
+        report_body = payload.get("report") if isinstance(payload, dict) else None
+        # The Worker's report names the work unit it was asked to do, and the summary line
+        # opens with it: both are facts the record carries, unlike an id read as a name.
+        named = str(payload.get("work_unit") or (report_body or {}).get("summary") or "")
+        return named.split(":")[0].strip() or f"{worker_id} (unnamed)"
+    return f"{worker_id} (unnamed)"
+
+
+def _worker_origin(report: "SubagentOutcome", outcome: "WorkerOutcome", name: str, *,
+                   plan: "FlowSubagent | None", follow_up_ids: set[str],
+                   adopted: set[str]) -> str:
+    """How this Worker came to run: planned, runtime, follow-up or adopted.
+
+    Read from the name the graph gave it (§36 names a gap Worker ``gap-…``, §37 names a
+    follow-up ``follow-up-…``) and, for a reloaded mission whose plan is gone, from the
+    work unit the Worker itself reported — never guessed from position.
+    """
+
+    if outcome.worker_id in follow_up_ids:
+        return "follow-up"
+    if outcome.worker_id in adopted:
+        return "adopted"
+    if plan is not None and any(worker.id == outcome.worker_id for worker in plan.workers):
+        return ("runtime" if name.startswith("gap-")
+                else "follow-up" if name.startswith("follow-up-") else "planned")
+    unit = str((outcome.payload or {}).get("work_unit") or "")
+    if unit.endswith("follow-up") or name.startswith("follow-up-"):
+        return "follow-up"
+    if unit.endswith("gap closure") or name.startswith("gap-"):
+        return "runtime"
+    return "planned"
 
 
 def _worker_objective(plan: "FlowSubagent | None", worker_id: str) -> str:
@@ -55711,6 +55746,16 @@ def run_dossier_self_test() -> list[DossierCheck]:
         sorted((ran | planned) - rows))
     add("a runtime Worker is in the execution summary", ran <= rows
         and all(row.origin for row in execution.tasks if row.id in ran))
+    add("the summary tells a planned Worker from a runtime one",
+        {row.origin for row in execution.tasks} >= {"planned", "runtime"},
+        sorted({row.origin for row in execution.tasks}))
+    add("a follow-up Worker is named as one",
+        any(row.origin == "follow-up" for row in execution.tasks)
+        or not result.follow_ups,
+        sorted({row.origin for row in execution.tasks}))
+    add("every Worker row is named by its work, not its id",
+        all("(unnamed)" not in row.role for row in execution.tasks if row.kind == "worker"),
+        [row.role for row in execution.tasks if "(unnamed)" in row.role])
     add("a task row carries its attempts and time",
         all(row.attempts >= 1 and row.seconds >= 0 for row in execution.tasks))
     add("the execution summary counts what the run recorded",
