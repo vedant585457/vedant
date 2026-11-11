@@ -25,6 +25,7 @@ python vedant_osint.py artifacts --self-test  # read-only artifact handling, no 
 python vedant_osint.py timeline --self-test   # source vs derived time, explained links
 python vedant_osint.py outcomes --self-test  # Worker statuses, no verdicts
 python vedant_osint.py review --self-test    # seven dimensions, pass or revise
+python vedant_osint.py retask --self-test    # a revise becomes a specific assignment
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -807,13 +808,49 @@ python vedant_osint.py review --check report.json --schema EvidenceSet --scope e
   limitations, schema) and never asks a model to grade a model: a grader that can be
   argued into a pass is not a control. The same result reviews identically twice.
 
+## Targeted retasking
+
+A review that says *revise* no longer buys the same prompt again. When retries remain,
+the Worker's next assignment is rebuilt from the review — its own objective, the exact
+deficiencies, the correction each implies, and the evidence already collected — and the
+previous attempt is kept in history until the configured retry limit is reached.
+
+```bash
+python vedant_osint.py retask --self-test   # 82 retasking checks, offline
+python vedant_osint.py retask --demo        # one retask, one repeat, one spent budget
+python vedant_osint.py retask --next report.json --schema EvidenceSet --objective "…"
+```
+
+- **A retry is a retask.** `RetaskedWorker` carries the objective *unchanged*, the
+  criteria, the output shape, one `RetaskItem` per dimension quoted from the review
+  with its correction, and a `prompt` that restates all of it. A retask with no
+  correction is refused at construction: repeating the instruction is exactly the
+  behaviour the section exists to prevent.
+- **"Specific" is a field, not a claim.** `retask_specificity` scores six signals —
+  objective restated, deficiency quoted, correction given, evidence in hand stated,
+  output shape named, not vague-only — and the flow's demo shows a 65-character
+  directive beside the ~1.3 kB assignment it becomes.
+- **The count is read, not re-derived.** `RetryBudget` records the Worker's own
+  `max_attempts` and the Subagent's `ReviewPolicy`, the smaller binds, and the source
+  of the ceiling is on the record. At the limit the unit returns `RETRY_EXHAUSTED` with
+  a partial report naming every unresolved deficiency — the evidence its attempts did
+  produce, at the status that admits what is missing.
+- **Evidence is carried, not collected twice.** `carryable_evidence` forwards only
+  items the review did not fault, only observations (never an inference), and never
+  what the attempt itself inherited. The prompt lists them with their ids under
+  *do not collect it again*; the history records what each attempt actually produced.
+- **History is append-only.** `RetaskLedger` holds every attempt (status, decision,
+  deficiencies, new evidence, the instruction it received) and every retask.
+  `retask_fingerprint` digests the substance of an instruction, so a repeated prompt is
+  detected even when re-worded — the demo shows one being caught.
+
 ## Status
 
 | Phase | Scope | State |
 |-------|-------|-------|
 | 1 | Foundation — CLI skeleton, config probing, version reporting | ✅ done |
 | 2 | Contracts — settings, `doctor`, preflight, models, state, renderer, lifecycle, resilience, model adapter | ✅ done |
-| 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control, Worker outcome contract, Subagent quality review) |
+| 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control, Worker outcome contract, Subagent quality review, targeted Worker retasking) |
 | 4 | Browser — browser-use / Playwright sessions and capture | 🟡 started (policy, scope, capture, guarded closure, agent mode) |
 | 5 | Collection — passive OSINT sources, artefact hashing | 🟡 started (source-aware web research; safe document/page extraction with injection defence; read-only artifact manifests, hashing and access ledger) |
 | 6 | Synthesis — cross-source correlation and reporting | 🟡 started (deterministic timelines, explained indicator correlation, content de-duplication) |

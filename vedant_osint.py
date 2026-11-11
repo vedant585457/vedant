@@ -806,6 +806,40 @@ before the result can reach the aggregate.
     python vedant_osint.py review --demo                # six results, four decisions
     python vedant_osint.py review --check report.json   # one result, judged
 
+Targeted retasking: a revise becomes a specific assignment
+------------------------------------------------------------
+A revise that re-sends the same prompt is a re-run wearing a retry's clothes.  What
+the next attempt gets instead is a *retask*: rebuilt from the review that rejected the
+last one, and specific enough to act on without having seen the review.
+
+*   **The original objective, unchanged** — a retask narrows what to *do*, never what
+    the unit is *for* — plus its criteria and the output shape it was assigned.
+*   **The exact deficiencies**, one per dimension, quoted verbatim from the review,
+    each with the correction its kind implies (``_CORRECTIONS`` covers every
+    :class:`DeficiencyKind`, and a kind with no correction is a refused retask).
+*   **The relevant prior evidence**, carried rather than collected twice: only what the
+    review did not fault, only observations rather than inferences, and never what the
+    attempt itself inherited.  The prompt lists the ids under *do not collect it again*.
+*   **A budget that is read, not re-derived.**  :class:`RetryBudget` takes the smaller
+    of the Worker's ``max_attempts`` and the Subagent's :class:`ReviewPolicy`, records
+    which ceiling binds, and at the limit returns a ``RETRY_EXHAUSTED`` result that is
+    partial when work survived and failed when none did — with every unresolved
+    deficiency named in its limitations.
+*   **History that is append-only.**  :class:`RetaskLedger` keeps each attempt (status,
+    decision, deficiencies, the evidence it produced, the instruction it received) and
+    each retask; :func:`retask_fingerprint` digests the substance of an instruction so a
+    repeated prompt is detectable even when re-worded.
+*   **Observably specific.**  :func:`retask_specificity` scores six signals — objective
+    restated, deficiency quoted, correction given, evidence in hand stated, shape
+    named, not vague-only — so "the prompt was specific" is a measurement rather than a
+    hope, and :data:`VAGUE_PHRASES` names the vocabulary that does not count.
+
+::
+
+    python vedant_osint.py retask --self-test           # 82 retasking checks
+    python vedant_osint.py retask --demo                # retask, repeat, spent budget
+    python vedant_osint.py retask --next report.json    # the assignment for a revise
+
 Structured model adapter
 ------------------------
 One model-calling interface sits between orchestration and every provider, so
@@ -871,6 +905,7 @@ Usage
     python vedant_osint.py timeline --self-test         # source vs derived time, links
     python vedant_osint.py outcomes --self-test         # Worker statuses, provenance
     python vedant_osint.py review --self-test           # seven dimensions, one decision
+    python vedant_osint.py retask --self-test           # a revise becomes a retask
     python vedant_osint.py extract --demo               # a hostile page, quoted and refused
     python vedant_osint.py extract --file report.docx   # what a document says, as data
     python vedant_osint.py extract --limits             # the size, time and text ceilings
@@ -1011,7 +1046,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 24
+VERSION_MINOR: int = 25
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -22339,6 +22374,8 @@ class FlowResult(StrictModel):
     research: dict[str, Any] = Field(default_factory=dict)
     #: Every Worker result's review (§34), and what was withheld because of it.
     reviews: "ReviewLedger | None" = None
+    #: Every retask this run issued (§35): a retried attempt's assignment.
+    retasks: list["RetaskedWorker"] = Field(default_factory=list)
 
     @property
     def review_summary(self) -> dict[str, Any]:
@@ -22351,6 +22388,23 @@ class FlowResult(StrictModel):
                               in self.reviews.by_decision().items() if ids},
                 "forwarded": len(self.reviews.forwarded),
                 "withheld": len(self.reviews.withheld)}
+
+    @property
+    def retask_summary(self) -> dict[str, Any]:
+        """What the retries were told — empty when nothing was retried (§35)."""
+
+        retasks = self.retasks or []
+        if not retasks:
+            return {}
+        repeats = sum(1 for index, retask in enumerate(retasks)
+                      if index and retask.fingerprint == retasks[index - 1].fingerprint)
+        return {"retasks": len(retasks),
+                "attempts": sorted({retask.attempt for retask in retasks}),
+                "corrected_dimensions": sorted({dimension for retask in retasks
+                                                for dimension in retask.corrects}),
+                "carried_evidence": sum(len(retask.prior_evidence) for retask in retasks),
+                "repeated_prompts": repeats,
+                "prompt_chars": [len(retask.prompt) for retask in retasks]}
 
     @property
     def total_workers(self) -> int:
@@ -22390,6 +22444,8 @@ class FlowResult(StrictModel):
             "checkpoint": self.checkpoint,
             "reviews": self.reviews.to_dict() if self.reviews is not None else None,
             "review_summary": self.review_summary,
+            "retasks": [retask.to_dict() for retask in self.retasks],
+            "retask_summary": self.retask_summary,
             "seconds": round(self.seconds, 3),
             "stage_order": self.stage_order(),
             "trace": self.trace,
@@ -22410,6 +22466,10 @@ class _WorkerState(TypedDict, total=False):
     verdict: dict[str, Any]
     attempts: Annotated[list[dict[str, Any]], operator.add]
     reviews: Annotated[list[dict[str, Any]], operator.add]
+    #: §35: the assignment the next attempt runs under, and the ids it must not
+    #: collect again.  ``None`` when the branch is not retried.
+    retask: dict[str, Any] | None
+    inherited: Annotated[list[str], operator.add]
 
 
 #: The state of one Subagent's graph.  Worker branches merge their outcomes and
@@ -22453,7 +22513,8 @@ def _worker_state() -> dict[str, Any]:
     """The initial state of one Worker graph."""
 
     return {"subagent": "", "worker": "", "wave": 0, "round": 0, "guidance": "",
-            "deadline": None, "attempts": [], "reviews": []}
+            "deadline": None, "attempts": [], "reviews": [], "retask": None,
+            "inherited": []}
 # --------------------------------------------------------------------------
 # 25.2 LangGraph, imported lazily
 # --------------------------------------------------------------------------
@@ -22600,6 +22661,17 @@ class HierarchicalFlow:
         #: the worker node for *every* path out of a branch, so a failed, blocked or
         #: adopted unit is on this list too.
         self._reviews: list[ReviewedWorkerResult] = []
+        #: §35: every retask issued, one per retried attempt, in the order issued.
+        self._retasks: list[RetaskedWorker] = []
+        #: Every attempt's review, not just the last one — the history the retask
+        #: ledger is built from.  The final review is also in ``_reviews``.
+        self._attempt_reviews: dict[str, list[ReviewedWorkerResult]] = {}
+        #: The review the Worker's own review node just wrote, handed to the outer
+        #: node so one attempt is judged once and the retask and the ledger agree.
+        self._judge_cache: dict[str, ReviewedWorkerResult] = {}
+        #: The evidence ids each Worker's current attempt inherited from an earlier one,
+        #: so a retask never offers an inherited item as if this attempt found it.
+        self._inherited: dict[str, list[str]] = {}
 
     def _limits_for_run(self) -> ResourceLimits:
         """The mission's limits, derived from the policy when none were given."""
@@ -23267,7 +23339,8 @@ class HierarchicalFlow:
         self._settled[subagent.id].add(worker.id)
         self._record_in_store(subagent, worker, outcome)
         return self._judge(subagent, worker, outcome, path="runner",
-                           keep_verdict=verdict)
+                           keep_verdict=verdict,
+                           keep_review=self._judge_cache.pop(worker.id, None))
 
     # -- 3b. the review gate (§34) -----------------------------------------
 
@@ -23275,7 +23348,8 @@ class HierarchicalFlow:
                outcome: WorkerOutcome, *, path: str,
                gate: FlowGate | None = None, why: str = "",
                evidence: Sequence[EvidenceItem] = (),
-               keep_verdict: ReviewVerdict | None = None) -> dict[str, Any]:
+               keep_verdict: ReviewVerdict | None = None,
+               keep_review: ReviewedWorkerResult | None = None) -> dict[str, Any]:
         """Review one Worker result, record it, and return the branch's payload.
 
         This is the *only* way out of :meth:`_node_worker`, so a path that skipped it
@@ -23294,10 +23368,13 @@ class HierarchicalFlow:
                 report = report.model_copy(update={
                     "evidence": [*report.evidence, *extra],
                     "sources": _sources_from_evidence([*report.evidence, *extra])})
-        judged = review_outcome(
+        # §35 hands the review its own review node already made for this attempt: the
+        # retask and the ledger must be the same judgement, not two of them.
+        judged = keep_review if keep_review is not None else review_outcome(
             outcome, worker=worker, subagent_id=subagent.id,
             scope=self.context.scope_entries, path=path,
             observations=_observations_for_path(gate, why))
+        self._note_attempt_review(judged)
         # A review is not a veto on the graph's own record: the runner's verdict
         # already decided any retry, so it is preserved beside the quality review.
         self._reviews.append(judged)
@@ -23338,10 +23415,73 @@ class HierarchicalFlow:
             "record the gap and stop this unit",
             reviewer="subagent-review")
 
+    def _note_attempt_review(self, judged: ReviewedWorkerResult, *,
+                             replace: bool = False) -> None:
+        """Keep one review per attempt, whichever node judged it first.
+
+        The Worker's own review node judges every attempt (it is the node that must
+        decide the retry), and the outer node reuses that judgement for the branch.  The
+        history is therefore written once per attempt rather than once per node, which is
+        what lets :meth:`retask_ledger` report the attempts that actually happened.
+        """
+
+        history = self._attempt_reviews.setdefault(judged.worker_id, [])
+        same = next((index for index, existing in enumerate(history)
+                     if existing.review.attempt == judged.review.attempt), None)
+        if same is None:
+            history.append(judged)
+        elif replace:
+            # The replay was caused by a judgement the seven dimensions did not make
+            # (§35.1): the history records *that* reason, because "the attempt passed
+            # and was retried anyway" would be a contradiction on the record.
+            history[same] = judged
+        else:
+            return
+        history.sort(key=lambda item: item.review.attempt)
+
     def review_ledger(self) -> ReviewLedger:
         """Every Worker result this run reviewed, with its verdict."""
 
         return review_ledger(self._reviews)
+
+    def retasks(self) -> list[RetaskedWorker]:
+        """Every retask this run issued, in the order it was issued (§35)."""
+
+        return list(self._retasks)
+
+    def retask_ledger(self, worker_id: str | None = None) -> list[RetaskLedger]:
+        """One history per Worker that was retried — attempts, retasks and budget.
+
+        Built from the run's own records rather than a parallel bookkeeping: the reviews
+        say how each attempt was judged, the retasks say what it was told, and the
+        Worker's spec says what its budget was.
+        """
+
+        histories: list[RetaskLedger] = []
+        for subagent in self.subagents:
+            for worker in subagent.workers:
+                if worker_id is not None and worker.id != worker_id:
+                    continue
+                # The attempt history, not the final review: the point of the ledger is
+                # every attempt, and the final review is only the last of them.
+                entries = [(result.outcome, result.review)
+                           for result in sorted(self._attempt_reviews.get(worker.id, []),
+                                                key=lambda item: item.review.attempt)]
+                if not entries:
+                    continue
+                assignments = [retask for retask in self._retasks
+                               if retask.worker_id == worker.id]
+                histories.append(retask_ledger(
+                    worker, entries, policy=self._review_policy(),
+                    assignments=assignments,
+                    inherited=self._inherited.get(worker.id, ())))
+        return histories if worker_id else [history for history in histories
+                                           if history.retries]
+
+    def _review_policy(self) -> ReviewPolicy:
+        """The §34 policy this run reviews under, read from the flow's own limits."""
+
+        return ReviewPolicy(max_revisions=max(0, self.policy.max_review_rounds))
 
     def run_with_reviews(self) -> FlowResult:
         """Run the mission; the result carries every Worker result's review (§34).
@@ -23540,10 +23680,16 @@ class HierarchicalFlow:
             # it is bounded, fair and cancellable like any other resource.
             with self.runtime.slot(ResourceKind.MODEL_CALL, unit=worker.id,
                                    deadline=deadline):
-                # The guidance a retry carries is the reviewer's, and the research
-                # contract rides with it — a Worker cannot be asked for sources it was
-                # never told to collect.
+                # §35: a retry runs under a *retasked* assignment, not the previous
+                # prompt.  The review node builds it and routes it here; the fallback
+                # exists only for a verdict that arrived without one (an adopted or
+                # scripted path), and it is the reviewer's own guidance rather than an
+                # invented instruction.  The research contract rides with it — a Worker
+                # cannot be asked for sources it was never told to collect.
+                retask_payload = state.get("retask")
                 guidance = str(state.get("guidance") or "")
+                if isinstance(retask_payload, Mapping) and retask_payload.get("prompt"):
+                    guidance = str(retask_payload["prompt"])
                 if self.policy.research_first:
                     contract = self.research_brief(worker).system_prompt()
                     guidance = (f"{guidance}\n\n{contract}" if guidance else contract)
@@ -23597,6 +23743,32 @@ class HierarchicalFlow:
                     f"attempts exhausted after {round_number} of {allowed}"],
             })
 
+        # §35: the retry is a retask.  What the next attempt is told is rebuilt from
+        # the *quality review* of the attempt that just returned — the exact
+        # deficiencies, the correction each implies, and the evidence worth carrying —
+        # and that instruction replaces the one-line guidance the runner suggested.
+        # The review is made here, once: the outer node reuses it through
+        # ``_judge_cache`` rather than judging the same attempt twice.
+        judged = review_outcome(outcome, worker=worker, subagent_id=subagent.id,
+                                scope=self.context.scope_entries, path="runner")
+        self._judge_cache[worker.id] = judged
+        self._note_attempt_review(judged)
+        retask = self._retask(subagent, worker, outcome, verdict, judged,
+                              round_number=round_number, allowed=allowed)
+        if retask is not None:
+            self._retasks.append(retask)
+            carried = set(retask.carried_ids)
+            self._inherited[worker.id] = sorted(carried)
+            verdict = verdict.model_copy(update={
+                "guidance": retask.prompt,
+                "findings": [*verdict.findings, f"retask: {retask.describe}"],
+            })
+            self._record(FlowStage.REVIEW, unit=worker.id, parent=subagent.id,
+                         wave=int(state.get("wave") or 0),
+                         detail=f"retask for attempt {retask.attempt}: {retask.describe}")
+        else:
+            carried = set()
+
         self._record(FlowStage.REVIEW, unit=worker.id, parent=subagent.id,
                      wave=int(state.get("wave") or 0),
                      detail=f"runner verdict: {verdict.verdict} "
@@ -23611,7 +23783,76 @@ class HierarchicalFlow:
             self.resume.settle_worker(subagent.id, worker.id, outcome=outcome,
                                       review=verdict, evidence=produced)
         return {"verdict": json.loads(model_to_json(verdict)),
-                "reviews": [json.loads(model_to_json(verdict))]}
+                "reviews": [json.loads(model_to_json(verdict))],
+                # None on a pass or a stop: a branch that is not retried gets no
+                # assignment, so "a retask was issued" is visible in the state rather
+                # than inferred from a string that might be the old prompt again.
+                "retask": (json.loads(model_to_json(retask))
+                           if retask is not None else None),
+                # The ids this attempt must not collect again, for the history.
+                "inherited": sorted(carried)}
+
+    def _retask(self, subagent: FlowSubagent, worker: FlowWorker,
+                outcome: WorkerOutcome, verdict: ReviewVerdict,
+                judged: ReviewedWorkerResult, *,
+                round_number: int, allowed: int) -> RetaskedWorker | None:
+        """Build the next attempt's assignment, or ``None`` when the branch stops.
+
+        Two sources are merged here, and neither overrides the other:
+
+        *   the **quality review** (§34) says which dimensions failed and why — that is
+            what makes the instruction specific rather than encouraging;
+        *   the **runner's verdict** says whether another attempt is worth making — that
+            is what the graph's retry edge has always consumed.
+
+        A retry with no quality deficiency (a tool that broke before any work ran) still
+        gets a retask: the instruction then says the work was never judged, which is the
+        honest thing to tell the next attempt, and a different thing from "fix the
+        source quality".
+        """
+
+        if not verdict.retry or judged.worker_id != worker.id:
+            return None
+        review = judged.review
+        report = judged.report
+        if review.attempt != outcome.attempt:
+            # The review on the branch is not about the attempt that just came back.
+            review = review_outcome(
+                outcome, worker=worker, subagent_id=subagent.id,
+                scope=self.context.scope_entries, path="runner").review
+        if review.passed or not review.deficiencies:
+            # The seven dimensions accepted the work and the Subagent's own criteria
+            # did not: the deficiencies are the verdict's findings, and they are still
+            # what the next attempt is told.  Silence here would send the previous
+            # prompt again, which is the one thing a retry may not do.
+            review = review_from_verdict(
+                verdict, worker_id=worker.id, subagent_id=subagent.id,
+                attempt=outcome.attempt, worker_status=review.worker_status,
+                path=review.path)
+            self._note_attempt_review(
+                ReviewedWorkerResult(worker_id=worker.id, subagent_id=subagent.id,
+                                     outcome=outcome, report=report, review=review),
+                replace=True)
+            self._record(FlowStage.REVIEW, unit=worker.id, parent=subagent.id,
+                         detail=f"retask from the runner verdict: {len(review.deficiencies)} "
+                                f"finding(s) the seven dimensions do not cover")
+        # The carried evidence is what this attempt produced *and* what it inherited:
+        # an item the Worker received from an earlier attempt is not new work now.
+        inherited = self._inherited.get(worker.id, ())
+        try:
+            return retask_worker(
+                review, report=report, attempt=round_number + 1,
+                objective=worker.objective, criteria=worker.completion_criteria,
+                output_schema=worker.output_schema, subagent_id=subagent.id,
+                work_unit=worker.work_unit, inherited=inherited,
+                guidance=verdict.guidance)
+        except (ValueError, TypeError) as exc:
+
+            # A review that cannot produce a retask must not produce a *silent* repeat:
+            # the verdict stops, and the reason is on the record.
+            self._record(FlowStage.REVIEW, unit=worker.id, parent=subagent.id,
+                         detail=f"retask refused: {str(exc)[:120]}")
+            return None
 
     def _after_worker_review(self, state: Mapping[str, Any]) -> str:
         """Retry the same Worker, or end its branch.
@@ -23886,6 +24127,7 @@ class HierarchicalFlow:
                         if self.resume is not None else ""),
             browser=browser_summary,
             reviews=self.review_ledger(),
+            retasks=self.retasks(),
             research={"workers": len(self._research),
                       "audits": {worker_id: audit["audit"]
                                  for worker_id, audit in self._research.items()},
@@ -24357,6 +24599,52 @@ def run_flow_self_test(console: "Console | None" = None) -> list[FlowCheck]:
         all("withheld" in report.to_dict() for report in result.reports))
     add("nothing is forwarded unreviewed",
         all(item.forwarded or item.review.reviewed for item in ledger.results))
+
+    # ---- 12. a retry is a retask (§35) ---------------------------------
+    retask_context = _selftest_context("exposure")
+    retask_units = flow_units_for(retask_context, "exposure")
+    retask_unit = next(unit for unit in retask_units if len(unit.workers) > 1)
+    retask_id = retask_unit.workers[1].id
+    guidances: dict[str, list[str]] = {}
+
+    class _SpyRunner(_CountingRunner):
+        """Records the instruction each attempt received."""
+
+        def run_worker(self, subagent, worker, *, attempt, guidance=""):
+            guidances.setdefault(worker.id, []).append(guidance)
+            return super().run_worker(subagent, worker, attempt=attempt, guidance=guidance)
+
+    spy = _SpyRunner(scope=retask_context.scope_entries, always_revise=[retask_id])
+    retask_flow = HierarchicalFlow(
+        context=retask_context, subagents=retask_units, runner=spy,
+        policy=FlowPolicy(max_review_rounds=1))
+    retask_result = retask_flow.run()
+    issued = retask_flow.retasks()
+    history = retask_flow.retask_ledger(retask_id)
+    add("a retried unit is handed a retask", len(issued) == 1, len(issued))
+    if issued:
+        assignment = issued[0]
+        add("the retask restates the unit's own objective",
+            assignment.objective == retask_unit.worker(retask_id).objective,
+            assignment.objective[:60])
+        add("the second attempt received the retask, not the first prompt",
+            guidances.get(retask_id, ["", ""])[-1].startswith("RETASK"),
+            guidances.get(retask_id, [""])[-1][:40])
+        add("the retask quotes the deficiency that caused it",
+            all(item.detail[:30] in assignment.prompt for item in assignment.corrections),
+            [item.detail[:40] for item in assignment.corrections])
+        add("the retask's fingerprint is on the record", bool(assignment.fingerprint))
+    add("the retry stops at the configured limit",
+        len(guidances.get(retask_id, [])) == 2, len(guidances.get(retask_id, [])))
+    add("the history keeps both attempts",
+        len(history) == 1 and len(history[0].attempts) == 2,
+        [len(item.attempts) for item in history])
+    add("the ledger names the retask it issued",
+        bool(history) and history[0].retasks[0].attempt == 2)
+    add("the retry did not repeat the instruction",
+        bool(history) and history[0].repeated() == [])
+    add("the result says what was retasked",
+        bool(retask_result.review_summary.get("reviews")))
     return checks
 
 
@@ -24450,6 +24738,9 @@ def _flow_demo(objective_key: str, *, out_dir: Path | None = None,
         "policy": json.loads(model_to_json(result.policy)),
         "reviews": result.reviews.to_dict() if result.reviews is not None else None,
         "review_summary": result.review_summary,
+        "retasks": [retask.to_dict() for retask in result.retasks],
+        "retask_histories": [history.summary() for history in flow.retask_ledger()],
+        "retask_summary": result.retask_summary,
         "trace": result.trace,
         "runtime_only": True,
         "browser": result.browser,
@@ -24496,6 +24787,16 @@ def render_flow_summary(payload: Mapping[str, Any]) -> Table:
             sorted(reviews["decisions"].items(), key=lambda pair: -len(pair[1])))))
         table.add_row("withheld at review",
                       f"{reviews.get('withheld', 0)} of {reviews.get('reviews', 0)}")
+    # §35: what a retry was told, and whether any prompt was repeated.
+    retask_summary = payload.get("retask_summary") or {}
+    if retask_summary:
+        table.add_row("retasks", escape(
+            f"{retask_summary['retasks']} retask(s) on attempt(s) "
+            f"{', '.join(str(attempt) for attempt in retask_summary['attempts'])}; "
+            f"corrected: {', '.join(retask_summary['corrected_dimensions']) or 'none'}"))
+        table.add_row("carried by retask",
+                      f"{retask_summary['carried_evidence']} evidence item(s); "
+                      f"{retask_summary['repeated_prompts']} repeated prompt(s)")
     table.add_row("runtime", f"{payload['seconds']}s")
     synthesis = payload.get("synthesis") or {}
     basis = synthesis.get("aggregate_basis") or {}
@@ -43717,8 +44018,1630 @@ def review_command(
     raise typer.Exit(ExitCode.USAGE)
 
 
+# --------------------------------------------------------------------------
+# 35. Targeted retasking: a revise that says exactly what to change
+# --------------------------------------------------------------------------
+#
+# §34 decides *that* a result must be revised.  This section decides what the next
+# attempt is told, and it is the difference between a retry and a re-run:
+#
+#   *   a **re-run** hands the Worker the same prompt and hopes;
+#   *   a **retask** hands it its own objective, the exact deficiencies the parent
+#       Subagent found, the corrections those imply, and the evidence it already
+#       collected — and nothing it already did.
+#
+# Four properties make that checkable rather than aspirational: the assignment is a
+# record (so "the prompt was specific" is a field, not a claim), the same review
+# produces the same retask (deterministic), every attempt is kept (history), and the
+# retry count is the *configured* one (a limit that is read, not re-derived).
+
+
+class RetaskItem(StrictModel):
+    """One thing the next attempt must change, traced back to the review that said so."""
+
+    dimension: ReviewDimension
+    kind: DeficiencyKind
+    #: The deficiency, verbatim: the Worker should not have to infer the complaint.
+    detail: str = Field(min_length=8)
+    #: What that deficiency requires of the next attempt, in the imperative.
+    correction: str = Field(min_length=8)
+    #: The report's own criteria this deficiency touches, when it touches any.
+    criteria: list[str] = Field(default_factory=list)
+
+    @property
+    def describe(self) -> str:
+        return f"{self.dimension.value}: {self.correction}"
+
+
+class PriorEvidence(StrictModel):
+    """The part of an earlier attempt worth carrying forward — and why it is worth it.
+
+    Only evidence the parent Subagent did not fault: a weak source, an unciteable
+    row or an out-of-scope item is not a head start, it is the same defect again.
+    """
+
+    item_id: str = Field(min_length=1)
+    statement: str = Field(min_length=1)
+    #: ``supports`` (evidence with no finding on it yet) or ``cited`` (already
+    #: carried by a finding the parent Subagent accepted).
+    relation: str = Field(pattern="^(supports|cited)$")
+    statement_hash: str = Field(min_length=8)
+    reason: str = Field(min_length=8)
+
+    @model_validator(mode="after")
+    def _check(self) -> "PriorEvidence":
+        if self.statement_hash != _statement_hash(self.statement):
+            raise ValueError(
+                "prior evidence does not match its own statement; a carried-forward "
+                "item must be the record that was reviewed")
+        return self
+
+    def check(self) -> "PriorEvidence":
+        """Re-assert the invariant for a record that crossed a boundary."""
+
+        return self._check()
+
+
+def _statement_hash(statement: str) -> str:
+    return hashlib.sha256(" ".join(statement.split()).encode("utf-8")).hexdigest()[:16]
+
+
+class AttemptHistory(StrictModel):
+    """One attempt, as it happened: what it was told, what it returned, how it was judged."""
+
+    attempt: int = Field(ge=1)
+    task_id: str = ""
+    status: EntityStatus
+    summary: str = ""
+    error: str | None = None
+    evidence_ids: list[str] = Field(default_factory=list)
+    #: The deficiencies that attempt produced, by dimension/kind.
+    deficiencies: list[str] = Field(default_factory=list)
+    decision: ReviewDecision | None = None
+    fault: WorkflowFault | None = None
+    #: Evidence this attempt added on top of what it inherited — never its whole set.
+    produced_ids: list[str] = Field(default_factory=list)
+    #: The retask it received, if it received one.
+    guidance: str = ""
+    seconds: float = 0.0
+
+
+class RetaskFailure(StrictModel):
+    """Why a revision could not be produced: refused, not silently skipped."""
+
+    worker_id: str = Field(min_length=1)
+    attempt: int = Field(ge=1)
+    reason: str = Field(min_length=8)
+
+
+class RetaskedWorker(StrictModel):
+    """The revised assignment one attempt runs under.
+
+    ``objective`` is the Worker's original objective, unchanged: a retask narrows what
+    to *do*, it never quietly changes what the unit is for.  :attr:`fingerprint`
+    covers the parts that must differ between attempts, so two retasks that differ
+    only in wording are detectable as the same instruction — which is exactly the
+    failure the acceptance clause is about.
+    """
+
+    worker_id: str = Field(min_length=1)
+    subagent_id: str = Field(min_length=1)
+    work_unit: str = ""
+    #: 1-based: this assignment is for the attempt after ``attempt``.
+    attempt: int = Field(ge=2)
+    objective: str = Field(min_length=1)
+    criteria: list[str] = Field(default_factory=list)
+    output_schema: str = "TaskResult"
+    #: The deficiencies, structurally.
+    corrections: list[RetaskItem] = Field(default_factory=list)
+    #: What to carry forward, structurally.
+    prior_evidence: list[PriorEvidence] = Field(default_factory=list)
+    #: What must not be collected, restated: the cost of a second attempt already paid.
+    already_collected: list[str] = Field(default_factory=list)
+    #: The instruction as the model reads it.  Built by :func:`render_retask_prompt`
+    #: and re-attached by :func:`retask_worker`; empty only mid-construction.
+    prompt: str = ""
+    #: Rendered deficiencies, for a reader who wants them flat.
+    deficiencies: list[str] = Field(default_factory=list)
+    #: The guidance the graph's own runner verdict carried, kept for provenance.
+    guidance: str = ""
+    fault: WorkflowFault = WorkflowFault.UNKNOWN
+    #: True when the failure was the tool's: the prompt says *try again*, not *do it
+    #: differently*, and carries no invented deficiency.
+    tool_failure: bool = False
+    #: The review that caused this retask.
+    because_of: str = Field(min_length=1)
+    fingerprint: str = ""
+
+    @field_validator("corrections")
+    @classmethod
+    def _one_per_dimension(cls, value: list[RetaskItem]) -> list[RetaskItem]:
+        seen: list[ReviewDimension] = []
+        for item in value:
+            if item.dimension in seen:
+                raise ValueError(
+                    f"two corrections for {item.dimension.value}: one statement of "
+                    "the problem per dimension, or the Worker is asked twice")
+            seen.append(item.dimension)
+        return value
+
+    @field_validator("prior_evidence")
+    @classmethod
+    def _distinct_prior(cls, value: list[PriorEvidence]) -> list[PriorEvidence]:
+        ids = [item.item_id for item in value]
+        if len(set(ids)) != len(ids):
+            raise ValueError("the same evidence cannot be carried forward twice")
+        return [item.check() for item in value]
+
+    @model_validator(mode="after")
+    def _coherent(self) -> "RetaskedWorker":
+        if self.tool_failure:
+            if any(item.kind not in {DeficiencyKind.TOOL_FAILURE, DeficiencyKind.BLOCKED,
+                                     DeficiencyKind.UNREVIEWABLE}
+                   for item in self.corrections):
+                raise ValueError(
+                    "a tool failure retask may not carry quality corrections: the "
+                    "work was never the problem")
+        elif not self.corrections:
+            raise ValueError(
+                "a quality retask must name at least one deficiency; repeating the "
+                "instruction unchanged is a retry, not a retask")
+        if self.attempt < 2:
+            raise ValueError("a retask is for a second or later attempt")
+        return self
+
+    @field_validator("prompt")
+    @classmethod
+    def _prompt_is_an_instruction(cls, value: str) -> str:
+        if value and len(value.strip()) < 40:
+            raise ValueError(
+                "a retask prompt must state the objective, the deficiencies and the "
+                "corrections; a line or two is the same prompt again")
+        return value
+
+    @property
+    def corrects(self) -> list[str]:
+        return [item.dimension.value for item in self.corrections]
+
+    @property
+    def carried_ids(self) -> list[str]:
+        return [item.item_id for item in self.prior_evidence]
+
+    @property
+    def describe(self) -> str:
+        cause = "tool" if self.tool_failure else "quality"
+        parts = [f"attempt {self.attempt} ({cause})"]
+        if self.corrections:
+            parts.append(f"correct {len(self.corrections)}: " + ", ".join(self.corrects))
+        if self.prior_evidence:
+            parts.append(f"carry {len(self.prior_evidence)} item(s)")
+        if self.already_collected:
+            parts.append(f"do not recollect {len(self.already_collected)}")
+        return "; ".join(parts)
+
+    #: Derived keys :meth:`to_dict` adds for a reader.  Declared here so
+    #: :meth:`from_dict` can strip exactly what it added, and reloading a record never
+    #: depends on remembering which fields were "real".
+    DERIVED: ClassVar[tuple[str, ...]] = ("describe", "corrects", "carried_ids")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**json.loads(model_to_json(self)), "describe": self.describe,
+                "corrects": self.corrects, "carried_ids": self.carried_ids}
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "RetaskedWorker":
+        return cls.model_validate(
+            {key: value for key, value in payload.items() if key not in cls.DERIVED})
+
+
+# --------------------------------------------------------------------------
+# 35.1 Building the retask from the review, the record and the budget
+# --------------------------------------------------------------------------
+
+#: What each deficiency asks of the next attempt.  A correction that could be said of
+#: any defect in its dimension is not a correction, so each kind gets its own words.
+_CORRECTIONS: dict[DeficiencyKind, str] = {
+    DeficiencyKind.TOOL_FAILURE:
+        "re-run the same unit: the failure was the tool's, and the work did not run",
+    DeficiencyKind.BLOCKED:
+        "the block below must be resolved before this unit can run; re-running it "
+        "unchanged will fail the same way",
+    DeficiencyKind.EMPTY:
+        "return at least one sourced item: an empty result cannot be judged, only "
+        "withheld",
+    DeficiencyKind.INCOMPLETE:
+        "answer the completion criteria listed below explicitly, or report the unit as "
+        "partial naming the one that could not be met",
+    DeficiencyKind.IRRELEVANT:
+        "return only observations about this unit's own slice; move the neighbouring "
+        "material out of the result",
+    DeficiencyKind.WEAK_SOURCE:
+        "replace the secondary source with the primary record it summarises; a search "
+        "result or a republished copy cannot carry the claim",
+    DeficiencyKind.UNSOURCED:
+        "attach the source reference for every finding, or drop the finding",
+    DeficiencyKind.INCONSISTENT:
+        "reconcile the status, the error and the limitations so they agree, and say "
+        "which one was wrong",
+    DeficiencyKind.OUT_OF_SCOPE:
+        "remove or replace every source outside the authorised scope entries below",
+    DeficiencyKind.WRONG_SHAPE:
+        "return the record in the shape the assignment named, filling the fields the "
+        "check below says are missing",
+    DeficiencyKind.UNREVIEWABLE:
+        "return a result the parent Subagent can judge: a status, evidence and the "
+        "limitations that apply",
+    DeficiencyKind.UNREVIEWED:
+        "return the result through the review gate: a verdict that was not performed "
+        "is not a verdict",
+}
+
+
+def correct_for(deficiency: Deficiency) -> str:
+    """The instruction one deficiency carries.  Total over the kinds, by construction."""
+
+    return _CORRECTIONS.get(
+        deficiency.kind,
+        f"address the {deficiency.dimension.value} deficiency and return the unit again")
+
+
+def _criteria_for(deficiency: Deficiency, criteria: Sequence[str]) -> list[str]:
+    """Which of the report's criteria this deficiency is about.
+
+    Matched through the detail, because that is how the reviewer names them; no
+    match means no attribution rather than a guess across all of them.
+    """
+
+    lowered = deficiency.detail.lower()
+    return [criterion for criterion in criteria
+            if criterion.lower() in lowered
+            or lowered in criterion.lower()
+            or _tokens(criterion) & _tokens(deficiency.detail)]
+
+
+
+def _faulted_ids(review: QualityReview) -> set[str]:
+    """The evidence the review actually faulted — the rest is worth carrying."""
+
+    faulted: set[str] = set()
+    for deficiency in review.deficiencies:
+        faulted.update(deficiency.evidence_ids)
+    return faulted
+
+
+def carryable_evidence(report: "WorkerReport | None", review: QualityReview, *,
+                       inherited: Sequence[str] = ()) -> list[PriorEvidence]:
+    """Evidence from the reviewed attempt the next attempt should not collect again.
+
+    Three filters, each for a reason:
+
+    *   **not faulted** — a weak source or an unciteable row is the defect itself;
+    *   **cited by an accepted finding, or on no finding at all** — a finding the
+        parent Subagent faulted is being redone, and its evidence goes with it;
+    *   **not inherited** — evidence the attempt itself received is not new work, and
+        re-offering it as prior evidence would launder an earlier failure forward.
+    """
+
+    if report is None or not report.usable:
+        return []
+    faulted = _faulted_ids(review)
+    cited_by_faulted: set[str] = set()
+    accepted_citations: set[str] = set()
+    for finding in report.findings:
+        if _finding_faulted(finding, review):
+            cited_by_faulted.update(finding.evidence_ids)
+        else:
+            accepted_citations.update(finding.evidence_ids)
+    known = set(inherited)
+    carried: list[PriorEvidence] = []
+    seen_statements: set[str] = set()
+    for item in report.evidence:
+        if item.id in faulted or item.id in known:
+            continue
+        relation = "cited" if item.id in accepted_citations else (
+            "supports" if item.id not in cited_by_faulted else "")
+        if relation == "cited":
+            reason = ("an accepted finding already cites it; re-use it rather than "
+                      "re-collecting it")
+        elif relation == "supports":
+            reason = "collected and sound, but not yet on any finding; it is usable"
+            relation = "supports"
+        else:
+            continue
+        statement = _statement_hash(item.statement)
+        if statement in seen_statements:
+            continue
+        seen_statements.add(statement)
+        if item.kind.name not in _CARRIABLE_KINDS:
+            continue
+        carried.append(PriorEvidence(item_id=item.id, statement=item.statement,
+                                     relation=relation, statement_hash=statement,
+                                     reason=reason))
+    return carried
+
+
+#: Evidence kinds that are a record of something observed.  An inference or an allegation
+#: is not carried forward as if it were collected fact (§19's record/claim split), and a
+#: retask that did so would launder an earlier conclusion into the next attempt.
+_CARRIABLE_KINDS = frozenset({"OBSERVATION"})
+
+
+def _finding_faulted(finding: Any, review: QualityReview) -> bool:
+    """Whether the review faults this finding's evidence.
+
+    The reviewer records what it faulted by evidence id, so a finding is implicated
+    when the evidence it cites is.  A relevance or completeness deficiency that names
+    no ids is about the result as a whole, not about any one finding.
+    """
+
+    faulted = _faulted_ids(review)
+    return bool(faulted) and bool(set(finding.evidence_ids) & faulted)
+
+
+def retask_worker(review: QualityReview, *, report: "WorkerReport | None" = None,
+                  attempt: int | None = None, objective: str = "",
+                  criteria: Sequence[str] = (), output_schema: str = "TaskResult",
+                  subagent_id: str = "", work_unit: str = "",
+                  inherited: Sequence[str] = (), guidance: str = "") -> RetaskedWorker:
+    """Build the next attempt's assignment from the review that rejected this one.
+
+    Refuses rather than improvises: a revise with nothing to correct gets no retask,
+    because sending the same instruction again is the behaviour this section exists to
+    prevent.
+    """
+
+    if review.decision is not ReviewDecision.REVISE:
+        raise ValueError(f"{review.decision.value} does not produce a retask")
+    tool_failure = review.fault is WorkflowFault.TOOL
+    items: list[RetaskItem] = []
+    seen: set[ReviewDimension] = set()
+    for deficiency in review.deficiencies:
+        if deficiency.dimension in seen:
+            # The dimension is stated once; the second detail joins the first, so the
+            # Worker reads one instruction per dimension instead of two overlapping ones.
+            for existing in items:
+                if existing.dimension is deficiency.dimension:
+                    existing.detail = f"{existing.detail}; {deficiency.detail}"[:400]
+            continue
+        seen.add(deficiency.dimension)
+        items.append(RetaskItem(
+            dimension=deficiency.dimension, kind=deficiency.kind,
+            detail=deficiency.detail, correction=correct_for(deficiency),
+            criteria=_criteria_for(deficiency, list(criteria))))
+    next_attempt = attempt or review.attempt + 1
+    carried = carryable_evidence(report, review, inherited=inherited)
+    assignment = RetaskedWorker(
+        worker_id=review.worker_id, subagent_id=subagent_id or review.subagent_id,
+        work_unit=work_unit, attempt=next_attempt,
+        objective=objective or review.worker_id, criteria=list(criteria),
+        output_schema=output_schema, corrections=items, prior_evidence=carried,
+        already_collected=[item.item_id for item in carried],
+        guidance=guidance or review.guidance, fault=review.fault,
+        tool_failure=tool_failure,
+        because_of=f"{review.decision.value} on attempt {review.attempt} "
+                   f"({review.describe()[:120]})",
+        prompt="", deficiencies=[item.describe for item in review.deficiencies])
+    return assignment.model_copy(update={"prompt": render_retask_prompt(assignment),
+                                         "fingerprint": retask_fingerprint(assignment)})
+
+
+def review_from_verdict(verdict: "ReviewVerdict", *, worker_id: str, subagent_id: str,
+                        attempt: int, worker_status: WorkerStatus,
+                        path: str = "runner") -> QualityReview:
+    """A revise built from the runner's own verdict, for the retask it must produce.
+
+    The seven dimensions are the *Subagent's* judgement (§34) and a verdict is the
+    graph's, and they can disagree: a Worker can return a shape-correct, sourced report
+    and still fail the Subagent's own research criteria.  When that happens the retry
+    still has to be a retask, so the verdict's findings are carried into the same
+    structure — as completeness deficiencies, because what the verdict judges is
+    whether the attempt met its criteria — rather than the retry falling back to the
+    one-line guidance the section exists to replace.
+    """
+
+    findings = [finding for finding in verdict.findings if len(finding.strip()) >= 12]
+    if not findings:
+        findings = [f"the Subagent rejected the attempt: {verdict.verdict}"]
+    deficiencies = [
+        Deficiency(dimension=ReviewDimension.COMPLETENESS, kind=DeficiencyKind.INCOMPLETE,
+                   detail=finding[:300],
+                   fix="answer this criterion explicitly in the next attempt")
+        for finding in findings]
+    return QualityReview(
+        worker_id=worker_id, subagent_id=subagent_id, attempt=attempt,
+        worker_status=worker_status, decision=ReviewDecision.REVISE,
+        checks=[DimensionResult(dimension=dimension) for dimension in REVIEW_DIMENSIONS
+                if dimension is not ReviewDimension.COMPLETENESS]
+        + [DimensionResult(dimension=ReviewDimension.COMPLETENESS,
+                           deficiencies=deficiencies)],
+        checked=list(REVIEW_DIMENSIONS), deficiencies=deficiencies,
+        guidance=(verdict.guidance or findings[0])[:300], retry=True, path=path)
+
+
+def render_retask_prompt(assignment: RetaskedWorker) -> str:
+    """The instruction the next attempt receives.  Every line is a reason to act.
+
+    Deliberately shaped like a brief rather than a scolding: what the unit is for, what
+    was wrong, what to do about it, what is already in hand, and what not to spend on
+    again.  A Worker given only "try harder" learns nothing from the first attempt.
+    """
+
+    lines = [
+        f"RETASK — attempt {assignment.attempt} of unit {assignment.work_unit or assignment.worker_id}",
+        "",
+        f"ORIGINAL OBJECTIVE (unchanged): {assignment.objective}",
+    ]
+    if assignment.criteria:
+        lines += ["ORIGINAL COMPLETION CRITERIA:"] + [
+            f"  - {criterion}" for criterion in assignment.criteria]
+    lines += ["", "WHY THE LAST ATTEMPT WAS NOT ACCEPTED: " + assignment.because_of, ""]
+    if assignment.corrections:
+        lines.append("WHAT MUST CHANGE (each line is a blocking deficiency):")
+        for index, item in enumerate(assignment.corrections, start=1):
+            lines.append(f"  {index}. [{item.dimension.value}/{item.kind.value}] {item.detail}")
+            lines.append(f"     -> {item.correction}")
+            if item.criteria:
+                lines += [f"     criterion: {criterion}" for criterion in item.criteria]
+    if assignment.tool_failure:
+        lines.append("This was a tool failure, not a quality failure: the work was never "
+                     "judged. Re-run it unchanged; do not rewrite what already succeeded.")
+    if assignment.prior_evidence:
+        lines += ["", "EVIDENCE YOU ALREADY HAVE (do not collect it again):"]
+        for item in assignment.prior_evidence:
+            lines.append(f"  - {item.item_id}: {item.statement[:180]} — {item.reason}")
+    else:
+        # Silence would be read as "there was nothing worth keeping".  Say which it is:
+        # the last attempt was thrown away, so this one starts from nothing.
+        lines += ["", "EVIDENCE YOU ALREADY HAVE: none — nothing from the last attempt "
+                      "survived review, so collect this unit from the start."]
+    if assignment.already_collected:
+        lines += [
+            "",
+            "DO NOT RE-COLLECT: " + ", ".join(assignment.already_collected),
+            "Return only what is new, plus these items re-cited by their existing ids.",
+        ]
+    lines += ["", f"OUTPUT SHAPE: {assignment.output_schema}"]
+    return "\n".join(lines)
+
+
+def retask_fingerprint(assignment: RetaskedWorker) -> str:
+    """A digest of the parts that make this instruction different from the last one.
+
+    Not the prompt's words: a re-worded version of the same instruction is the same
+    instruction, and the point of the fingerprint is to catch exactly that.
+    """
+
+    payload = {
+        "worker": assignment.worker_id,
+        "corrects": [[item.dimension.value, item.kind.value, item.correction]
+                     for item in assignment.corrections],
+        "schema": assignment.output_schema,
+        "fault": assignment.fault.value,
+    }
+    return content_id("retask", payload, length=12)
+
+
+#: How two attempts compare.  A revise that changed nothing is not a revision.
+RETASK_COMPARISON_KEYS: tuple[str, ...] = (
+    "objective", "corrects", "corrections", "carried_ids", "output_schema", "attempt")
+
+
+def compare_retasks(before: RetaskedWorker | None, after: RetaskedWorker) -> dict[str, Any]:
+    """Which fields moved between two retasks — and whether any of the substance did."""
+
+    if before is None:
+        return {"attempt": before, "changed": True, "fields": list(RETASK_COMPARISON_KEYS),
+                "substantive": True, "same_fingerprint": False}
+    fields = [key for key in RETASK_COMPARISON_KEYS
+              if _comparable(getattr(before, key)) != _comparable(getattr(after, key))]
+    substantive = bool({"corrects", "corrections", "carried_ids"} & set(fields))
+    return {"attempt": after.attempt, "fields": fields, "changed": bool(fields),
+            "substantive": substantive,
+            "same_fingerprint": before.fingerprint == after.fingerprint}
+
+
+def _comparable(value: Any) -> Any:
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    return str(value)
+
+
+def retask_repeats(before: RetaskedWorker | None, after: RetaskedWorker) -> bool:
+    """True when two attempts would be given the same instruction twice."""
+
+    return before is not None and before.fingerprint == after.fingerprint
+
+
+# --------------------------------------------------------------------------
+# 35.2 The budget: the retry limit, read rather than re-derived
+# --------------------------------------------------------------------------
+
+class RetryBudget(StrictModel):
+    """How many attempts one unit gets, and where that number came from.
+
+    Two limits exist and both bind: the Worker's own ``max_attempts`` (§from the plan)
+    and the Subagent's :class:`ReviewPolicy`.  The effective limit is the smaller, and
+    it is recorded with its source so a mission can *show* why a third attempt did not
+    happen instead of stopping unexplained.
+    """
+
+    worker_id: str = Field(min_length=1)
+    max_attempts: int = Field(default=2, ge=1, le=10)
+    max_revisions: int = Field(default=2, ge=0, le=10)
+    #: ``worker``, ``policy`` or ``tool``: which ceiling binds, and why.
+    source: str = Field(pattern="^(worker|policy|tool)$")
+
+    @property
+    def limit(self) -> int:
+        return min(self.max_attempts, self.max_revisions + 1)
+
+
+def retry_budget(worker: "FlowWorker", *, policy: ReviewPolicy,
+                 tool_failure: bool = False) -> RetryBudget:
+    """The effective attempt budget for one unit, and the ceiling that sets it."""
+
+    if tool_failure and not policy.retry_tool_failures:
+        return RetryBudget(worker_id=worker.id, max_attempts=worker.max_attempts,
+                           max_revisions=policy.max_revisions, source="tool")
+    limit_from_worker = worker.max_attempts
+    limit_from_policy = policy.max_revisions + 1
+    source = "worker" if limit_from_worker <= limit_from_policy else "policy"
+    return RetryBudget(worker_id=worker.id, max_attempts=worker.max_attempts,
+                       max_revisions=policy.max_revisions, source=source)
+
+
+# --------------------------------------------------------------------------
+# 35.3 History: the retasks, and the status a spent budget leaves behind
+# --------------------------------------------------------------------------
+
+class RetaskLedger(StrictModel):
+    """Every retask and every attempt for one unit, in order.
+
+    ``history`` is append-only: a revision that overwrote the previous assignment would
+    destroy the record of what the Worker was told, which is the only thing that makes
+    "the retry prompt was observably specific" checkable after the fact.
+    """
+
+    worker_id: str = Field(min_length=1)
+    objective: str = ""
+    retasks: list[RetaskedWorker] = Field(default_factory=list)
+    attempts: list[AttemptHistory] = Field(default_factory=list)
+    budget: RetryBudget | None = None
+    #: Deficiencies that no attempt resolved, when the budget ran out.
+    unresolved: list[str] = Field(default_factory=list)
+    final_status: EntityStatus | None = None
+
+    @model_validator(mode="after")
+    def _ordered(self) -> "RetaskLedger":
+        attempts = [attempt.attempt for attempt in self.attempts]
+        if attempts != sorted(set(attempts)):
+            raise ValueError("attempt history must be ordered and free of duplicates")
+        targets = [retask.attempt for retask in self.retasks]
+        if targets != sorted(set(targets)):
+            raise ValueError("retasks must be ordered and free of duplicates")
+        return self
+
+    @property
+    def retries(self) -> int:
+        return max(0, len(self.attempts) - 1)
+
+    @property
+    def exhausted(self) -> bool:
+        """Whether the budget is spent — the fact that decides partial versus retry."""
+
+        return self.budget is not None and len(self.attempts) >= self.budget.limit
+
+    def latest(self) -> RetaskedWorker | None:
+        return self.retasks[-1] if self.retasks else None
+
+    def for_attempt(self, attempt: int) -> RetaskedWorker | None:
+        return next((retask for retask in self.retasks if retask.attempt == attempt), None)
+
+    def repeated(self) -> list[int]:
+        """Attempts that were handed an instruction identical to the one before."""
+
+        repeats: list[int] = []
+        for index, retask in enumerate(self.retasks):
+            if index and retask.fingerprint == self.retasks[index - 1].fingerprint:
+                repeats.append(retask.attempt)
+        return repeats
+
+    def summary(self) -> dict[str, Any]:
+        return {"worker": self.worker_id, "attempts": len(self.attempts),
+                "retasks": len(self.retasks),
+                "limit": self.budget.limit if self.budget else None,
+                "exhausted": self.exhausted,
+                "repeated_instructions": self.repeated(),
+                "unresolved": list(self.unresolved),
+                "final_status": self.final_status.value if self.final_status else None}
+
+
+def attempt_record(outcome: "WorkerOutcome", review: QualityReview, *,
+                   retask: RetaskedWorker | None = None,
+                   inherited: Sequence[str] = ()) -> AttemptHistory:
+    """One attempt as history: what it returned, how it was judged, what it added."""
+
+    report = _report_of(outcome)
+    evidence_ids = list(report.evidence_ids) if report is not None else list(
+        outcome.evidence_ids)
+    inherited_ids = set(inherited)
+    return AttemptHistory(
+        attempt=outcome.attempt, task_id=outcome.task_id, status=outcome.status,
+        summary=outcome.summary, error=outcome.error, evidence_ids=evidence_ids,
+        deficiencies=[f"{item.dimension.value}/{item.kind.value}"
+                      for item in review.deficiencies]
+        if review.attempt == outcome.attempt else [],
+        decision=review.decision if review.attempt == outcome.attempt else None,
+        fault=review.fault if review.attempt == outcome.attempt else None,
+        produced_ids=[item for item in evidence_ids if item not in inherited_ids],
+        guidance=retask.prompt if retask is not None else "",
+        seconds=round(outcome.seconds, 3))
+
+
+def retask_ledger(worker: "FlowWorker", entries: Sequence[tuple["WorkerOutcome",
+                                                                QualityReview]],
+                  *, policy: ReviewPolicy | None = None,
+                  assignments: Sequence[RetaskedWorker] = (),
+                  inherited: Sequence[str] = ()) -> RetaskLedger:
+    """Assemble one unit's history from the attempts that actually happened."""
+
+    agreed = policy or ReviewPolicy()
+    retasks = sorted(assignments, key=lambda retask: retask.attempt)
+    by_attempt = {retask.attempt: retask for retask in retasks}
+    attempts = [
+        attempt_record(outcome, review, retask=by_attempt.get(outcome.attempt),
+                       # Only an attempt after a retask inherited anything: the first
+                       # one was given the assignment, not a head start.
+                       inherited=inherited if outcome.attempt > 1 else ())
+        for outcome, review in entries]
+    tool_failure = bool(entries) and entries[-1][1].fault is WorkflowFault.TOOL
+    budget = retry_budget(worker, policy=agreed, tool_failure=tool_failure)
+    return RetaskLedger(worker_id=worker.id, objective=worker.objective,
+                        retasks=retasks, attempts=attempts, budget=budget)
+
+
+def exhausted_outcome(worker: "FlowWorker", *, entries: Sequence[tuple["WorkerOutcome",
+                                                                     QualityReview]],
+                      policy: ReviewPolicy | None = None,
+                      inherited: Sequence[str] = (),
+                      status: EntityStatus | None = None) -> tuple[
+                          "WorkerOutcome", RetaskLedger]:
+    """What one unit returns when its retry budget is spent.
+
+    The acceptance clause's second half: **stop at the limit** and return a partial or
+    blocked status that still names what is unresolved.  The earlier attempts' evidence
+    is carried into the final report — an exhausted unit is not an empty one — and the
+    status says which of the two honest labels applies: ``partial`` when it produced
+    usable work, ``blocked`` when it produced none.
+    """
+
+    ledger = retask_ledger(worker, entries, policy=policy, inherited=inherited)
+    unresolved = [f"{item.dimension.value}/{item.kind.value}: {item.detail}"
+                  for item in entries[-1][1].deficiencies] if entries else []
+    last = entries[-1][0] if entries else None
+    # A unit with no attempts at all still has a parent: the report has to say which
+    # Subagent's budget it exhausted, and the Worker's id is the only other fact here.
+    subagent_id = (last.subagent_id if last and last.subagent_id
+                   else worker.id)
+
+    # What the exhausted unit still has is the reports its attempts produced: the
+    # same evidence, with the same provenance, restated at the status that honours
+    # what is missing.  An attempt whose own report was unusable contributes nothing,
+    # which is how "partial" and "blocked" come to differ without being guessed.
+    evidence: list[EvidenceItem] = []
+    for outcome, _review in entries:
+        entry_report = _report_of(outcome)
+        if entry_report is None or not entry_report.usable:
+            continue
+        known = {seen.id for seen in evidence}
+        evidence.extend(item for item in entry_report.evidence if item.id not in known)
+    final = status or (EntityStatus.BLOCKED if evidence else EntityStatus.FAILED)
+    ledger = ledger.model_copy(update={"unresolved": unresolved, "final_status": final})
+    report = report_from_evidence(
+        worker.id, subagent_id,
+        status=(WorkerStatus.PARTIAL if evidence else WorkerStatus.FAILED),
+        evidence=evidence,
+        findings=[WorkerFinding(statement=f"{worker.name}: attempt {attempt.attempt} "
+                                          f"returned evidence that no review accepted",
+                                evidence_ids=[row.id for row in evidence
+                                              if row.id in attempt.produced_ids])
+                  for attempt in ledger.attempts
+                  if attempt.decision is not ReviewDecision.PASS
+                  and any(row.id in attempt.produced_ids for row in evidence)],
+        summary=(f"{worker.name}: {len(entries)} attempt(s) spent the "
+                 f"{ledger.budget.limit if ledger.budget else 0}-attempt budget with "
+                 f"{len(unresolved)} deficiency(ies) unresolved"),
+        limitations=unresolved or ["the unit never produced a reviewable attempt"],
+        task_id=content_id("task", worker.id, "exhausted", len(entries)),
+        attempt=len(entries) or 1,
+        error=ErrorInfo(code="retry-exhausted",
+                        message="retry budget exhausted: "
+                                + ("; ".join(unresolved[:3]) if unresolved
+                                   else "no attempt was reviewable"),
+                        stage="review", component=worker.id,
+                        attempt=len(entries) or 1),
+    )
+    outcome = outcome_from_report(report, gate=FlowGate.RETRY_EXHAUSTED).model_copy(
+        update={"status": final})
+    return outcome, ledger
+
+
+# --------------------------------------------------------------------------
+# 35.4 Scripted retasks: an accepted attempt, a revised one, a spent budget
+# --------------------------------------------------------------------------
+
+def _retask_worker_spec(index: int = 1, **overrides: Any) -> "FlowWorker":
+    """A Worker to retask: a real FlowWorker, with the fields the retask reads."""
+
+    payload: dict[str, Any] = {
+        "id": f"wrk-retask-{index}", "name": f"retask-demo-{index}",
+        "objective": "correlate each proxy CONNECT with the resolver query that caused it",
+        "work_unit": "proxy correlation",
+        "completion_criteria": [
+            "every CONNECT is paired with the resolver query that precedes it",
+            "each pair cites the log lines it came from",
+        ],
+        "expected_evidence": "≥2 observation item(s) from ≥2 source(s)",
+        "output_schema": "CorrelationTable",
+        "max_attempts": 3,
+    }
+    payload.update(overrides)
+    return FlowWorker(**payload)
+
+
+def _retask_source(name: str, kind: SourceKind, *, path: str | None = None,
+                   method: RetrievalMethod = RetrievalMethod.LOCAL_READ) -> SourceReference:
+    return SourceReference(kind=kind, artifact_path=path, title=name,
+                           retrieved_at=utc_now(), retrieval_method=method,
+                           excerpt=f"{name} excerpt")
+
+
+def _retask_attempt_one() -> tuple["WorkerOutcome", QualityReview, "FlowWorker"]:
+    """A first attempt that got half the job done: two sound rows, one weak source."""
+
+    worker = _retask_worker_spec()
+    log = _retask_source("resolver log", SourceKind.LOG_FILE, path="/evidence/dns.log")
+    proxy = _retask_source("proxy log", SourceKind.LOG_FILE, path="/evidence/proxy.log")
+    search = _retask_source("search result", SourceKind.SEARCH_ENGINE,
+                            path="/evidence/cached.html")
+    evidence = [
+        EvidenceItem(kind=EvidenceKind.OBSERVATION,
+                     statement="the CONNECT to evil.example.org at 10:00:00Z follows the "
+                               "resolver query at 09:59:58Z",
+                     sources=[proxy, log], confidence=Confidence.LOW,
+                     confidence_basis="two log lines read in order",
+                     collected_by=worker.id, observed_at=utc_now()),
+        EvidenceItem(kind=EvidenceKind.OBSERVATION,
+                     statement="the resolver query for evil.example.org at 09:59:58Z came "
+                               "from host-07",
+                     sources=[log], confidence=Confidence.LOW,
+                     confidence_basis="one log line",
+                     collected_by=worker.id, observed_at=utc_now()),
+        EvidenceItem(kind=EvidenceKind.OBSERVATION,
+                     statement="a search summary says host-07 is the office gateway",
+                     sources=[search], confidence=Confidence.LOW,
+                     confidence_basis="one retrieval of a secondary source",
+                     collected_by=worker.id, observed_at=utc_now()),
+    ]
+    findings = [
+        WorkerFinding(statement="the CONNECT follows the resolver query by two seconds",
+                      evidence_ids=[evidence[0].id]),
+        WorkerFinding(statement="host-07 issued the query",
+                      evidence_ids=[evidence[1].id]),
+        WorkerFinding(statement="host-07 is the office gateway",
+                      evidence_ids=[evidence[2].id]),
+    ]
+    report = report_from_evidence(
+        worker.id, "sa-retask", status=WorkerStatus.COMPLETED, evidence=evidence,
+        findings=findings, summary="paired one CONNECT and identified the host",
+        task_id="task-retask-1", attempt=1)
+    outcome = outcome_from_report(report)
+    # The review the parent Subagent would actually write for that result.
+    review = QualityReview(
+        worker_id=worker.id, subagent_id="sa-retask", task_id=outcome.task_id,
+        attempt=1, worker_status=WorkerStatus.COMPLETED,
+        decision=ReviewDecision.REVISE,
+        checks=[DimensionResult(dimension=dimension) for dimension in REVIEW_DIMENSIONS
+                if dimension is not ReviewDimension.SOURCE_QUALITY]
+        + [DimensionResult(dimension=ReviewDimension.SOURCE_QUALITY, deficiencies=[
+            Deficiency(dimension=ReviewDimension.SOURCE_QUALITY,
+                       kind=DeficiencyKind.WEAK_SOURCE,
+                       detail="the gateway claim rests on a search summary, not the "
+                              "inventory record",
+                       evidence_ids=[evidence[2].id],
+                       fix="cite the inventory record for host-07")])],
+        checked=list(REVIEW_DIMENSIONS),
+        deficiencies=[Deficiency(dimension=ReviewDimension.SOURCE_QUALITY,
+                                 kind=DeficiencyKind.WEAK_SOURCE,
+                                 detail="the gateway claim rests on a search summary, "
+                                        "not the inventory record",
+                                 evidence_ids=[evidence[2].id],
+                                 fix="cite the inventory record for host-07")],
+        guidance="cite the inventory record for host-07 instead of a search summary",
+        retry=True, path="runner")
+    return outcome, review, worker
+
+
+def _retask_second_attempt(worker: "FlowWorker", retask: RetaskedWorker) -> tuple[
+        "WorkerOutcome", QualityReview]:
+    """The attempt the retask produced: it re-cites what it had and adds the inventory row.
+
+    The evidence it already held keeps its ids — that is what "not duplicated" means in
+    practice: the second attempt returns three items, not five, because the two it
+    inherited are cited rather than collected again.
+    """
+
+    inventory = _retask_source("inventory export", SourceKind.LOCAL_ARTIFACT,
+                               path="/evidence/inventory.csv")
+    carried = [
+        EvidenceItem(kind=EvidenceKind.OBSERVATION,
+                     statement="the CONNECT to evil.example.org at 10:00:00Z follows the "
+                               "resolver query at 09:59:58Z",
+                     sources=[_retask_source("proxy log", SourceKind.LOG_FILE,
+                                             path="/evidence/proxy.log")],
+                     confidence=Confidence.MEDIUM,
+                     confidence_basis="two corroborating log lines, re-read",
+                     collected_by=worker.id, observed_at=utc_now()),
+        EvidenceItem(kind=EvidenceKind.OBSERVATION,
+                     statement="the resolver query for evil.example.org at 09:59:58Z came "
+                               "from host-07",
+                     sources=[_retask_source("resolver log", SourceKind.LOG_FILE,
+                                             path="/evidence/dns.log")],
+                     confidence=Confidence.MEDIUM,
+                     confidence_basis="one log line, corroborated by the inventory",
+                     collected_by=worker.id, observed_at=utc_now()),
+    ]
+    added = EvidenceItem(kind=EvidenceKind.OBSERVATION,
+                         statement="the inventory export lists host-07 as the office gateway",
+                         sources=[inventory], confidence=Confidence.HIGH,
+                         confidence_basis="the authoritative inventory record",
+                         collected_by=worker.id, observed_at=utc_now())
+    evidence = [*carried, added]
+    report = report_from_evidence(
+        worker.id, "sa-retask", status=WorkerStatus.COMPLETED, evidence=evidence,
+        findings=[WorkerFinding(statement="host-07 issued the query and is the gateway",
+                                evidence_ids=[carried[1].id, added.id])],
+        summary="re-cited the two accepted rows and added the inventory record",
+        task_id="task-retask-2", attempt=2)
+    outcome = outcome_from_report(report)
+    review = QualityReview(
+        worker_id=worker.id, subagent_id="sa-retask", task_id=outcome.task_id,
+        attempt=2, worker_status=WorkerStatus.COMPLETED,
+        decision=ReviewDecision.PASS,
+        checks=[DimensionResult(dimension=dimension) for dimension in REVIEW_DIMENSIONS],
+        checked=list(REVIEW_DIMENSIONS), path="runner",
+        guidance="")
+    return outcome, review
+
+
+def retask_demo_cases() -> dict[str, Any]:
+    """Three units: the retask that worked, the retask that repeated, the spent budget."""
+
+    outcome_one, review_one, worker = _retask_attempt_one()
+    first = retask_worker(
+        review_one, report=report_from_outcome(outcome_one), attempt=2,
+        objective=worker.objective, criteria=worker.completion_criteria,
+        output_schema=worker.output_schema, subagent_id="sa-retask",
+        work_unit=worker.work_unit, guidance=review_one.guidance)
+    outcome_two, review_two = _retask_second_attempt(worker, first)
+
+    # A second revise that finds exactly what the first did: the same complaint, a new
+    # attempt number.  This is the failure mode the task names — a retry in place of a
+    # retask — and the fingerprint is what makes it visible.
+    repeat_review = review_one.model_copy(update={"attempt": 2, "task_id": "task-retask-2"})
+    repeated = retask_worker(repeat_review, report=report_from_outcome(outcome_one),
+                             attempt=3, objective=worker.objective,
+                             criteria=worker.completion_criteria,
+                             output_schema=worker.output_schema, subagent_id="sa-retask",
+                             work_unit=worker.work_unit)
+
+    # A unit that never passes: three attempts, one unresolved deficiency each time.
+    stuck_worker = _retask_worker_spec(2, max_attempts=2)
+    stuck_entries: list[tuple["WorkerOutcome", QualityReview]] = []
+    for attempt in (1, 2):
+        line = EvidenceItem(
+            kind=EvidenceKind.OBSERVATION,
+            statement=f"attempt {attempt}: the CONNECT at 10:00:00Z has no matching query",
+            sources=[_retask_source("proxy log", SourceKind.LOG_FILE,
+                                    path="/evidence/proxy.log")],
+            confidence=Confidence.LOW, confidence_basis="one log line read",
+            collected_by=stuck_worker.id, observed_at=utc_now())
+        report = report_from_evidence(
+            stuck_worker.id, "sa-retask", status=WorkerStatus.COMPLETED,
+            evidence=[line],
+            findings=[WorkerFinding(statement="the CONNECT has no matching query",
+                                    evidence_ids=[line.id])],
+            summary=f"attempt {attempt}: no query matched the CONNECT",
+            task_id=f"task-stuck-{attempt}", attempt=attempt)
+        outcome = outcome_from_report(report)
+        stuck_entries.append((outcome, QualityReview(
+            worker_id=stuck_worker.id, subagent_id="sa-retask",
+            task_id=outcome.task_id, attempt=attempt,
+            worker_status=WorkerStatus.COMPLETED, decision=ReviewDecision.REVISE,
+            checks=[DimensionResult(dimension=dimension) for dimension in REVIEW_DIMENSIONS
+                    if dimension is not ReviewDimension.COMPLETENESS]
+            + [DimensionResult(dimension=ReviewDimension.COMPLETENESS, deficiencies=[
+                Deficiency(dimension=ReviewDimension.COMPLETENESS,
+                           kind=DeficiencyKind.INCOMPLETE,
+                           detail="no CONNECT is paired with the resolver query that "
+                                  "precedes it",
+                           fix="pair at least one CONNECT, or report the unit partial")])],
+            checked=list(REVIEW_DIMENSIONS),
+            deficiencies=[Deficiency(dimension=ReviewDimension.COMPLETENESS,
+                                     kind=DeficiencyKind.INCOMPLETE,
+                                     detail="no CONNECT is paired with the resolver query "
+                                            "that precedes it",
+                                     fix="pair at least one CONNECT, or report partial")],
+            guidance="pair at least one CONNECT with the query before it",
+            retry=True, path="runner")))
+    spent_outcome, spent_ledger = exhausted_outcome(
+        stuck_worker, entries=stuck_entries, policy=ReviewPolicy(max_revisions=1))
+
+    ledger = retask_ledger(worker, [(outcome_one, review_one), (outcome_two, review_two)],
+                           policy=ReviewPolicy(max_revisions=2), assignments=[first])
+    return {
+        "worker": worker,
+        "attempts": (outcome_one, outcome_two),
+        "reviews": (review_one, review_two),
+        "retask": first,
+        "repeated": repeated,
+        "comparison": compare_retasks(first, repeated),
+        "first_instruction": revision_directive(review_one),
+        "ledger": ledger,
+        "stuck": spent_ledger,
+        "stuck_result": spent_outcome,
+        "stuck_worker": stuck_worker,
+    }
+
+
+def _retask_payload(cases: Mapping[str, Any]) -> dict[str, Any]:
+    """The demo, serialised: what a reader or a test consumes."""
+
+    first: RetaskedWorker = cases["retask"]
+    return {
+        "objective": first.objective,
+        "retask": first.to_dict(),
+        "prompt": first.prompt,
+        "prior_evidence": [item.model_dump(mode="json") for item in first.prior_evidence],
+        "comparison": cases["comparison"],
+        "repeated": cases["repeated"].to_dict(),
+        "first_instruction": cases["first_instruction"].model_dump(mode="json"),
+        "ledger": cases["ledger"].summary(),
+        "budget": cases["ledger"].budget.model_dump(mode="json"),
+        "stuck": cases["stuck"].summary(),
+        "stuck_result": json.loads(model_to_json(cases["stuck_result"])),
+        "attempts": [
+            {"attempt": attempt.attempt, "status": attempt.status.value,
+             "produced": len(attempt.produced_ids), "decision": attempt.decision.value
+             if attempt.decision else None,
+             "deficiencies": attempt.deficiencies}
+            for attempt in cases["ledger"].attempts],
+    }
+
+
+def retask_quality_demo() -> dict[str, Any]:
+    """The retasking demo as the CLI prints and ``--json`` exports it."""
+
+    cases = retask_demo_cases()
+    payload = _retask_payload(cases)
+    payload["contrast"] = task_contrast(cases["first_instruction"], cases["retask"])
+    specificity = retask_specificity(cases["retask"])
+    payload["acceptance"] = {
+        "specific": specificity["specific"],
+        "signals": specificity["signals"],
+        "counts_enforced": cases["stuck"].exhausted,
+        "limit": cases["stuck"].budget.limit if cases["stuck"].budget else None,
+        "attempts": len(cases["stuck"].attempts),
+        "history": len(cases["ledger"].retasks) + len(cases["ledger"].attempts),
+        "unresolved": list(cases["stuck"].unresolved),
+        "repeated": cases["ledger"].repeated(),
+        "duplicate_prompt": retask_repeats(cases["retask"], cases["repeated"]),
+    }
+    return payload
+
+
+# --------------------------------------------------------------------------
+# 35.5 Observability: is this retask specific, and is it different?
+# --------------------------------------------------------------------------
+
+#: Words that make an instruction look specific without saying anything.  A retask
+#: containing only these is the same prompt in a new envelope.
+VAGUE_PHRASES: tuple[str, ...] = (
+    "try again", "do better", "be more careful", "improve quality", "retry",
+    "review the result", "make sure", "ensure quality", "fix the issues",
+    "address the deficiencies", "follow the instructions",
+)
+
+
+def retask_specificity(retask: RetaskedWorker) -> dict[str, Any]:
+    """Whether this instruction could be acted on by someone who never saw the review.
+
+    Five things count, and each is a field rather than an opinion: the objective is
+    restated, the deficiencies are quoted, each carries a correction, the earlier
+    evidence is listed, and the prompt refuses vague-only vocabulary.
+    """
+
+    prompt = retask.prompt.lower()
+    vague_only = all(
+        phrase in prompt for phrase in ("try again",)) and not retask.corrections
+    signals = {
+        "restates_objective": bool(retask.objective)
+        and retask.objective.strip() in retask.prompt,
+        "quotes_deficiencies": bool(retask.corrections) and all(
+            item.detail[:40] in retask.prompt for item in retask.corrections),
+        "gives_corrections": bool(retask.corrections) and all(
+            len(item.correction) >= 20 for item in retask.corrections),
+        # Either the items are listed or the prompt says there were none: both are
+        # specific, and a silent omission is neither.
+        "carries_prior_evidence": bool(retask.prior_evidence)
+        or "EVIDENCE YOU ALREADY HAVE: none" in retask.prompt,
+        "names_output_shape": retask.output_schema.lower() in prompt,
+        "not_vague_only": not vague_only,
+    }
+    return {"signals": signals, "score": sum(signals.values()),
+            "specific": all(signals.values()), "vague_only": vague_only}
+
+
+def task_contrast(directive: RevisionDirective, retask: RetaskedWorker) -> dict[str, Any]:
+    """The one-line instruction of §34 beside the assignment rebuilt from it."""
+
+    return {
+        "directive": {"instruction": directive.instruction,
+                      "because": list(directive.because),
+                      "chars": len(directive.instruction)},
+        "retask": {"objective": retask.objective,
+                   "corrections": [item.describe for item in retask.corrections],
+                   "carry": retask.carried_ids, "chars": len(retask.prompt),
+                   "attempt": retask.attempt},
+        "specificity": retask_specificity(retask),
+        "difference": compare_retasks(None, retask),
+    }
+
+
+# --------------------------------------------------------------------------
+# 35.6 Self-test — the acceptance clause, as executable checks
+# --------------------------------------------------------------------------
+
+def run_retask_self_test() -> list[ReviewCheck]:
+    """Prove the retasking contract.
+
+    The acceptance clause names three properties, and they are groups 4, 5 and 6:
+    retry prompts are observably specific, retry counts are enforced, and earlier
+    evidence is not duplicated unnecessarily.
+    """
+
+    checks: list[ReviewCheck] = []
+    add = checks.append
+    cases = retask_demo_cases()
+    worker: FlowWorker = cases["worker"]
+    retask: RetaskedWorker = cases["retask"]
+    first_outcome, second_outcome = cases["attempts"]
+    first_review, second_review = cases["reviews"]
+
+    # ---- 1. the retask exists, and says what it is ----------------------
+    add(_rc("a revise produces a revised assignment", isinstance(retask, RetaskedWorker)))
+    add(_rc("the assignment carries the original objective",
+            retask.objective == worker.objective, retask.objective[:60]))
+    add(_rc("it is for the attempt after the one that failed", retask.attempt == 2,
+            retask.attempt))
+    add(_rc("it keeps the unit's own criteria and shape",
+            retask.criteria == worker.completion_criteria
+            and retask.output_schema == worker.output_schema))
+    add(_rc("it names the review that caused it", bool(retask.because_of),
+            retask.because_of[:80]))
+    add(_rc("it records the fault it was written for",
+            retask.fault is WorkflowFault.WORKER, retask.fault))
+
+    # ---- 2. the exact deficiencies, and a correction for each -----------
+    add(_rc("every deficiency of the review is carried, verbatim",
+            [item.detail for item in retask.corrections]
+            == [item.detail for item in first_review.deficiencies],
+            [item.detail[:50] for item in retask.corrections]))
+    add(_rc("every deficiency is also on the flat record",
+            retask.deficiencies == [item.describe for item in first_review.deficiencies]))
+    add(_rc("each deficiency gets a correction of its own",
+            all(item.correction and item.correction != item.detail
+                for item in retask.corrections)))
+    add(_rc("the correction names what to do, not just what was wrong",
+            all(len(item.correction) >= 20 for item in retask.corrections),
+            [item.correction[:40] for item in retask.corrections]))
+    add(_rc("two deficiencies in one dimension are merged, not duplicated",
+            len({item.dimension for item in retask.corrections})
+            == len(retask.corrections)))
+    add(_rc("every deficiency kind has a correction",
+            all(correct_for(Deficiency(
+                dimension=ReviewDimension.COMPLETENESS, kind=kind,
+                detail="a specific deficiency of the required length",
+                fix="apply the correction this kind carries"))
+                for kind in DeficiencyKind)))
+
+    # ---- 3. the relevant prior evidence, and only that -------------------
+    add(_rc("the attempt's sound evidence is carried forward",
+            len(retask.prior_evidence) == 2, retask.carried_ids))
+    add(_rc("the item the review faulted is not carried",
+            not ({item.id for item in report_from_outcome(first_outcome).evidence
+                  if item.statement.startswith("a search summary")} & set(retask.carried_ids)),
+            retask.carried_ids))
+    add(_rc("each carried item says why it is worth carrying",
+            all(len(item.reason) >= 20 for item in retask.prior_evidence)))
+    add(_rc("each carried item is the record that was reviewed",
+            all(item.check() and item.statement_hash == _statement_hash(item.statement)
+                for item in retask.prior_evidence)))
+    add(_rc("a carried item cannot be attached to a different statement",
+            bool(_refuses(lambda: PriorEvidence(
+                item_id="ev-x", statement="the original statement",
+                relation="cited", statement_hash="0" * 16,
+                reason="it was reviewed and was not faulted"))[0])))
+    add(_rc("evidence the attempt itself inherited is not carried again",
+            not ({i.item_id for i in carryable_evidence(
+                report_from_outcome(first_outcome), first_review,
+                inherited=[item.id for item in report_from_outcome(first_outcome).evidence])}
+                & set(retask.carried_ids))))
+    add(_rc("an inference is not carried forward as if it were collected",
+            carryable_evidence(
+                report_from_evidence(
+                    "wrk-x", "sa-x", status=WorkerStatus.PARTIAL,
+                    evidence=[EvidenceItem(
+                        kind=EvidenceKind.INFERENCE,
+                        statement="the write was probably made by the updater",
+                        sources=[_retask_source("log", SourceKind.LOG_FILE,
+                                                path="/evidence/log")],
+                        confidence=Confidence.LOW, confidence_basis="one log line",
+                        reasoning="the timestamp falls inside the updater's window")],
+                    findings=[], limitations=["only one log line survived"]),
+                first_review) == []))
+    add(_rc("a failed attempt carries nothing forward",
+            carryable_evidence(report_from_outcome(WorkerOutcome(
+                worker_id="wrk-x", subagent_id="sa-x", status=EntityStatus.FAILED,
+                attempt=1, gate=FlowGate.ERROR, summary="the tool broke",
+                error="unexpected end of pcap record")), first_review) == []))
+
+    # ---- 4. retry prompts are observably specific -----------------------
+    specificity = retask_specificity(retask)
+    add(_rc("the retask scores specific on every signal", specificity["specific"],
+            specificity["signals"]))
+    add(_rc("the prompt restates the objective it is revising",
+            retask.objective in retask.prompt))
+    add(_rc("the prompt quotes the deficiency, not a summary of it",
+            all(item.detail[:40] in retask.prompt for item in retask.corrections)))
+    add(_rc("the prompt carries the correction, not just the complaint",
+            all(item.correction[:40] in retask.prompt for item in retask.corrections)))
+    add(_rc("the prompt names the evidence already in hand",
+            all(item.item_id in retask.prompt for item in retask.prior_evidence)))
+    add(_rc("the prompt names the output shape", retask.output_schema in retask.prompt))
+    add(_rc("the prompt says what not to collect again",
+            "DO NOT RE-COLLECT" in retask.prompt))
+    # A revise whose evidence was all thrown away says so, rather than going quiet.
+    bare = retask_worker(first_review, report=None, attempt=2,
+                         objective=worker.objective, criteria=worker.completion_criteria,
+                         output_schema=worker.output_schema, subagent_id="sa-retask")
+    add(_rc("a retask with nothing to carry says there is nothing",
+            "EVIDENCE YOU ALREADY HAVE: none" in bare.prompt, bare.prompt[-180:]))
+    add(_rc("an empty carry still scores specific", retask_specificity(bare)["specific"],
+            retask_specificity(bare)["signals"]))
+    add(_rc("an empty carry lists no ids", bare.carried_ids == []))
+    add(_rc("the prompt is longer than the one-line directive it came from",
+            len(retask.prompt) > 4 * len(cases["first_instruction"].instruction),
+            f"{len(retask.prompt)} vs {len(cases['first_instruction'].instruction)}"))
+    vague = RetaskedWorker.model_validate({
+        **_tool_retask_payload(retask),
+        "prompt": "try again. be more careful. improve quality. " * 3,
+        "corrections": [], "prior_evidence": [], "already_collected": [],
+        "objective": worker.objective})
+    add(_rc("a vague-only instruction does not score specific",
+            not retask_specificity(vague)["specific"],
+            retask_specificity(vague)["signals"]))
+    add(_rc("the same review produces the same instruction twice",
+            retask.fingerprint == retask_worker(
+                first_review, report=report_from_outcome(first_outcome), attempt=2,
+                objective=worker.objective, criteria=worker.completion_criteria,
+                output_schema=worker.output_schema, subagent_id="sa-retask",
+                work_unit=worker.work_unit).fingerprint))
+    add(_rc("an instruction identical to the previous one is detected",
+            retask_repeats(retask, cases["repeated"]),
+            (retask.fingerprint, cases["repeated"].fingerprint)))
+    add(_rc("the repeat is reported with no substantive change",
+            cases["comparison"]["same_fingerprint"] is True
+            and cases["comparison"]["substantive"] is False, cases["comparison"]))
+    add(_rc("a different deficiency is not reported as a repeat",
+            not retask_repeats(retask, retask_worker(
+                first_review.model_copy(update={
+                    "deficiencies": [first_review.deficiencies[0].model_copy(
+                        update={"detail": "the gateway claim rests on a cached page "
+                                          "with no publisher named"})]}),
+                report=report_from_outcome(first_outcome), attempt=3,
+                objective=worker.objective, subagent_id="sa-retask"))))
+    add(_rc("the comparison of a first retask is substantive by definition",
+            compare_retasks(None, retask)["substantive"]))
+
+    # ---- 5. the retry count is enforced, and read ----------------------
+    spent: RetaskLedger = cases["stuck"]
+    add(_rc("the budget is the Worker's own limit", spent.budget is not None
+            and spent.budget.limit == 2, spent.budget))
+    add(_rc("the budget records which ceiling binds", spent.budget.source in
+            {"worker", "policy", "tool"}, spent.budget.source))
+    add(_rc("a smaller policy limit binds instead of the Worker's",
+            retry_budget(worker, policy=ReviewPolicy(max_revisions=0)).limit == 1,
+            retry_budget(worker, policy=ReviewPolicy(max_revisions=0)).limit))
+    add(_rc("a worker with a two-attempt budget stops after two",
+            retry_budget(_retask_worker_spec(3, max_attempts=2),
+                         policy=ReviewPolicy(max_revisions=5)).limit == 2))
+    add(_rc("a tool failure is not retried when the policy forbids it",
+            retry_budget(worker, policy=ReviewPolicy(retry_tool_failures=False),
+                         tool_failure=True).source == "tool"))
+    add(_rc("the exhausted unit used exactly its limit",
+            len(spent.attempts) == spent.budget.limit, len(spent.attempts)))
+    add(_rc("the exhausted unit says so", spent.exhausted))
+    add(_rc("the final result is not a pass",
+            cases["stuck_result"].status is not EntityStatus.SUCCEEDED,
+            cases["stuck_result"].status))
+    add(_rc("it says in the record that the work is partial",
+            _report_of(cases["stuck_result"]) is not None
+            and _report_of(cases["stuck_result"]).status is WorkerStatus.PARTIAL,
+            _report_of(cases["stuck_result"]).status
+            if _report_of(cases["stuck_result"]) else None))
+    add(_rc("the final result stops on the retry gate",
+            cases["stuck_result"].gate is FlowGate.RETRY_EXHAUSTED,
+            cases["stuck_result"].gate))
+    add(_rc("the unresolved deficiencies are on the final result",
+            len(spent.unresolved) == 1 and "incomplete" in spent.unresolved[0],
+            spent.unresolved))
+    add(_rc("those deficiencies are in the error the caller reads",
+            "unresolved" in (cases["stuck_result"].error or "")
+            or "budget" in (cases["stuck_result"].error or ""),
+            cases["stuck_result"].error))
+    add(_rc("an exhausted unit keeps the evidence its attempts produced",
+            bool(cases["stuck_result"].evidence_ids),
+            cases["stuck_result"].evidence_ids))
+    add(_rc("a unit that produced nothing is failed, not partial",
+            _report_of(exhausted_outcome(cases["stuck_worker"], entries=[],
+                                         policy=ReviewPolicy())[0])
+            .status is WorkerStatus.FAILED))
+    add(_rc("one more attempt than the limit is refused by the budget, not run",
+            retry_budget(cases["stuck_worker"],
+                         policy=ReviewPolicy(max_revisions=1)).limit == 2))
+
+    # ---- 6. earlier evidence is not duplicated -------------------------
+    ledger: RetaskLedger = cases["ledger"]
+    add(_rc("every attempt is in the history", len(ledger.attempts) == 2,
+            [attempt.attempt for attempt in ledger.attempts]))
+    add(_rc("the history records what each attempt produced",
+            len(ledger.attempts[0].produced_ids) == 3
+            and len(ledger.attempts[1].produced_ids) == 3,
+            [len(attempt.produced_ids) for attempt in ledger.attempts]))
+    add(_rc("the second attempt re-cites the carried evidence instead of recollecting it",
+            len(report_from_outcome(second_outcome).evidence)
+            == len(report_from_outcome(first_outcome).evidence),
+            f"{len(report_from_outcome(second_outcome).evidence)} vs "
+            f"{len(report_from_outcome(first_outcome).evidence)}"))
+    add(_rc("no evidence id appears twice in the second attempt",
+            len({item.id for item in report_from_outcome(second_outcome).evidence})
+            == len(report_from_outcome(second_outcome).evidence)))
+    add(_rc("the retask names exactly the ids it carries",
+            retask.carried_ids == [item.item_id for item in retask.prior_evidence]))
+    add(_rc("the prompt lists them so the Worker does not go looking again",
+            all(item_id in retask.prompt for item_id in retask.carried_ids)))
+    add(_rc("the history keeps the instruction the second attempt received",
+            ledger.attempts[1].guidance == retask.prompt, ledger.attempts[1].guidance[:60]))
+    add(_rc("the first attempt records no instruction, because it had none",
+            ledger.attempts[0].guidance == ""))
+    add(_rc("the attempt that carried evidence was told it already had it",
+            "EVIDENCE YOU ALREADY HAVE" in retask.prompt))
+    add(_rc("the evidence the second attempt collected itself is not listed as inherited",
+            not (set(retask.carried_ids)
+                 & {item.id for item in report_from_outcome(second_outcome).evidence
+                    if item.statement.startswith("the inventory")}),
+            retask.carried_ids))
+
+    # ---- 7. a retask that repeats is refused, not issued ----------------
+    add(_rc("a revise with no deficiency gets no retask",
+            bool(_refuses(lambda: retask_worker(
+                first_review.model_copy(update={"deficiencies": []}),
+                report=report_from_outcome(first_outcome)))[0])))
+    add(_rc("a pass gets no retask",
+            bool(_refuses(lambda: retask_worker(
+                second_review, report=report_from_outcome(second_outcome)))[0])))
+    add(_rc("an assignment with no correction is refused",
+            bool(_refuses(lambda: RetaskedWorker.model_validate(
+                {**_retask_payload(retask), "corrections": []}))[0])))
+    add(_rc("two corrections for one dimension are refused",
+            bool(_refuses(lambda: RetaskedWorker.model_validate(
+                {**_tool_retask_payload(retask),
+                 "corrections": [first_review.deficiencies[0].model_dump(mode="json"),
+                                 first_review.deficiencies[0].model_dump(mode="json")],
+                 "tool_failure": False}))[0])))
+    add(_rc("a tool-failure retask may not carry quality corrections",
+            bool(_refuses(lambda: RetaskedWorker.model_validate(
+                {**_tool_retask_payload(retask),
+                 "corrections": [first_review.deficiencies[0].model_dump(mode="json")]}))[0])))
+    add(_rc("the same evidence cannot be carried forward twice",
+            bool(_refuses(lambda: RetaskedWorker.model_validate(
+                {**_retask_payload(retask),
+                 "prior_evidence": [retask.prior_evidence[0].model_dump(mode="json")] * 2}))[0])))
+    add(_rc("a retask for a first attempt is refused",
+            bool(_refuses(lambda: RetaskedWorker.model_validate(
+                {**_retask_payload(retask), "attempt": 1}))[0])))
+
+    # ---- 8. a tool failure is retasked differently ----------------------
+    tool_review = first_review.model_copy(update={
+        "fault": WorkflowFault.TOOL,
+        "checks": [DimensionResult(dimension=dimension) for dimension in REVIEW_DIMENSIONS],
+        "deficiencies": [Deficiency(dimension=ReviewDimension.COMPLETENESS,
+                                    kind=DeficiencyKind.TOOL_FAILURE,
+                                    detail="the attempt failed at the tool: unexpected "
+                                           "end of pcap record at offset 4096",
+                                    fix="re-run the same unit after the tool recovers")],
+        "guidance": "retry the same unit: the failure was the tool's, not the work's"})
+    tool_retask = retask_worker(tool_review, report=None, attempt=2,
+                                objective=worker.objective, subagent_id="sa-retask")
+    add(_rc("a tool failure retask says the work was not judged",
+            "never judged" in tool_retask.prompt, tool_retask.prompt[-160:]))
+    add(_rc("it tells the Worker not to rewrite what succeeded",
+            "do not rewrite" in tool_retask.prompt.lower()))
+    add(_rc("it carries no prior evidence, because none was produced",
+            tool_retask.prior_evidence == []))
+    add(_rc("it is marked as a tool failure", tool_retask.tool_failure))
+    add(_rc("a quality retask is not marked as one", not retask.tool_failure))
+
+    # ---- 9. the history and its renderer -------------------------------
+    add(_rc("the history is ordered and duplicate-free",
+            [attempt.attempt for attempt in ledger.attempts] == [1, 2]))
+    add(_rc("the history summarises the budget it spent",
+            ledger.summary()["limit"] == 3 and ledger.summary()["attempts"] == 2,
+            ledger.summary()))
+    add(_rc("an out-of-order history is refused",
+            bool(_refuses(lambda: RetaskLedger.model_validate(
+                {"worker_id": "wrk-x", "attempts": [
+                    {"attempt": 2, "status": "succeeded"}, {"attempt": 1, "status": "failed"}]}))[0])))
+    add(_rc("the demo payload carries the prompt and the comparison",
+            {"prompt", "comparison", "ledger", "stuck", "acceptance"}
+            <= set(retask_quality_demo()), sorted(retask_quality_demo())))
+    demo = retask_quality_demo()
+    add(_rc("the demo's acceptance block is green",
+            demo["acceptance"]["specific"] is True
+            and demo["acceptance"]["counts_enforced"] is True
+            and bool(demo["acceptance"]["unresolved"]), demo["acceptance"]))
+    add(_rc("the demo shows the repeated prompt it refused to send",
+            demo["acceptance"]["duplicate_prompt"] is True, demo["acceptance"]))
+    add(_rc("the retask reloads from its own serialisation",
+            RetaskedWorker.from_dict(retask.to_dict()).fingerprint == retask.fingerprint))
+    add(_rc("reloading keeps the prompt the Worker was given",
+            RetaskedWorker.from_dict(retask.to_dict()).prompt == retask.prompt))
+    return checks
+
+
+def _tool_retask_payload(retask: RetaskedWorker) -> dict[str, Any]:
+    """The serialised retask, with the tool-failure shape it is being tested against."""
+
+    payload = json.loads(model_to_json(retask))
+    return {**payload, "tool_failure": True}
+
+
+# --------------------------------------------------------------------------
+# 35.7 Rendering: the instruction, the corrections and the history
+# --------------------------------------------------------------------------
+
+def render_retask(assignment: RetaskedWorker, *, show_prompt: bool = True) -> Group:
+    """One retask: what the Worker is told, and why each line is there."""
+
+    head = Table(title=f"retask — attempt {assignment.attempt} of {assignment.worker_id}",
+                 title_justify="left", box=None, pad_edge=False)
+    head.add_column("field", style="dim", no_wrap=True)
+    head.add_column("value", overflow="fold", max_width=78)
+    head.add_row("objective", escape(assignment.objective))
+    head.add_row("work unit", escape(assignment.work_unit or "—"))
+    head.add_row("output shape", escape(assignment.output_schema))
+    head.add_row("caused by", escape(assignment.because_of[:160]))
+    head.add_row("fault", escape(assignment.fault.value))
+    head.add_row("fingerprint", escape(assignment.fingerprint))
+
+    corrections = Table(title="what must change", title_justify="left", box=None,
+                        pad_edge=False)
+    corrections.add_column("dimension", no_wrap=True)
+    corrections.add_column("deficiency", overflow="fold", max_width=40)
+    corrections.add_column("correction", overflow="fold", max_width=40)
+    for item in assignment.corrections:
+        corrections.add_row(escape(item.dimension.value), escape(item.detail[:180]),
+                            escape(item.correction[:180]))
+
+    rows: list[Any] = [head, Text(""), corrections]
+    if assignment.prior_evidence:
+        carried = Table(title="evidence already in hand", title_justify="left", box=None,
+                        pad_edge=False)
+        carried.add_column("item", no_wrap=True)
+        carried.add_column("relation", no_wrap=True)
+        carried.add_column("statement", overflow="fold", max_width=56)
+        for item in assignment.prior_evidence:
+            carried.add_row(escape(item.item_id), escape(item.relation),
+                            escape(item.statement[:150]))
+        rows += [Text(""), carried,
+                 Text(f"carried forward, not re-collected: "
+                      f"{len(assignment.prior_evidence)} item(s)", style="dim")]
+    if show_prompt:
+        rows += [Text(""), Panel(Text(assignment.prompt), title="the instruction it sends",
+                                 title_align="left", border_style="cyan", expand=False)]
+    return Group(*rows)
+
+
+def render_retask_demo(payload: Mapping[str, Any]) -> Group:
+    """The demo: one retask, the repeat it refused, and the budget it spent."""
+
+    contrast = payload["contrast"]
+    sides = Table(title="one line of guidance, beside the assignment it becomes",
+                  expand=False,
+                  title_justify="left", box=None, pad_edge=False)
+    sides.add_column("", style="dim", no_wrap=True)
+    sides.add_column("§34 directive", overflow="fold", max_width=36)
+    sides.add_column("§35 retask", overflow="fold", max_width=46)
+    sides.add_row("content", escape(contrast["directive"]["instruction"][:200]),
+                  escape("; ".join(contrast["retask"]["corrections"])[:260]))
+    sides.add_row("size", f"{contrast['directive']['chars']} chars",
+                  f"{contrast['retask']['chars']} chars")
+    sides.add_row("carries evidence", "no",
+                  ", ".join(contrast["retask"]["carry"]) or "none")
+
+    signals = Table(title="is the retry prompt observably specific?", title_justify="left",
+                    box=None, pad_edge=False, expand=False)
+    signals.add_column("", width=2)
+    signals.add_column("signal", no_wrap=True)
+    for name, ok in payload["acceptance"]["signals"].items():
+        glyph, colour = ("✔", "green") if ok else ("✘", "red")
+        signals.add_row(f"[{colour}]{glyph}[/{colour}]", escape(name.replace("_", " ")))
+
+    history = Table(title="attempt history", title_justify="left", box=None,
+                    pad_edge=False, expand=False)
+    history.add_column("attempt", justify="right", no_wrap=True)
+    history.add_column("status", no_wrap=True)
+    history.add_column("decision", no_wrap=True)
+    history.add_column("deficiencies", overflow="fold", max_width=40)
+    history.add_column("new evidence", justify="right")
+    for attempt in payload["attempts"]:
+        history.add_row(str(attempt["attempt"]), escape(attempt["status"]),
+                        escape(str(attempt["decision"] or "—")),
+                        escape(", ".join(attempt["deficiencies"]) or "—"),
+                        str(attempt["produced"]))
+
+    budget = payload["budget"] or {}
+    stuck = payload["stuck"]
+    tail = Text(
+        f"\nhistory: {payload['ledger']['attempts']} attempt(s), "
+        f"{payload['ledger']['retasks']} retask(s), limit "
+        f"{payload['ledger']['limit']} ({budget.get('source', '?')} binds)\n"
+        f"repeated instruction detected: "
+        f"{payload['acceptance']['duplicate_prompt']}\n"
+        f"spent budget: {stuck['attempts']}/{stuck['limit']} attempt(s), "
+        f"final status {stuck['final_status']}, "
+        f"{len(stuck['unresolved'])} unresolved\n"
+        "a retry is a retask: the objective is restated, the deficiencies are quoted, "
+        "each one carries its correction, and the evidence already collected is carried "
+        "rather than collected twice",
+        style="dim")
+    return Group(render_retask(RetaskedWorker.from_dict(payload["retask"])),
+                 Text(""), sides, Text(""), signals, Text(""), history, tail)
+
+
+@app.command("retask", help="Targeted retasking: a revise becomes a specific assignment.")
+def retask_command(
+    self_test: bool = typer.Option(False, "--self-test",
+                                   help="Prove the retasking contract offline."),
+    demo: bool = typer.Option(False, "--demo",
+                              help="One retask, one repeat, one spent budget."),
+    next_report: str | None = typer.Option(
+        None, "--next", help="Build the retask for a reviewed Worker report ('-' for stdin).",
+        show_default=False),
+    objective: str = typer.Option("", "--objective",
+                                  help="The unit's original objective for --next."),
+    criteria: list[str] = typer.Option(
+        [], "--criteria", help="A completion criterion for --next. Repeatable."),
+    schema: str = typer.Option("EvidenceSet", "--schema",
+                               help="The output schema the unit was assigned."),
+    worker: str = typer.Option("worker", "--worker", help="Worker id for --next."),
+    subagent: str = typer.Option("subagent", "--subagent",
+                                 help="Parent Subagent id for --next."),
+    attempt: int = typer.Option(1, "--attempt", help="The attempt the report is."),
+    scope: list[str] = typer.Option(
+        [], "--scope", help="An authorised scope entry. Repeatable."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Turn a rejected result into the assignment the next attempt runs under.
+
+    ``--next`` is the seam for a pipeline: it reviews one report, and when the verdict
+    is a revise it prints the retask — the prompt, its corrections, and the evidence to
+    carry — exiting **7 (policy)** so the caller can withhold the work.
+    """
+
+    console = get_console()
+
+    if self_test:
+        checks = run_retask_self_test()
+        failures = [check for check in checks if not check.ok]
+        if as_json:
+            _emit(json.dumps({"ok": not failures,
+                              "checks": [asdict(check) for check in checks]}, indent=2))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        console.print()
+        table = Table(title="retask self-test", title_justify="left", box=None,
+                      pad_edge=False)
+        table.add_column("", width=2)
+        table.add_column("check", no_wrap=True)
+        table.add_column("detail", overflow="fold")
+        for check in checks:
+            glyph, colour = ("✔", "green") if check.ok else ("✘", "red")
+            table.add_row(f"[{colour}]{glyph}[/{colour}]", escape(check.name),
+                          escape(check.detail))
+        console.print(table)
+        colour = "green" if not failures else "red"
+        console.print(f"\n[{colour}]{len(checks) - len(failures)} passed[/] · "
+                      f"{len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    if demo:
+        payload = retask_quality_demo()
+        if as_json:
+            _emit(json.dumps(payload, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(render_retask_demo(payload))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    if next_report:
+        if schema not in OUTPUT_SCHEMAS:
+            console.print(f"[red]✘[/red] unknown schema {escape(schema)}; choose from: "
+                          f"{', '.join(OUTPUT_SCHEMAS)}")
+            raise typer.Exit(ExitCode.USAGE)
+        if next_report != "-" and not Path(next_report).expanduser().exists():
+            console.print(f"[red]✘[/red] no such file: {escape(next_report[:160])}")
+            raise typer.Exit(ExitCode.USAGE)
+        try:
+            raw = (sys.stdin.read() if next_report == "-"
+                   else Path(next_report).expanduser().read_text(encoding="utf-8"))
+            report = WorkerReport.from_dict(json.loads(raw))
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            console.print(f"[red]✘[/red] not a Worker report: "
+                          f"{escape(_first_sentence(str(exc))[:200])}")
+            raise typer.Exit(ExitCode.USAGE) from exc
+        # The report names its own Worker; the flag is for a report whose id the
+        # operator wants judged under a different unit.  Defaulting to "worker" would
+        # put two names for one attempt on the record.
+        judged_worker = FlowWorker(
+            id=report.worker_id, name=worker or report.worker_id,
+            objective=objective or report.summary or report.worker_id,
+            work_unit=worker or report.worker_id,
+            completion_criteria=list(criteria), output_schema=schema)
+        judged = review_outcome(
+            outcome_from_report(report), worker=judged_worker,
+            subagent_id=subagent or report.subagent_id, scope=list(scope))
+        review = judged.review
+        if review.decision is not ReviewDecision.REVISE:
+            if as_json:
+                _emit(json.dumps({"review": review.to_dict(), "next_step": "forward",
+                                  "retask": None}, indent=2, default=str))
+                raise typer.Exit(ExitCode.OK if review.passed else ExitCode.POLICY)
+            console.print()
+            console.print(render_review_record(review))
+            console.print(Text("\nno retask: the decision is not a revise", style="dim"))
+            raise typer.Exit(ExitCode.OK if review.passed else ExitCode.POLICY)
+        assignment = retask_worker(
+            review, report=report, attempt=max(2, attempt + 1),
+            objective=judged_worker.objective, criteria=judged_worker.completion_criteria,
+            output_schema=schema, subagent_id=judged.subagent_id,
+            work_unit=judged_worker.work_unit, guidance=review.guidance)
+        if as_json:
+            _emit(json.dumps({"review": review.to_dict(), "retask": assignment.to_dict(),
+                              "specificity": retask_specificity(assignment),
+                              "next_step": "retry"}, indent=2, default=str))
+            raise typer.Exit(ExitCode.POLICY)
+        console.print()
+        console.print(render_retask(assignment))
+        console.print()
+        raise typer.Exit(ExitCode.POLICY)
+
+    console.print("[red]✘[/red] choose --demo, --self-test or --next FILE")
+    raise typer.Exit(ExitCode.USAGE)
+
 # ══════════════════════════════════════════════════════════════════════════
-# 35. Entry point
+# 36. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 
