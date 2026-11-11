@@ -51303,7 +51303,8 @@ def _render_loop_report(assessment: SaturationReport,
 #     for the same unit blocks that line: it stops asking, says what it would take
 #     to unblock, and the gap travels into the report;
 # 3.  **stop** — when the mission itself is the thing making no progress (rounds
-#     that add no claims), the mission stops, with the reason on the record.
+#     that add no claims, or a round that re-aims where an earlier one aimed), the
+#     mission stops, with the series it judged on the record.
 #
 # Three facts make this more than a counter:
 #
