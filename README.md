@@ -24,6 +24,7 @@ python vedant_osint.py extract --self-test    # bounded, untrusted document extr
 python vedant_osint.py artifacts --self-test  # read-only artifact handling, no writes
 python vedant_osint.py timeline --self-test   # source vs derived time, explained links
 python vedant_osint.py outcomes --self-test  # Worker statuses, no verdicts
+python vedant_osint.py review --self-test    # seven dimensions, pass or revise
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -768,13 +769,51 @@ python vedant_osint.py outcomes --check report.json # validate a report ('-' = s
   and the gaps a Worker declares reach the Subagent's aggregate instead of being
   re-invented there.
 
+## Subagent quality review
+
+After every Worker result — including a failed, blocked, deferred or resumed one —
+its parent Subagent judges it on seven dimensions and records a **pass** or a
+**revise**, with the concrete deficiency and what to change. Nothing reaches the
+Subagent's aggregate unreviewed.
+
+```bash
+python vedant_osint.py review --self-test        # 100 review checks, offline
+python vedant_osint.py review --demo             # six results, four decisions
+python vedant_osint.py review --check report.json --schema EvidenceSet --scope example.com
+```
+
+- **Seven dimensions, each able to bite.** `completeness` (criteria and expected
+  volume), `relevance` (the finding is about *this* unit's slice), `source-quality`
+  (a secondary source cannot carry the claim; two-source confidence checked),
+  `provenance` (every item locatable, every finding citing evidence the report
+  holds), `consistency` (status vs error vs limitations, duplicated statements),
+  `scope` (every cited source inside the authorised entries) and `schema` (the shape
+  the assignment named — `EvidenceSet`, `TimelineTable`, `HashManifest`, …).
+- **A pass cannot carry a blocking deficiency, and a revise cannot omit one.** A
+  revise with no deficiency, no guidance, or no retry is refused at construction, so
+  "needs work" always arrives with the dimension, the detail and the fix.
+- **A failed tool call and a poor successful call take different paths.** A failed
+  call is `fault: tool` — retried while the budget allows, told to *try again*, and
+  its deficiencies limited to the cause, not to the schema it could not fill. Poor
+  work on a call that worked is `fault: worker` — revised with the specific
+  deficiency and a different instruction, because re-running it unchanged would fail
+  the same way. A blocked unit is neither: it stops with its reason.
+- **Nothing is forwarded unreviewed.** The review sits inside the Worker's branch
+  before the join: `HierarchicalFlow._judge` is the only exit, a bare outcome is
+  refused by `require_review`, and the aggregate takes evidence only from results
+  that passed — withheld units are named in `SubagentOutcome.withheld`, in the
+  aggregate's own payload, and in the `flow --demo` summary.
+- **The review is deterministic and offline.** It reads the record (status, evidence,
+  limitations, schema) and never asks a model to grade a model: a grader that can be
+  argued into a pass is not a control. The same result reviews identically twice.
+
 ## Status
 
 | Phase | Scope | State |
 |-------|-------|-------|
 | 1 | Foundation — CLI skeleton, config probing, version reporting | ✅ done |
 | 2 | Contracts — settings, `doctor`, preflight, models, state, renderer, lifecycle, resilience, model adapter | ✅ done |
-| 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control, Worker outcome contract) |
+| 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control, Worker outcome contract, Subagent quality review) |
 | 4 | Browser — browser-use / Playwright sessions and capture | 🟡 started (policy, scope, capture, guarded closure, agent mode) |
 | 5 | Collection — passive OSINT sources, artefact hashing | 🟡 started (source-aware web research; safe document/page extraction with injection defence; read-only artifact manifests, hashing and access ledger) |
 | 6 | Synthesis — cross-source correlation and reporting | 🟡 started (deterministic timelines, explained indicator correlation, content de-duplication) |

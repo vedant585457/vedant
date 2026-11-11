@@ -767,6 +767,45 @@ every boundary its output crosses, not requests in a prompt.
     python vedant_osint.py outcomes --check report.json # validate one report
     python vedant_osint.py outcomes --check - < report.json   # the same, from a pipe
 
+Subagent quality review: every Worker result is judged, none is forwarded
+----------------------------------------------------------------------------
+A Worker's record says what happened; it does not say whether the work is good
+enough.  That is its parent Subagent's judgement, made on seven dimensions, recorded
+before the result can reach the aggregate.
+
+*   **Seven dimensions, each a check rather than a heading**: completeness (the
+    unit's own criteria and the volume its assignment stated), relevance (the finding
+    is about *this* unit's slice), source quality (a search result or a republished
+    copy cannot carry a load-bearing observation, and medium confidence from one
+    source is refused), provenance (every item locatable, every finding citing
+    evidence the report holds), consistency (status, error and limitations agree; no
+    duplicate statements; no assessment phrased as an observation), scope (every cited
+    source inside the authorised entries) and schema (the shape the assignment named,
+    from :data:`OUTPUT_SCHEMAS`).
+*   **A decision with a concrete deficiency.**  A pass may not carry a blocking
+    deficiency, and a revise may not omit one: :class:`QualityReview` refuses both, so
+    "needs work" always arrives with the dimension, the detail and the fix.
+*   **A failed tool call is not a quality judgement.**  It is ``fault: tool`` —
+    retried while the budget allows, told to *try again*, and its deficiencies kept to
+    the cause rather than the schema it never got to fill.  Poor work on a call that
+    worked is ``fault: worker`` — revised with what to change, because re-running it
+    unchanged would fail the same way.  :func:`next_step` is that distinction as one
+    function, and :class:`ReviewPolicy` is where the budgets for each are set.
+*   **Nothing is forwarded unreviewed.**  The review lives inside the Worker's branch,
+    before the Subagent's join: :meth:`HierarchicalFlow._judge` is the only exit from
+    that node, a bare outcome is refused by :func:`require_review`, and the aggregate
+    takes evidence only from results that passed — a withheld unit is named in
+    :attr:`SubagentOutcome.withheld` instead of disappearing.
+*   **Deterministic and offline.**  The reviewer reads the record and never asks a
+    model to grade a model: the same result reviews identically twice, which is what
+    makes it a control rather than a conversation.
+
+::
+
+    python vedant_osint.py review --self-test           # 100 review checks
+    python vedant_osint.py review --demo                # six results, four decisions
+    python vedant_osint.py review --check report.json   # one result, judged
+
 Structured model adapter
 ------------------------
 One model-calling interface sits between orchestration and every provider, so
@@ -831,6 +870,7 @@ Usage
     python vedant_osint.py artifacts --self-test        # read-only artifacts, access ledger
     python vedant_osint.py timeline --self-test         # source vs derived time, links
     python vedant_osint.py outcomes --self-test         # Worker statuses, provenance
+    python vedant_osint.py review --self-test           # seven dimensions, one decision
     python vedant_osint.py extract --demo               # a hostile page, quoted and refused
     python vedant_osint.py extract --file report.docx   # what a document says, as data
     python vedant_osint.py extract --limits             # the size, time and text ceilings
@@ -929,6 +969,7 @@ import time
 import uuid
 import operator
 from asyncio import CancelledError
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -970,7 +1011,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 23
+VERSION_MINOR: int = 24
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -15362,8 +15403,14 @@ def _team_payload(name: str) -> dict[str, Any]:
                         "name": "log-correlator",
                         "objective": "correlate process records with the write window",
                         "tools": ["log.parse"],
-                        "completion_criteria": ["correlation table produced or the lack of records stated"],
-                    }
+                        # One criterion, because the assignment is indivisible: the
+                        # alternatives (a candidate, or why there is none) are one
+                        # question, and the unit is judged on whether it answered it.
+                        "completion_criteria": [
+                            "each candidate process is listed with the record placing "
+                            "it in the write window, or stated as absent",
+                        ],
+                    },
                 ],
                 "max_workers": 1,
             },
@@ -19600,7 +19647,8 @@ def worker_plan_for(draft: SubagentSpecDraft) -> WorkerPlan:
                     minimum_items=draft.evidence.minimum_items,
                     minimum_sources=draft.evidence.minimum_sources,
                 ),
-                output_schema=_schema_for(unit),
+                output_schema=_schema_for(
+                    unit, expected_items=draft.evidence.minimum_items),
                 budget=WorkerBudget(
                     max_attempts=min(unit.max_attempts, draft.termination.max_attempts_per_task),
                     timeout_seconds=WORKER_DEFAULT_SECONDS,
@@ -19650,15 +19698,22 @@ def _basis_for(unit: "WorkerInstruction", draft: SubagentSpecDraft) -> WorkUnitB
     return WorkUnitBasis.SOURCE
 
 
-def _schema_for(unit: "WorkerInstruction") -> str:
-    """The narrowest output shape this build can validate for the unit."""
+def _schema_for(unit: "WorkerInstruction", *, expected_items: int = 1) -> str:
+    """The narrowest output shape this build can validate for the unit.
+
+    Narrower is better, but never narrower than the unit's own declared volume: a
+    correlation table needs two rows to correlate, so a unit expected to return one
+    item is asked for the shape it can actually fill.  Handing it a schema it is
+    then guaranteed to fail is a plan defect dressed as a requirement — and the
+    review (§34) would rightly withhold the result.
+    """
 
     lowered = f"{unit.name} {unit.objective}".lower()
     if "hash" in lowered:
         return "HashManifest"
     if "timeline" in lowered:
         return "TimelineTable"
-    if "correlat" in lowered:
+    if "correlat" in lowered and expected_items >= 2:
         return "CorrelationTable"
     if "snapshot" in lowered:
         return "SnapshotList"
@@ -21345,6 +21400,10 @@ def run_resource_self_test() -> list[ConcurrencyCheck]:
     limited = ResourceLimits(max_concurrent_workers=2, max_concurrent_subagents=2,
                              max_concurrent_model_calls=2, max_subagents=8,
                              max_workers_per_subagent=8, queue_timeout_seconds=10.0)
+    # The runner must cite the mission's own scope: since §34 a Worker citing an
+    # out-of-scope source is *withheld* by its parent Subagent, so a runner inventing
+    # "example.com" for a forensic mission would fail the review, not the limits.
+    runner = _MeasuringRunner(scope=context.scope_entries, delay_seconds=0.02)
     parallel_flow = HierarchicalFlow(context=context, subagents=wide, runner=runner,
                                      runtime=ConcurrencyRuntime(limited))
     parallel_result = parallel_flow.run()
@@ -21788,6 +21847,10 @@ class FlowWorker(StrictModel):
     depends_on: list[str] = Field(default_factory=list)
     completion_criteria: list[str] = Field(default_factory=list)
     expected_evidence: str = ""
+    #: What this Worker was assigned to return.  Carried on the graph's own record so
+    #: the review (§34) can check the result against the shape that was asked for,
+    #: rather than against a default it invented at review time.
+    output_schema: str = "TaskResult"
     max_attempts: int = Field(default=2, ge=1, le=10)
     timeout_seconds: int = Field(default=300, ge=5, le=3600)
 
@@ -21800,6 +21863,7 @@ class FlowWorker(StrictModel):
             input_names=[item.name for item in draft.inputs],
             depends_on=[unit for unit in draft.depends_on_units()],
             completion_criteria=list(draft.completion_criteria),
+            output_schema=draft.output_schema,
             expected_evidence=draft.expected_evidence.describe(),
             max_attempts=draft.budget.max_attempts,
             timeout_seconds=draft.budget.timeout_seconds,
@@ -22005,10 +22069,11 @@ class DeterministicRunner:
                 http_status=200 if url else None,
                 excerpt=criterion[:160],
             )
+            statement = f"{worker.name}: {criterion}"
             items.append(
                 EvidenceItem(
                     kind=EvidenceKind.OBSERVATION,
-                    statement=f"{worker.name}: {criterion}",
+                    statement=statement,
                     sources=[source],
                     confidence=Confidence.LOW,
                     confidence_basis=(
@@ -22016,6 +22081,13 @@ class DeterministicRunner:
                         "not a collected finding"
                     ),
                     collected_by=worker.id,
+                    # A Worker asked for a manifest, a timeline or a correlation has to
+                    # return the shape it was asked for (§34.1): the digest is of the
+                    # text this run recorded, and the instant is when it recorded it —
+                    # both facts the runner actually has, not invented ones.
+                    observed_at=source.retrieved_at,
+                    tags=[f"sha256:{hashlib.sha256(statement.encode('utf-8')).hexdigest()}",
+                          "record"],
                 )
             )
         return items
@@ -22172,6 +22244,9 @@ class SubagentOutcome(StrictModel):
     #: Attempts beyond the first, summed over this Subagent's Workers.
     retries: int = Field(default=0, ge=0)
     seconds: float = Field(default=0.0, ge=0)
+    #: Worker ids whose results were reviewed and *not* forwarded (§34).  A name
+    #: here is a unit that ran, was judged, and whose work the aggregate refused.
+    withheld: list[str] = Field(default_factory=list)
 
     @property
     def evidence_ids(self) -> list[str]:
@@ -22204,6 +22279,9 @@ class SubagentOutcome(StrictModel):
             "evidence": len(self.evidence),
             "retries": self.retries,
             "reviews": len(self.reviews),
+            # §34: the ids the parent Subagent judged and did not forward, so the
+            # aggregate's own payload says what is missing from it.
+            "withheld": list(self.withheld),
             "join": self.aggregate_basis.describe() if self.aggregate_basis else "not met",
             "seconds": round(self.seconds, 3),
             "gaps": [gap.describe() for gap in self.gaps],
@@ -22259,6 +22337,20 @@ class FlowResult(StrictModel):
     browser: dict[str, Any] = Field(default_factory=dict)
     #: What the source-aware audit found in the research reports this run produced.
     research: dict[str, Any] = Field(default_factory=dict)
+    #: Every Worker result's review (§34), and what was withheld because of it.
+    reviews: "ReviewLedger | None" = None
+
+    @property
+    def review_summary(self) -> dict[str, Any]:
+        """The counts of the reviews behind this result — empty when none ran."""
+
+        if self.reviews is None:
+            return {}
+        return {"reviews": len(self.reviews.results),
+                "decisions": {name: ids for name, ids
+                              in self.reviews.by_decision().items() if ids},
+                "forwarded": len(self.reviews.forwarded),
+                "withheld": len(self.reviews.withheld)}
 
     @property
     def total_workers(self) -> int:
@@ -22296,6 +22388,8 @@ class FlowResult(StrictModel):
             "concurrency": self.concurrency,
             "resume": self.resume,
             "checkpoint": self.checkpoint,
+            "reviews": self.reviews.to_dict() if self.reviews is not None else None,
+            "review_summary": self.review_summary,
             "seconds": round(self.seconds, 3),
             "stage_order": self.stage_order(),
             "trace": self.trace,
@@ -22502,6 +22596,10 @@ class HierarchicalFlow:
         #: Worker evidence already on record, so an adopted outcome keeps its facts
         #: even when the caller supplied no store.
         self._adopted_evidence: dict[str, list[EvidenceItem]] = {}
+        #: Every Worker result with its parent Subagent's review (§34).  Appended by
+        #: the worker node for *every* path out of a branch, so a failed, blocked or
+        #: adopted unit is on this list too.
+        self._reviews: list[ReviewedWorkerResult] = []
 
     def _limits_for_run(self) -> ResourceLimits:
         """The mission's limits, derived from the policy when none were given."""
@@ -23101,7 +23199,13 @@ class HierarchicalFlow:
                 for worker in subagent.workers]
 
     def _node_worker(self, state: Mapping[str, Any]) -> dict[str, Any]:
-        """Run one Worker's attempt→review→retry graph, inside its own branch."""
+        """Run one Worker's attempt→review→retry graph, inside its own branch.
+
+        §34: every way out of this node — deferred, adopted, refused, deferred by
+        backpressure, cancelled, crashed, or finished — passes through
+        :meth:`_judge`, which records the parent Subagent's review before the
+        outcome can reach the aggregate.  There is no other exit.
+        """
 
         subagent = self._by_id[str(state.get("subagent"))]
         worker = subagent.worker(str(state.get("worker")))
@@ -23109,24 +23213,27 @@ class HierarchicalFlow:
             return {"outcomes": [], "reviews": []}
         gate = self._blocked(subagent, worker)
         if gate is not FlowGate.NONE:
-            return {"outcomes": [json.loads(model_to_json(
-                        self._blocked_outcome(subagent, worker, gate)))], "reviews": []}
+            blocked = self._blocked_outcome(subagent, worker, gate)
+            return self._judge(subagent, worker, blocked, path="deferred",
+                               gate=gate, why=blocked.error or gate.value)
 
         # A resumed run answers a settled unit from its record: no slot, no
-        # runner, no second copy of the evidence.
+        # runner, no second copy of the evidence.  It is still judged — a review is
+        # not re-run, but its absence would leave the unit unreviewed on this path.
         adopted = self._adopt_worker(subagent, worker)
         if adopted is not None:
             outcome, verdict = adopted
-            return {"outcomes": [json.loads(model_to_json(outcome))],
-                    "reviews": ([] if verdict is None
-                                else [json.loads(model_to_json(verdict))])}
+            return self._judge(subagent, worker, outcome, path="adopted",
+                               evidence=self._adopted_evidence.get(worker.id, ()),
+                               keep_verdict=verdict)
 
         # The router is asked *before* a slot is taken: a Worker with nothing it
         # is allowed to do should not consume the capacity one that can work needs.
         refused = self._route_worker(subagent, worker)
         if refused is not None:
             self._settled[subagent.id].add(worker.id)
-            return {"outcomes": [json.loads(model_to_json(refused))], "reviews": []}
+            return self._judge(subagent, worker, refused, path="refused",
+                               gate=FlowGate.ERROR, why=refused.error or "capability refused")
 
         try:
             # The Worker holds one worker slot for its whole attempt→review loop;
@@ -23139,28 +23246,111 @@ class HierarchicalFlow:
         except (QueueTimeout, BudgetExceeded) as exc:
             # Backpressure, not a crash: the unit is deferred with its reason and
             # the graph keeps its join intact.
-            return {"outcomes": [json.loads(model_to_json(
-                        self._blocked_outcome(subagent, worker, FlowGate.BUDGET,
-                                              why=redact_text(str(exc))[:120])))],
-                    "reviews": []}
+            deferred = self._blocked_outcome(subagent, worker, FlowGate.BUDGET,
+                                             why=redact_text(str(exc))[:120])
+            return self._judge(subagent, worker, deferred, path="deferred",
+                               gate=FlowGate.BUDGET, why=deferred.error or "")
         except CancellationRequested as exc:
-            return {"outcomes": [json.loads(model_to_json(
-                        self._blocked_outcome(subagent, worker, FlowGate.CANCELLED,
-                                              why=redact_text(str(exc))[:120])))],
-                    "reviews": []}
+            cancelled = self._blocked_outcome(subagent, worker, FlowGate.CANCELLED,
+                                              why=redact_text(str(exc))[:120])
+            return self._judge(subagent, worker, cancelled, path="deferred",
+                               gate=FlowGate.CANCELLED, why=cancelled.error or "")
         except Exception as exc:              # noqa: BLE001 - a unit never kills the mission
-            return {"outcomes": [json.loads(model_to_json(
-                        self._blocked_outcome(subagent, worker, FlowGate.ERROR,
-                                              why=f"{type(exc).__name__}: {str(exc)}"[:120])))],
-                    "reviews": []}
+            crashed = self._blocked_outcome(subagent, worker, FlowGate.ERROR,
+                                            why=f"{type(exc).__name__}: {str(exc)}"[:120])
+            return self._judge(subagent, worker, crashed, path="deferred",
+                               gate=FlowGate.ERROR, why=crashed.error or "")
         outcome = WorkerOutcome.model_validate(result["outcome"])
         verdict = ReviewVerdict.model_validate(result["verdict"])
         self._gates[worker.id] = FlowGate.NONE if verdict.approved else (
             FlowGate.RETRY_EXHAUSTED if verdict.verdict == "revise" else FlowGate.REVIEW_REJECTED)
         self._settled[subagent.id].add(worker.id)
         self._record_in_store(subagent, worker, outcome)
+        return self._judge(subagent, worker, outcome, path="runner",
+                           keep_verdict=verdict)
+
+    # -- 3b. the review gate (§34) -----------------------------------------
+
+    def _judge(self, subagent: FlowSubagent, worker: FlowWorker,
+               outcome: WorkerOutcome, *, path: str,
+               gate: FlowGate | None = None, why: str = "",
+               evidence: Sequence[EvidenceItem] = (),
+               keep_verdict: ReviewVerdict | None = None) -> dict[str, Any]:
+        """Review one Worker result, record it, and return the branch's payload.
+
+        This is the *only* way out of :meth:`_node_worker`, so a path that skipped it
+        would have to be a new path.  The review is always the parent Subagent's own
+        (§34's dimension checks), augmented — never replaced — by the runner's
+        verdict, which the graph already needs for its retry edge.
+        """
+
+        report = report_from_outcome(outcome)
+        if evidence:
+            # An adopted outcome's evidence lives in the checkpoint, so the report
+            # built from the outcome alone would have ids but no items.
+            known = {item.id for item in report.evidence}
+            extra = [item for item in evidence if item.id not in known]
+            if extra:
+                report = report.model_copy(update={
+                    "evidence": [*report.evidence, *extra],
+                    "sources": _sources_from_evidence([*report.evidence, *extra])})
+        judged = review_outcome(
+            outcome, worker=worker, subagent_id=subagent.id,
+            scope=self.context.scope_entries, path=path,
+            observations=_observations_for_path(gate, why))
+        # A review is not a veto on the graph's own record: the runner's verdict
+        # already decided any retry, so it is preserved beside the quality review.
+        self._reviews.append(judged)
+        # Two judgements share this stage and both belong in the ledger: the runner's
+        # verdict (which drives the retry edge, recorded by the Worker's own review
+        # node) and this quality review (which decides what is forwarded).  They are
+        # labelled so a reader can tell which row is which.
+        self._record(FlowStage.REVIEW, unit=worker.id, parent=subagent.id,
+                     detail=f"quality review: {judged.review.decision.value} "
+                            f"({path}): {judged.review.describe()[:96]}")
+        verdict = keep_verdict or self._verdict_for(judged.review, worker)
         return {"outcomes": [json.loads(model_to_json(outcome))],
-                "reviews": [json.loads(model_to_json(verdict))]}
+                "reviews": ([] if keep_verdict is None
+                            else [json.loads(model_to_json(keep_verdict))]),
+                "verdict": json.loads(model_to_json(verdict))}
+
+    @staticmethod
+    def _verdict_for(review: QualityReview, worker: FlowWorker) -> ReviewVerdict:
+        """The graph's verdict, derived from the quality review when there is none.
+
+        The graph needs a :class:`ReviewVerdict` for its retry edge; the review is what
+        says whether another attempt is worth making.  Keeping the two records
+        separate is deliberate: one is the Subagent's judgement of the work, the other
+        is the graph's instruction to itself.
+        """
+
+        if review.decision is ReviewDecision.PASS:
+            return ReviewVerdict(worker_id=worker.id, approved=True, verdict="pass",
+                                 criteria=list(worker.completion_criteria),
+                                 reviewer="subagent-review")
+        findings = [item.describe for item in review.deficiencies] or [
+            f"no blocking deficiency was recorded ({review.decision.value})"]
+        return ReviewVerdict(
+            worker_id=worker.id, approved=False,
+            verdict=("revise" if review.decision is ReviewDecision.REVISE else "reject"),
+            criteria=list(worker.completion_criteria), findings=findings,
+            retry=review.retry, guidance=review.guidance or review.stop_reason or
+            "record the gap and stop this unit",
+            reviewer="subagent-review")
+
+    def review_ledger(self) -> ReviewLedger:
+        """Every Worker result this run reviewed, with its verdict."""
+
+        return review_ledger(self._reviews)
+
+    def run_with_reviews(self) -> FlowResult:
+        """Run the mission; the result carries every Worker result's review (§34).
+
+        The review is not a mode: :meth:`run` and this method are the same run, and
+        this name exists so a caller can read the intent at the call site.
+        """
+
+        return self.run()
 
     def _close_browser(self, *, reason: str) -> dict[str, Any]:
         """Close the browser this run opened, whatever else happened.
@@ -23409,7 +23599,8 @@ class HierarchicalFlow:
 
         self._record(FlowStage.REVIEW, unit=worker.id, parent=subagent.id,
                      wave=int(state.get("wave") or 0),
-                     detail=f"{verdict.verdict} (attempt {round_number}/{allowed})")
+                     detail=f"runner verdict: {verdict.verdict} "
+                            f"(attempt {round_number}/{allowed})")
         if self.tracker is not None and verdict.retry:
             self.tracker.review(subagent.id, verdict=verdict.verdict,
                                 criterion=(verdict.criteria or ["completion"])[0],
@@ -23464,6 +23655,7 @@ class HierarchicalFlow:
             latest[outcome.worker_id] = outcome
         evidence: list[EvidenceItem] = []
         gaps: list[UnknownValue] = []
+        withheld: list[QualityReview] = []
         retries = 0
         for worker in subagent.workers:
             outcome = latest.get(worker.id)
@@ -23483,6 +23675,19 @@ class HierarchicalFlow:
                 else:
                     for payload in outcome.payload.get("evidence", []):
                         evidence.append(EvidenceItem.model_validate(payload))
+                # §34: the aggregate may not take a Worker's word for it.  Every
+                # result that reaches this loop has a review — the node refuses to
+                # return without one — and the review decides whether its work is
+                # forwarded or withheld.
+                judged = self.review_ledger().for_worker(worker.id)
+                if judged is None:            # pragma: no cover - the node always judges
+                    raise UnreviewedResult(worker.id, stage="subagent-aggregate")
+                if not judged.forwarded:
+                    withheld.append(judged.review)
+                    mine = set(judged.report.evidence_ids if judged.report else [])
+                    kept = [item for item in evidence if item.id not in mine]
+                    evidence.clear()
+                    evidence.extend(kept)
                 report = _report_of(outcome)
                 if report is not None:
                     # The gaps the Worker itself declared travel with its evidence: a
@@ -23517,6 +23722,9 @@ class HierarchicalFlow:
             reviews=reviews, evidence=evidence, aggregate_basis=barrier,
             open_questions=list(subagent.addresses_questions), gaps=gaps,
             retries=retries, seconds=time.monotonic() - started,
+            # What was judged and not forwarded, so a withheld result is visible in
+            # the aggregate rather than merely absent from it (§34).
+            withheld=sorted({review.worker_id for review in withheld}),
         )
         self._record(FlowStage.SUBAGENT_AGGREGATE, unit=subagent.id, parent="master",
                      detail=f"{barrier.describe()}; {len(evidence)} evidence item(s), "
@@ -23677,6 +23885,7 @@ class HierarchicalFlow:
             checkpoint=(str(self.resume.store.path_for(self.mission_id))
                         if self.resume is not None else ""),
             browser=browser_summary,
+            reviews=self.review_ledger(),
             research={"workers": len(self._research),
                       "audits": {worker_id: audit["audit"]
                                  for worker_id, audit in self._research.items()},
@@ -24131,6 +24340,23 @@ def run_flow_self_test(console: "Console | None" = None) -> list[FlowCheck]:
         payload["stage_order"] == result.stage_order(), payload["stage_order"])
     add("the result records the structure it compiled",
         payload["structure"] == structures["master"], payload["structure"])
+
+    # ---- 11. every result on the way out was judged (§34) --------------
+    ledger = flow.review_ledger()
+    add("every Worker result in the run was reviewed",
+        ledger.reviewed_count == len(ledger.results) > 0,
+        f"{ledger.reviewed_count}/{len(ledger.results)}")
+    add("the review is a row in the ledger, not a side note",
+        any(str(event.get("detail", "")).startswith("quality review:")
+            for event in result.trace),
+        [e.get("detail") for e in result.trace if "quality" in str(e.get("detail", ""))][:1])
+    add("the result carries its reviews",
+        payload["review_summary"].get("reviews") == len(ledger.results),
+        payload["review_summary"])
+    add("each aggregate says what was withheld from it",
+        all("withheld" in report.to_dict() for report in result.reports))
+    add("nothing is forwarded unreviewed",
+        all(item.forwarded or item.review.reviewed for item in ledger.results))
     return checks
 
 
@@ -24222,6 +24448,8 @@ def _flow_demo(objective_key: str, *, out_dir: Path | None = None,
         "stopped": result.stopped,
         "stop_reason": result.stop_reason,
         "policy": json.loads(model_to_json(result.policy)),
+        "reviews": result.reviews.to_dict() if result.reviews is not None else None,
+        "review_summary": result.review_summary,
         "trace": result.trace,
         "runtime_only": True,
         "browser": result.browser,
@@ -24260,6 +24488,14 @@ def render_flow_summary(payload: Mapping[str, Any]) -> Table:
     table.add_row("threads", f"{len(payload['threads'])} "
                              + escape(", ".join(payload["threads"][:3])))
     table.add_row("evidence", str(payload["evidence"]))
+    # §34: what the Subagents judged, and what the mission therefore withheld.
+    reviews = payload.get("review_summary") or {}
+    if reviews.get("decisions"):
+        table.add_row("review decisions", escape(", ".join(
+            f"{len(ids)} {decision}" for decision, ids in
+            sorted(reviews["decisions"].items(), key=lambda pair: -len(pair[1])))))
+        table.add_row("withheld at review",
+                      f"{reviews.get('withheld', 0)} of {reviews.get('reviews', 0)}")
     table.add_row("runtime", f"{payload['seconds']}s")
     synthesis = payload.get("synthesis") or {}
     basis = synthesis.get("aggregate_basis") or {}
@@ -24277,9 +24513,12 @@ def render_flow_timeline(payload: Mapping[str, Any], *, limit: int = 30) -> Tabl
     table.add_column("#", justify="right", no_wrap=True)
     table.add_column("at", justify="right", no_wrap=True)
     table.add_column("stage", no_wrap=True)
-    table.add_column("unit", overflow="fold")
+    table.add_column("unit", overflow="fold", max_width=34)
     table.add_column("wave", justify="right", no_wrap=True)
     table.add_column("thread", no_wrap=True)
+    # The detail column is where §34 becomes visible in a run: a review row says
+    # what was decided and why, instead of leaving the reader to fetch the ledger.
+    table.add_column("detail", overflow="fold", max_width=44)
     rows = payload["trace"]
     names = {sub["id"]: sub["role"] for sub in payload["subagents"]}
     for event in rows[:limit]:
@@ -24287,7 +24526,8 @@ def render_flow_timeline(payload: Mapping[str, Any], *, limit: int = 30) -> Tabl
         where = f"{names.get(event.get('parent'), event.get('parent'))}/{unit}" \
             if event.get("parent") and event.get("unit") else names.get(unit, unit)
         table.add_row(str(event["seq"]), f"{event['at']:.3f}s", str(event["stage"]),
-                      escape(str(where)), str(event["wave"]), escape(str(event["thread"])))
+                      escape(str(where)), str(event["wave"]), escape(str(event["thread"])),
+                      escape(str(event.get("detail") or "")))
     if len(rows) > limit:
         table.add_row("…", "", "", f"{len(rows) - limit} more event(s)", "", "")
     return table
@@ -24404,6 +24644,7 @@ def flow_command(
                     ("workers", ", ".join(report["workers"])),
                     ("evidence", report["evidence"]),
                     ("reviews", report["reviews"]),
+                    ("withheld", ", ".join(report.get("withheld") or []) or "none"),
                     ("retries", report["retries"]),
                     ("join", report["join"]),
                     ("gaps", "; ".join(report["gaps"]) or "none"),
@@ -34542,7 +34783,7 @@ def run_extraction_self_test() -> list[ExtractionCheck]:
         not any(capability.value in page.text for capability in Capability),
         [capability.value for capability in Capability
          if capability.value in page.text])
-    entry = _source_section("# 30. Safe document and page extraction", "# 34. Entry point")
+    entry = _source_section("# 30. Safe document and page extraction", "# 35. Entry point")
     add("the extraction section grants no capability",
         bool(entry) and "CapabilityGrant(" not in entry, len(entry))
     add("the extraction section never constructs a router",
@@ -41086,7 +41327,7 @@ def run_outcome_self_test() -> list[OutcomeCheck]:
                 for payload in demo["reports"].values())))
 
     # ---- 12. the section's own discipline ---------------------------------
-    section = _source_section("# 33. Worker outcomes", "# 34. Entry point")
+    section = _source_section("# 33. Worker outcomes", "# 34.1 The output schema")
     add(_oc("the Worker-outcome section is present and bounded", bool(section),
             len(section)))
     add(_oc("the section grants no capability",
@@ -41356,7 +41597,2128 @@ def outcomes_command(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 34. Entry point
+# 34. Subagent quality review: every Worker result is judged, none is forwarded
+# ══════════════════════════════════════════════════════════════════════════
+#
+# §33 fixed what a Worker may return.  This section is the other half: the parent
+# Subagent's judgement of what came back, along exactly the seven dimensions the
+# task names, and a decision — pass or revise — with the deficiency that caused it.
+#
+# Two properties are the point, and both are structural:
+#
+# 1.  **Nothing is forwarded unreviewed.**  The review lives inside the Worker's
+#     branch, before the Subagent's join.  A failed, blocked, deferred, refused or
+#     resumed result is reviewed too: a unit that produced nothing still has to be
+#     judged, because "no result" is a fact the aggregate must be able to cite.
+# 2.  **A failed call and a poor call are different paths.**  A failed tool call is
+#     not a quality judgement: the tool broke, so re-running the same unit may
+#     legitimately fix it, and the decision is `retry`/`blocked`/`failed` with the
+#     error as the deficiency.  A successful call that ignores its mandate is a
+#     `revise` with a *specific* deficiency and guidance, and a re-run without a
+#     change of approach would just fail the same way.
+#
+# The reviewer is deterministic and offline.  It reads the record the Worker
+# returned — statuses, evidence, sources, limitations, schema — and never asks a
+# model to grade another model, because a grader that can be argued into a pass is
+# not a control.
+
+
+class ReviewDimension(str, Enum):
+    """The seven things a Subagent checks, and nothing else.
+
+    Naming them is not documentation: every deficiency is attached to one of these,
+    so a revise that cites none of them cannot exist, and a review that skipped a
+    dimension says so in :attr:`QualityReview.checked` rather than implying it
+    looked.
+    """
+
+    COMPLETENESS = "completeness"      # the unit's criteria and expected volume were done
+    RELEVANCE = "relevance"            # what came back is about the unit's slice
+    SOURCE_QUALITY = "source-quality"  # the sources are the kind that can carry the claim
+    PROVENANCE = "provenance"          # every claim is traceable to a locator
+    CONSISTENCY = "consistency"        # the record does not contradict itself
+    SCOPE = "scope"                    # nothing outside the authorised scope was touched
+    SCHEMA = "schema"                  # the output satisfies the assignment's schema
+
+    @property
+    def rank(self) -> int:
+        return list(ReviewDimension).index(self)
+
+
+#: The order they are checked and reported in.  Fixed, so two runs of the same record
+#: produce the same review down to the order of its deficiencies.
+REVIEW_DIMENSIONS: tuple[ReviewDimension, ...] = tuple(ReviewDimension)
+
+
+class DeficiencyKind(str, Enum):
+    """What sort of thing is wrong.  The kind decides how a retry is handled."""
+
+    TOOL_FAILURE = "tool-failure"        # the tool broke; the Worker did not fail
+    BLOCKED = "blocked"                  # a dependency, permission or policy stop
+    EMPTY = "empty"                      # the run succeeded and returned nothing usable
+    INCOMPLETE = "incomplete"            # fewer items than the assignment required
+    IRRELEVANT = "irrelevant"            # the work is not about the assigned slice
+    WEAK_SOURCE = "weak-source"          # the source cannot carry the claim
+    UNSOURCED = "unsourced"             # a claim with no locator behind it
+    INCONSISTENT = "inconsistent"        # the record contradicts itself
+    OUT_OF_SCOPE = "out-of-scope"        # work outside the authorised scope
+    WRONG_SHAPE = "wrong-shape"          # the output does not satisfy the schema
+    UNREVIEWABLE = "unreviewable"        # nothing usable to judge against
+    UNREVIEWED = "unreviewed"            # the branch never produced a review
+
+    @property
+    def fault(self) -> "WorkflowFault":
+        """Whose problem this is — the tool's, the mission's, or the Worker's."""
+
+        if self is DeficiencyKind.TOOL_FAILURE:
+            # The *call* failed: a different rule decides its retry (§34.4), which is
+            # the whole point of separating it from bad work.
+            return WorkflowFault.TOOL
+        if self in {DeficiencyKind.BLOCKED, DeficiencyKind.UNREVIEWABLE}:
+            return WorkflowFault.ENVIRONMENT
+        if self in {DeficiencyKind.IRRELEVANT, DeficiencyKind.WEAK_SOURCE,
+                    DeficiencyKind.UNSOURCED, DeficiencyKind.INCONSISTENT,
+                    DeficiencyKind.OUT_OF_SCOPE, DeficiencyKind.WRONG_SHAPE,
+                    DeficiencyKind.INCOMPLETE, DeficiencyKind.EMPTY}:
+            return WorkflowFault.WORKER
+        return WorkflowFault.UNKNOWN
+
+
+class WorkflowFault(str, Enum):
+    """Where a deficiency came from.  The distinction the task's clauses turn on."""
+
+    TOOL = "tool"                # the call itself failed
+    WORKER = "worker"            # the call worked; the work is not good enough
+    ENVIRONMENT = "environment"  # nothing to do with the attempt's quality
+    UNKNOWN = "unknown"
+
+
+class ReviewDecision(str, Enum):
+    """Pass, direct a revision, or record a stop.  Four outcomes, all reviewed."""
+
+    PASS = "pass"          # forwarded to the Subagent's aggregate
+    REVISE = "revise"      # sent back with the deficiency and what to change
+    BLOCKED = "blocked"    # cannot be fixed by trying again: a named stop
+    FAILED = "failed"      # the attempt failed and no revision is possible or left
+
+    @property
+    def forwards(self) -> bool:
+        """Whether the result may be forwarded — including a partial one."""
+
+        return self is ReviewDecision.PASS
+
+    @property
+    def actionable(self) -> bool:
+        """Whether another attempt could change the outcome."""
+
+        return self is ReviewDecision.REVISE
+
+
+class ReviewDimensionError(ValueError):
+    """A review that tries to pass a record with an open deficiency."""
+
+
+class Deficiency(StrictModel):
+    """One concrete thing wrong, the dimension it belongs to, and what fixes it.
+
+    ``detail`` is required and must be specific: "low quality" is refused by
+    length, because a deficiency a Worker cannot act on is a shrug with a field.
+    """
+
+    dimension: ReviewDimension
+    kind: DeficiencyKind
+    detail: str = Field(min_length=12)
+    evidence_ids: list[str] = Field(default_factory=list)
+    fix: str = Field(min_length=8)
+    blocking: bool = True
+    #: A short, citation-ready line for the aggregate; built from the fields above.
+    @property
+    def describe(self) -> str:
+        return f"{self.dimension.value}/{self.kind.value}: {self.detail}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "dimension": self.dimension.value,
+            "kind": self.kind.value,
+            "fault": self.kind.fault.value,
+            "detail": self.detail,
+            "evidence_ids": list(self.evidence_ids),
+            "fix": self.fix,
+            "blocking": self.blocking,
+        }
+
+
+class DimensionResult(StrictModel):
+    """What one dimension found.  ``ok`` is derived, so a pass cannot be asserted."""
+
+    dimension: ReviewDimension
+    deficiencies: list[Deficiency] = Field(default_factory=list)
+    note: str = ""
+
+    @model_validator(mode="after")
+    def _consistent(self) -> "DimensionResult":
+        for deficiency in self.deficiencies:
+            if deficiency.dimension is not self.dimension:
+                raise ValueError(
+                    f"a {self.dimension.value} result cannot hold a "
+                    f"{deficiency.dimension.value} deficiency")
+        return self
+
+    @property
+    def ok(self) -> bool:
+        return not self.deficiencies
+
+    @property
+    def blocking(self) -> list[Deficiency]:
+        return [item for item in self.deficiencies if item.blocking]
+
+    def describe(self) -> str:
+        if self.ok:
+            return f"{self.dimension.value}: ok" + (f" — {self.note}" if self.note else "")
+        return (f"{self.dimension.value}: {len(self.deficiencies)} deficiency(ies) — "
+                + "; ".join(item.detail for item in self.deficiencies)[:160])
+
+
+class QualityReview(StrictModel):
+    """The parent Subagent's verdict on one Worker result.
+
+    The acceptance clause is a field: ``reviewed`` is true on every review this
+    module can build, and :class:`UnreviewedResult` is what happens when a branch
+    tries to forward a result without one — there is no path from a Worker outcome
+    to an aggregate that skips this record.
+    """
+
+    worker_id: str = Field(min_length=1)
+    subagent_id: str = Field(min_length=1)
+    task_id: str = ""
+    attempt: int = Field(default=1, ge=1)
+    #: What the Worker returned, restated in this section's vocabulary.
+    worker_status: WorkerStatus
+    decision: ReviewDecision
+
+    #: One entry per dimension that was checked, in :data:`REVIEW_DIMENSIONS` order.
+    checks: list[DimensionResult] = Field(default_factory=list)
+    #: The dimensions this review actually performed, deduplicated and ordered.
+    checked: list[ReviewDimension] = Field(default_factory=list)
+    #: The blocking deficiencies, in the order they were found.
+    deficiencies: list[Deficiency] = Field(default_factory=list)
+    #: What a revision must change.  Empty on a pass; required on a revise.
+    guidance: str = ""
+    retry: bool = False
+    #: Set when the decision is BLOCKED or FAILED: why no further attempt helps.
+    stop_reason: str = ""
+
+    #: True by construction.  A record that crossed a boundary can be asked.
+    reviewed: bool = True
+    reviewer: str = "subagent"
+    #: How the result travelled: "runner", "tool-failure", "deferred", "refused",
+    #: "adopted", "recovered".  Part of the provenance of the verdict itself.
+    path: str = "runner"
+    seconds: float = Field(default=0.0, ge=0)
+
+    @model_validator(mode="after")
+    def _coherent(self) -> "QualityReview":
+        if not self.reviewed:
+            raise ValueError("a QualityReview that was not performed is not a review")
+        if not self.checked:
+            raise ValueError("a review must state which dimensions it checked")
+        # 1. A blocking deficiency and a pass are contradictory.
+        if self.decision.forwards and self.blocking_deficiencies:
+            raise ReviewDimensionError(
+                f"a pass may not carry a blocking deficiency: "
+                f"{self.blocking_deficiencies[0].detail}")
+        if self.decision.forwards and self.retry:
+            raise ValueError("a pass cannot also ask for a retry")
+        # 2. A revise must say what to change, and must cite at least one deficiency.
+        if self.decision is ReviewDecision.REVISE:
+            if not self.deficiencies:
+                raise ValueError("a revise must name the deficiency behind it")
+            if not self.guidance.strip():
+                raise ValueError("a revise must say what to change")
+            if not self.retry:
+                raise ValueError("a revise without a retry would discard the unit's work")
+        # 3. A stop must give its reason.
+        if self.decision in {ReviewDecision.BLOCKED, ReviewDecision.FAILED} \
+                and not self.stop_reason.strip():
+            raise ValueError(f"a {self.decision.value} decision must give its reason")
+        # 4. Every deficiency is attached to a dimension that was checked.
+        for deficiency in self.deficiencies:
+            if deficiency.dimension not in self.checked:
+                raise ValueError(
+                    f"a {deficiency.dimension.value} deficiency was reported but that "
+                    "dimension is not among those checked")
+        return self
+
+    # -- views a reader or the next stage needs ---------------------------
+
+    @property
+    def blocking_deficiencies(self) -> list[Deficiency]:
+        return [item for item in self.deficiencies if item.blocking]
+
+    @property
+    def passed(self) -> bool:
+        return self.decision is ReviewDecision.PASS
+
+    @property
+    def fault(self) -> WorkflowFault:
+        """Whether this was the tool's failure or the Worker's poor work."""
+
+        if not self.deficiencies:
+            return WorkflowFault.UNKNOWN
+        primary = self.deficiencies[0]
+        return primary.kind.fault if primary.kind is not DeficiencyKind.EMPTY \
+            else WorkflowFault.WORKER
+
+    def dimension(self, dimension: ReviewDimension) -> DimensionResult | None:
+        return next((check for check in self.checks if check.dimension is dimension), None)
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "QualityReview":
+        """Reload a review this build wrote, dropping the derived display keys.
+
+        A review is stored beside the case file it belongs to, so it has to come back:
+        ``to_dict`` adds ``fault`` for the reader and an ``ok`` per dimension, and
+        neither is a field.  Everything else is validated again on the way in.
+        """
+
+        def clean(item: Mapping[str, Any]) -> dict[str, Any]:
+            """Drop the keys that are derived for the reader, at any depth."""
+
+            out = {key: value for key, value in item.items() if key not in {"fault", "ok"}}
+            for key in ("deficiencies", "checks"):
+                if isinstance(out.get(key), list):
+                    out[key] = [clean(entry) for entry in out[key]
+                                if isinstance(entry, Mapping)]
+            return out
+
+        return cls.model_validate(clean(dict(payload)))
+
+    def describe(self) -> str:
+        return (f"{self.decision.value} on {self.worker_id} "
+                f"(attempt {self.attempt}, {self.worker_status.value}): "
+                f"{len(self.checked)}/{len(REVIEW_DIMENSIONS)} dimension(s) checked, "
+                f"{len(self.deficiencies)} deficiency(ies)"
+                + ("" if not self.guidance else f" — {self.guidance[:80]}"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "worker_id": self.worker_id,
+            "subagent_id": self.subagent_id,
+            "task_id": self.task_id,
+            "attempt": self.attempt,
+            "worker_status": self.worker_status.value,
+            "decision": self.decision.value,
+            "reviewed": self.reviewed,
+            "path": self.path,
+            "fault": self.fault.value,
+            "checked": [dimension.value for dimension in self.checked],
+            "checks": [{"dimension": check.dimension.value, "ok": check.ok,
+                        "note": check.note,
+                        "deficiencies": [item.to_dict() for item in check.deficiencies]}
+                       for check in self.checks],
+            "deficiencies": [item.to_dict() for item in self.deficiencies],
+            "guidance": self.guidance,
+            "retry": self.retry,
+            "stop_reason": self.stop_reason,
+            "reviewer": self.reviewer,
+            "seconds": round(self.seconds, 3),
+        }
+
+
+class UnreviewedResult(RuntimeError):
+    """Raised when a Worker result would be forwarded with no review at all.
+
+    A programming error, not a mission failure: it exists so that an edit which
+    wires an aggregate straight to a runner fails loudly in the self-test, instead
+    of quietly forwarding work nobody judged.
+    """
+
+    def __init__(self, worker_id: str, *, stage: str = "aggregate") -> None:
+        self.worker_id = worker_id
+        self.stage = stage
+        super().__init__(
+            f"{stage}: worker {worker_id!r} has no review; a result may not be "
+            "forwarded until its parent Subagent has judged it")
+
+
+# --------------------------------------------------------------------------
+# 34.1 The output schema each Worker was assigned, as a real check
+# --------------------------------------------------------------------------
+
+#: What each schema in :data:`OUTPUT_SCHEMAS` requires of the record, stated as the
+#: predicate the reviewer applies.  One row per schema, so a schema that no check
+#: covers cannot be added to the plan without this table changing.
+SCHEMA_REQUIREMENTS: dict[str, str] = {
+    "TaskResult": "a summary and at least one finding",
+    "EvidenceSet": "findings with evidence and a source reference",
+    "TimelineTable": "a dated instant on every event",
+    "HashManifest": "a content hash on the evidence",
+    "CorrelationTable": "evidence sharing an indicator kind with another item",
+    "SnapshotList": "each item retrievable at a stated time",
+}
+
+
+#: A digest carried in a tag: the algorithm and its hex, or bare 64 hex characters.
+_HASH_TAG = re.compile(r"^(?:sha(?:1|256|512)|md5):[0-9a-f]{16,}$|^[0-9a-f]{64}$", re.I)
+
+
+def _schema_problem(report: WorkerReport, schema: str) -> str:
+    """Why this report does not satisfy ``schema``; empty when it does.
+
+    Deliberately literal: each schema asks for something the record either has or
+    does not.  A schema that required a judgement would be a rubric, not a schema.
+    """
+
+    if not report.evidence and not report.findings:
+        return f"{schema}: the report contains neither evidence nor findings"
+    if schema == "EvidenceSet":
+        if not report.findings:
+            return "EvidenceSet: findings are required, and none were returned"
+        if not any(item.sources for item in report.evidence):
+            return "EvidenceSet: every item must carry a source reference, and none does"
+    elif schema == "TimelineTable":
+        undated = [item.id for item in report.evidence if item.observed_at is None]
+        if not report.evidence or len(undated) == len(report.evidence):
+            return "TimelineTable: no event carries an observed instant"
+    elif schema == "HashManifest":
+        def hashed(item: EvidenceItem) -> bool:
+            custody_hash = item.custody.integrity_hash if item.custody else None
+            # A ``sha256:<hex>`` tag, or a 64-hex tag on its own.  Matching on the
+            # word "hash" alone would accept the *label* of a hash with no digest.
+            return (custody_hash is not None
+                    or any(_HASH_TAG.match(tag) is not None for tag in item.tags))
+
+        if not any(hashed(item) for item in report.evidence):
+            return "HashManifest: no item carries a hash"
+    elif schema == "CorrelationTable":
+        # Items of a *kind* that more than one item shares: an indicator observed once
+        # is not a correlation, however many tags it carries.
+        shared = Counter(item.kind for item in report.evidence)
+        if sum(1 for count in shared.values() if count >= 2) < 1:
+            return "CorrelationTable: correlation needs at least two items sharing a kind"
+    elif schema == "SnapshotList":
+        # ``retrieved_at`` is defaulted at construction, so it is always present and
+        # would make this check unfalsifiable.  What a snapshot list needs is the
+        # *method*: how the capture was made, stated rather than assumed.
+        stated = [item for item in report.evidence if item.sources and all(
+            source.retrieval_method is not RetrievalMethod.UNKNOWN
+            for source in item.sources)]
+        if not stated or len(stated) != len(report.evidence):
+            return "SnapshotList: each item must state how it was captured"
+    elif schema == "TaskResult":
+        if not report.summary.strip():
+            return "TaskResult: a summary is required"
+    return ""
+
+
+# --------------------------------------------------------------------------
+# 34.2 The reviewer: seven dimensions, one decision
+# --------------------------------------------------------------------------
+
+#: Source kinds that can carry a load-bearing observation on their own.  The rest
+#: are usable, but only beside something better: a search-engine result page, a
+#: social post or a republished mirror is not a primary record.
+_PRIMARY_SOURCE_KINDS: frozenset[SourceKind] = frozenset({
+    SourceKind.PUBLIC_WEB, SourceKind.API, SourceKind.DNS, SourceKind.WHOIS,
+    SourceKind.CERTIFICATE_LOG, SourceKind.LOCAL_ARTIFACT, SourceKind.DOCUMENT,
+    SourceKind.ARTIFACT_IMAGE, SourceKind.MEMORY_IMAGE, SourceKind.LOG_FILE,
+    SourceKind.ARCHIVE,
+})
+
+#: Phrases that make a statement an assessment rather than an observation, which a
+#: Worker's record may not contain (§33) — checked again here because a record can
+#: be constructed by another process and arrive with one.
+_ASSESSMENT_PHRASES: tuple[str, ...] = ("we conclude", "this proves", "the actor is",
+                                        "in conclusion", "case closed")
+
+#: Words that show a statement is about the Worker's own slice.  Relevance is judged
+#: with a blunt lexical overlap against the unit's mandate, because a reviewer that
+#: guessed at meaning could be argued with.
+_RELEVANCE_STOPWORDS: frozenset[str] = frozenset({
+    "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "with", "by", "from",
+    "that", "this", "each", "every", "all", "any", "at", "as", "is", "are", "be", "it",
+    "its", "their", "one", "per", "least", "more", "than", "into", "not", "no", "has",
+    "have", "was", "were", "will", "would", "can", "may", "should", "must", "unit",
+    "worker", "collect", "collected", "record", "records", "item", "items", "source",
+    "sources", "row", "rows", "data", "value", "values", "with", "and", "its",
+})
+
+
+def _tokens(text: str) -> set[str]:
+    return {word for word in re.findall(r"[a-z0-9][a-z0-9._-]{2,}", (text or "").lower())
+            if word not in _RELEVANCE_STOPWORDS}
+
+
+def _mandate_tokens(worker: "FlowWorker") -> set[str]:
+    return _tokens(" ".join([worker.work_unit, worker.objective, worker.expected_evidence,
+                             *worker.completion_criteria]))
+
+
+class SubagentReviewer:
+    """Judge one Worker result on the seven dimensions, and decide.
+
+    The reviewer is the parent Subagent's judgement, expressed as code: it reads the
+    record (a :class:`WorkerReport` in §33's vocabulary plus the graph's outcome),
+    never the Worker's internal state.  Nothing here depends on the clock, the
+    network or a model, so the same record reviews identically every time — which is
+    what makes it a control rather than a conversation.
+    """
+
+    def __init__(self, *, scope: Sequence[str] = (), primary_sources_only: bool = False,
+                 minimum_items: int | None = None,
+                 minimum_sources: int | None = None) -> None:
+        self.scope = [entry for entry in scope if str(entry).strip()]
+        self.primary_sources_only = primary_sources_only
+        self.minimum_items = minimum_items
+        self.minimum_sources = minimum_sources
+
+    # -- the whole review --------------------------------------------------
+
+    def review(self, worker: "FlowWorker", report: WorkerReport, *,
+               subagent_id: str, attempt: int = 1, path: str = "runner",
+               observations: Sequence[Deficiency] = ()) -> QualityReview:
+        """Judge one report.  Every dimension is checked; the decision follows.
+
+        ``observations`` are deficiencies the *graph* already knows about — a
+        deferred unit, a refused capability, a result adopted from a checkpoint —
+        passed in as findings so they reach the same record as everything else
+        rather than living beside it in a separate note.
+        """
+
+        findings = list(observations)
+        findings.extend(self._completeness(worker, report))
+        findings.extend(self._relevance(worker, report))
+        findings.extend(self._source_quality(worker, report))
+        findings.extend(self._provenance(report))
+        findings.extend(self._consistency(worker, report))
+        findings.extend(self._scope(worker, report))
+        findings.extend(self._schema(worker, report))
+
+        grouped: dict[ReviewDimension, list[Deficiency]] = {
+            dimension: [] for dimension in REVIEW_DIMENSIONS}
+        for deficiency in findings:
+            grouped[deficiency.dimension].append(deficiency)
+        checks = [DimensionResult(dimension=dimension, deficiencies=grouped[dimension])
+                  for dimension in REVIEW_DIMENSIONS]
+        return self._decide(worker, report, checks, subagent_id=subagent_id,
+                            attempt=attempt, path=path)
+
+    def _decide(self, worker: "FlowWorker", report: WorkerReport,
+                checks: Sequence[DimensionResult], *, subagent_id: str,
+                attempt: int, path: str) -> QualityReview:
+        """Turn the findings into pass / revise / blocked / failed.
+
+        This is where the task's two clauses separate:
+
+        *   the run **failed or was blocked** — the *tool* did not work.  There is no
+            quality to judge, so the deficiencies are the environment's; a retry is
+            possible while the Worker's budget allows one, and otherwise the unit
+            stops with a reason.
+        *   the run **succeeded or was partial** and the work is deficient — the tool
+            worked and the *work* is wrong.  That is a revise, with the specific
+            deficiency and a specific instruction, never a silent re-run.
+        """
+
+        deficiencies = [item for check in checks for item in check.deficiencies]
+        blocking = [item for item in deficiencies if item.blocking]
+        environment = [item for item in blocking
+                       if item.kind.fault is WorkflowFault.ENVIRONMENT]
+        poor_work = [item for item in blocking if item not in environment]
+
+        if report.status is WorkerStatus.FAILED:
+            # Not a quality call: the call failed.  Report it as such, keep what
+            # survived, and let the budget decide whether another attempt happens.
+            # Complaints that follow *from* the failure — a missing hash, a short
+            # schema — are consequences, not separate findings, and counting them
+            # would blame the Worker for the tool's fault.
+            reason = (report.error.message if report.error
+                      else "; ".join(report.limitations)[:200] or "the attempt failed")
+            causal = [item for item in blocking
+                      if item.kind.fault in {WorkflowFault.TOOL, WorkflowFault.ENVIRONMENT}]
+            can_retry = attempt < max(worker.max_attempts, 1)
+            return QualityReview(
+                worker_id=worker.id, subagent_id=subagent_id,
+                task_id=report.task_id, attempt=attempt,
+                worker_status=report.status,
+                decision=(ReviewDecision.REVISE if can_retry else ReviewDecision.FAILED),
+                checks=list(checks), checked=list(REVIEW_DIMENSIONS),
+                deficiencies=causal or [Deficiency(
+                    dimension=ReviewDimension.COMPLETENESS,
+                    kind=DeficiencyKind.TOOL_FAILURE,
+                    detail=f"the attempt failed at the tool: {reason}"[:200],
+                    fix="re-run the same unit; if the tool fails again, record the gap")],
+                guidance=("retry the same unit: the failure was the tool's, not the "
+                          "work's" if can_retry else ""),
+                retry=can_retry,
+                stop_reason="" if can_retry else f"attempts exhausted after {attempt}: {reason}"[:220],
+                path=path)
+
+        if report.status is WorkerStatus.BLOCKED:
+            reason = "; ".join(report.limitations)[:200] or "the unit was blocked"
+            return QualityReview(
+                worker_id=worker.id, subagent_id=subagent_id,
+                task_id=report.task_id, attempt=attempt,
+                worker_status=report.status, decision=ReviewDecision.BLOCKED,
+                checks=list(checks), checked=list(REVIEW_DIMENSIONS),
+                deficiencies=blocking or [Deficiency(
+                    dimension=ReviewDimension.COMPLETENESS, kind=DeficiencyKind.BLOCKED,
+                    detail=f"the unit could not run: {reason}"[:200],
+                    fix="resolve the block before the unit is attempted again")],
+                guidance="", retry=False, stop_reason=reason, path=path)
+
+        if blocking:
+            # The tool worked and the work is not good enough: a revise, never a
+            # silent re-run, and never a pass with a note nobody reads.
+            return QualityReview(
+                worker_id=worker.id, subagent_id=subagent_id,
+                task_id=report.task_id, attempt=attempt,
+                worker_status=report.status, decision=ReviewDecision.REVISE,
+                checks=list(checks), checked=list(REVIEW_DIMENSIONS),
+                deficiencies=blocking,
+                guidance=self._guidance(poor_work or blocking),
+                retry=attempt < max(worker.max_attempts, 1),
+                stop_reason=("" if attempt < max(worker.max_attempts, 1)
+                             else f"attempts exhausted after {attempt}"),
+                path=path)
+
+        # Nothing blocking.  A partial report with only an *environmental* note is
+        # forwarded: its work is usable and its gaps are on the record.
+        return QualityReview(
+            worker_id=worker.id, subagent_id=subagent_id,
+            task_id=report.task_id, attempt=attempt, worker_status=report.status,
+            decision=ReviewDecision.PASS, checks=list(checks),
+            checked=list(REVIEW_DIMENSIONS),
+            deficiencies=[item for item in deficiencies if not item.blocking],
+            path=path)
+
+    @staticmethod
+    def _guidance(deficiencies: Sequence[Deficiency]) -> str:
+        """What the Worker must change, phrased as instructions in its own terms."""
+
+        fixes: list[str] = []
+        for deficiency in deficiencies:
+            if deficiency.fix not in fixes:
+                fixes.append(deficiency.fix)
+        head = f"{len(deficiencies)} blocking deficiency(ies): " if len(deficiencies) > 1 else ""
+        return (head + "; ".join(fixes[:3]))[:400]
+
+    # -- 1. completeness ---------------------------------------------------
+
+    def _completeness(self, worker: "FlowWorker", report: WorkerReport) -> list[Deficiency]:
+        """Were the unit's own criteria met, with the volume the assignment stated?"""
+
+        problems: list[Deficiency] = []
+        if not report.status.usable:
+            # A blocked or failed unit never had the chance to return the volume the
+            # assignment expected.  Counting its absence as a further incompleteness
+            # would blame the Worker for the wall it hit.
+            return problems
+        if not report.findings:
+            problems.append(Deficiency(
+                dimension=ReviewDimension.COMPLETENESS, kind=DeficiencyKind.EMPTY,
+                detail="the run was reported as usable but contains no finding",
+                fix="return at least one finding, or report the unit as blocked"))
+        criteria = [item for item in worker.completion_criteria if item.strip()]
+        covered = " ".join([report.summary, *[item.statement for item in report.findings],
+                            *report.limitations]).lower()
+        if report.status is WorkerStatus.COMPLETED and criteria:
+            unmet = [criterion for criterion in criteria
+                     if not _tokens(criterion) & set(re.findall(r"[a-z0-9._-]{3,}", covered))]
+            if unmet:
+                problems.append(Deficiency(
+                    dimension=ReviewDimension.COMPLETENESS, kind=DeficiencyKind.INCOMPLETE,
+                    detail=f"the report does not address: {unmet[0][:80]}",
+                    fix="answer each completion criterion explicitly, or name the one "
+                        "that could not be met and report the unit as partial"))
+        if self.minimum_items and len(report.evidence) < self.minimum_items:
+            problems.append(Deficiency(
+                dimension=ReviewDimension.COMPLETENESS, kind=DeficiencyKind.INCOMPLETE,
+                detail=f"{len(report.evidence)} item(s) returned, "
+                       f"{self.minimum_items} were required",
+                fix=f"collect at least {self.minimum_items} item(s) for this unit"))
+        if self.minimum_sources and len({source.locator for source in report.sources}) \
+                < self.minimum_sources:
+            problems.append(Deficiency(
+                dimension=ReviewDimension.COMPLETENESS, kind=DeficiencyKind.INCOMPLETE,
+                detail=f"{len(report.sources)} distinct source(s), "
+                       f"{self.minimum_sources} were required",
+                fix="cite distinct sources rather than one source repeatedly"))
+        return problems
+
+    # -- 2. relevance ------------------------------------------------------
+
+    def _relevance(self, worker: "FlowWorker", report: WorkerReport) -> list[Deficiency]:
+        """Is the work about the slice it was assigned, or about something else?"""
+
+        problems: list[Deficiency] = []
+        mandate = _mandate_tokens(worker)
+        statements = [item.statement for item in report.findings]
+        if statements and mandate:
+            overlap = sum(1 for statement in statements
+                          if _tokens(statement) & mandate)
+            if overlap == 0:
+                problems.append(Deficiency(
+                    dimension=ReviewDimension.RELEVANCE, kind=DeficiencyKind.IRRELEVANT,
+                    detail=(f"none of the {len(statements)} finding(s) mentions anything "
+                            f"in this unit's mandate ({worker.work_unit[:40]})"),
+                    evidence_ids=[item.id for item in report.evidence][:4],
+                    fix="return only observations about this unit's own slice; a "
+                        "neighbouring unit's material belongs to that unit"))
+        if report.status is WorkerStatus.COMPLETED and not report.evidence \
+                and not report.findings:
+            problems.append(Deficiency(
+                dimension=ReviewDimension.RELEVANCE, kind=DeficiencyKind.EMPTY,
+                detail="a completed report with nothing in it cannot be relevant to anything",
+                fix="return the observations, or report the unit as blocked"))
+        return problems
+
+    # -- 3. source quality -------------------------------------------------
+
+    def _source_quality(self, worker: "FlowWorker", report: WorkerReport) -> list[Deficiency]:
+        """Can these sources carry the claim the finding makes?"""
+
+        problems: list[Deficiency] = []
+        weak = [item for item in report.evidence
+                if item.sources and all(source.kind not in _PRIMARY_SOURCE_KINDS
+                                        for source in item.sources)]
+        if weak and len(weak) == len(report.evidence):
+            problems.append(Deficiency(
+                dimension=ReviewDimension.SOURCE_QUALITY, kind=DeficiencyKind.WEAK_SOURCE,
+                detail=(f"all {len(weak)} item(s) rest on secondary sources "
+                        f"({', '.join(sorted({source.kind.value for item in weak for source in item.sources}))[:60]})"),
+                evidence_ids=[item.id for item in weak][:4],
+                fix="cite the primary record (the log, the advisory itself) rather than "
+                    "a search result or a republished copy"))
+        thin = [item for item in report.evidence
+                if item.sources and item.confidence in {Confidence.MEDIUM, Confidence.HIGH}
+                and len({source.locator for source in item.sources}) < 2]
+        if thin:
+            problems.append(Deficiency(
+                dimension=ReviewDimension.SOURCE_QUALITY,
+                kind=DeficiencyKind.INCONSISTENT,
+                detail=(f"{len(thin)} item(s) claim medium or high confidence from a "
+                        "single source"),
+                evidence_ids=[item.id for item in thin][:4],
+                fix="lower the confidence, or corroborate the item from a second source"))
+        if self.primary_sources_only:
+            unpreserved = [item for item in report.evidence
+                           if item.sources and not any(
+                               getattr(source, "content_hash", None) is not None
+                               or getattr(source, "http_status", None)
+                               for source in item.sources)]
+            if unpreserved:
+                problems.append(Deficiency(
+                    dimension=ReviewDimension.SOURCE_QUALITY,
+                    kind=DeficiencyKind.UNSOURCED,
+                    detail=(f"{len(unpreserved)} item(s) cite a source with no capture "
+                            "evidence (no hash, no HTTP status)"),
+                    evidence_ids=[item.id for item in unpreserved][:4],
+                    fix="capture the source (hash or status) so the claim can be "
+                        "checked after the page changes"))
+        return problems
+
+    # -- 4. provenance -----------------------------------------------------
+
+    def _provenance(self, report: WorkerReport) -> list[Deficiency]:
+        """Can every claim be traced to a locator, and every locator to a claim?"""
+
+        problems: list[Deficiency] = []
+        unsourced = [item.id for item in report.evidence if not item.sources]
+        if unsourced and report.status.usable:
+            problems.append(Deficiency(
+                dimension=ReviewDimension.PROVENANCE, kind=DeficiencyKind.UNSOURCED,
+                detail=f"{len(unsourced)} evidence item(s) carry no source reference",
+                evidence_ids=unsourced[:4],
+                fix="attach a SourceReference to each item, or drop the item"))
+        known = set(report.evidence_ids)
+        dangling = sorted({evidence_id for finding in report.findings
+                           for evidence_id in finding.evidence_ids
+                           if evidence_id not in known})
+        if dangling:
+            problems.append(Deficiency(
+                dimension=ReviewDimension.PROVENANCE, kind=DeficiencyKind.UNSOURCED,
+                detail=f"{len(dangling)} finding(s) cite evidence the report does not hold",
+                evidence_ids=dangling[:4],
+                fix="cite only evidence that is in this report"))
+        located = {source.locator for source in report.sources}
+        outside = sorted({source.locator for item in report.evidence
+                          for source in item.sources if source.locator not in located})
+        if outside and report.status.usable:
+            problems.append(Deficiency(
+                dimension=ReviewDimension.PROVENANCE, kind=DeficiencyKind.UNSOURCED,
+                detail=(f"{len(outside)} cited source(s) are not listed in the report's "
+                        f"sources ({outside[0][:50]})"),
+                fix="list every cited source in the report's sources, so a reader can "
+                    "enumerate them"))
+        return problems
+
+    # -- 5. internal consistency -------------------------------------------
+
+    def _consistency(self, worker: "FlowWorker", report: WorkerReport) -> list[Deficiency]:
+        """Does the record agree with itself — status, error, findings, limitations?"""
+
+        problems: list[Deficiency] = []
+        if report.error is not None and report.status is WorkerStatus.COMPLETED:
+            problems.append(Deficiency(
+                dimension=ReviewDimension.CONSISTENCY,
+                kind=DeficiencyKind.INCONSISTENT,
+                detail="a completed report carries an error",
+                fix="report the status the error implies"))
+        if report.status is WorkerStatus.PARTIAL and not report.limitations:
+            problems.append(Deficiency(
+                dimension=ReviewDimension.CONSISTENCY,
+                kind=DeficiencyKind.INCONSISTENT,
+                detail="a partial report names no limitation",
+                fix="state what the partial result leaves out"))
+        ids = [item.id for item in report.evidence]
+        if len(set(ids)) != len(ids):
+            problems.append(Deficiency(
+                dimension=ReviewDimension.CONSISTENCY,
+                kind=DeficiencyKind.INCONSISTENT,
+                detail="the same evidence id appears more than once",
+                fix="de-duplicate the evidence before returning it"))
+        statements = [item.statement.strip().lower() for item in report.findings]
+        if len(set(statements)) != len(statements):
+            problems.append(Deficiency(
+                dimension=ReviewDimension.CONSISTENCY,
+                kind=DeficiencyKind.INCONSISTENT,
+                detail="two findings say exactly the same thing",
+                fix="report each observation once, with all the evidence for it"))
+        for finding in report.findings:
+            lowered = finding.statement.lower()
+            if any(phrase in lowered for phrase in _ASSESSMENT_PHRASES):
+                problems.append(Deficiency(
+                    dimension=ReviewDimension.CONSISTENCY,
+                    kind=DeficiencyKind.INCONSISTENT,
+                    detail=f"a finding states an assessment: {finding.statement[:70]}",
+                    evidence_ids=list(finding.evidence_ids)[:2],
+                    fix="state the observation, not the conclusion it suggests"))
+        return problems
+
+    # -- 6. scope compliance -----------------------------------------------
+
+    def _scope(self, worker: "FlowWorker", report: WorkerReport) -> list[Deficiency]:
+        """Was anything touched that the mission did not authorise?"""
+
+        problems: list[Deficiency] = []
+        if not self.scope:
+            return problems
+        allowed = [entry.lower() for entry in self.scope]
+        outside: list[str] = []
+        for item in report.evidence:
+            for source in item.sources:
+                locator = source.locator.lower()
+                if not any(entry in locator or locator in entry for entry in allowed):
+                    outside.append(source.locator)
+        if outside:
+            problems.append(Deficiency(
+                dimension=ReviewDimension.SCOPE, kind=DeficiencyKind.OUT_OF_SCOPE,
+                detail=(f"{len(outside)} cited source(s) fall outside the authorised "
+                        f"scope ({outside[0][:60]})"),
+                evidence_ids=[item.id for item in report.evidence
+                              if any(source.locator == outside[0] for source in item.sources)][:3],
+                fix="collect only within the mission's scope; anything outside it is "
+                    "dropped and reported as a gap"))
+        return problems
+
+    # -- 7. output schema ---------------------------------------------------
+
+    def _schema(self, worker: "FlowWorker", report: WorkerReport) -> list[Deficiency]:
+        """Does the result satisfy the shape the assignment asked for?"""
+
+        schema = getattr(worker, "output_schema", "") or "TaskResult"
+        if not report.status.usable:
+            # A unit that failed or was blocked could not return the shape it was
+            # asked for; its own deficiency already says so, and a schema complaint
+            # here would blame the Worker for the wall it hit.
+            return []
+        problem = _schema_problem(report, schema)
+        if not problem:
+            return []
+        return [Deficiency(
+            dimension=ReviewDimension.SCHEMA, kind=DeficiencyKind.WRONG_SHAPE,
+            detail=problem[:200],
+            fix=f"return the record in the {schema} shape the assignment names "
+                f"({SCHEMA_REQUIREMENTS.get(schema, 'see the assignment')})")]
+
+
+# --------------------------------------------------------------------------
+# 34.3 The gate: one record per Worker, and no way around it
+# --------------------------------------------------------------------------
+
+class ReviewedWorkerResult(StrictModel):
+    """A Worker's outcome *and* its parent's review, as one record.
+
+    Pairing them is the acceptance clause made structural: the aggregate asks for a
+    pair, so a bare outcome has nowhere to go, and :func:`require_review` refuses
+    what a caller insists on.
+    """
+
+    worker_id: str = Field(min_length=1)
+    subagent_id: str = Field(min_length=1)
+    outcome: "WorkerOutcome"
+    #: The contract's report, when one could be recovered from the outcome.
+    report: WorkerReport | None = None
+    #: The judgement.  Not optional, and not defaulted.
+    review: QualityReview
+
+    @model_validator(mode="after")
+    def _pair_names_the_same_unit(self) -> "ReviewedWorkerResult":
+        if self.review.worker_id != self.worker_id:
+            raise ValueError(
+                f"the review is for {self.review.worker_id!r} but the outcome is for "
+                f"{self.worker_id!r}")
+        if not self.review.reviewed:
+            raise ValueError("a result carries an unreviewed verdict")
+        return self
+
+    @property
+    def forwarded(self) -> bool:
+        """Whether this result may enter the Subagent's aggregate's evidence."""
+
+        # ``forwards`` is a property of the decision; ``passed`` is the review's.  Asking
+        # the review is the honest question here: the decision alone does not know
+        # whether a blocking deficiency was recorded.
+        return self.review.passed
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"worker_id": self.worker_id, "subagent_id": self.subagent_id,
+                "is_reviewed": True, "forwarded": self.forwarded,
+                "review": self.review.to_dict(),
+                "report": self.report.to_dict() if self.report else None,
+                "status": self.outcome.status.value}
+
+
+def review_worker_result(
+    worker: "FlowWorker", outcome: "WorkerOutcome", *, subagent_id: str,
+    reviewer: SubagentReviewer, path: str = "runner",
+    report: WorkerReport | None = None,
+    observations: Sequence[Deficiency] = (),
+) -> ReviewedWorkerResult:
+    """Review one outcome and pair it with the verdict.  Total over every status.
+
+    Every path into a Worker's branch ends here — success, partial, tool failure,
+    deferral, refused capability, checkpoint adoption — because the graph's worker
+    node calls it on the way out.  The ``path`` is recorded rather than inferred, so
+    a reader can tell a reviewed failure from a reviewed success.
+    """
+
+    recovered = report if report is not None else report_from_outcome(outcome)
+    verdict = reviewer.review(worker, recovered, subagent_id=subagent_id,
+                              attempt=outcome.attempt, path=path,
+                              observations=observations)
+    return ReviewedWorkerResult(worker_id=outcome.worker_id, subagent_id=subagent_id,
+                                outcome=outcome, report=recovered, review=verdict)
+
+
+def require_review(result: Any, *, stage: str = "aggregate") -> ReviewedWorkerResult:
+    """Refuse anything that is not a reviewed result.
+
+    The single place the graph's aggregate is allowed to take a Worker's output from.
+    A bare :class:`WorkerOutcome` reaching this point is a wiring error, and saying
+    so loudly is the whole acceptance criterion: no result is forwarded unreviewed.
+    """
+
+    if isinstance(result, ReviewedWorkerResult):
+        return result
+    if isinstance(result, WorkerOutcome):
+        raise UnreviewedResult(result.worker_id, stage=stage)
+    raise UnreviewedResult(getattr(result, "worker_id", "?"), stage=stage)
+
+
+def _observations_for_path(gate: "FlowGate | None", why: str) -> list[Deficiency]:
+    """The deficiency the *graph* already knows about, as a review observation.
+
+    A unit that never ran is still a result to review, and its deficiency is not a
+    quality judgement: the tool was never called.  Encoding it here keeps that
+    distinction out of the dimension checks, which are about work that happened.
+    """
+
+    if gate is None:
+        return []
+    kind = {FlowGate.BUDGET: DeficiencyKind.BLOCKED,
+            FlowGate.CANCELLED: DeficiencyKind.BLOCKED,
+            FlowGate.DEPENDENCY_FAILED: DeficiencyKind.BLOCKED}.get(gate,
+                                                                    DeficiencyKind.TOOL_FAILURE)
+    return [Deficiency(
+        dimension=ReviewDimension.COMPLETENESS, kind=kind,
+        detail=f"the unit did not run: {why or gate.value}"[:200],
+        fix=("resolve the dependency or the budget, then attempt the unit again"
+             if kind is DeficiencyKind.BLOCKED
+             else "re-run the unit; the call did not complete"),
+    )]
+
+
+# --------------------------------------------------------------------------
+# 34.4 What the Subagent does with the verdict
+# --------------------------------------------------------------------------
+
+class ReviewPolicy(StrictModel):
+    """How the Subagent acts on a review.  One place, so the behaviour is testable.
+
+    The default is the task's rule: a failed call may be retried, poor work must be
+    revised, and a stop is honoured.  ``retry_tool_failures`` exists because a
+    tool failure is not the Worker's fault; ``max_attempts`` is the Worker's own
+    budget, not a second one invented here.
+    """
+
+    #: A revise must be attempted, and it must carry guidance.  Turning this off
+    #: would forward unrevised work, which the acceptance clause forbids.
+    require_guidance: bool = True
+    #: Whether a failed call is retried within the budget.  False means fail fast.
+    retry_tool_failures: bool = True
+    #: How many times a *quality* revise may be attempted for one unit.
+    max_revisions: int = Field(default=2, ge=0, le=10)
+
+    @model_validator(mode="after")
+    def _coherent(self) -> "ReviewPolicy":
+        if not self.require_guidance:
+            raise ValueError(
+                "require_guidance cannot be disabled: a revise with no instruction "
+                "would forward the same work again")
+        return self
+
+
+def next_step(review: QualityReview, *, policy: ReviewPolicy | None = None,
+              revisions_so_far: int = 0) -> str:
+    """What happens next for one reviewed unit: ``forward``, ``retry`` or ``stop``.
+
+    The task's central distinction, as one function a caller can test:
+
+    *   a **failed tool call** — ``retry`` while the budget allows, else ``stop``;
+    *   **poor work on a call that succeeded** — ``retry`` with the revision, while
+        the revision budget allows, else ``stop`` with the deficiency on record;
+    *   a **pass** — ``forward``.  There is no fourth outcome.
+    """
+
+    agreed = policy or ReviewPolicy()
+    if review.decision.forwards:
+        return "forward"
+    if review.decision is ReviewDecision.REVISE:
+        if not review.retry:
+            return "stop"
+        if review.fault is WorkflowFault.TOOL and not agreed.retry_tool_failures:
+            return "stop"
+        if review.fault is WorkflowFault.WORKER and revisions_so_far >= agreed.max_revisions:
+            return "stop"
+        return "retry"
+    return "stop"
+
+
+class RevisionDirective(StrictModel):
+    """What a revise sends back, and how many times it may be sent.
+
+    Kept separate from the verdict so a resume can see that a unit was already
+    revised twice, without re-reading every review in the ledger.
+    """
+
+    worker_id: str = Field(min_length=1)
+    attempt: int = Field(default=1, ge=1)
+    #: The deficiencies that caused it, by dimension and kind.
+    because: list[str] = Field(min_length=1)
+    instruction: str = Field(min_length=8)
+    #: True when the failure was the tool's: the instruction is "try again", not
+    #: "do it differently", and a Worker that is told the wrong one of those will
+    #: change work that was never the problem.
+    tool_failure: bool = False
+
+    @property
+    def describe(self) -> str:
+        cause = "tool failure" if self.tool_failure else "quality"
+        return f"attempt {self.attempt} ({cause}): {self.instruction[:120]}"
+
+
+def revision_directive(review: QualityReview) -> RevisionDirective:
+    """Turn a revise into the instruction the next attempt receives."""
+
+    if review.decision is not ReviewDecision.REVISE:
+        raise ValueError(f"{review.decision.value} is not a revise and carries no directive")
+    tool_failure = review.fault is WorkflowFault.TOOL
+    return RevisionDirective(
+        worker_id=review.worker_id, attempt=review.attempt,
+        because=[f"{item.dimension.value}/{item.kind.value}" for item in review.deficiencies],
+        instruction=review.guidance or "revise the unit and return it again",
+        tool_failure=tool_failure)
+
+
+# --------------------------------------------------------------------------
+# 34.5 The ledger: every unit's verdict, and the refusal to skip one
+# --------------------------------------------------------------------------
+
+class ReviewLedger(StrictModel):
+    """Every reviewed result for one mission, and the two properties that matter.
+
+    :attr:`forwarded` lists what entered the aggregate and :attr:`withheld` what did
+    not, each with the review that decided it — so "nothing was forwarded without
+    review" and "nothing reviewed was silently dropped" are both checkable.
+    """
+
+    results: list[ReviewedWorkerResult] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _every_result_is_reviewed(self) -> "ReviewLedger":
+        for result in self.results:
+            if not result.review.reviewed:
+                raise UnreviewedResult(result.worker_id, stage="ledger")
+        return self
+
+    @property
+    def forwarded(self) -> list[ReviewedWorkerResult]:
+        return [result for result in self.results if result.forwarded]
+
+    @property
+    def withheld(self) -> list[ReviewedWorkerResult]:
+        return [result for result in self.results if not result.forwarded]
+
+    @property
+    def complete(self) -> bool:
+        """Whether every result passed — i.e. the mission may forward all of it."""
+
+        return bool(self.results) and all(result.forwarded for result in self.results)
+
+    @property
+    def reviewed_count(self) -> int:
+        return sum(1 for result in self.results if result.review.reviewed)
+
+    def for_worker(self, worker_id: str) -> ReviewedWorkerResult | None:
+        return next((result for result in self.results
+                     if result.worker_id == worker_id), None)
+
+    def deficiencies(self) -> list[Deficiency]:
+        return [item for result in self.results for item in result.review.deficiencies]
+
+    def by_decision(self) -> dict[str, list[str]]:
+        grouped: dict[str, list[str]] = {decision.value: [] for decision in ReviewDecision}
+        for result in self.results:
+            grouped[result.review.decision.value].append(result.worker_id)
+        return grouped
+
+    def paths(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for result in self.results:
+            counts[result.review.path] = counts.get(result.review.path, 0) + 1
+        return counts
+
+    def summary(self) -> str:
+        decisions = ", ".join(f"{len(ids)} {name}"
+                              for name, ids in self.by_decision().items() if ids) or "none"
+        return (f"{len(self.results)} result(s): {decisions}; "
+                f"{len(self.forwarded)} forwarded, {len(self.withheld)} withheld; "
+                f"every result reviewed: "
+                f"{'yes' if self.reviewed_count == len(self.results) else 'no'}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "results": [result.to_dict() for result in self.results],
+            "forwarded": [result.worker_id for result in self.forwarded],
+            "withheld": [result.worker_id for result in self.withheld],
+            "by_decision": self.by_decision(),
+            "paths": self.paths(),
+            "complete": self.complete,
+            "reviewed": self.reviewed_count,
+            "deficiencies": [item.describe for item in self.deficiencies()],
+            "summary": self.summary(),
+        }
+
+
+def review_ledger(results: Sequence[ReviewedWorkerResult]) -> ReviewLedger:
+    return ReviewLedger(results=list(results))
+
+
+# --------------------------------------------------------------------------
+# 34.6 Wiring the review into the flow
+# --------------------------------------------------------------------------
+
+
+def _reviewer_for(worker: "FlowWorker", *, scope: Sequence[str] = (),
+                  minimum_items: int | None = None,
+                  minimum_sources: int | None = None) -> SubagentReviewer:
+    """The reviewer a Subagent uses for one of its Workers.
+
+    Built per Worker because the *expectation* is per Worker: the assignment's
+    expected volume belongs to that unit, not to the Subagent's average.
+    """
+
+    return SubagentReviewer(scope=scope, minimum_items=minimum_items,
+                            minimum_sources=minimum_sources)
+
+
+def _expected_volume(worker: "FlowWorker") -> tuple[int | None, int | None]:
+    """The item and source counts in a Worker's ``expected_evidence`` line.
+
+    ``ExpectedEvidence.describe`` renders as "≥2 observation item(s) from ≥1
+    source(s)", so the numbers the plan *stated* can be read back rather than
+    guessed.  Nothing found means ``None``: an unstated expectation is not a zero.
+    """
+
+    text = worker.expected_evidence or ""
+    items = re.search(r"≥\s*(\d+)\s+\S*\s*item", text)
+    sources = re.search(r"from\s*≥\s*(\d+)\s*source", text)
+    return (int(items.group(1)) if items else None,
+            int(sources.group(1)) if sources else None)
+
+
+def review_outcome(outcome: "WorkerOutcome", *, worker: "FlowWorker",
+                   subagent_id: str, scope: Sequence[str] = (),
+                   path: str = "runner",
+                   observations: Sequence[Deficiency] = ()) -> ReviewedWorkerResult:
+    """Review one graph outcome with the expectations its own assignment stated."""
+
+    items, sources = _expected_volume(worker)
+    reviewer = _reviewer_for(worker, scope=scope, minimum_items=items,
+                             minimum_sources=sources)
+    return review_worker_result(worker, outcome, subagent_id=subagent_id,
+                                reviewer=reviewer, path=path,
+                                observations=observations)
+
+
+def review_summary(reviews: Sequence[QualityReview]) -> dict[str, Any]:
+    """The counts a reader wants from a set of reviews, without the records."""
+
+    decisions: dict[str, list[str]] = {decision.value: [] for decision in ReviewDecision}
+    dimensions: dict[str, int] = {dimension.value: 0 for dimension in REVIEW_DIMENSIONS}
+    for review in reviews:
+        decisions[review.decision.value].append(review.worker_id)
+        for deficiency in review.deficiencies:
+            dimensions[deficiency.dimension.value] += 1
+    return {"reviews": len(reviews),
+            "decisions": {name: ids for name, ids in decisions.items() if ids},
+            "deficiencies_by_dimension": {name: count for name, count in dimensions.items()
+                                          if count},
+            "faults": {fault.value: sum(1 for review in reviews
+                                        if review.fault is fault)
+                       for fault in WorkflowFault if any(
+                           review.fault is fault for review in reviews)},
+            "reviewed": all(review.reviewed for review in reviews)}
+
+
+# --------------------------------------------------------------------------
+# 34.7 Scripted results: one of every kind the reviewer has to handle
+# --------------------------------------------------------------------------
+
+def _review_source(name: str, *, url: str | None = None, path: str | None = None,
+                   kind: SourceKind | None = None) -> SourceReference:
+    return SourceReference(
+        kind=kind or (SourceKind.PUBLIC_WEB if url else SourceKind.LOG_FILE),
+        url=url, artifact_path=None if url else path, title=name,
+        retrieved_at=datetime(2026, 5, 4, 10, 0, tzinfo=timezone.utc),
+        retrieval_method=RetrievalMethod.HTTP if url else RetrievalMethod.LOCAL_READ,
+        http_status=200 if url else None)
+
+
+def _review_evidence(statement: str, *, tag: str, url: str | None = None,
+                     path: str | None = None, kind: SourceKind | None = None,
+                     confidence: Confidence = Confidence.LOW,
+                     basis: str | None = "one retrieval",
+                     observed: datetime | None = None) -> EvidenceItem:
+    return EvidenceItem(
+        kind=EvidenceKind.OBSERVATION, statement=statement,
+        sources=[_review_source(tag, url=url, path=path, kind=kind)],
+        confidence=confidence, confidence_basis=basis, tags=[tag],
+        observed_at=observed or datetime(2026, 5, 4, 10, 0, tzinfo=timezone.utc))
+
+
+def _review_worker(name: str = "w-proxy", *,
+                   criteria: Sequence[str] = ("each proxy event has a timestamp",),
+                   schema: str = "EvidenceSet", unit: str = "") -> "FlowWorker":
+    """One Worker as the graph sees it, with a mandate the reviewer can check."""
+
+    return FlowWorker(
+        id=f"worker-{name}", name=name, work_unit=unit or f"{name} records",
+        objective=f"collect the {name} records that answer this part of the assignment",
+        completion_criteria=list(criteria), output_schema=schema,
+        expected_evidence="≥1 observation item(s) from ≥1 source(s)",
+        max_attempts=2)
+
+
+def review_demo_cases() -> dict[str, Any]:
+    """Six results a parent Subagent has to judge, and what it decides for each.
+
+    Each case's Worker carries the mandate its report is answering — the reviewer
+    judges relevance and completeness against *that unit's own* criteria, so a case
+    that mixed two mandates would test the fixture instead of the reviewer.
+
+    *   ``good`` — a complete, sourced report answering its criteria.  Pass.
+    *   ``weak_source`` — a real observation resting on a search-engine result page
+        only.  Revise: the claim may be true, but its source cannot carry it.
+    *   ``needs_revision`` — a successful call that ignored its mandate: a mailbox
+        receipt when the unit was asked for a timeline, and no instant to place.
+    *   ``partial`` — one day of a log, with the missing days named.  Pass: partial
+        work with usable provenance and its gaps stated is forwardable.
+    *   ``tool_failure`` — the tool died mid-read, one record survived.  Retry (the
+        failure was the tool's), not a quality revise.
+    *   ``blocked`` — the archive needs a key.  Blocked, not failed, and not revised.
+    """
+
+    scope = ["example.com", "/evidence"]
+    cases: dict[str, Any] = {}
+
+    good_worker = _review_worker(
+        "w-proxy", criteria=("each proxy event has a timestamp",),
+        unit="proxy events", schema="EvidenceSet")
+    good_report = report_from_evidence(
+        "worker-w-proxy", "sa-network", status=WorkerStatus.COMPLETED,
+        evidence=[_review_evidence(
+            "the proxy event at 10:00:00Z has a timestamp and a CONNECT to "
+            "evil.example.org", tag="proxy event", path="/evidence/proxy.log")],
+        summary="read the proxy log; every proxy event carries a timestamp")
+    cases["good"] = {
+        "worker": good_worker,
+        "review": review_outcome(outcome_from_report(good_report),
+                                 worker=good_worker, subagent_id="sa-network",
+                                 scope=scope),
+    }
+
+    weak_worker = _review_worker(
+        "w-advisory", criteria=("the advisory names a registration date",),
+        unit="advisory registration", schema="EvidenceSet")
+    weak_report = report_from_evidence(
+        "worker-w-advisory", "sa-network", status=WorkerStatus.COMPLETED,
+        evidence=[_review_evidence(
+            "the advisory names a registration date of March 2026 for the domain",
+            tag="advisory registration", url="https://example.com/search/result?id=7",
+            kind=SourceKind.SEARCH_ENGINE)],
+        summary="read the advisory registration date from a search result")
+    cases["weak_source"] = {
+        "worker": weak_worker,
+        "review": review_outcome(outcome_from_report(weak_report),
+                                 worker=weak_worker, subagent_id="sa-network",
+                                 scope=scope),
+    }
+
+    # A successful call whose work is wrong: the output schema was TimelineTable and
+    # nothing carries an instant, and the finding is about another unit's slice.
+    wrong_worker = _review_worker(
+        "w-timeline", schema="TimelineTable",
+        criteria=("every timeline event is placed on the timeline",),
+        unit="timeline events")
+    wrong_report = WorkerReport(
+        worker_id="worker-w-timeline", subagent_id="sa-network",
+        status=WorkerStatus.COMPLETED, summary="collected the records",
+        findings=[WorkerFinding(statement="a subscription receipt was found in the mailbox",
+                                evidence_ids=["ev-receipt"])],
+        evidence=[EvidenceItem(
+            id="ev-receipt", kind=EvidenceKind.OBSERVATION,
+            statement="a subscription receipt was found in the mailbox",
+            sources=[_review_source("receipt", path="/evidence/mail.eml")],
+            confidence=Confidence.LOW, confidence_basis="one retrieval",
+            tags=["receipt"], observed_at=None)],
+        sources=[_review_source("receipt", path="/evidence/mail.eml")])
+    cases["needs_revision"] = {
+        "worker": wrong_worker,
+        "review": review_outcome(outcome_from_report(wrong_report),
+                                 worker=wrong_worker, subagent_id="sa-network",
+                                 scope=scope),
+    }
+
+    partial_worker = _review_worker(
+        "w-dns", criteria=("each dns query has a timestamp",), unit="dns queries",
+        schema="EvidenceSet")
+    partial_report = report_from_evidence(
+        "worker-w-dns", "sa-network", status=WorkerStatus.PARTIAL,
+        evidence=[_review_evidence(
+            "the dns query for evil.example.org has a timestamp of 09:30:00Z",
+            tag="dns query", path="/evidence/dns.log")],
+        summary="read one day of the resolver log; the other six are missing",
+        limitations=["the rotated logs for the other six days are not on this host"])
+    cases["partial"] = {
+        "worker": partial_worker,
+        "review": review_outcome(outcome_from_report(partial_report),
+                                 worker=partial_worker, subagent_id="sa-network",
+                                 scope=scope),
+    }
+
+    failure_worker = _review_worker(
+        "w-hash", schema="HashManifest", criteria=("the capture is hashed",),
+        unit="capture hashes")
+    failure_report = report_from_evidence(
+        "worker-w-hash", "sa-network", status=WorkerStatus.FAILED,
+        evidence=[_review_evidence(
+            "the capture's first record hashes to the advisory's sample digest",
+            tag="capture hashes", path="/evidence/capture.pcap")],
+        summary="hashed one record before the reader aborted",
+        limitations=["the pcap reader aborted at a malformed record boundary"],
+        error=ErrorInfo(code="pcap-truncated", stage="tool", component="w-hash",
+                        message="unexpected end of pcap record at offset 4096"))
+    cases["tool_failure"] = {
+        "worker": failure_worker,
+        "review": review_outcome(outcome_from_report(failure_report),
+                                 worker=failure_worker, subagent_id="sa-network",
+                                 scope=scope),
+    }
+
+    blocked_worker = _review_worker(
+        "w-archive", schema="SnapshotList",
+        criteria=("the snapshot list has dates",), unit="archive snapshots")
+    cases["blocked"] = {
+        "worker": blocked_worker,
+        "review": review_outcome(
+            outcome_from_report(blocked_report(
+                "worker-w-archive", "sa-network",
+                "the archive requires an API key this mission does not hold")),
+            worker=blocked_worker, subagent_id="sa-network", scope=scope),
+    }
+    return cases
+
+
+def review_quality_demo() -> dict[str, Any]:
+    """The six cases, their decisions, and the two different next steps."""
+
+    cases = review_demo_cases()
+    results = [case["review"] for case in cases.values()]
+    ledger = review_ledger(results)
+    reviews = [result.review for result in results]
+    failure = cases["tool_failure"]["review"].review
+    revision = cases["needs_revision"]["review"].review
+    return {
+        "dimensions": [dimension.value for dimension in REVIEW_DIMENSIONS],
+        "cases": {
+            name: {
+                "worker": case["worker"].name,
+                "schema": case["worker"].output_schema,
+                "review": case["review"].review.to_dict(),
+                "next": next_step(case["review"].review),
+                "directive": (revision_directive(case["review"].review).model_dump(mode="json")
+                              if case["review"].review.decision is ReviewDecision.REVISE
+                              else None),
+            }
+            for name, case in cases.items()
+        },
+        "ledger": ledger.to_dict(),
+        "summary": review_summary(reviews),
+        "contrast": {
+            "failed_tool_call": {
+                "decision": failure.decision.value,
+                "fault": failure.fault.value,
+                "next": next_step(failure),
+                "guidance": failure.guidance,
+                "because": [item.describe for item in failure.deficiencies],
+                "treatment": "retry the same unit: the tool broke, the work did not",
+            },
+            "low_quality_success": {
+                "decision": revision.decision.value,
+                "fault": revision.fault.value,
+                "next": next_step(revision),
+                "guidance": revision.guidance,
+                "because": [item.describe for item in revision.deficiencies],
+                "treatment": "revise with the named deficiency: re-running unchanged "
+                             "would fail the same way",
+            },
+        },
+    }
+
+
+# --------------------------------------------------------------------------
+# 34.8 Self-test — the acceptance criteria as executable checks
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ReviewCheck:
+    name: str
+    ok: bool
+    detail: str = ""
+
+
+def _rc(name: str, ok: Any, detail: Any = "") -> ReviewCheck:
+    return ReviewCheck(name=name, ok=bool(ok), detail=str(detail)[:150])
+
+
+def _refuses(call: Callable[[], Any]) -> tuple[str, str]:
+    try:
+        call()
+    except (ValueError, TypeError, UnreviewedResult) as exc:
+        return type(exc).__name__, str(exc)
+    return "", "accepted"
+
+
+def run_review_self_test() -> list[ReviewCheck]:
+    """Prove the review contract: seven dimensions, one decision, no skips.
+
+    The acceptance clause is group 8: every Worker result — including a failed, a
+    partial, a deferred and an adopted one — is reviewed before it can be forwarded.
+    Group 9 is the other half: a failed tool call and a poor but successful call are
+    decided, instructed and counted differently.
+    """
+
+    checks: list[ReviewCheck] = []
+    add = checks.append
+
+    # ---- 1. the vocabulary ------------------------------------------------
+    add(_rc("exactly seven review dimensions are defined", len(ReviewDimension) == 7,
+            [dimension.value for dimension in ReviewDimension]))
+    add(_rc("the seven dimensions are the ones the task names",
+            [dimension.value for dimension in ReviewDimension]
+            == ["completeness", "relevance", "source-quality", "provenance",
+                "consistency", "scope", "schema"]))
+    add(_rc("the dimensions are ordered deterministically",
+            REVIEW_DIMENSIONS == tuple(ReviewDimension)
+            and ReviewDimension.SCOPE.rank > ReviewDimension.RELEVANCE.rank))
+    add(_rc("four review decisions are defined", len(ReviewDecision) == 4,
+            [decision.value for decision in ReviewDecision]))
+    add(_rc("only a pass forwards the result",
+            [decision for decision in ReviewDecision if decision.forwards]
+            == [ReviewDecision.PASS]))
+    add(_rc("only a revise is actionable",
+            [decision for decision in ReviewDecision if decision.actionable]
+            == [ReviewDecision.REVISE]))
+    add(_rc("a deficiency knows whose fault it is",
+            DeficiencyKind.TOOL_FAILURE.fault is WorkflowFault.TOOL
+            and DeficiencyKind.BLOCKED.fault is WorkflowFault.ENVIRONMENT
+            and DeficiencyKind.UNSOURCED.fault is WorkflowFault.WORKER
+            and DeficiencyKind.OUT_OF_SCOPE.fault is WorkflowFault.WORKER))
+    add(_rc("there is a decision for every status a Worker can return",
+            set(WorkerStatus) == {WorkerStatus.COMPLETED, WorkerStatus.PARTIAL,
+                                  WorkerStatus.BLOCKED, WorkerStatus.FAILED}))
+
+    # ---- 2. a pass cannot carry a blocking deficiency ---------------------
+    demo = review_quality_demo()
+    cases = demo["cases"]
+    # The live records behind the demo's serialised view: assertions about the model
+    # go through these, not through the dicts the demo renders.
+    objects = review_demo_cases()
+    good = cases["good"]["review"]
+    add(_rc("a good result passes", good["decision"] == "pass", good["decision"]))
+    add(_rc("a pass names every dimension it checked",
+            good["checked"] == [dimension.value for dimension in REVIEW_DIMENSIONS],
+            good["checked"]))
+    add(_rc("a pass carries no blocking deficiency", not good["deficiencies"]))
+    add(_rc("every review says it was performed", good["reviewed"] is True))
+    pass_with_deficiency = _refuses(lambda: QualityReview(
+        worker_id="w", subagent_id="s", worker_status=WorkerStatus.COMPLETED,
+        decision=ReviewDecision.PASS, checked=list(REVIEW_DIMENSIONS),
+        deficiencies=[Deficiency(dimension=ReviewDimension.PROVENANCE,
+                                 kind=DeficiencyKind.UNSOURCED,
+                                 detail="an item has no source at all",
+                                 fix="attach a source")]))
+    add(_rc("a pass with a blocking deficiency cannot be built",
+            pass_with_deficiency[0] in {"ReviewDimensionError", "ValidationError"}
+            and "blocking deficiency" in pass_with_deficiency[1],
+            pass_with_deficiency[1][:100]))
+    add(_rc("a review with no dimensions checked cannot be built",
+            _refuses(lambda: QualityReview(
+                worker_id="w", subagent_id="s", worker_status=WorkerStatus.COMPLETED,
+                decision=ReviewDecision.PASS))[0] == "ValidationError"))
+    add(_rc("a review that says it was not performed cannot be built",
+            _refuses(lambda: QualityReview(
+                worker_id="w", subagent_id="s", worker_status=WorkerStatus.COMPLETED,
+                decision=ReviewDecision.PASS, checked=list(REVIEW_DIMENSIONS),
+                reviewed=False))[0] == "ValidationError"))
+    add(_rc("a deficiency on an unchecked dimension cannot be reported",
+            _refuses(lambda: QualityReview(
+                worker_id="w", subagent_id="s", worker_status=WorkerStatus.COMPLETED,
+                decision=ReviewDecision.REVISE, guidance="fix it properly",
+                retry=True, checked=[ReviewDimension.COMPLETENESS],
+                deficiencies=[Deficiency(dimension=ReviewDimension.SCHEMA,
+                                         kind=DeficiencyKind.WRONG_SHAPE,
+                                         detail="the shape is wrong for this unit",
+                                         fix="return the assigned shape")]))[0]
+            == "ValidationError"))
+
+    # ---- 3. a revise is concrete -----------------------------------------
+    revision = cases["needs_revision"]["review"]
+    add(_rc("poor work is revised, not passed", revision["decision"] == "revise",
+            revision["decision"]))
+    add(_rc("a revise carries a concrete deficiency",
+            bool(revision["deficiencies"])
+            and all(item["detail"] for item in revision["deficiencies"])))
+    add(_rc("the deficiency names its dimension",
+            {item["dimension"] for item in revision["deficiencies"]}
+            <= {dimension.value for dimension in REVIEW_DIMENSIONS}))
+    add(_rc("a revise says what to change", len(revision["guidance"]) >= 12,
+            revision["guidance"][:100]))
+    add(_rc("a revise asks for another attempt", revision["retry"] is True))
+    add(_rc("a revise cannot be built without a deficiency",
+            _refuses(lambda: QualityReview(
+                worker_id="w", subagent_id="s", worker_status=WorkerStatus.COMPLETED,
+                decision=ReviewDecision.REVISE, checked=list(REVIEW_DIMENSIONS),
+                guidance="do it again", retry=True))[0] == "ValidationError"))
+    add(_rc("a revise cannot be built without guidance",
+            _refuses(lambda: QualityReview(
+                worker_id="w", subagent_id="s", worker_status=WorkerStatus.COMPLETED,
+                decision=ReviewDecision.REVISE, checked=list(REVIEW_DIMENSIONS),
+                retry=True,
+                deficiencies=[Deficiency(dimension=ReviewDimension.PROVENANCE,
+                                         kind=DeficiencyKind.UNSOURCED,
+                                         detail="an item has no source at all",
+                                         fix="attach a source reference")]))[0]
+            == "ValidationError"))
+    add(_rc("a revise that would discard the work cannot be built",
+            _refuses(lambda: QualityReview(
+                worker_id="w", subagent_id="s", worker_status=WorkerStatus.COMPLETED,
+                decision=ReviewDecision.REVISE, checked=list(REVIEW_DIMENSIONS),
+                guidance="do it again", retry=False,
+                deficiencies=[Deficiency(dimension=ReviewDimension.PROVENANCE,
+                                         kind=DeficiencyKind.UNSOURCED,
+                                         detail="an item has no source at all",
+                                         fix="attach a source reference")]))[0]
+            == "ValidationError"))
+    add(_rc("a stop must give its reason",
+            _refuses(lambda: QualityReview(
+                worker_id="w", subagent_id="s", worker_status=WorkerStatus.BLOCKED,
+                decision=ReviewDecision.BLOCKED, checked=list(REVIEW_DIMENSIONS)))[0]
+            == "ValidationError"))
+    directive = cases["needs_revision"]["directive"]
+    add(_rc("a revise becomes a directive with an instruction", 
+            bool(directive) and len(directive["instruction"]) >= 8))
+    add(_rc("the directive cites the deficiency it came from",
+            bool(directive["because"])
+            and directive["because"][0] in
+            {f"{item['dimension']}/{item['kind']}" for item in revision["deficiencies"]}))
+    add(_rc("a directive cannot be built from a pass",
+            _refuses(lambda: revision_directive(
+                QualityReview.from_dict(good)))[0] == "ValueError"))
+
+    # ---- 4. each dimension actually bites --------------------------------
+    worker = _review_worker("w-check", criteria=("every event has a timestamp",))
+    reviewer = SubagentReviewer(scope=["example.com", "/evidence"])
+    perfect = report_from_evidence(
+        "worker-w-check", "sa-network", status=WorkerStatus.COMPLETED,
+        evidence=[_review_evidence("the event has a timestamp of 10:00:00Z",
+                                   tag="event", path="/evidence/log.txt")],
+        summary="read the log")
+    clean = reviewer.review(worker, perfect, subagent_id="sa-network")
+    add(_rc("a clean result has no deficiency in any dimension",
+            not clean.deficiencies, [item.describe for item in clean.deficiencies]))
+
+    irrelevant = reviewer.review(
+        worker, report_from_evidence(
+            "worker-w-check", "sa-network", status=WorkerStatus.COMPLETED,
+            evidence=[_review_evidence("a subscription receipt was found",
+                                       tag="receipt", path="/evidence/mail.eml")],
+            summary="read the mailbox"), subagent_id="sa-network")
+    add(_rc("a result about another slice fails relevance",
+            (irrelevant.dimension(ReviewDimension.RELEVANCE) or DimensionResult(
+                dimension=ReviewDimension.RELEVANCE)).ok is False,
+            [item.describe for item in irrelevant.deficiencies]))
+
+    weak = reviewer.review(
+        worker, report_from_evidence(
+            "worker-w-check", "sa-network", status=WorkerStatus.COMPLETED,
+            evidence=[_review_evidence("the event has a timestamp per the search snippet",
+                                       tag="event", url="https://search.example/x",
+                                       kind=SourceKind.SEARCH_ENGINE)],
+            summary="read a search snippet"), subagent_id="sa-network")
+    add(_rc("a secondary-only source fails source quality",
+            not (weak.dimension(ReviewDimension.SOURCE_QUALITY) or
+                 DimensionResult(dimension=ReviewDimension.SOURCE_QUALITY)).ok,
+            [item.describe for item in weak.deficiencies]))
+    add(_rc("the source deficiency names the secondary kind",
+            any("secondary" in item.detail.lower() for item in weak.deficiencies)))
+
+    overconfident = reviewer.review(
+        worker, report_from_evidence(
+            "worker-w-check", "sa-network", status=WorkerStatus.COMPLETED,
+            evidence=[_review_evidence("the event has a timestamp of 10:00:00Z",
+                                       tag="event", path="/evidence/log.txt",
+                                       confidence=Confidence.HIGH,
+                                       basis="one source, judged reliable")],
+            summary="read the log"), subagent_id="sa-network")
+    add(_rc("high confidence from one source is a deficiency",
+            any("single source" in item.detail for item in overconfident.deficiencies),
+            [item.describe for item in overconfident.deficiencies]))
+
+    unscoped = reviewer.review(
+        worker, report_from_evidence(
+            "worker-w-check", "sa-network", status=WorkerStatus.COMPLETED,
+            evidence=[_review_evidence("the event has a timestamp of 10:00:00Z",
+                                       tag="event", url="https://elsewhere.org/log")],
+            summary="read a log elsewhere"), subagent_id="sa-network")
+    add(_rc("a source outside the authorised scope fails scope compliance",
+            any(item.dimension is ReviewDimension.SCOPE
+                for item in unscoped.deficiencies),
+            [item.describe for item in unscoped.deficiencies]))
+    no_scope = SubagentReviewer(scope=[]).review(worker, perfect,
+                                                 subagent_id="sa-network")
+    add(_rc("scope is judged against the mission's own entries: no entries, no refusal",
+            (no_scope.dimension(ReviewDimension.SCOPE) or
+             DimensionResult(dimension=ReviewDimension.SCOPE)).ok is True,
+            "an empty scope cannot be violated, and is not guessed at"))
+
+    schema_worker = _review_worker("w-schema", schema="TimelineTable",
+                                   criteria=("every event is placed on the timeline",))
+    wrong_shape = SubagentReviewer(scope=["/evidence"]).review(
+        schema_worker, report_from_evidence(
+            "worker-w-schema", "sa-network", status=WorkerStatus.COMPLETED,
+            evidence=[EvidenceItem(kind=EvidenceKind.OBSERVATION,
+                                   statement="an event is placed on the timeline at 10:00",
+                                   sources=[_review_source("timeline",
+                                                           path="/evidence/log.txt")],
+                                   tags=["event"])],
+            summary="placed the events"), subagent_id="sa-network")
+    add(_rc("a result that does not satisfy its output schema is a deficiency",
+            any(item.dimension is ReviewDimension.SCHEMA and "TimelineTable" in item.detail
+                for item in wrong_shape.deficiencies),
+            [item.describe for item in wrong_shape.deficiencies]))
+    add(_rc("every schema the plan can assign has a requirement",
+            set(SCHEMA_REQUIREMENTS) == set(OUTPUT_SCHEMAS),
+            sorted(set(OUTPUT_SCHEMAS) - set(SCHEMA_REQUIREMENTS))))
+    # A valid record whose *shape* is wrong for the assigned schema: a snapshot list
+    # needs a retrieval time, and this source was never retrieved from.
+    snapshot_source = SourceReference(kind=SourceKind.LOCAL_ARTIFACT,
+                                      artifact_path="/evidence/snapshots/index.txt")
+    snapshot_report = WorkerReport(
+        worker_id="w", subagent_id="s", status=WorkerStatus.COMPLETED,
+        summary="listed the snapshots from the index",
+        findings=[WorkerFinding(statement="a snapshot of the page exists",
+                                evidence_ids=["ev-snapshot"])],
+        evidence=[EvidenceItem(id="ev-snapshot", kind=EvidenceKind.OBSERVATION,
+                               statement="a snapshot of the page exists",
+                               sources=[snapshot_source.model_copy(
+                                   update={"retrieval_method": RetrievalMethod.UNKNOWN})],
+                               tags=["snapshot"])])
+    add(_rc("a snapshot list check asks how each item was captured",
+            "state how it was captured" in _schema_problem(snapshot_report, "SnapshotList"),
+            _schema_problem(snapshot_report, "SnapshotList")))
+    tagged = snapshot_report.model_copy(update={
+        "evidence": [snapshot_report.evidence[0].model_copy(
+            update={"tags": ["sha256:" + "a" * 64]})]})
+    add(_rc("a hash manifest check asks for a hash",
+            "no item carries a hash" in _schema_problem(snapshot_report, "HashManifest")
+            and _schema_problem(tagged, "HashManifest") == "",
+            _schema_problem(snapshot_report, "HashManifest")))
+
+    duplicated = SubagentReviewer(scope=["/evidence"]).review(
+        worker, report_from_evidence(
+            "worker-w-check", "sa-network", status=WorkerStatus.COMPLETED,
+            evidence=[_review_evidence("the event has a timestamp of 10:00:00Z",
+                                       tag="event", path="/evidence/log.txt"),
+                      _review_evidence("the event has a timestamp of 10:00:00Z",
+                                       tag="event", path="/evidence/log.txt")],
+            summary="read the log"), subagent_id="sa-network")
+    add(_rc("the same statement twice is an inconsistency",
+            any("same thing" in item.detail for item in duplicated.deficiencies),
+            [item.describe for item in duplicated.deficiencies]))
+
+    short = SubagentReviewer(scope=["/evidence"], minimum_items=3).review(
+        worker, perfect, subagent_id="sa-network")
+    add(_rc("fewer items than the assignment expected is incomplete",
+            any(item.dimension is ReviewDimension.COMPLETENESS
+                and item.kind is DeficiencyKind.INCOMPLETE
+                for item in short.deficiencies),
+            [item.describe for item in short.deficiencies]))
+    add(_rc("the numeric expectation is read back from the assignment",
+            all(isinstance(value, int) for value in _expected_volume(worker)),
+            _expected_volume(worker)))
+
+    # ---- 5. a failed call is not a quality judgement ---------------------
+    # These are live records, so they are read as attributes; the demo's own view is
+    # asserted separately, where the serialisation is what is being tested.
+    failure = objects["tool_failure"]["review"].review
+    add(_rc("a failed tool call is reviewed too", failure.reviewed is True))
+    add(_rc("a failed call is the tool's fault, not the Worker's",
+            failure.fault is WorkflowFault.TOOL, failure.fault.value))
+    add(_rc("a failed call is retried while the budget allows",
+            failure.decision is ReviewDecision.REVISE and failure.retry is True,
+            (failure.decision.value, failure.retry)))
+    add(_rc("the retry instruction is to try again, not to work differently",
+            "the failure was the tool's" in failure.guidance, failure.guidance))
+    add(_rc("the failed call keeps the record that survived",
+            len(objects["tool_failure"]["review"].outcome.evidence_ids) == 1,
+            objects["tool_failure"]["review"].outcome.evidence_ids))
+    exhausted = review_outcome(
+        outcome_from_report(report_from_evidence(
+            "worker-w-hash", "sa-network", status=WorkerStatus.FAILED,
+            evidence=[_review_evidence("the first record hashes to the digest",
+                                       tag="hash", path="/evidence/capture.pcap")],
+            summary="hashed one record", attempt=2,
+            error=ErrorInfo(code="pcap", message="the reader aborted"))),
+        worker=_review_worker("w-hash"), subagent_id="sa-network")
+    add(_rc("a failed call with no attempts left stops, with a reason",
+            exhausted.review.decision is ReviewDecision.FAILED
+            and bool(exhausted.review.stop_reason),
+            (exhausted.review.decision.value, exhausted.review.stop_reason[:60])))
+    add(_rc("a stop does not pretend another attempt is coming",
+            exhausted.review.retry is False))
+
+    # ---- 6. a blocked unit is not a failure ------------------------------
+    blocked = objects["blocked"]["review"].review
+    add(_rc("a blocked unit is reviewed and blocked, not failed",
+            blocked.decision is ReviewDecision.BLOCKED, blocked.decision.value))
+    add(_rc("a blocked unit is not revised: another attempt would hit the same wall",
+            blocked.retry is False))
+    add(_rc("a blocked unit's reason reaches the review",
+            "API key" in blocked.stop_reason, blocked.stop_reason[:80]))
+    add(_rc("a blocked unit's deficiency is the environment's, not the Worker's",
+            all(item.kind.fault in {WorkflowFault.ENVIRONMENT, WorkflowFault.TOOL}
+                for item in blocked.deficiencies)
+            and all(item.kind.fault is not WorkflowFault.WORKER
+                    for item in blocked.deficiencies),
+            [item.describe for item in blocked.deficiencies]))
+
+    # ---- 7. a partial result can be forwarded ----------------------------
+    partial = objects["partial"]["review"].review
+    add(_rc("a partial result with provenance passes",
+            partial.decision is ReviewDecision.PASS,
+            [item.describe for item in partial.deficiencies]))
+    add(_rc("a partial result is not described as complete",
+            partial.worker_status is WorkerStatus.PARTIAL))
+
+    # ---- 8. nothing is forwarded unreviewed (the acceptance clause) ------
+    ledger = review_ledger([case["review"] for case in objects.values()])
+    add(_rc("every demo case produced a review", len(ledger.results) == len(cases)))
+    add(_rc("the ledger states every result was reviewed",
+            ledger.reviewed_count == len(ledger.results), ledger.reviewed_count))
+    add(_rc("the ledger splits forwarded from withheld",
+            len(ledger.forwarded) + len(ledger.withheld) == len(ledger.results)))
+    add(_rc("a bare outcome is refused at the aggregate",
+            _refuses(lambda: require_review(WorkerOutcome(
+                worker_id="worker-x", subagent_id="sa"))) [0] == "UnreviewedResult"))
+    add(_rc("the refusal names the unit and the stage",
+            "worker-x" in (lambda exc: exc)("worker-x")
+            and "aggregate" in str(_refuses(lambda: require_review(
+                WorkerOutcome(worker_id="worker-x", subagent_id="sa"),
+                stage="aggregate"))[1])))
+    add(_rc("a ledger refuses a result whose verdict was not performed",
+            _refuses(lambda: ReviewLedger.model_validate({"results": [
+                ReviewedWorkerResult.model_construct(
+                    worker_id="w", subagent_id="s",
+                    outcome=WorkerOutcome(worker_id="w", subagent_id="s"),
+                    report=None,
+                    review=QualityReview.model_construct(
+                        reviewed=False, worker_id="w", subagent_id="s",
+                        worker_status=WorkerStatus.COMPLETED,
+                        decision=ReviewDecision.PASS,
+                        checked=list(REVIEW_DIMENSIONS), checks=[],
+                        deficiencies=[])).model_dump()]}))[0]
+            in {"UnreviewedResult", "ValidationError"},
+            "a verdict that was not performed cannot reach the ledger, whether the "
+            "review or the ledger refuses it"))
+    add(_rc("a reviewed result cannot pair a review with another unit",
+            _refuses(lambda: ReviewedWorkerResult(
+                worker_id="worker-a", subagent_id="sa",
+                outcome=WorkerOutcome(worker_id="worker-a", subagent_id="sa"),
+                review=good and QualityReview.model_validate(good)))[0]
+            == "ValidationError"))
+    add(_rc("a failed result is reviewed before the aggregate sees it",
+            ledger.for_worker("worker-w-hash") is not None
+            and ledger.for_worker("worker-w-hash").review.reviewed is True))
+    add(_rc("a blocked result is reviewed before the aggregate sees it",
+            ledger.for_worker("worker-w-archive") is not None
+            and ledger.for_worker("worker-w-archive").review.reviewed is True))
+
+    # the flow's own seam: run a real mission and check the ledger it produced
+    context = _selftest_context("exposure")
+    units = flow_units_for(context, "exposure")
+    flow = HierarchicalFlow(context=context, subagents=units,
+                            runner=_CountingRunner(scope=context.scope_entries))
+    flow.run_with_reviews()
+    flow_ledger = flow.review_ledger()
+    add(_rc("a real mission reviews every Worker result",
+            flow_ledger.reviewed_count == len(flow_ledger.results)
+            and len(flow_ledger.results) >= sum(len(unit.workers) for unit in units),
+            flow_ledger.summary()))
+    add(_rc("a real mission forwards only what passed",
+            all(result.forwarded for result in flow_ledger.forwarded)
+            and all(not result.forwarded for result in flow_ledger.withheld)))
+    add(_rc("the reviews name all seven dimensions",
+            all(len(result.review.checked) == len(REVIEW_DIMENSIONS)
+                for result in flow_ledger.results)))
+    add(_rc("every forwarded result has a report a reader can follow",
+            all(result.report is not None for result in flow_ledger.forwarded)))
+
+    # A Worker that fails inside a *multi-Worker* Subagent: the unit's failure must
+    # not take its subagent — or the mission — down with it.
+    mixed = next(unit for unit in units if len(unit.workers) >= 2)
+    flow_failing = HierarchicalFlow(
+        context=context, subagents=units,
+        runner=_CountingRunner(scope=context.scope_entries,
+                               failing=[mixed.workers[0].id]))
+    failing_result = flow_failing.run_with_reviews()
+    failing_ledger = flow_failing.review_ledger()
+    add(_rc("a failed Worker is still reviewed in a real mission",
+            failing_ledger.reviewed_count == len(failing_ledger.results),
+            failing_ledger.summary()))
+    add(_rc("a failed Worker does not stop the mission",
+            failing_result.synthesis is not None and not failing_result.stopped,
+            failing_result.stop_reason))
+    add(_rc("the failed unit's review is on the record",
+            any(result.review.decision is not ReviewDecision.PASS
+                for result in failing_ledger.results),
+            failing_ledger.by_decision()))
+    add(_rc("the mission's result carries every review",
+            failing_result.reviews is not None
+            and len(failing_result.reviews.results) == len(failing_ledger.results)))
+    add(_rc("the mission's result summarises the decisions",
+            bool(failing_result.review_summary.get("decisions")),
+            failing_result.review_summary))
+    failed_unit = next(result for result in failing_ledger.results
+                       if result.worker_id == mixed.workers[0].id)
+    add(_rc("the failed unit's review names the tool as the cause",
+            failed_unit.review.fault is WorkflowFault.TOOL,
+            [item.describe for item in failed_unit.review.deficiencies]))
+    add(_rc("the failed unit's work is withheld from its Subagent's aggregate",
+            not failed_unit.forwarded))
+    add(_rc("the surviving Worker's work is forwarded",
+            any(result.forwarded for result in failing_ledger.results
+                if result.worker_id != mixed.workers[0].id)))
+
+    # ---- 9. a failed call and a poor call are handled differently --------
+    contrast = demo["contrast"]
+    add(_rc("a failed tool call and a poor call are attributed differently",
+            contrast["failed_tool_call"]["fault"]
+            != contrast["low_quality_success"]["fault"],
+            (contrast["failed_tool_call"]["fault"],
+             contrast["low_quality_success"]["fault"])))
+    add(_rc("a failed tool call and a poor call are told different things",
+            contrast["failed_tool_call"]["guidance"]
+            != contrast["low_quality_success"]["guidance"]
+            and "retry" in contrast["failed_tool_call"]["guidance"]))
+    add(_rc("a failed call is retried as-is, a poor call is revised",
+            contrast["failed_tool_call"]["treatment"].startswith("retry the same unit")
+            and contrast["low_quality_success"]["treatment"].startswith("revise")))
+    add(_rc("the difference is the fault, not the severity",
+            contrast["failed_tool_call"]["fault"] == "tool"
+            and contrast["low_quality_success"]["fault"] == "worker"))
+    add(_rc("a failed call is told to retry, a poor call is told what to change",
+            "retry" in contrast["failed_tool_call"]["treatment"]
+            and len(contrast["low_quality_success"]["guidance"]) >= 12))
+    add(_rc("a fresh failed call is retried", next_step(failure) == "retry",
+            next_step(failure)))
+    add(_rc("a fresh quality revise is retried",
+            next_step(objects["needs_revision"]["review"].review) == "retry"))
+    add(_rc("a revise beyond the revision budget stops",
+            next_step(objects["needs_revision"]["review"].review,
+                      revisions_so_far=ReviewPolicy().max_revisions) == "stop"))
+    add(_rc("a failed call with no attempts left stops",
+            next_step(exhausted.review) == "stop", next_step(exhausted.review)))
+    add(_rc("a failed call is not retried when the policy forbids it",
+            next_step(failure, policy=ReviewPolicy(retry_tool_failures=False)) == "stop"))
+    add(_rc("a pass always forwards",
+            next_step(QualityReview.from_dict(good)) == "forward"))
+    add(_rc("a review reloads from its own serialisation",
+            QualityReview.from_dict(
+                objects["tool_failure"]["review"].review.to_dict()
+            ).decision is ReviewDecision.REVISE,
+            "a review stored with a case file must come back"))
+    add(_rc("the guidance cannot be switched off",
+            _refuses(lambda: ReviewPolicy(require_guidance=False))[0]
+            == "ValidationError", "a revise with no instruction would repeat the work"))
+    add(_rc("the two paths are distinguishable in the ledger",
+            set(ledger.paths()) >= {"runner"}))
+
+    # ---- 10. determinism, serialisation, and the section's discipline ----
+    again = review_quality_demo()
+    add(_rc("two runs of the demo decide identically",
+            [case["review"]["decision"] for case in demo["cases"].values()]
+            == [case["review"]["decision"] for case in again["cases"].values()]))
+    add(_rc("a review serialises to plain JSON",
+            isinstance(json.dumps(objects["weak_source"]["review"].review.to_dict()),
+                       str)))
+    add(_rc("a review records which dimensions it checked",
+            cases["weak_source"]["review"]["checked"] == [d.value for d in REVIEW_DIMENSIONS]))
+    add(_rc("a serialised review carries the deficiency's fix",
+            all(item["fix"] for case in demo["cases"].values()
+                for item in case["review"]["deficiencies"])))
+    add(_rc("every deficiency's detail is long enough to act on",
+            all(len(item.detail) >= 12 and len(item.fix) >= 8
+                for item in ledger.deficiencies())))
+    section = _source_section(
+        "# 34. Subagent quality review: every Worker result is judged, none is forwarded",
+        "# 35. Entry point")
+    add(_rc("the review section is present and bounded", bool(section), len(section)))
+    add(_rc("the review section calls no model",
+            bool(section) and "call_model(" not in section))
+    add(_rc("the review section grants no capability",
+            bool(section) and "CapabilityGrant(" not in section))
+    add(_rc("the review section dispatches no tool",
+            bool(section) and "CapabilityRouter(" not in section and ".route(" not in section))
+    add(_rc("the review section names every dimension",
+            all(dimension.value in section for dimension in ReviewDimension)))
+    return checks
+
+
+# --------------------------------------------------------------------------
+# 34.9 Rendering
+# --------------------------------------------------------------------------
+
+_DECISION_STYLE: dict[str, str] = {"pass": "green", "revise": "yellow",
+                                   "blocked": "cyan", "failed": "red"}
+
+
+def render_review_self_test(checks: Sequence[ReviewCheck]) -> Table:
+    table = Table(title="review self-test", title_justify="left", box=None,
+                  pad_edge=False)
+    table.add_column("", width=2)
+    table.add_column("check", no_wrap=True)
+    table.add_column("detail", overflow="fold")
+    for check in checks:
+        glyph, colour = ("✔", "green") if check.ok else ("✘", "red")
+        table.add_row(f"[{colour}]{glyph}[/{colour}]", escape(check.name),
+                      escape(check.detail))
+    return table
+
+
+def render_review_record(review: QualityReview) -> Group:
+    """One review, dimension by dimension, with the decision under it."""
+
+    table = Table(title=f"{review.decision.value} — {review.worker_id} "
+                        f"(attempt {review.attempt}, {review.worker_status.value})",
+                  title_justify="left", box=None, pad_edge=False)
+    table.add_column("dimension", no_wrap=True)
+    table.add_column("", width=2)
+    table.add_column("finding", overflow="fold", max_width=78)
+    for check in review.checks:
+        glyph, colour = ("✔", "green") if check.ok else ("✘", "red")
+        table.add_row(escape(check.dimension.value),
+                      f"[{colour}]{glyph}[/{colour}]",
+                      escape("; ".join(item.detail for item in check.deficiencies)
+                             or check.note or "ok"))
+    colour = _DECISION_STYLE.get(review.decision.value, "white")
+    rows: list[Any] = [table, Text("")]
+    if review.guidance:
+        rows.append(Text(f"what to change: {review.guidance}", style="yellow"))
+    if review.stop_reason:
+        rows.append(Text(f"stop reason: {review.stop_reason}", style="dim"))
+    # A ``Text`` with a style does not parse markup, so the verdict is a span rather
+    # than a tag: an operator should never see "[yellow]" printed at them.
+    verdict = Text("\n", style="dim")
+    verdict.append(review.decision.value, style=colour)
+    verdict.append(f" · fault: {review.fault.value} · next: {next_step(review)} · "
+                   f"{review.describe()}", style="dim")
+    rows.append(verdict)
+    return Group(*rows)
+
+
+def render_review_demo(payload: Mapping[str, Any]) -> Group:
+    """The seven dimensions, six verdicts, and the two different next steps."""
+
+    table = Table(title="every Worker result, judged by its parent Subagent",
+                  title_justify="left", box=None, pad_edge=False)
+    table.add_column("result", no_wrap=True)
+    table.add_column("returned", no_wrap=True)
+    table.add_column("decision", no_wrap=True)
+    table.add_column("fault", no_wrap=True)
+    table.add_column("dims", justify="right")
+    table.add_column("deficiencies", overflow="fold", max_width=52)
+    for name, case in payload["cases"].items():
+        review = case["review"]
+        colour = _DECISION_STYLE.get(review["decision"], "white")
+        table.add_row(
+            escape(name), escape(str(review["worker_status"])),
+            f"[{colour}]{escape(review['decision'])}[/{colour}]",
+            escape(str(review["fault"])),
+            f"{len(review['checked'])}/{len(payload['dimensions'])}",
+            escape("; ".join(item["detail"] for item in review["deficiencies"])[:150]
+                   or "—"))
+
+    contrast = payload["contrast"]
+    sides = Table(title="two failures, two paths", title_justify="left", box=None,
+                  pad_edge=False)
+    sides.add_column("", no_wrap=True)
+    sides.add_column("failed tool call", overflow="fold", max_width=42)
+    sides.add_column("low-quality success", overflow="fold", max_width=42)
+    for label, key in (("decision", "decision"), ("fault", "fault"),
+                       ("next step", "next"), ("treatment", "treatment")):
+        sides.add_row(escape(label), escape(str(contrast["failed_tool_call"][key])[:120]),
+                      escape(str(contrast["low_quality_success"][key])[:120]))
+
+    ledger = payload["ledger"]
+    tail = Text(
+        f"\n{ledger['summary']}\n"
+        f"{len(REVIEW_DIMENSIONS)} dimensions per review: "
+        + ", ".join(payload["dimensions"]) + "\n"
+        "no Worker result is forwarded until its parent Subagent has judged it — "
+        "including the failed, blocked and partial ones",
+        style="dim")
+    return Group(table, sides, tail)
+
+
+@app.command("review", help="Subagent quality review: seven dimensions, pass or revise.")
+def review_command(
+    self_test: bool = typer.Option(False, "--self-test",
+                                   help="Prove the review contract offline."),
+    demo: bool = typer.Option(False, "--demo",
+                              help="Six results judged: pass, revise, blocked, failed."),
+    check: str | None = typer.Option(
+        None, "--check", help="Review a Worker report file ('-' for stdin).",
+        show_default=False),
+    worker: str = typer.Option("worker", "--worker", help="Worker id for --check."),
+    subagent: str = typer.Option("subagent", "--subagent",
+                                 help="Parent Subagent id for --check."),
+    criteria: list[str] = typer.Option(
+        [], "--criteria", help="The unit's completion criteria for --check. Repeatable."),
+    schema: str = typer.Option("EvidenceSet", "--schema",
+                               help="The output schema the unit was assigned."),
+    scope: list[str] = typer.Option(
+        [], "--scope", help="An authorised scope entry. Repeatable."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Judge a Worker result the way its parent Subagent would, or show it happening.
+
+    ``--check`` is the seam for a result produced elsewhere: it reviews one report and
+    exits **7 (policy)** when the verdict is not a pass, so a pipeline can withhold
+    work exactly as the aggregate would.
+    """
+
+    console = get_console()
+
+    if self_test:
+        checks = run_review_self_test()
+        failures = [check for check in checks if not check.ok]
+        if as_json:
+            _emit(json.dumps({"ok": not failures,
+                              "checks": [asdict(check) for check in checks]}, indent=2))
+            raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+        console.print()
+        console.print(render_review_self_test(checks))
+        colour = "green" if not failures else "red"
+        console.print(f"\n[{colour}]{len(checks) - len(failures)} passed[/] · "
+                      f"{len(failures)} failed\n")
+        raise typer.Exit(ExitCode.OK if not failures else ExitCode.INTERNAL)
+
+    if demo:
+        payload = review_quality_demo()
+        if as_json:
+            _emit(json.dumps(payload, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK)
+        console.print()
+        console.print(render_review_demo(payload))
+        console.print()
+        raise typer.Exit(ExitCode.OK)
+
+    if check:
+        if schema not in OUTPUT_SCHEMAS:
+            console.print(f"[red]✘[/red] unknown schema {escape(schema)}; choose from: "
+                          f"{', '.join(OUTPUT_SCHEMAS)}")
+            raise typer.Exit(ExitCode.USAGE)
+        if check != "-" and not Path(check).expanduser().exists():
+            console.print(f"[red]✘[/red] no such file: {escape(check[:160])}")
+            raise typer.Exit(ExitCode.USAGE)
+        try:
+            raw = (sys.stdin.read() if check == "-"
+                   else Path(check).expanduser().read_text(encoding="utf-8"))
+            report = WorkerReport.from_dict(json.loads(raw))
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            console.print(f"[red]✘[/red] not a Worker report: "
+                          f"{escape(_first_sentence(str(exc))[:200])}")
+            raise typer.Exit(ExitCode.USAGE) from exc
+        judged_worker = FlowWorker(
+            id=report.worker_id, name=worker or report.worker_id,
+            objective=report.summary or report.worker_id,
+            work_unit=worker or report.worker_id,
+            completion_criteria=list(criteria), output_schema=schema)
+        judged = review_outcome(
+            outcome_from_report(report), worker=judged_worker,
+            subagent_id=subagent or report.subagent_id, scope=list(scope))
+        review = judged.review
+        if as_json:
+            _emit(json.dumps({"review": review.to_dict(),
+                              "next": next_step(review),
+                              "directive": (revision_directive(review).model_dump(mode="json")
+                                            if review.decision is ReviewDecision.REVISE
+                                            else None)}, indent=2, default=str))
+            raise typer.Exit(ExitCode.OK if review.passed else ExitCode.POLICY)
+        console.print()
+        console.print(render_review_record(review))
+        console.print()
+        raise typer.Exit(ExitCode.OK if review.passed else ExitCode.POLICY)
+
+    console.print("[red]✘[/red] choose --demo, --self-test or --check FILE")
+    raise typer.Exit(ExitCode.USAGE)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 35. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
 
