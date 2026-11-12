@@ -1153,7 +1153,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 33
+VERSION_MINOR: int = 34
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -22649,6 +22649,26 @@ class FlowResult(StrictModel):
     #: reason a mission stopped is here, not only in the trace, because the trace is
     #: diagnostics and the reason is a finding.
     loops: "LoopLedger | None" = None
+    #: §45: every coverage matrix the Master built, in round order.  A reader can see what
+    #: the mission believed after each round, not only what it concluded at the end.
+    coverage: "CoverageLedger | None" = None
+
+    @property
+    def coverage_summary(self) -> dict[str, Any]:
+        """The last matrix as counts — empty when the mission tracked no questions."""
+
+        latest = self.coverage.latest() if self.coverage is not None else None
+        if latest is None:
+            return {}
+        summary = {"round": latest.round, "questions": len(latest.rows),
+                   "statuses": latest.by_status(),
+                   "orphans": list(latest.orphans),
+                   "dropped": list(latest.dropped),
+                   "next_question": latest.next_question,
+                   "open": len(latest.open_rows),
+                   "complete": latest.complete,
+                   "clause": latest.acceptance()}
+        return summary
 
     @property
     def loop_summary(self) -> dict[str, Any]:
@@ -22780,6 +22800,8 @@ class FlowResult(StrictModel):
             "master_decisions": [item.to_dict() for item in self.master_decisions],
             "follow_ups": [item.to_dict() for item in self.follow_ups],
             "loops": self.loops.to_dict() if self.loops is not None else None,
+            "coverage": self.coverage.to_dict() if self.coverage is not None else None,
+            "coverage_summary": self.coverage_summary,
             "loop_summary": self.loop_summary,
             "mission_review": self.review_summary_of_mission,
             "stop_condition": self.stop_condition.value,
@@ -23110,6 +23132,9 @@ class HierarchicalFlow:
         #: Evidence count before each round's follow-up work and after it, so the
         #: saturation question is answerable from the record rather than re-derived.
         self._round_evidence: list[tuple[int, int]] = []
+        #: §45: the round each evidence item arrived in, so a question is stamped with the
+        #: round its answer came in rather than the round that last re-read it.
+        self._evidence_rounds: dict[str, int] = {}
         self._review_round = 1
         self._reviews_used = 0
         #: The normalised claims the previous round saw, for the saturation test.
@@ -23123,6 +23148,11 @@ class HierarchicalFlow:
         self._claims_now: set[str] = set()
         self._round_claims: list[set[str]] = []
         self._round_aims: list[dict[str, Any]] = []
+        #: §45: every coverage matrix the Master built, in round order.  The ledger is what
+        #: makes the matrix *dynamic* — one matrix says what the mission believed at the
+        #: end, and the ledger says what it believed after each round, so a question can be
+        #: seen becoming answered (or failing to).
+        self._coverage: CoverageLedger = CoverageLedger()
         #: Follow-up assignments this mission opened, in the order it opened them.
         self._follow_ups: list[FollowUpAssignment] = []
         #: What each follow-up round created, so the result can name it.
@@ -23531,6 +23561,14 @@ class HierarchicalFlow:
             f"{self.policy.max_parallel_workers} worker"))
         for subagent in self.subagents:
             self._settled.setdefault(subagent.id, set())
+        # §45, before any report exists: which question each planned unit serves.  A plan
+        # whose units cannot be attributed to a question is reported here, at the round in
+        # which the mistake was made, rather than at the end when nothing can be done.
+        self._coverage = record_coverage(self._coverage, build_coverage_matrix(
+            self.context, units=self.subagents, round_number=0, seen_at="plan"))
+        opening = self._coverage.latest()
+        self._record(FlowStage.PLAN, detail=opening.summary() if opening is not None else
+                     "coverage: no questions were stated")
         return {"mission_id": self.mission_id, "objective": self.context.objective,
                 "waves": [list(wave) for wave in waves]}
 
@@ -24027,6 +24065,11 @@ class HierarchicalFlow:
         """Every Worker result this run reviewed, with its verdict."""
 
         return review_ledger(self._reviews)
+
+    def coverage_ledger(self) -> CoverageLedger:
+        """§45: every matrix this run built, in round order (a copy)."""
+
+        return self._coverage.model_copy(deep=True)
 
     def master_reviews(self) -> list[MasterReview]:
         """Every review the Master made, in the order it made them (§37)."""
@@ -25022,12 +25065,41 @@ class HierarchicalFlow:
             self._round_evidence[-1] = (before, len(review.evidence_ids))
         self._round_evidence.append((len(review.evidence_ids), len(review.evidence_ids)))
 
+        # §45: the matrix, after this round's reports — recomputed from the record, never
+        # carried forward and patched.  A matrix that was edited instead of rebuilt could
+        # report a question answered by a claim no report still makes.  Built here, before
+        # the next round is planned, because the matrix is what decides what that round is
+        # for: the nomination is passed to the planner, which attaches it to every
+        # assignment it opens.
+        for item_id in review.evidence_ids if review is not None else ():
+            self._evidence_rounds.setdefault(item_id, rounds_done)
+        matrix = build_coverage_matrix(
+            self.context, ordered, units=self.subagents, round_number=rounds_done,
+            seen_at="review", criteria_checks=mission_checks,
+            evidence=[item for report in ordered for item in report.evidence],
+            previous=self._coverage.latest(),
+            served_questions=[decision.serves_question for decision in self._master_decisions
+                              if decision.serves_question],
+            evidence_rounds=self._evidence_rounds,
+            # the round that just ended served this row; it is not re-nominated over an
+            # equally open question merely because its index is lower
+            just_served=self._master_decisions[-1].serves_question
+            if self._master_decisions else "")
+        self._coverage = record_coverage(self._coverage, matrix)
+        nominated = (matrix.row(matrix.row_index(matrix.next_question))
+                     if matrix.next_question else None)
+        self._record(FlowStage.MASTER_REVIEW, detail=(
+            f"coverage: {matrix.summary()}"
+            + (f"; next question {matrix.next_question}" if matrix.next_question else
+               "; no open question is worth a round")))
+
         # 2. what the next round would do, chosen before the decision so the decision
         #    can refuse it for a bound it can see.
         seats = self._master_seats()
         assignments = (plan_follow_ups(
             review, reports=ordered, subagents=self.subagents, policy=self.policy,
-            round_number=rounds_done + 1, licence_remaining=seats) 
+            round_number=rounds_done + 1, licence_remaining=seats,
+            serving=nominated)
             if not stopped else [])
         # Saturation is measured in *substance*, not in ids: §36 and §37 both create new
         # evidence rows by giving a Worker a new objective, so an id-only test would
@@ -25082,7 +25154,9 @@ class HierarchicalFlow:
             review, policy=self.policy, round_number=rounds_done,
             reviews_used=reviews_used, cancelled=False,
             deadline_expired=self.runtime.expired(), assignments=assignments,
-            evidence_added=added, blocked=blocked)
+            evidence_added=added, blocked=blocked,
+            nominated_question=matrix.next_question or "",
+            uncovered=matrix.uncovered)
         self._master_decisions.append(decision)
         self._record(FlowStage.MASTER_REVIEW, detail=decision.summary())
         # ``stopped`` keeps its old meaning — "no aggregate will be produced" — and
@@ -25092,6 +25166,7 @@ class HierarchicalFlow:
         update: dict[str, Any] = {
             "reviews": [json.loads(model_to_json(review))],
             "decisions": [json.loads(model_to_json(decision))],
+            "coverage": json.loads(model_to_json(matrix)),
             "reviewed": reviews_used, "round": rounds_done,
             "stopped": False, "stop_reason": "",
         }
@@ -25630,7 +25705,11 @@ class HierarchicalFlow:
             # separately from the objective because a criterion is not a question, and a
             # report that presented one as the other would be answering something else.
             question=(self.context.mission_questions[0]
-                      if self.context.mission_questions else ""))
+                      if self.context.mission_questions else ""),
+            # §45: the matrix as the last review left it, so the document carries what the
+            # run believed about its own coverage rather than a matrix rebuilt from the
+            # document it is part of.
+            coverage=self._coverage.latest())
         synthesis = synthesis.model_copy(update={"report": report})
         self._record(FlowStage.MASTER_SYNTHESIZE,
                      detail=f"{barrier.describe()}; {len(synthesis.sourced_claims)} sourced "
@@ -25712,6 +25791,7 @@ class HierarchicalFlow:
             master_decisions=self.master_decisions(),
             follow_ups=self.follow_ups(),
             loops=self._loops.model_copy(update={"saturation": self.loop_saturation()}),
+            coverage=self._coverage,
             research={"workers": len(self._research),
                       "audits": {worker_id: audit["audit"]
                                  for worker_id, audit in self._research.items()},
@@ -26293,6 +26373,9 @@ def run_flow_self_test(console: "Console | None" = None) -> list[FlowCheck]:
         bool(history) and history[0].repeated() == [])
     add("the result says what was retasked",
         bool(retask_result.review_summary.get("reviews")))
+
+    # ---- 13. the coverage matrix (§45) ---------------------------------
+    checks.extend(run_coverage_self_test())
     return checks
 
 
@@ -26412,6 +26495,12 @@ def _flow_demo(objective_key: str, *, out_dir: Path | None = None,
         "retask_histories": [history.summary() for history in flow.retask_ledger()],
         "retask_summary": result.retask_summary,
         "trace": result.trace,
+        # §45: the ledger and its verdict, so a demo's payload is the same record a run's is.
+        # A copy, because the payload outlives the run: a later append to the live ledger would
+        # change a record that was already handed to a reader.
+        "coverage": (result.coverage.model_copy(deep=True).to_dict()
+                     if result.coverage is not None else None),
+        "coverage_summary": result.coverage_summary,
         "runtime_only": True,
         "browser": result.browser,
         "log_lines": len(logger.read_records()) if logger is not None else 0,
@@ -26424,6 +26513,35 @@ def _flow_demo(objective_key: str, *, out_dir: Path | None = None,
         target.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
         payload["artefact"] = str(target)
     return payload
+
+
+def coverage_from_payload(payload: Mapping[str, Any]) -> CoverageMatrix | None:
+    """The last matrix a ``flow`` payload carries, or ``None``.
+
+    Tolerant on purpose: a payload written by an older build has no ``coverage`` key, and a
+    payload whose ledger cannot be read back should cost the reader a section, not the whole
+    screen.  Nothing here invents a matrix — an unreadable one renders as absent.
+    """
+
+    ledger = payload.get("coverage")
+    if not isinstance(ledger, Mapping):
+        return None
+    try:
+        latest = CoverageLedger.model_validate(ledger).latest()
+    except Exception:                                # pydantic ValidationError and friends
+        return None
+    return latest
+
+
+def render_flow_coverage(payload: Mapping[str, Any]) -> Group | None:
+    """§45's block for the ``flow`` screen: the matrix, or a line saying there is none."""
+
+    matrix = coverage_from_payload(payload)
+    if matrix is None:
+        return Group(Text("[dim]coverage: this payload carries no matrix "
+                          "(written by a build before §45, or the mission tracked no "
+                          "question)[/dim]"))
+    return render_coverage_matrix(matrix)
 
 
 def render_flow_summary(payload: Mapping[str, Any]) -> Table:
@@ -26472,6 +26590,17 @@ def render_flow_summary(payload: Mapping[str, Any]) -> Table:
     basis = synthesis.get("aggregate_basis") or {}
     table.add_row("master join", escape(
         f"{len(basis.get('received', []))}/{len(basis.get('expected', []))} report(s) received"))
+    # §45: what the Master asked itself, and whether every task answers one of those things.
+    matrix = coverage_from_payload(payload)
+    if matrix is not None and matrix.rows:
+        clause = matrix.acceptance()
+        table.add_row("coverage", escape(
+            f"{len(matrix.rows)} question(s), {len(matrix.answered)} answered, "
+            f"{len(matrix.open_rows)} open"
+            + (f"; {len(matrix.orphans)} orphan unit(s)" if matrix.orphans else "")))
+        table.add_row("coverage clause", escape(
+            "every task serves a question and none is dropped" if clause["ok"]
+            else "explainable: " + "; ".join(clause["errors"][:2])))
     if payload.get("stopped"):
         table.add_row("stopped", escape(str(payload["stop_reason"])))
     return table
@@ -26647,6 +26776,10 @@ def flow_command(
             MissionPresentation.from_dict(payload["presentation"])))
         console.print()
         console.print(render_flow_summary(payload))
+        coverage = render_flow_coverage(payload)
+        if coverage is not None:
+            console.print()
+            console.print(coverage)
         console.print()
         console.print(render_offline_cost(payload["cost"]))
         console.print()
@@ -26705,6 +26838,10 @@ def flow_command(
             MissionPresentation.from_dict(payload["presentation"])))
         console.print()
         console.print(render_flow_summary(payload))
+        coverage = render_flow_coverage(payload)
+        if coverage is not None:
+            console.print()
+            console.print(coverage)
         for report in payload["reports"]:
             console.print()
             console.print(Panel(Text("\n".join(
@@ -26807,6 +26944,10 @@ def flow_command(
             "synthesis": json.loads(model_to_json(result.synthesis)) if result.synthesis else None,
             "stage_order": result.stage_order(), "worker_attempts": result.worker_attempts,
             "retries": result.retries, "evidence": len(result.evidence),
+            # §45: the matrices, and the one-line verdict.  A run's record should say what it
+            # believed after each round, not only what it concluded.
+            "coverage": result.coverage.to_dict() if result.coverage is not None else None,
+            "coverage_summary": result.coverage_summary,
             "peak_concurrency": flow.trace.max_concurrency(),
             "ledger_concurrency": flow.trace.max_concurrency(),
             "threads": sorted(flow.trace.threads())[:4],
@@ -26822,6 +26963,10 @@ def flow_command(
             MissionPresentation.from_dict(payload["presentation"])))
         console.print()
         console.print(render_flow_summary(payload))
+        coverage = render_flow_coverage(payload)
+        if coverage is not None:
+            console.print()
+            console.print(coverage)
         console.print()
         console.print(render_flow_timeline(payload, limit=max(4, trace_limit)))
         if payload["synthesis"]:
@@ -26921,6 +27066,13 @@ def _run_mock_flow(context: "MasterContext", *, scenario: str,
         "synthesis": json.loads(model_to_json(result.synthesis)) if result.synthesis else None,
         "stage_order": result.stage_order(), "worker_attempts": result.worker_attempts,
         "retries": result.retries, "evidence": len(result.evidence),
+        # §34/§45: the same summaries the demo and live payloads carry, so a reader of a
+        # mock run's JSON does not have to special-case which flow path wrote it.
+        "review_summary": result.review_summary,
+        "reviews": result.reviews.to_dict() if result.reviews is not None else None,
+        "coverage": (result.coverage.model_copy(deep=True).to_dict()
+                     if result.coverage is not None else None),
+        "coverage_summary": result.coverage_summary,
         "peak_concurrency": 1, "ledger_concurrency": 1, "threads": [],
         "seconds": round(result.seconds, 3), "stopped": result.stopped,
         "stop_reason": result.stop_reason,
@@ -49863,6 +50015,13 @@ class FollowUpAssignment(StrictModel):
     round: int = Field(default=1, ge=1)
     #: The seat it spent, when it spent one: ``""`` for an existing Subagent.
     licence_remaining: int | None = None
+    #: §45: the coverage row this assignment serves (``cq-…``).  The Master nominates the
+    #: highest-value open question and attaches it here, so the assignment itself answers
+    #: "which mission question does this task serve?" — the first half of the clause — without
+    #: a reader having to reconstruct it from the objective's wording.
+    question_id: str = ""
+    #: The question's own words, quoted, so the assignment is readable without the matrix.
+    question: str = ""
 
     @model_validator(mode="after")
     def _route_is_carried_through(self) -> "FollowUpAssignment":
@@ -49896,7 +50055,8 @@ class FollowUpAssignment(StrictModel):
                 "lens": self.lens.value,
                 "completion_criteria": list(self.completion_criteria),
                 "tools": list(self.tools), "justification": self.justification,
-                "round": self.round, "licence_remaining": self.licence_remaining}
+                "round": self.round, "licence_remaining": self.licence_remaining,
+                "question_id": self.question_id, "question": self.question}
 
 
 class MasterReview(StrictModel):
@@ -50002,6 +50162,14 @@ class MasterDecision(StrictModel):
     #: Every bound that refused more work, in precedence order.
     refusals: list[str] = Field(default_factory=list)
     basis: str = Field(min_length=12)
+    #: §45: the coverage row this round serves (``cq-…``), empty when the decision is a stop
+    #: or the mission stated no questions.  Recorded so "which question does this task serve"
+    #: is answerable from the decision alone, without re-reading the matrix.
+    serves_question: str = ""
+    #: §45: what the matrix still could not account for when the decision was made — a
+    #: question nobody owns, a unit no question claims.  Carried on the decision because a
+    #: caveat that only lives in the matrix is a caveat the decision did not weigh.
+    uncovered: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _consistent(self) -> "MasterDecision":
@@ -50047,6 +50215,8 @@ class MasterDecision(StrictModel):
                 "round": self.round,
                 "assignments": [item.to_dict() for item in self.assignments],
                 "refusals": list(self.refusals), "basis": self.basis,
+                "serves_question": self.serves_question,
+                "uncovered": list(self.uncovered),
                 "summary": self.summary()}
 
 
@@ -50568,7 +50738,9 @@ def decide_master(review: MasterReview, *, policy: "FlowPolicy", round_number: i
                   reviews_used: int = 1, deadline_expired: bool = False,
                   cancelled: bool = False, assignments: Sequence[FollowUpAssignment] = (),
                   evidence_added: int | None = None,
-                  blocked: Sequence[str] = ()) -> MasterDecision:
+                  blocked: Sequence[str] = (),
+                  nominated_question: str = "",
+                  uncovered: Sequence[str] = ()) -> MasterDecision:
     """Turn a review into a bounded decision: finish, stop, or continue.
 
     The order of the questions is the whole design.
@@ -50591,6 +50763,12 @@ def decide_master(review: MasterReview, *, policy: "FlowPolicy", round_number: i
     ``stop_on_blocking_failure`` adds one more bound at the front of that list: if the
     mission is configured to refuse a synthesis over a blocking failure, a review with
     a blocking report left over does not get to spend a round trying again.
+
+    ``nominated_question`` and ``uncovered`` are §45's contribution, and they change no
+    decision — they travel with it.  The matrix picks *which* question the next round serves,
+    and the decision records it plus whatever the matrix still could not explain, so the
+    answer to "which question does this task serve" is on the task's own assignment and the
+    caveats are on the decision that spent the round.
     """
 
     reasons = replan_refusals(review, policy=policy, round_number=round_number,
@@ -50601,7 +50779,7 @@ def decide_master(review: MasterReview, *, policy: "FlowPolicy", round_number: i
         return MasterDecision(
             action="stop",
             condition=StopCondition.BLOCKED if cancelled else StopCondition.DEADLINE,
-            round=round_number, refusals=reasons,
+            round=round_number, refusals=reasons, uncovered=list(uncovered),
             basis=("the mission was cancelled before another round could start"
                    if cancelled else
                    "the mission deadline expired before another round could start"))
@@ -50613,6 +50791,7 @@ def decide_master(review: MasterReview, *, policy: "FlowPolicy", round_number: i
         # limitations" is the honest ending.
         return MasterDecision(
             action="final", condition=StopCondition.COMPLETE, round=round_number,
+            uncovered=list(uncovered),
             refusals=([f"{len(nominated)} concern(s) remain outside every existing "
                        f"Subagent; they are reported as limitations"]),
             basis=(f"every mission criterion is met ({len(review.criteria_met)}); "
@@ -50621,28 +50800,32 @@ def decide_master(review: MasterReview, *, policy: "FlowPolicy", round_number: i
     if reasons:
         return MasterDecision(
             action="stop", condition=stop_condition_for(reasons), round=round_number,
-            refusals=reasons,
+            refusals=reasons, uncovered=list(uncovered),
             basis=("no further round is allowed: " + "; ".join(reasons)))
     open_targets = review.open_targets
     if not open_targets:
         return MasterDecision(
             action="stop", condition=StopCondition.SATURATION, round=round_number,
             refusals=["the review found nothing another round could act on"],
+            uncovered=list(uncovered),
             basis=(f"every lens is satisfied and every mission question is answered, "
                    f"but {len(review.criteria_unmet)} mission criterion/criteria are "
                    f"still unmet"))
     if not assignments:
         return MasterDecision(
             action="stop", condition=StopCondition.SATURATION, round=round_number,
+            uncovered=list(uncovered),
             refusals=[f"{len(open_targets)} target(s) are open and none can be assigned: "
                       f"no existing Subagent's objective covers them"],
             basis=("further work would be a new mission rather than a remedy, so none "
                    "is planned"))
     return MasterDecision(
         action="continue", condition=StopCondition.NONE, round=round_number,
-        assignments=list(assignments),
+        assignments=list(assignments), serves_question=nominated_question,
+        uncovered=list(uncovered),
         basis=(f"{len(assignments)} bounded follow-up(s) for {len(open_targets)} open "
-               f"target(s); round {round_number} of {policy.max_replan_rounds}"))
+               f"target(s); round {round_number} of {policy.max_replan_rounds}"
+               + (f"; serving {nominated_question}" if nominated_question else "")))
 
 
 def stop_condition_for(refusals: Sequence[str]) -> StopCondition:
@@ -50720,7 +50903,8 @@ def plan_follow_ups(review: MasterReview, *, reports: Sequence["SubagentOutcome"
                     subagents: Sequence["FlowSubagent"], policy: "FlowPolicy",
                     round_number: int = 1,
                     licence_remaining: int | None = None,
-                    max_new_subagents: int = 1) -> list[FollowUpAssignment]:
+                    max_new_subagents: int = 1,
+                    serving: "CoverageCell | None" = None) -> list[FollowUpAssignment]:
     """The assignments a continue decision would run, most-specific first.
 
     Two routes, and the choice between them is a *bound*, not a preference:
@@ -50736,6 +50920,12 @@ def plan_follow_ups(review: MasterReview, *, reports: Sequence["SubagentOutcome"
 
     Nothing is returned for a lens that found a concern with no remedy: an assignment
     with no way to close its gap is busy-work, and the loop would spin on it.
+
+    ``serving`` is §45's nomination: the coverage row the Master has decided the round should
+    serve.  Its question is attached to every assignment the round opens, so the assignment
+    answers "which mission question does this task serve?" by itself, and its wording is
+    preferred when the review found a concern that names the question — the round then serves
+    the question rather than merely being compatible with it.
     """
 
     assignments: list[FollowUpAssignment] = []
@@ -50752,7 +50942,7 @@ def plan_follow_ups(review: MasterReview, *, reports: Sequence["SubagentOutcome"
         if not target:
             continue
         owner = _owner_for(finding.target, reports, subagents)
-        key = (_claim_key(target), owner)
+        key = (_claim_key(finding.target), owner)
         if key in seen:
             # Two lenses may point at one target — a report that drifted *and* left a
             # gap — and one follow-up answers both.  The owner is part of the key
@@ -50774,7 +50964,9 @@ def plan_follow_ups(review: MasterReview, *, reports: Sequence["SubagentOutcome"
                 justification=(f"the {finding.lens.value} lens found a concern inside "
                                f"this Subagent's own assignment, so one more Worker "
                                f"closes it without widening the mission"),
-                round=round_number))
+                round=round_number,
+                question_id=serving.id if serving is not None else "",
+                question=serving.question if serving is not None else ""))
             continue
         if finding.lens is ReviewLens.RELEVANCE:
             # Drift is fixed by re-pointing a report that exists, never by hiring a new
@@ -50796,7 +50988,9 @@ def plan_follow_ups(review: MasterReview, *, reports: Sequence["SubagentOutcome"
             justification=("no existing Subagent's objective covers this gap and the "
                            "master review named it explicitly"),
             round=round_number,
-            licence_remaining=max(0, seats - created)))
+            licence_remaining=max(0, seats - created),
+            question_id=serving.id if serving is not None else "",
+            question=serving.question if serving is not None else ""))
     return assignments
 
 
@@ -53282,7 +53476,7 @@ class SynthesisSection(StrictModel):
 
     kind: str = Field(pattern="^(executive-summary|scope-and-methods|key-findings|"
                               "indicators|hypotheses|contradictions|confidence|gaps|"
-                              "limitations|next-steps)$")
+                              "limitations|next-steps|coverage)$")
     title: str = Field(min_length=3)
     #: The prose.  May be empty for a section whose content is entirely structured
     #: (key findings, indicators, contradictions), which is why it is not ``min_length=1``.
@@ -53324,6 +53518,10 @@ REQUIRED_SECTIONS: tuple[tuple[str, str], ...] = (
     ("gaps", "Evidence gaps"),
     ("limitations", "Limitations"),
     ("next-steps", "Recommended next steps"),
+    # §45: the eleventh.  The task's ten sections answer what was found; this one answers
+    # *for which question*, and a report that cannot say that is one a reader has to trust
+    # rather than check.
+    ("coverage", "Coverage"),
 )
 
 
@@ -53368,6 +53566,11 @@ class MasterReport(StrictModel):
     aggregate_basis: JoinBarrier | None = None
     #: What the mission did not synthesise and why (blocked lines, refusals).
     withheld: list[str] = Field(default_factory=list)
+    #: §45: the matrix as it stood when the report was assembled — every question the mission
+    #: asked, what answers it, and what is still open.  Carried on the report rather than only
+    #: on the run, because a reader holding the document is the reader who needs to know
+    #: whether an important question was left out.
+    coverage: "CoverageMatrix | None" = None
 
     @field_validator("generated_at", mode="before")
     @classmethod
@@ -53887,7 +54090,8 @@ def synthesise_report(reports: Sequence["SubagentOutcome"], *, context: "MasterC
                       withheld: Sequence[str] = (),
                       barrier: JoinBarrier | None = None,
                       review: "MasterReview | None" = None,
-                      question: str = "") -> MasterReport:
+                      question: str = "",
+                      coverage: "CoverageMatrix | None" = None) -> MasterReport:
     """Assemble the finished document from the reviewed record.
 
     The order is the argument.  Evidence is indexed first (so every later step cites real
@@ -53938,7 +54142,7 @@ def synthesise_report(reports: Sequence["SubagentOutcome"], *, context: "MasterC
             "origins and capped by epistemic kind, contradictions are preserved rather "
             "than settled, and no attribution of conduct or identity is made. Nothing "
             "outside the gaps and limitations sections should be read as established."),
-        aggregate_basis=barrier, withheld=list(withheld))
+        aggregate_basis=barrier, withheld=list(withheld), coverage=coverage)
 
     indicator_section = _indicators_section(index, indicators)
 
@@ -53954,6 +54158,7 @@ def synthesise_report(reports: Sequence["SubagentOutcome"], *, context: "MasterC
         _gaps_section(gap_records),
         _limitations_section(limitations, withheld),
         _next_steps_section(report.next_steps),
+        _coverage_section(coverage),
     ]
     # The summary is a *section* like the others, so the completeness check and the
     # citation check treat it the same way — and so a reader can ask what it rests on.
@@ -53971,6 +54176,75 @@ def synthesise_report(reports: Sequence["SubagentOutcome"], *, context: "MasterC
              *[f"no report from: {gap.target[:80]}" for gap in review.coverage]]))
     _assert_complete(report, index)
     return report
+
+
+def _coverage_section(matrix: "CoverageMatrix | None") -> SynthesisSection:
+    """§45 in the document: which question each task served, and which is still open.
+
+    A mission that stated no questions gets a section saying so rather than an empty table:
+    "the mission stated no question" is a fact about the mission's design, and a reader who
+    found a blank section would not know whether to blame the mission or the writer.
+    """
+
+    if matrix is None:
+        return SynthesisSection(
+            kind="coverage", title="Coverage", body=(
+                "The mission did not record a coverage matrix: its questions, the units that "
+                "serve them and what answers each were not tracked, so this report cannot "
+                "say which question any finding serves."),
+            evidence_ids=[])
+    if not matrix.rows:
+        return SynthesisSection(
+            kind="coverage", title="Coverage", body=(
+                "The mission stated no question. That is a limitation of the mission's design "
+                "rather than of its evidence: a report with no question cannot be checked "
+                "against one, and this document does not claim to answer anything the "
+                "objective did not ask."),
+            evidence_ids=[])
+    lines = [
+        f"The mission asked {len(matrix.rows)} question(s). This table is the Master's "
+        f"coverage after round {matrix.round}, recomputed from the reports it had received:",
+        "",
+        "| # | question | status | served by | evidence | confidence |",
+        "|---|----------|--------|-----------|----------|------------|",
+    ]
+    for row in matrix.rows:
+        served = ", ".join(row.subagent_roles or row.subagent_ids) or "**nobody**"
+        lines.append(f"| {row.index} | {_md_cell(row.question, limit=140)} "
+                     f"| {row.status.label} | {_md_cell(served, limit=90)} "
+                     f"| {len(row.evidence_ids)} | {row.confidence.value} |")
+    open_rows = matrix.open_rows
+    if open_rows:
+        lines.extend(["", "**Still open, and why:**"])
+        for row in open_rows:
+            lines.append(f"- Q{row.index} ({row.status.label}): "
+                         f"{_md_inline(row.checked_by or 'no reason recorded')}")
+    else:
+        lines.extend(["", "Every question the mission asked is answered by reviewed evidence."])
+    if matrix.dropped:
+        lines.extend(["", "**Dropped — asked and no longer carried by the mission:**"])
+        lines.extend(f"- {_md_inline(item)}" for item in matrix.dropped)
+    if matrix.orphans:
+        lines.extend(["", "**Tasks no mission question claims** (work the mission cannot "
+                          "explain): " + ", ".join(f"`{unit}`" for unit in matrix.orphans)])
+    if matrix.unattributed:
+        lines.extend(["", f"{len(matrix.unattributed)} claim(s) in the evidence table answer "
+                          f"no named question; they support the objective rather than a "
+                          f"question, and are listed here rather than folded into one."])
+    clause = matrix.acceptance()
+    lines.extend(["", f"**Coverage clause:** every task serves a question "
+                      f"{_mark_word(clause['every_task_serves_one'])} · nothing dropped "
+                      f"{_mark_word(clause['nothing_dropped'])} · open questions explained "
+                      f"{_mark_word(clause['open_questions_explained'])}"])
+    evidence_ids = list(dict.fromkeys(item for row in matrix.rows for item in row.evidence_ids))
+    return SynthesisSection(kind="coverage", title="Coverage", body="\n".join(lines),
+                            evidence_ids=evidence_ids)
+
+
+def _mark_word(ok: bool) -> str:
+    """A word, not a glyph: the Markdown is read in places a ✓ does not render."""
+
+    return "**yes**" if ok else "**NO**"
 
 
 def _indicator_rows(index: EvidenceIndex) -> list[IndicatorRow]:
@@ -54218,6 +54492,7 @@ DOCUMENT_SECTIONS: tuple[tuple[str, str], ...] = (
     ("gaps", "Evidence gaps"),
     ("limitations", "Limitations"),
     ("next-steps", "Recommended next steps"),
+    ("coverage", "Coverage"),
     ("execution", "Agent and task execution"),
     ("time", "Time usage"),
     ("errors", "Errors"),
@@ -55638,6 +55913,13 @@ def render_dossier_markdown(dossier: MissionDossier, *, width: int = 96) -> str:
                    "record was not examined for them, which is itself worth stating.")
     parts.append("## Limitations\n\n" + limitations + "\n")
     parts.append("## Recommended next steps\n\n" + _md_next_steps(report))
+    # §45: the matrix, from the report's own copy of it.  Rendered through the same section
+    # body the report carries, so the document and the JSON cannot disagree about coverage.
+    # The body is appended as Markdown rather than through ``_md_block``: it *is* a table, and
+    # escaping it would print the pipes as text.  It is safe to append because every cell in
+    # it was written through ``_md_cell``/``_md_inline``, which is where the untrusted text
+    # from the mission is neutralised.
+    parts.append("## Coverage\n\n" + report.section_of("coverage").body.strip() + "\n")
     parts.append("## Agent and task execution\n\n" + _md_execution(execution))
     parts.append("## Time usage\n\n" + _md_time(execution.time))
     parts.append("## Errors\n\n" + _md_errors(execution))
@@ -56022,7 +56304,7 @@ def render_dossier_demo(payload: Mapping[str, Any]) -> Group:
     formats.add_column("what it is", overflow="fold")
     formats.add_column("carries", overflow="fold", max_width=52)
     formats.add_row("markdown", "the document, for a person",
-                    "twenty sections, tables, citations by id")
+                    f"{len(DOCUMENT_SECTIONS)} sections, tables, citations by id")
     formats.add_row("json", "the record, for a machine",
                     f"{len(payload['schema_keys'])} top-level keys, re-validated on read")
     formats.add_row("terminal", "the summary, for the screen",
@@ -56132,6 +56414,21 @@ def run_dossier_self_test() -> list[DossierCheck]:
         report is not None and dossier.execution.stopping.statement[:60] in markdown)
     add("the document states its acceptance clause", "## Acceptance" in markdown
         and "JSON re-validates" in markdown)
+    # §45: the coverage section is written from the report's own matrix, so a document that
+    # printed it and a record that stored it cannot disagree about which question each task
+    # served — the one claim this section exists to make.
+    coverage_section = report.section_of("coverage") if report is not None else None
+    add("the report carries the coverage matrix",
+        report is not None and report.coverage is not None
+        and bool(report.coverage.rows), report.coverage.round if report is not None
+        and report.coverage is not None else None)
+    add("the document prints the matrix the report carries",
+        coverage_section is not None and bool(report is not None and report.coverage is not None)
+        and all(f"Q{row.index}" in markdown for row in report.coverage.rows),
+        len(report.coverage.rows) if report is not None and report.coverage is not None else 0)
+    add("the document states the coverage clause in words",
+        coverage_section is not None and "Coverage clause" in coverage_section.body,
+        coverage_section.body[-70:] if coverage_section is not None else "")
 
     # ---- 3. the JSON -------------------------------------------------------
     payload = dossier.to_json()
@@ -56680,6 +56977,10 @@ class MissionPresentation(StrictModel):
     produced_by: str = ""
     networkshape: str = ""
     retention: str = ""
+    #: §45 on one line: how many questions the mission asked, how many are answered, and —
+    #: when one exists — the question the Master would spend the next round on.  Short
+    #: because the screen's job is to make a reader open the report, not to replace it.
+    coverage: str = ""
 
     @property
     def outcome(self) -> MissionOutcome:
@@ -56708,6 +57009,7 @@ class MissionPresentation(StrictModel):
                 "stopping_reason": self.stopping_reason, "next_step": self.next_step,
                 "unfinished": [item.to_dict() for item in self.unfinished],
                 "produced_by": self.produced_by, "networkshape": self.networkshape,
+                "coverage": self.coverage,
                 "retention": self.retention,
                 "outcome": self.outcome.value,
                 "blocking": [item.cause for item in self.blocking]}
@@ -56745,6 +57047,7 @@ class MissionPresentation(StrictModel):
             next_step=str(payload.get("next_step") or ""),
             produced_by=str(payload.get("produced_by") or ""),
             networkshape=str(payload.get("networkshape") or ""),
+            coverage=str(payload.get("coverage") or ""),
             retention=str(payload.get("retention") or ""))
 
 
@@ -57098,7 +57401,35 @@ def build_presentation(dossier: MissionDossier, *, report_paths: Sequence[str] =
         produced_by=dossier.audit.environment.describe(),
         networkshape=(f"{dossier.audit.hierarchy.describe()} — "
                       f"stopped: {dossier.audit.stopping.kind}"),
+        coverage=_presentation_coverage(report),
         retention=RETENTION_SHORT)
+
+
+def _presentation_coverage(report: "MasterReport") -> str:
+    """The matrix as one line for the screen: asked, answered, and what is still open."""
+
+    matrix = report.coverage
+    if matrix is None:
+        return "no coverage matrix: the mission did not track which question each task served"
+    if not matrix.rows:
+        return "the mission stated no question, so no finding answers one"
+    # Only the statuses that actually occur, in rank order: "0 answered" is noise on a mission
+    # where nothing has been answered yet, and silence about a contradiction would be worse.
+    counts: dict[QuestionStatus, int] = {}
+    for row in matrix.rows:
+        counts[row.status] = counts.get(row.status, 0) + 1
+    phrase = ", ".join(f"{counts[status]} {status.label}"
+                       for status in sorted(counts, key=lambda item: item.rank))
+    line = f"{len(matrix.rows)} question(s): {phrase}"
+    if matrix.orphans:
+        line += f"; {len(matrix.orphans)} task(s) serve no question"
+    # The matrix's own nomination, not a second ranking computed here: the screen must quote
+    # the decision the Master made, or the two would agree only by coincidence.
+    index = matrix.row_index(matrix.next_question) if matrix.next_question else None
+    nominated = matrix.row(index) if index is not None else None
+    if nominated is not None:
+        line += f" — next: Q{nominated.index} ({nominated.status.label})"
+    return line
 
 
 def build_stopped_presentation(result: "FlowResult", *, report_paths: Sequence[str] = (),
@@ -57159,6 +57490,10 @@ def build_stopped_presentation(result: "FlowResult", *, report_paths: Sequence[s
         next_step=("re-run the same unit with a tool that can answer, or report the gap "
                    "the failure left"),
         produced_by=_audit_environment(mode=_result_mode(result)).describe(),
+        coverage=(f"{len(result.coverage.latest().rows)} question(s) tracked; the mission "
+                  f"stopped before coverage could be concluded"
+                  if result.coverage is not None and result.coverage.latest() is not None
+                  else "no coverage matrix: the mission stopped before it tracked one"),
         networkshape=(f"{len(result.reports)} subagent(s), "
                       f"{sum(len(report.outcomes) for report in result.reports)} worker(s) — "
                       f"stopped: {result.stop_reason[:80] or 'not stated'}"),
@@ -57290,6 +57625,10 @@ def render_mission_presentation(presentation: MissionPresentation, *,
         footer.add_row("produced by", escape(presentation.produced_by))
     if presentation.networkshape:
         footer.add_row("shape", escape(presentation.networkshape))
+    if presentation.coverage:
+        # §45: above "next", because the next step is chosen from it — a reader should meet
+        # the question before the recommendation that answers it.
+        footer.add_row("coverage", escape(presentation.coverage[:200]))
     if presentation.next_step:
         footer.add_row("next", escape(presentation.next_step[:160]))
     footer.add_row("detail", escape("the findings above are the headline of each; the full "
@@ -61008,6 +61347,1165 @@ def _allows_mock(result: "FlowResult") -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# 45. The coverage matrix: which question each task serves, and which is dropped
+# --------------------------------------------------------------------------
+#
+# A mission that answers nine questions and silently forgets the tenth looks exactly like a
+# mission that answered nine and was asked nine.  That is the failure this section exists to
+# make impossible, and the reason it is a *matrix* rather than a checklist: every claim the
+# report makes has to trace back to a question, and every question has to trace forwards to
+# an owner, evidence and a confidence — or to a stated reason why it is still open.
+#
+# The matrix arises in two places, and the discipline is that they are one object:
+#
+#   * **After every Subagent round** the Master recomputes it from the reports it has.  That
+#     is what makes it *dynamic*: a question's status is not the mission's intention, it is
+#     what the reports currently support.  The matrix is written after each round, so the
+#     history shows a question moving from ``assigned`` to ``answered`` (or failing to).
+#   * **Before it chooses the next round** the Master asks the matrix which question is worth
+#     the next unit of work, by rank: an unanswered question with evidence already pointing
+#     at it, then an assigned one with none, then a question nothing has ever owned.  A
+#     follow-up carries that question id, so "which mission question does this task serve?"
+#     is answerable from the assignment alone.
+#
+# The four rules that make the acceptance clause checkable rather than rhetorical:
+#
+#   1. **Every unit has a question.** A unit claimed by no question is a task the mission
+#      cannot explain, and :func:`build_coverage_matrix` reports it (`orphans`) rather than
+#      quietly attaching it to something.
+#   2. **Every supported claim cites an item, and every cited item has a row.** A finding
+#      whose evidence belongs to no question is the other gap — work with no purpose.
+#   3. **Nothing disappears.** A question that was asked and is not answered is `open`, with
+#      the reason and the round it was last looked at.  A question dropped from the matrix
+#      would have to be dropped *from the record*, which is what §40 publishes.
+#   4. **A dropped question is loud.** `dropped` is computed, the presentation prints it,
+#      the report's section names it, and the audit's clause fails if one exists.
+
+#: The prefix every coverage row's id carries, so an id is recognisable in a citation list.
+COVERAGE_ID_PREFIX: str = "cq-"
+
+
+class QuestionStatus(str, Enum):
+    """What the mission can currently say about one of its own questions.
+
+    Ordered by ``rank`` — the order the Master spends work in.  The names are chosen so a
+    reader who knows nothing about this build can still read a row: a question that was never
+    given to anybody is ``unassigned``, and one that was given to somebody who returned
+    nothing is still ``assigned`` (the assignment happened; the answer did not).
+    """
+
+    DROPPED = "dropped"          # asked, nobody owns it, and no round can still act on it
+    UNASSIGNED = "unassigned"    # asked, and no unit claims it
+    ASSIGNED = "assigned"        # a unit claims it; no evidence answers it yet
+    PARTIAL = "partial"          # evidence points at it; the question is not closed
+    ANSWERED = "answered"        # reviewed evidence answers it, with a stated confidence
+    CONTRADICTED = "contradicted"  # evidence answers it and another report disputes it
+
+    @property
+    def rank(self) -> int:
+        """How much the next round of work would gain from this question, as a number.
+
+        ``contradicted`` outranks ``partial`` because a disputed answer is a *believed*
+        answer with a hole under it, and settling it changes what the report may say.
+        """
+
+        return {QuestionStatus.CONTRADICTED: 0, QuestionStatus.PARTIAL: 1,
+                QuestionStatus.ASSIGNED: 2, QuestionStatus.UNASSIGNED: 3,
+                QuestionStatus.ANSWERED: 8, QuestionStatus.DROPPED: 9}[self]
+
+    @property
+    def open(self) -> bool:
+        """Whether more work could still change this row."""
+
+        return self not in {QuestionStatus.ANSWERED, QuestionStatus.DROPPED}
+
+    @property
+    def label(self) -> str:
+        return {QuestionStatus.ANSWERED: "answered", QuestionStatus.PARTIAL: "partial",
+                QuestionStatus.ASSIGNED: "assigned", QuestionStatus.UNASSIGNED: "unassigned",
+                QuestionStatus.CONTRADICTED: "contradicted",
+                QuestionStatus.DROPPED: "DROPPED"}[self]
+
+
+class CoverageCell(StrictModel):
+    """One row of the matrix: a question, its owner, its evidence, and what is still missing.
+
+    The row is the unit a reader checks.  Everything in it is derived from the record — the
+    ``evidence_ids`` are ids that exist in the mission's evidence set, the ``subagent_ids`` are
+    reports the mission holds — so a row cannot claim a coverage the record does not have.
+
+    As with the matrix that holds it, ``to_dict`` writes two derived booleans (``open``,
+    ``covered``), so unknown input is ignored and a written row reads back as itself.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(min_length=1)
+    #: 1-based position in the mission's own question list.  Stable across rounds, because a
+    #: question that moved position between rounds could not be compared with itself.
+    index: int = Field(ge=1)
+    question: str = Field(min_length=1)
+    status: QuestionStatus = QuestionStatus.UNASSIGNED
+    #: The units that claim it — planned before any report exists, resolved to report ids
+    #: once the reports arrive.
+    subagent_ids: list[str] = Field(default_factory=list)
+    subagent_roles: list[str] = Field(default_factory=list)
+    #: The required evidence behind it (§39's deliverable, as a requirement).
+    required: list[str] = Field(default_factory=list)
+    #: The mission's own completion criteria this question must satisfy.
+    criteria: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    #: The claims those items make, quoted, so a reader need not open the table.
+    statements: list[str] = Field(default_factory=list)
+    confidence: Confidence = Confidence.UNKNOWN
+    #: Why: the rule that decided the status, in the same style as §37's ``checked_by``.
+    checked_by: str = ""
+    gaps: list[str] = Field(default_factory=list)
+    #: The last round this row was looked at, and the first round it was ``answered``.
+    last_round: int = Field(default=0, ge=0)
+    answered_round: int = Field(default=0, ge=0)
+    #: The item a contradicting report names, when one disputes this question's answer.
+    contradicted_by: str = ""
+
+    @field_validator("question")
+    @classmethod
+    def _no_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("a coverage row is about a question; a blank one is not a row")
+        return value.strip()
+
+    @property
+    def open(self) -> bool:
+        return self.status.open
+
+    @property
+    def covered(self) -> bool:
+        """Whether anything currently owns this question, answered or not.
+
+        Different from ``status.open``, and the difference is the point: an ``assigned``
+        question is covered and unanswered, an ``unassigned`` one is neither.
+        """
+
+        return bool(self.subagent_ids or self.subagent_roles)
+
+    def describe(self) -> str:
+        where = ", ".join(self.subagent_roles or self.subagent_ids) or "nobody"
+        return f"Q{self.index} [{self.status.label}] {self.question[:100]} — {where}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"id": self.id, "index": self.index, "question": self.question,
+                "status": self.status.value, "subagent_ids": list(self.subagent_ids),
+                "subagent_roles": list(self.subagent_roles),
+                "required": list(self.required), "criteria": list(self.criteria),
+                "evidence_ids": list(self.evidence_ids),
+                "statements": list(self.statements),
+                "confidence": self.confidence.value, "checked_by": self.checked_by,
+                "gaps": list(self.gaps), "last_round": self.last_round,
+                "answered_round": self.answered_round,
+                "contradicted_by": self.contradicted_by,
+                "open": self.open, "covered": self.covered}
+
+
+class CoverageMatrix(StrictModel):
+    """One round's view of what the mission asked and what it has.
+
+    ``format_version`` is its own: a matrix is a record a tool may read on its own, and a
+    reader that had to parse a whole flow result to get one would build their own parser.
+
+    ``to_dict`` carries derived keys (``orphans``, ``status_counts``, ``acceptance``) that are
+    properties here, so the model ignores unknown input: a matrix this build wrote is a matrix
+    this build can read back, which is what keeps ``--json`` a two-way format.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    format_version: str = "argus-coverage/1"
+    mission_id: str = ""
+    objective: str = ""
+    round: int = Field(default=0, ge=0)
+    #: Where this view came from: the plan (before any report), a review, or the synthesis.
+    seen_at: str = "plan"
+    rows: list[CoverageCell] = Field(default_factory=list)
+    #: Units no question claims — "the mission cannot explain this task".
+    orphans: list[str] = Field(default_factory=list)
+    #: Claims whose evidence belongs to no question — work with no question behind it.
+    unattributed: list[str] = Field(default_factory=list)
+    #: Questions nothing has ever owned, and questions the mission stopped working on.
+    unassigned: list[str] = Field(default_factory=list)
+    dropped: list[str] = Field(default_factory=list)
+    #: The question the next round would spend its work on, and why it is that one.
+    next_question: str = ""
+    next_reason: str = ""
+
+    def row(self, index: int) -> CoverageCell | None:
+        return next((row for row in self.rows if row.index == index), None)
+
+    def by_status(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for row in self.rows:
+            counts[row.status.value] = counts.get(row.status.value, 0) + 1
+        return counts
+
+    @property
+    def answered(self) -> list[CoverageCell]:
+        return [row for row in self.rows
+                if row.status in {QuestionStatus.ANSWERED, QuestionStatus.CONTRADICTED}]
+
+    @property
+    def open_rows(self) -> list[CoverageCell]:
+        return [row for row in self.rows if row.open]
+
+    def row_index(self, row_id: str) -> int | None:
+        """The question number behind a row id, so a decision can cite a number a reader sees."""
+
+        row = next((item for item in self.rows if item.id == row_id), None)
+        return row.index if row is not None else None
+
+    @property
+    def uncovered(self) -> list[str]:
+        """What the matrix could not account for, in the words a decision carries.
+
+        Only the two facts a decision should weigh: a task no question claims (the mission
+        cannot say why it ran) and a question with no owner at all (the mission has asked
+        something it is not looking for).  Dropped questions are not here — they are a
+        separate, louder fact — and claims without a question are counted, not listed,
+        because they are a tidiness defect rather than a coverage one.
+        """
+
+        facts: list[str] = []
+        facts.extend(f"task with no question: {unit}" for unit in self.orphans[:4])
+        facts.extend(f"question with no owner: {item[:110]}" for item in self.unassigned[:4])
+        facts.extend(f"question dropped: {item[:110]}" for item in self.dropped[:4])
+        return facts
+
+    @property
+    def complete(self) -> bool:
+        """Whether every question the mission asked is answered or explicitly dropped.
+
+        A matrix with no rows is *not* complete: a mission that asked nothing has not
+        covered anything, and saying otherwise is the same empty success §37 refuses.
+        """
+
+        return bool(self.rows) and not self.open_rows
+
+    @property
+    def intact(self) -> bool:
+        """Whether every question the mission asked is still in the matrix.
+
+        This is the "nothing silently dropped" test, and it is a *set* comparison rather than
+        a count: a round that replaced one question with another would pass a count.
+        """
+
+        asked = {_claim_key(row.question) for row in self.rows if row.question.strip()}
+        return (len(asked) == len(self.rows)
+                and all(row.question.strip() for row in self.rows))
+
+    def acceptance(self) -> dict[str, Any]:
+        """Task 41's clause, evaluated on the matrix in front of it.
+
+        *The Master can explain which mission question each task serves, and no important
+        question is silently dropped.*  Each half is two checks here: units are claimed and
+        claims are questioned, then every question is present and any that is not answered
+        says why.
+        """
+
+        errors: list[str] = []
+        notes: list[str] = []
+        if not self.rows:
+            errors.append("the matrix has no rows: the mission asked nothing, so it covered "
+                          "nothing")
+        if self.orphans:
+            errors.append(f"{len(self.orphans)} unit(s) are claimed by no question: "
+                          + ", ".join(self.orphans[:3]))
+        if not self.intact:
+            errors.append("a question the mission asked is missing from the matrix")
+        unexplained = [row for row in self.open_rows if not row.checked_by.strip()]
+        if unexplained:
+            errors.append(f"{len(unexplained)} open question(s) say nothing about why they "
+                          f"are open")
+        if self.dropped:
+            errors.append(f"{len(self.dropped)} question(s) were dropped: "
+                          + ", ".join(self.dropped[:2]))
+        if self.unattributed:
+            notes.append(f"{len(self.unattributed)} claim(s) belong to no question: "
+                         + ", ".join(self.unattributed[:2]))
+        # Four enforceable keys and one count.  A *claim* with no question behind it is
+        # reported but not enforced: a review can collect something that serves the
+        # objective rather than any named question, and failing the clause for that would
+        # make the clause about tidiness instead of about dropped questions.  A *task* with
+        # no question is enforced, because a task nobody can explain is work with no reason.
+        return {
+            "names_the_question": all(row.question.strip() for row in self.rows),
+            "every_task_serves_one": not self.orphans,
+            "nothing_dropped": self.intact and not self.dropped,
+            "open_questions_explained": not unexplained,
+            "claims_without_a_question": len(self.unattributed),
+            "ok": not errors, "errors": errors, "notes": notes,
+        }
+
+    def summary(self) -> str:
+        counts = self.by_status()
+        parts = [f"{counts[key]} {name}" for key, name in
+                 (("answered", "answered"), ("contradicted", "contradicted"),
+                  ("partial", "partial"), ("assigned", "assigned"),
+                  ("unassigned", "unassigned"), ("dropped", "dropped"))
+                 if counts.get(key)]
+        return (f"round {self.round}: {len(self.rows)} question(s) — "
+                + (", ".join(parts) or "none recorded")
+                + (f"; {len(self.orphans)} orphan unit(s)" if self.orphans else ""))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"format_version": self.format_version, "mission_id": self.mission_id,
+                "objective": self.objective, "round": self.round,
+                "seen_at": self.seen_at,
+                "rows": [row.to_dict() for row in self.rows],
+                "orphans": list(self.orphans),
+                "unattributed": list(self.unattributed),
+                "unassigned": list(self.unassigned),
+                "dropped": list(self.dropped),
+                "next_question": self.next_question,
+                "next_reason": self.next_reason,
+                "status_counts": self.by_status(),
+                "complete": self.complete,
+                "acceptance": self.acceptance()}
+
+
+class CoverageLedger(StrictModel):
+    """Every matrix the Master built, in round order.
+
+    The ledger is what makes "dynamic" checkable: a single matrix says what the mission
+    believed at the end, and a ledger says what it believed after each round — so a reader
+    can see a question *become* answered, and can see whether a round was spent on the
+    question the previous matrix nominated.
+    """
+
+    format_version: str = "argus-coverage/1"
+    matrices: list[CoverageMatrix] = Field(default_factory=list)
+
+    #: ``to_dict`` also emits the derived ``rounds`` and ``latest`` keys, so the model ignores
+    #: unknown input — a record this build wrote has to be a record this build can read back,
+    #: and ``--json`` output that could not be re-read would make the format one-way.
+    model_config = ConfigDict(extra="ignore")
+
+    def latest(self) -> CoverageMatrix | None:
+        return self.matrices[-1] if self.matrices else None
+
+    @property
+    def rounds(self) -> list[int]:
+        return [matrix.round for matrix in self.matrices]
+
+    def question_moved(self, index: int) -> list[QuestionStatus]:
+        """One question's status in every matrix it appears in, oldest first.
+
+        The series is how a reader checks that a round *did* something: a question whose
+        status is unchanged across two rounds was worked on and did not move, which is a
+        fact worth recording rather than a failure worth hiding.
+        """
+
+        series: list[QuestionStatus] = []
+        for matrix in self.matrices:
+            row = matrix.row(index)
+            if row is not None:
+                series.append(row.status)
+        return series
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"format_version": self.format_version,
+                "rounds": self.rounds,
+                "matrices": [matrix.to_dict() for matrix in self.matrices],
+                "latest": self.latest().to_dict() if self.latest() is not None else None}
+
+
+# ➤ building one matrix -----------------------------------------------------
+
+#: What a question's evidence has to do before it counts as an answer: the same two content
+#: words §37's coverage lens requires.  Defined once, here, because a matrix that used a
+#: looser test than the review would report questions answered that the review still calls
+#: gaps — two judges, two answers, and the report would carry both.
+ANSWER_OVERLAP: int = 2
+
+
+def coverage_id(index: int, question: str) -> str:
+    """A stable id for a question's row: position plus the question's own content.
+
+    Position alone would break when a question is edited; content alone would collide for two
+    questions about one subject.  Together they are stable across rounds and unique within a
+    mission, which is what a follow-up needs in order to cite the row it serves.
+    """
+
+    return f"{COVERAGE_ID_PREFIX}{index}-{content_id('q', _claim_key(question), length=6)}"
+
+
+def coverage_rows(context: "MasterContext",
+                  units: Sequence["FlowSubagent"] = (),
+                  round_number: int = 0, seen_at: str = "plan") -> list[CoverageCell]:
+    """The questions as rows, before any evidence: who claims each, and what it needs.
+
+    This is the ``assigned`` matrix — the one a plan produces.  It exists so that "which
+    question does this task serve?" has an answer *before* the task runs, which is what the
+    Master needs in order to decide what to run at all.
+    """
+
+    questions = [(index, text) for index, text in enumerate(context.mission_questions, start=1)
+                 if text.strip()]
+    rows: list[CoverageCell] = []
+    for index, question in questions:
+        wanted = _topic_words(question)
+        claimed = [unit for unit in units
+                   if _unit_serves_question(unit, question, wanted)]
+        rows.append(CoverageCell(
+            id=coverage_id(index, question), index=index, question=question,
+            status=QuestionStatus.ASSIGNED if claimed else QuestionStatus.UNASSIGNED,
+            subagent_ids=[unit.id for unit in claimed],
+            subagent_roles=[unit.role for unit in claimed],
+            required=_required_evidence(claimed),
+            criteria=_criteria_for_question(question, context.completion_criteria),
+            last_round=round_number,
+            checked_by=("a planned unit names it in its assignment"
+                        if claimed else
+                        "no planned unit names it: the mission has asked something it "
+                        "has not assigned")))
+    return rows
+
+
+def build_coverage_matrix(context: "MasterContext",
+                          reports: Sequence["SubagentOutcome"] = (),
+                          *, units: Sequence["FlowSubagent"] = (),
+                          round_number: int = 0, seen_at: str = "review",
+                          evidence: Sequence["EvidenceItem"] | None = None,
+                          criteria_checks: Sequence["CriterionCheck"] = (),
+                          previous: CoverageMatrix | None = None,
+                          served_questions: Sequence[str] = (),
+                          evidence_rounds: Mapping[str, int] | None = None,
+                          just_served: str = "") -> CoverageMatrix:
+    """Assemble the matrix for one round from whatever the Master currently holds.
+
+    Called with no reports it produces the *plan's* matrix (who is assigned what).  Called
+    after a round it produces the round's matrix, and the two are the same function on
+    different inputs — which is why a question cannot change meaning between them.
+
+    ``served_questions`` is what earlier rounds spent their follow-ups on, so the nomination
+    can rotate rather than nominate the same question every round.
+
+    ``evidence_rounds`` maps an evidence id to the round it arrived in, so a question is
+    stamped with the round its answer *arrived* in rather than with the round that happened to
+    re-read it.  Without it every later round re-stamps an old answer, and the ledger's one
+    job — showing a question move — would report movement that never happened.
+
+    ``previous`` carries the round a question was answered in and the questions an earlier
+    round saw.  A question present in ``previous`` and absent from ``context`` is the case
+    this section exists to catch, and it is reported as ``dropped`` *and* passed through, so
+    the row survives the round in which the mission forgot it.
+    """
+
+    items = list(evidence) if evidence is not None else [
+        item for report in reports for item in report.evidence]
+    rows = coverage_rows(context, units, round_number=round_number, seen_at=seen_at)
+    by_id = {row.index: row for row in rows}
+
+    # 1. Each report's evidence is attached to the question it answers — never copied into
+    #    more than one row, because a claim counted twice is a claim the matrix overstates.
+    claimed_items: set[str] = set()
+    for index, row in by_id.items():
+        wanted = _topic_words(row.question)
+        attached = [item for item in items
+                    if _item_answers_question(item.statement, wanted)
+                    and item.id not in claimed_items]
+        if not attached:
+            continue
+        claimed_items.update(item.id for item in attached)
+        disputed = _question_disputed(row.question, reports)
+        row.evidence_ids = [item.id for item in attached]
+        row.statements = [item.statement[:240] for item in attached[:4]]
+        row.confidence = _weakest_confidence(attached)
+        row.contradicted_by = disputed
+        if disputed:
+            row.status = QuestionStatus.CONTRADICTED
+            row.checked_by = (f"a report disputes this question: {disputed[:160]}")
+        else:
+            met = _criteria_met_for(row.question, reports, criteria_checks)
+            row.status = QuestionStatus.ANSWERED if met else QuestionStatus.PARTIAL
+            row.checked_by = (
+                "a reviewed statement shares at least "
+                f"{ANSWER_OVERLAP} content words with it and adds something the question "
+                "did not"
+                + ("; a criterion check for it is met, which is what closes the question "
+                   "rather than merely supporting it" if met else
+                   "; no criterion check for it is met, so it is support rather than an "
+                   "answer"))
+            if met and row.gaps:
+                # The gaps were the reason it stayed open; a met criterion settles them, and
+                # a matrix that kept them would send the next round at a closed question.
+                row.gaps = []
+            if row.status is QuestionStatus.ANSWERED and row.confidence is Confidence.UNKNOWN:
+                # An answer with no stated confidence cannot be read: the status would say
+                # "answered" and the row would refuse to say how far it may be believed.
+                # The weakest attached claim's confidence is the only honest figure, and the
+                # report's own confidence is already the weakest of its findings.
+                row.confidence = _weakest_confidence(attached) \
+                    if attached else Confidence.UNKNOWN
+    # 2. Rows whose evidence was taken by an earlier row keep their status honest: they are
+    #    assigned and unanswered, not answered by a claim another question already used.
+    for row in rows:
+        if row.evidence_ids:
+            continue
+        if row.status is QuestionStatus.UNASSIGNED:
+            continue
+        row.checked_by = (row.checked_by or
+                          "no reviewed statement answers it yet, though a unit claims it")
+
+    # 3. Questions an earlier round saw and this one does not: the mission changed its
+    #    questions.  A question cannot be removed by forgetting it, so it is carried forward
+    #    with the round it was lost in.
+    if previous is not None:
+        known = {_claim_key(row.question) for row in rows}
+        for old in previous.rows:
+            if _claim_key(old.question) in known:
+                current = next(row for row in rows
+                               if _claim_key(row.question) == _claim_key(old.question))
+                current.answered_round = old.answered_round
+                if current.status is QuestionStatus.UNASSIGNED and old.answered_round:
+                    # It was answered and nothing answers it now: the evidence went away,
+                    # which is a different fact from never having had any.
+                    current.checked_by = (
+                        f"answered in round {old.answered_round}, but no report now "
+                        f"carries that answer")
+                continue
+            lost = old.model_copy(deep=True)
+            lost.status = QuestionStatus.DROPPED
+            lost.last_round = round_number
+            lost.checked_by = (
+                f"the mission asked this in round {old.last_round or 1} and its question "
+                f"list no longer contains it (round {round_number}); an answer may not be "
+                f"withdrawn by restating the objective")
+            rows.append(lost)
+            by_id[lost.index] = lost
+
+    # 4. A question answered in an earlier round keeps the round it was answered in.  The
+    #    arrival round comes from ``evidence_rounds``; a caller that does not track it (the
+    #    plan, a synthetic matrix) falls back to "when this matrix first saw the answer".
+    arrivals = dict(evidence_rounds or {})
+    for row in rows:
+        if row.status in {QuestionStatus.ANSWERED, QuestionStatus.CONTRADICTED} \
+                and not row.answered_round:
+            row.answered_round = min(
+                (arrivals[item] for item in row.evidence_ids if item in arrivals),
+                default=round_number or 0)
+        row.last_round = round_number or row.last_round
+
+    # 5. The two accounting tests: units no question claims, and claims no question owns.
+    orphaned = _orphan_units(rows, units, reports)
+    unattributed = [item.id for item in items if item.id not in claimed_items][:12]
+    matrix = CoverageMatrix(
+        mission_id=context.mission_id or content_id("cov", context.objective.lower()),
+        objective=context.objective, round=round_number, seen_at=seen_at, rows=rows,
+        orphans=orphaned, unattributed=unattributed,
+        unassigned=[f"Q{row.index}: {row.question[:110]}" for row in rows
+                    if row.status is QuestionStatus.UNASSIGNED],
+        dropped=[f"Q{row.index}: {row.question[:110]}" for row in rows
+                 if row.status is QuestionStatus.DROPPED])
+    nomination = nominate_question(matrix, already_served=tuple(served_questions or ()),
+                                   just_served=just_served)
+    if nomination is not None:
+        row, reason = nomination
+        matrix.next_question = row.id
+        matrix.next_reason = reason
+    return matrix
+
+
+#: The scaffolding a Worker's bookkeeping wraps around a question: §39 records a gap as
+#: "the result addresses: <question>" and a follow-up as "at least one reviewed observation
+#: addresses: <question>".  Both are honest rows, and neither answers anything — the words
+#: they add are the mission talking about its own work.
+_BOOKKEEPING_SCAFFOLD = re.compile(
+    # The id-prefixed forms as well as the phrases: a written row keeps the `gap-gap-…`
+    # or `follow-up-…` prefix, and a digits-only token is still a word to ``_topic_words``.
+    r"\b(?:gap|follow-up|flw|wrk|sa|ev)-[a-z]*-?[0-9a-z]+[0-9][0-9a-z]*|"
+    r"the result addresses:|at least one reviewed observation addresses:|"
+    r"observation\(s\) collected|\bthe result\b|\baddresses\b",
+    re.IGNORECASE)
+
+
+def _answering_words(statement: str) -> set[str]:
+    """A statement's content words with its bookkeeping scaffolding removed.
+
+    The echo guard §37 applies compares a statement's words with the question's; a row that
+    *quotes* the question survives that test because the scaffolding around the quote is new
+    vocabulary ("result", "addresses", "observation").  Stripping the scaffolding first is
+    what makes "this row repeats the question" detectable, and it is the difference between a
+    matrix that reports a mission covered by its own bookkeeping and one that does not.
+    """
+
+    return _topic_words(_BOOKKEEPING_SCAFFOLD.sub(" ", statement))
+
+
+def _item_answers_question(statement: str, wanted: set[str]) -> bool:
+    """Whether one statement answers a question: shared subject *and* something new.
+
+    The echo guard is §37's, with the scaffolding removed first (see
+    :func:`_answering_words`): a row that restates the question shares its words exactly and
+    answers nothing, however it is phrased.
+    """
+
+    if not wanted:
+        return False
+    words = _answering_words(statement)
+    if len(words & wanted) < ANSWER_OVERLAP:
+        return False
+    return bool(words - wanted)
+
+
+def _unit_serves_question(unit: "FlowSubagent", question: str, wanted: set[str]) -> bool:
+    """Whether a unit's assignment claims a question.
+
+    Three ways, in decreasing directness: the unit says so (``addresses_questions``), or its
+    objective shares two content words with the question, or one word plus the mission's own
+    criterion for it — the same falling scale §37's relevance lens uses, and for the same
+    reason: a Worker's honest, narrow objective should still be attributable to the question
+    it serves.
+    """
+
+    if question.strip().lower() in {text.strip().lower()
+                                    for text in unit.addresses_questions}:
+        return True
+    if not wanted:
+        return False
+    if len(_topic_words(unit.objective) & wanted) >= ANSWER_OVERLAP:
+        return True
+    if len(_topic_words(unit.role) & wanted) >= ANSWER_OVERLAP:
+        return True
+    return any(len(_topic_words(criterion) & wanted) >= ANSWER_OVERLAP
+               for criterion in unit.completion_criteria)
+
+
+def _required_evidence(units: Sequence["FlowSubagent"]) -> list[str]:
+    """What the claiming units were asked to return, deduplicated and bounded."""
+
+    required: list[str] = []
+    for unit in units:
+        for worker in unit.workers:
+            for criterion in worker.completion_criteria[:2]:
+                if criterion not in required:
+                    required.append(criterion[:160])
+    return required[:4]
+
+
+def _criteria_for_question(question: str, criteria: Sequence[str]) -> list[str]:
+    """The mission criteria this question has to satisfy, by shared subject."""
+
+    wanted = _topic_words(question)
+    return [criterion for criterion in criteria
+            if len(_topic_words(criterion) & wanted) >= 1][:3]
+
+
+def _criteria_met_for(question: str, reports: Sequence["SubagentOutcome"],
+                      mission_checks: Sequence["CriterionCheck"]) -> bool:
+    """Whether any criterion this question serves is recorded as met."""
+
+    wanted = _topic_words(question)
+    for check in mission_checks:
+        if check.met and len(_topic_words(check.criterion) & wanted) >= 1:
+            return True
+    for report in reports:
+        for check in _report_criteria(report):
+            if check.met and len(_topic_words(check.criterion) & wanted) >= ANSWER_OVERLAP:
+                return True
+    return False
+
+
+def _question_disputed(question: str, reports: Sequence["SubagentOutcome"]) -> str:
+    """The conflict that disputes this question's answer, or ``""``.
+
+    A question is contradicted when a report's *stated disagreement* is about the same
+    subject: §39 preserves those rather than settling them, and a matrix that reported such a
+    question as answered would be the one place in the build where a conflict disappeared.
+    """
+
+    wanted = _topic_words(question)
+    for report in reports:
+        for conflict in report.disagreements:
+            if len(_topic_words(conflict.topic) & wanted) >= 1:
+                return conflict.topic or "a report's disagreement"
+    return ""
+
+
+def _weakest_confidence(items: Sequence["EvidenceItem"]) -> Confidence:
+    """The confidence of the weakest item behind an answer — never an average."""
+
+    ranks = {Confidence.UNKNOWN: 0, Confidence.LOW: 1, Confidence.MEDIUM: 2,
+             Confidence.HIGH: 3}
+    if not items:
+        return Confidence.UNKNOWN
+    return min((item.confidence for item in items), key=lambda level: ranks[level])
+
+
+def _orphan_units(rows: Sequence[CoverageCell], units: Sequence["FlowSubagent"],
+                  reports: Sequence["SubagentOutcome"]) -> list[str]:
+    """Units no question claims — the tasks the mission cannot explain.
+
+    Both levels are checked, because both can be orphaned: a planned Subagent no question
+    claims, and a rubric-invented runtime or follow-up Worker whose assignment names nothing
+    the mission asked.  A follow-up is the likelier one, and the more important: it is work
+    the mission chose to do *after* it had already seen its answers.
+    """
+
+    claimed = {unit_id for row in rows for unit_id in row.subagent_ids}
+    claimed_roles = {role.strip().lower() for row in rows for role in row.subagent_roles}
+    orphans: list[str] = []
+    for unit in units:
+        if unit.id in claimed or unit.role.strip().lower() in claimed_roles:
+            continue
+        orphans.append(unit.id)
+    for report in reports:
+        if report.subagent_id in claimed or report.role.strip().lower() in claimed_roles:
+            continue
+        if report.subagent_id not in orphans:
+            orphans.append(report.subagent_id)
+    return orphans[:8]
+
+
+# ➤ choosing the next question ---------------------------------------------
+
+def nominate_question(matrix: CoverageMatrix, *,
+                      already_served: Sequence[str] = (),
+                      just_served: str = "") -> tuple[CoverageCell, str] | None:
+    """The question the next round of work should serve, and the reason it is that one.
+
+    The order is by :attr:`QuestionStatus.rank`, and then by how much the round could gain:
+    a ``contradicted`` question before a ``partial`` one, an ``assigned`` question with no
+    evidence before an ``unassigned`` one (somebody is already looking), and a question with
+    a stated gap before one without.  ``answered`` questions are not nominated: spending a
+    round re-answering one is the loop §38 exists to stop.
+
+    ``already_served`` holds the questions earlier rounds spent work on, and ``just_served``
+    the one the round that produced this matrix spent it on.  They break ties *after* status
+    and before everything else: without them the highest-ranked question is nominated every
+    round and the second — equally contradicted, equally important — is never served: not
+    dropped, but never chosen.  Rotating is what makes "the next highest-value action" a
+    decision about the mission rather than about the ranking.
+
+    Rotation comes last, after status *and* after the row's stated gaps, so it cannot outrank
+    substance: a question that has acquired a gap, or moved between statuses, is chosen again
+    however recently it was served — leaving a newly-open question unanswered would be a worse
+    use of the round than repeating a subject.
+
+    Returning ``None`` is a real answer — it means nothing open is worth a round — and the
+    decision that follows records it as saturation rather than as a plan.
+    """
+
+    candidates = [row for row in matrix.rows if row.open]
+    if not candidates:
+        return None
+    served = set(already_served)
+    # Substance first, then rotation: a question with a stated gap outranks an equal-status
+    # one without, however recently the gap-less one was served.  Rotation is the last word
+    # only among rows the matrix has nothing else to choose between.
+    candidates.sort(key=lambda row: (row.status.rank, 1 if row.id in served else 0,
+                                     0 if row.gaps else 1,
+                                     1 if row.id == just_served else 0, row.index))
+    chosen = candidates[0]
+    reason = {
+        QuestionStatus.CONTRADICTED:
+            f"a report disputes the answer to Q{chosen.index}, so the report cannot state it "
+            f"until the dispute is settled",
+        QuestionStatus.PARTIAL:
+            f"Q{chosen.index} has evidence but no met criterion, so one more sourced record "
+            f"could close it",
+        QuestionStatus.ASSIGNED:
+            f"Q{chosen.index} is assigned and no reviewed statement answers it yet",
+        QuestionStatus.UNASSIGNED:
+            f"Q{chosen.index} has never been assigned: nobody has looked for it at all",
+    }.get(chosen.status, f"Q{chosen.index} is the highest-value open question")
+    return chosen, reason[:300]
+
+
+# ➤ updating the ledger after a round --------------------------------------
+
+def record_coverage(ledger: CoverageLedger, matrix: CoverageMatrix) -> CoverageLedger:
+    """Append one round's matrix, replacing an earlier matrix for the same round.
+
+    Replacement rather than duplication because a round is reviewed once: a second matrix for
+    round 2 would be the same round's second opinion, and a reader comparing the two would
+    have to decide which was the round.
+    """
+
+    kept = [item for item in ledger.matrices if item.round != matrix.round]
+    kept.append(matrix)
+    return ledger.model_copy(update={"matrices": sorted(kept, key=lambda item: item.round)})
+
+
+# ➤ rendering --------------------------------------------------------------
+
+_COVERAGE_STYLE: dict[QuestionStatus, str] = {
+    QuestionStatus.ANSWERED: "green",
+    QuestionStatus.CONTRADICTED: "yellow",
+    QuestionStatus.PARTIAL: "cyan",
+    QuestionStatus.ASSIGNED: "blue",
+    QuestionStatus.UNASSIGNED: "magenta",
+    QuestionStatus.DROPPED: "red",
+}
+
+_COVERAGE_GLYPH: dict[QuestionStatus, str] = {
+    QuestionStatus.ANSWERED: "✔", QuestionStatus.CONTRADICTED: "⚑",
+    QuestionStatus.PARTIAL: "◐", QuestionStatus.ASSIGNED: "→",
+    QuestionStatus.UNASSIGNED: "○", QuestionStatus.DROPPED: "✘",
+}
+
+
+def render_coverage_matrix(matrix: CoverageMatrix, *, width: int = 120) -> Group:
+    """The matrix as a table: one row per question, its status, owner, evidence and gaps."""
+
+    table = Table(title=f"coverage — round {matrix.round} ({matrix.seen_at})",
+                  title_justify="left", box=None, pad_edge=False, expand=True)
+    table.add_column("#", justify="right", width=2, no_wrap=True)
+    table.add_column("question", overflow="fold", ratio=3)
+    table.add_column("status", no_wrap=True)
+    table.add_column("served by", overflow="fold", ratio=2)
+    table.add_column("evidence", justify="right", no_wrap=True)
+    table.add_column("conf.", no_wrap=True)
+    table.add_column("still missing", overflow="fold", ratio=2)
+    for row in matrix.rows:
+        colour = _COVERAGE_STYLE[row.status]
+        served = ", ".join(row.subagent_roles or row.subagent_ids) or "nobody"
+        missing = ("; ".join(row.gaps[:2]) if row.gaps
+                   else ("—" if row.status is QuestionStatus.ANSWERED
+                         else row.checked_by[:110] or "not stated"))
+        table.add_row(
+            str(row.index), escape(row.question[:160]),
+            f"[{colour}]{_COVERAGE_GLYPH[row.status]} {row.status.label}[/{colour}]",
+            escape(served[:70]), str(len(row.evidence_ids)),
+            row.confidence.value, escape(missing[:140]))
+    blocks: list[Any] = [table]
+    notes = Table.grid(padding=(0, 1))
+    notes.add_column(width=2, no_wrap=True)
+    notes.add_column(overflow="fold", max_width=width)
+    notes.add_row("[dim]·[/dim]", escape(matrix.summary()))
+    if matrix.orphans:
+        notes.add_row("[red]✘[/red]", escape(
+            "units claimed by no question: " + ", ".join(matrix.orphans[:4])))
+    if matrix.unattributed:
+        notes.add_row("[yellow]![/yellow]", escape(
+            f"{len(matrix.unattributed)} claim(s) belong to no question yet"))
+    if matrix.next_question:
+        notes.add_row("[green]→[/green]", escape(
+            f"next: {matrix.next_question} — {matrix.next_reason}"))
+    blocks.extend([Text(""), notes])
+    return Group(*blocks)
+
+
+def render_coverage_summary(matrix: CoverageMatrix) -> str:
+    """The matrix as plain text, for a log or a pipe."""
+
+    lines = [f"coverage — round {matrix.round} ({matrix.seen_at})", matrix.summary()]
+    for row in matrix.rows:
+        lines.append(f"  Q{row.index:<2} [{row.status.label:<12}] "
+                     f"{row.question[:80]:<80} {len(row.evidence_ids)} item(s)")
+    if matrix.orphans:
+        lines.append("  orphaned: " + ", ".join(matrix.orphans[:4]))
+    if matrix.next_question:
+        lines.append(f"  next: {matrix.next_question} — {matrix.next_reason[:120]}")
+    return "\n".join(lines)
+
+
+def run_coverage_self_test() -> list["FlowCheck"]:
+    """Prove §45 offline: the matrix is derived, it moves with the evidence, and it explains.
+
+    Every check builds its own matrix from a context and a set of claims, so the suite is a
+    property of the section rather than of one fixture — and the last group runs the *real*
+    graph, because a matrix that is right in isolation and never wired in would pass all the
+    rest and cover nothing.
+    """
+
+    checks: list[FlowCheck] = []
+
+    def add(name: str, ok: bool, detail: Any = "") -> None:
+        checks.append(_flow_check(name, ok, detail))
+
+    def claim(statement: str, *, kind: EvidenceKind = EvidenceKind.OBSERVATION,
+              collected_by: str = "collector") -> EvidenceItem:
+        """One reviewed claim with a real source, so the model's own rules still apply.
+
+        Built through the public model rather than a stub because the matrix's job is to read
+        the mission's *actual* evidence: a fixture that skipped the rules §31 enforces would
+        prove the matrix works on claims the mission cannot produce.
+        """
+
+        return EvidenceItem(
+            kind=kind, statement=statement, collected_by=collected_by,
+            confidence=Confidence.MEDIUM,
+            confidence_basis="one first-party page states it; nothing corroborates it yet",
+            sources=[SourceReference(kind=SourceKind.PUBLIC_WEB,
+                                     url=f"https://example.com/{content_id('src', statement)}",
+                                     title="vendor advisory",
+                                     retrieval_method=RetrievalMethod.HTTP)],
+            reasoning=("the page states the affected release explicitly"
+                       if kind is EvidenceKind.INFERENCE else None))
+
+    context = _selftest_context("exposure")
+    units = flow_units_for(context, "exposure")
+    questions = list(context.mission_questions)
+    add("the fixture states questions to cover", bool(questions), len(questions))
+
+    # ---- 1. the plan's matrix, before any evidence -----------------------
+    planned = build_coverage_matrix(context, units=units, round_number=0, seen_at="plan")
+    add("the plan's matrix has one row per question",
+        len(planned.rows) == len(questions), f"{len(planned.rows)}/{len(questions)}")
+    add("every row names its question", all(row.question.strip() for row in planned.rows))
+    add("every row is owned or says nobody owns it",
+        all(row.covered or row.status is QuestionStatus.UNASSIGNED for row in planned.rows),
+        [row.status.value for row in planned.rows])
+    add("a planned question is not answered by its plan",
+        all(row.status is not QuestionStatus.ANSWERED for row in planned.rows),
+        [row.status.value for row in planned.rows])
+    add("every planned unit is claimed by a row or is an orphan",
+        all(unit.id in planned.orphans
+            or any(unit.id in row.subagent_ids for row in planned.rows)
+            for unit in units),
+        f"{len(planned.orphans)} orphan(s) of {len(units)} unit(s)")
+    add("the plan nominates the question the first round should serve",
+        bool(planned.next_question) and bool(planned.next_reason),
+        (planned.next_question, planned.next_reason[:60]))
+
+    # ---- 2. a claim that answers the question answers it ---------------
+    question = planned.rows[0].question
+    wanted = _topic_words(question)
+    share = sorted(wanted)[:ANSWER_OVERLAP]
+    # The claim shares the question's own words and adds a fact the question did not state.
+    answered_claim = claim("the published advisories name libfoo 2.3.1 as the affected "
+                           "component, per the vendor's own page")
+    echo_claim = claim(f"the result addresses: {question}")
+    answered = build_coverage_matrix(
+        context, units=units, round_number=1, seen_at="review", evidence=[answered_claim])
+    add("a claim that answers the first question is attached to it",
+        answered_claim.id in answered.rows[0].evidence_ids,
+        (answered.rows[0].status.value, answered.rows[0].evidence_ids))
+    add("a claim that shares the question's words is not the question restated",
+        _item_answers_question(answered_claim.statement, wanted),
+        (share, sorted(_answering_words(answered_claim.statement))))
+    add("a row that echoes the question answers nothing",
+        not _item_answers_question(echo_claim.statement, wanted),
+        echo_claim.statement[:80])
+    echoed = build_coverage_matrix(
+        context, units=units, round_number=1, seen_at="review", evidence=[echo_claim])
+    add("an echoed question leaves the row unanswered",
+        echoed.rows[0].status is not QuestionStatus.ANSWERED
+        and echo_claim.id not in echoed.rows[0].evidence_ids
+        and echo_claim.id in echoed.unattributed,
+        (echoed.rows[0].status.value, echoed.unattributed))
+    add("the answer is stated with a confidence, not asserted as a fact",
+        answered.rows[0].confidence is not Confidence.UNKNOWN,
+        answered.rows[0].confidence.value)
+
+    # ---- 3. one claim is attached once, never to two rows ---------------
+    shared = claim(f"{question}: the advisories name libfoo 2.3.1 in the affected component "
+                   f"list")
+    twice = build_coverage_matrix(context, units=units, round_number=2, seen_at="review",
+                                  evidence=[shared])
+    holders = [row.index for row in twice.rows if shared.id in row.evidence_ids]
+    add("one claim is counted for one question only", len(holders) <= 1, holders)
+    add("the matrix totals no more evidence than it was given",
+        sum(len(row.evidence_ids) for row in twice.rows) <= 1,
+        sum(len(row.evidence_ids) for row in twice.rows))
+
+    # ---- 4. a dropped question is carried, not forgotten ---------------
+    shorter = context.model_copy(update={"mission_questions": questions[1:]})
+    dropped = build_coverage_matrix(shorter, units=units, round_number=3, seen_at="review",
+                                    previous=planned)
+    dropped_rows = [row for row in dropped.rows if row.status is QuestionStatus.DROPPED]
+    add("a question the mission stopped asking is carried forward",
+        len(dropped.rows) == len(planned.rows) and len(dropped_rows) == 1,
+        f"{len(dropped.rows)} row(s), {len(dropped_rows)} dropped")
+    add("the dropped row says which round lost it",
+        all("round" in row.checked_by for row in dropped_rows),
+        [row.checked_by[:60] for row in dropped_rows])
+    add("the dropped question is listed, so it cannot be silent",
+        len(dropped.dropped) == 1, dropped.dropped)
+    add("dropping a question fails the coverage clause",
+        not dropped.acceptance()["ok"], dropped.acceptance()["errors"])
+
+    # ---- 5. the clause says both halves, and only what is enforceable ---
+    clean = build_coverage_matrix(context, units=units, round_number=1, seen_at="review",
+                                  evidence=[answered_claim])
+    clause = clean.acceptance()
+    add("the clause names both halves of the acceptance",
+        {"names_the_question", "every_task_serves_one", "nothing_dropped",
+         "open_questions_explained"} <= set(clause), sorted(clause))
+    add("a mission whose tasks all serve an asked question passes",
+        clause["every_task_serves_one"] and clause["nothing_dropped"]
+        and clause["open_questions_explained"], clause["errors"])
+    orphan_matrix = clean.model_copy(deep=True, update={"orphans": ["sa-orphaned"]})
+    add("a task no question claims fails the clause",
+        not orphan_matrix.acceptance()["ok"], orphan_matrix.acceptance()["errors"])
+    add("a claim with no question behind it is counted, not failed",
+        clause["claims_without_a_question"] >= 0 and clause["ok"],
+        (clause["claims_without_a_question"], clause["ok"]))
+    add("one blank question is enough to fail 'names the question'",
+        not clean.model_copy(deep=True, update={"rows": []}).acceptance()["ok"]
+        or not build_coverage_matrix(
+            context.model_copy(update={"mission_questions": []}), units=(),
+            round_number=1).acceptance()["names_the_question"],
+        build_coverage_matrix(context.model_copy(update={"mission_questions": []}), units=(),
+                              round_number=1).acceptance())
+
+    # ---- 6. the matrix moves as evidence arrives ------------------------
+    empty = build_coverage_matrix(context, units=units, round_number=1, seen_at="review")
+    filled = build_coverage_matrix(context, units=units, round_number=4, seen_at="review",
+                                   evidence=[answered_claim], previous=empty,
+                                   evidence_rounds={answered_claim.id: 3})
+    moved = [row.status for row in empty.rows] != [row.status for row in filled.rows]
+    add("evidence moves a question's status", moved,
+        ([row.status.value for row in empty.rows],
+         [row.status.value for row in filled.rows]))
+    stamped = build_coverage_matrix(context, units=units, round_number=4, seen_at="review",
+                                    evidence=[answered_claim], previous=empty,
+                                    criteria_checks=[CriterionCheck(
+                                        criterion=question + " and its version", met=True,
+                                        evidence_ids=[answered_claim.id])],
+                                    evidence_rounds={answered_claim.id: 3})
+    add("a question is stamped with the round its answer arrived in, not the round that "
+        "re-read it",
+        stamped.rows[0].status is QuestionStatus.ANSWERED
+        and stamped.rows[0].answered_round == 3,
+        (stamped.rows[0].status.value, stamped.rows[0].answered_round))
+    # A criterion met for the question is what turns support into an answer; the matrix
+    # reads the mission's own criteria rather than deciding for itself when a question is done.
+    met_check = CriterionCheck(criterion=question + " and its version", met=True,
+                               evidence_ids=[answered_claim.id])
+    closed = build_coverage_matrix(context, units=units, round_number=1, seen_at="review",
+                                   evidence=[answered_claim],
+                                   criteria_checks=[met_check],
+                                   evidence_rounds={answered_claim.id: 1})
+    add("a met criterion closes the question the evidence only supported",
+        closed.rows[0].status is QuestionStatus.ANSWERED
+        and "criterion" in closed.rows[0].checked_by,
+        (closed.rows[0].status.value, closed.rows[0].checked_by[:90]))
+    add("a closed question carries a confidence to be believed at",
+        closed.rows[0].confidence is not Confidence.UNKNOWN,
+        closed.rows[0].confidence.value)
+
+    # ---- 7. the nomination is a decision, and it rotates ---------------
+    served_first = nominate_question(planned)
+    add("a matrix with an open question nominates one", served_first is not None)
+    add("the nomination gives a reason, not just an id",
+        bool(served_first) and len(served_first[1]) > 20,
+        served_first[1][:80] if served_first else "")
+    # Two equally open questions, one of them asked first: the first round takes Q1 and the
+    # second takes Q2, which is the difference between choosing the best question and
+    # choosing the same question until it closes.
+    two_rows = planned.model_copy(deep=True)
+    second = two_rows.rows[0].model_copy(deep=True, update={
+        "id": coverage_id(2, "the archive snapshots are complete"), "index": 2,
+        "question": "the archive snapshots are complete",
+        "subagent_ids": [], "subagent_roles": []})
+    two_rows.rows.append(second)
+    first_choice = nominate_question(two_rows)
+    second_choice = (nominate_question(two_rows, already_served=[first_choice[0].id])
+                     if first_choice is not None else None)
+    add("the next round is not spent on the question the last one served",
+        first_choice is not None and second_choice is not None
+        and first_choice[0].id != second_choice[0].id,
+        ((first_choice[0].question[:40], second_choice[0].question[:40])
+         if first_choice and second_choice else None))
+    gap_choice = nominate_question(
+        two_rows, already_served=[first_choice[0].id] if first_choice else [],
+        just_served=second_choice[0].id if second_choice else "")
+    add("rotation cannot outrank a question that has a stated gap",
+        gap_choice is not None and bool(gap_choice[0].gaps or not first_choice[0].gaps),
+        ((gap_choice[0].question[:40], len(gap_choice[0].gaps)) if gap_choice else None))
+    saturated = build_coverage_matrix(
+        context.model_copy(update={"mission_questions": []}), units=(), round_number=4)
+    add("a mission with nothing open nominates nothing",
+        nominate_question(saturated) is None)
+
+    # ---- 8. the ledger keeps every round, and reads back --------------
+    ledger = CoverageLedger()
+    for matrix in (planned, empty, filled):
+        ledger = record_coverage(ledger, matrix)
+    add("the ledger keeps one matrix per round", ledger.rounds == [0, 1, 4], ledger.rounds)
+    add("the ledger is in round order whatever order it was given",
+        ledger.rounds == sorted(ledger.rounds), ledger.rounds)
+    add("re-recording a round replaces it rather than duplicating it",
+        record_coverage(ledger, empty).rounds == ledger.rounds,
+        record_coverage(ledger, empty).rounds)
+    add("the ledger reads back as itself",
+        CoverageLedger.model_validate(ledger.to_dict()).to_dict() == ledger.to_dict())
+    add("the ledger names the round a question moved in",
+        len(ledger.question_moved(1)) == len(ledger.matrices),
+        [status.value for status in ledger.question_moved(1)])
+
+    # ---- 9. the document says it, in words ----------------------------
+    section = _coverage_section(filled)
+    add("the report has a coverage section", section.kind == "coverage"
+        and section.title == "Coverage")
+    add("the section carries the table of questions",
+        "| # | question | status |" in section.body, section.body[:60])
+    add("the section says the clause in words, not glyphs",
+        "**yes**" in section.body or "**NO**" in section.body, section.body[-90:])
+    blank = _coverage_section(None)
+    add("a mission with no matrix says so rather than showing an empty table",
+        "did not record a coverage matrix" in blank.body and "|" not in blank.body,
+        blank.body[:80])
+    add("coverage is a document section and a required one",
+        ("coverage", "Coverage") in DOCUMENT_SECTIONS
+        and any(kind == "coverage" for kind, _title in REQUIRED_SECTIONS),
+        len(REQUIRED_SECTIONS))
+
+    # ---- 10. the rendered matrix and summary agree with the record ----
+    table = render_coverage_matrix(filled)
+    summary = render_coverage_summary(filled)
+    add("the matrix renders as a table of rows", table is not None)
+    add("the text summary names every question",
+        all(f"Q{row.index}" in summary for row in filled.rows), summary.splitlines()[:2])
+    add("the text summary names the next question",
+        (filled.next_question in summary) or not filled.next_question,
+        filled.next_question)
+
+    # ---- 11. the real graph builds it, round by round ------------------
+    coverage_flow = HierarchicalFlow(
+        context=context, subagents=flow_units_for(context, "exposure"),
+        runner=_CountingRunner(scope=context.scope_entries))
+    coverage_result = coverage_flow.run()
+    run_ledger = coverage_result.coverage
+    add("a real run records a coverage matrix", run_ledger is not None
+        and bool(run_ledger.matrices), run_ledger.rounds if run_ledger else None)
+    add("the ledger has a plan's matrix and a review's",
+        run_ledger is not None
+        and {"plan"} <= {matrix.seen_at for matrix in run_ledger.matrices}
+        and "review" in {matrix.seen_at for matrix in run_ledger.matrices},
+        [matrix.seen_at for matrix in run_ledger.matrices] if run_ledger else None)
+    add("the plan's matrix is round 0, before any work ran",
+        run_ledger is not None and run_ledger.matrices[0].round == 0,
+        run_ledger.rounds if run_ledger else None)
+    add("the matrix covers the mission's own questions",
+        run_ledger is not None and len(run_ledger.latest().rows) == len(questions),
+        len(run_ledger.latest().rows) if run_ledger and run_ledger.latest() else 0)
+    add("the result carries the ledger to its readers",
+        coverage_result.coverage_summary.get("questions") == len(questions),
+        coverage_result.coverage_summary)
+    add("the summary and the ledger agree about the last round",
+        coverage_result.coverage_summary.get("round")
+        == run_ledger.latest().round,
+        (coverage_result.coverage_summary.get("round"),
+         run_ledger.latest().round))
+    decisions = coverage_result.master_decisions
+    nominations = [matrix.next_question for matrix in run_ledger.matrices if matrix.next_question]
+    add("a decision that continues names the question it serves",
+        all(decision.serves_question for decision in decisions
+            if decision.action == "continue") or not nominations,
+        [(decision.action, decision.serves_question) for decision in decisions])
+    served = [decision.serves_question for decision in decisions if decision.serves_question]
+    add("the served question is one the previous matrix nominated",
+        all(item in nominations for item in served), (served, nominations))
+    assigned = [item for item in coverage_flow.follow_ups() if item.question_id]
+    add("a follow-up assignment carries the question it serves", bool(assigned) or not served,
+        [(item.role, item.question_id) for item in assigned])
+    add("each follow-up quotes the question, not just its id",
+        all(item.question.strip() for item in assigned), [item.question[:40] for item in assigned])
+
+    return checks
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 44. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -62454,7 +63952,9 @@ def _flow_result_from_payload(payload: Mapping[str, Any]) -> FlowResult:
                           for item in payload.get("master_decisions") or []
                           if _written_like_model(item, MasterDecision)],
         loops=(LoopLedger.model_validate(payload["loops"])
-               if isinstance(payload.get("loops"), dict) else None))
+               if isinstance(payload.get("loops"), dict) else None),
+        coverage=(CoverageLedger.model_validate(payload["coverage"])
+                  if isinstance(payload.get("coverage"), dict) else None))
 
 
 def _written_like_model(payload: Any, model: type[BaseModel]) -> bool:

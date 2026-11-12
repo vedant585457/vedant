@@ -2,13 +2,13 @@
   "schema_version": 1,
   "mission_id": "flow-a995e56deaae",
   "objective": "map the publicly documented exposure of example.com and rank the advisory-backed risks",
-  "generated_at": "2026-11-11T11:48:21.328650Z",
+  "generated_at": "2026-11-12T09:04:47.918631Z",
   "format_version": "argus-dossier/1",
   "report": {
     "mission_id": "flow-a995e56deaae",
     "objective": "map the publicly documented exposure of example.com and rank the advisory-backed risks",
     "question": "the published advisories name the affected component",
-    "generated_at": "2026-11-11T11:48:19.383348Z",
+    "generated_at": "2026-11-12T09:04:47.893954Z",
     "sections": [
       {
         "kind": "executive-summary",
@@ -115,6 +115,13 @@
         "item_ids": [
           "gap-1"
         ]
+      },
+      {
+        "kind": "coverage",
+        "title": "Coverage",
+        "body": "The mission asked 1 question(s). This table is the Master's coverage after round 2, recomputed from the reports it had received:\n\n| # | question | status | served by | evidence | confidence |\n|---|----------|--------|-----------|----------|------------|\n| 1 | the published advisories name the affected component | assigned | published-advisories, dns-and-archive | 0 | unknown |\n\n**Still open, and why:**\n- Q1 (assigned): a planned unit names it in its assignment\n\n6 claim(s) in the evidence table answer no named question; they support the objective rather than a question, and are listed here rather than folded into one.\n\n**Coverage clause:** every task serves a question **yes** \u00b7 nothing dropped **yes** \u00b7 open questions explained **yes**",
+        "evidence_ids": [],
+        "item_ids": []
       }
     ],
     "findings": [
@@ -247,7 +254,58 @@
       ],
       "missing": []
     },
-    "withheld": []
+    "withheld": [],
+    "coverage": {
+      "format_version": "argus-coverage/1",
+      "mission_id": "cov-a995e56deaae",
+      "objective": "map the publicly documented exposure of example.com and rank the advisory-backed risks",
+      "round": 2,
+      "seen_at": "review",
+      "rows": [
+        {
+          "id": "cq-1-q-d0838f",
+          "index": 1,
+          "question": "the published advisories name the affected component",
+          "status": "assigned",
+          "subagent_ids": [
+            "sa-7adc0f884bde",
+            "sa-4de82fcd5ca6"
+          ],
+          "subagent_roles": [
+            "published-advisories",
+            "dns-and-archive"
+          ],
+          "required": [
+            "each advisory has a version or an explicit unknown",
+            "at least one reviewed observation addresses: each documented risk cites a first-party advisory",
+            "every record type has a value or an unknown",
+            "snapshot list captured with dates"
+          ],
+          "criteria": [],
+          "evidence_ids": [],
+          "statements": [],
+          "confidence": "unknown",
+          "checked_by": "a planned unit names it in its assignment",
+          "gaps": [],
+          "last_round": 2,
+          "answered_round": 0,
+          "contradicted_by": ""
+        }
+      ],
+      "orphans": [],
+      "unattributed": [
+        "ev-c759a5e97a06",
+        "ev-5a152a290231",
+        "ev-7a78d9ac296e",
+        "ev-b54e5ec0f860",
+        "ev-631b08366592",
+        "ev-5a152a290231"
+      ],
+      "unassigned": [],
+      "dropped": [],
+      "next_question": "cq-1-q-d0838f",
+      "next_reason": "Q1 is assigned and no reviewed statement answers it yet"
+    }
   },
   "execution": {
     "mission_id": "flow-a995e56deaae",
@@ -272,7 +330,7 @@
         "gate": "none",
         "attempts": 1,
         "evidence": 3,
-        "seconds": 0.055,
+        "seconds": 0.058,
         "origin": "planned",
         "note": "ready"
       },
@@ -280,12 +338,12 @@
         "id": "wrk-7fa8d41b476a",
         "kind": "worker",
         "role": "advisory-reader",
-        "objective": "",
+        "objective": "retrieve each advisory page and extract the fixed version",
         "status": "succeeded",
         "gate": "none",
         "attempts": 1,
         "evidence": 1,
-        "seconds": 0.05,
+        "seconds": 0.051,
         "origin": "planned",
         "note": ""
       },
@@ -298,20 +356,20 @@
         "gate": "none",
         "attempts": 1,
         "evidence": 1,
-        "seconds": 0.05,
+        "seconds": 0.051,
         "origin": "runtime",
         "note": ""
       },
       {
         "id": "wrk-03581617fd6c",
         "kind": "worker",
-        "role": "published-advisories follow-up",
-        "objective": "",
+        "role": "follow-up-flw-5b6f40",
+        "objective": "close the reviewed gap for published-advisories: coverage on nobody covers: each documented risk cites a first-party advisory",
         "status": "succeeded",
         "gate": "none",
         "attempts": 1,
         "evidence": 1,
-        "seconds": 0.05,
+        "seconds": 0.051,
         "origin": "follow-up",
         "note": ""
       },
@@ -324,7 +382,7 @@
         "gate": "none",
         "attempts": 1,
         "evidence": 3,
-        "seconds": 0.116,
+        "seconds": 0.122,
         "origin": "planned",
         "note": "ready"
       },
@@ -332,7 +390,7 @@
         "id": "wrk-e9cfb6efebac",
         "kind": "worker",
         "role": "dns-collector",
-        "objective": "",
+        "objective": "collect the published record set for example.com",
         "status": "succeeded",
         "gate": "none",
         "attempts": 1,
@@ -345,12 +403,12 @@
         "id": "wrk-d9962bee6734",
         "kind": "worker",
         "role": "archive-collector",
-        "objective": "",
+        "objective": "list archive snapshots of example.com",
         "status": "succeeded",
         "gate": "none",
         "attempts": 1,
         "evidence": 1,
-        "seconds": 0.052,
+        "seconds": 0.051,
         "origin": "planned",
         "note": ""
       },
@@ -363,89 +421,95 @@
         "gate": "none",
         "attempts": 1,
         "evidence": 1,
-        "seconds": 0.05,
+        "seconds": 0.051,
         "origin": "runtime",
         "note": ""
       }
     ],
     "errors": [],
     "retries_history": [],
-    "follow_ups": [],
+    "follow_ups": [
+      "existing: coverage \u2192 sa-7adc0f884bde"
+    ],
     "adopted": [],
     "withheld": [],
     "time": {
-      "total_seconds": 0.312,
-      "critical_path_seconds": 0.309,
-      "ledger_origin_seconds": 0.34,
+      "total_seconds": 0.349,
+      "critical_path_seconds": 0.346,
+      "ledger_origin_seconds": 0.474,
       "per_unit_seconds": {
-        "wrk-03581617fd6c": 0.05,
-        "wrk-60aa16261035": 0.05,
-        "wrk-7fa8d41b476a": 0.05,
-        "wrk-ac9fe515391b": 0.05,
-        "wrk-d9962bee6734": 0.052,
+        "wrk-03581617fd6c": 0.051,
+        "wrk-60aa16261035": 0.051,
+        "wrk-7fa8d41b476a": 0.051,
+        "wrk-ac9fe515391b": 0.051,
+        "wrk-d9962bee6734": 0.051,
         "wrk-e9cfb6efebac": 0.051
       },
       "stages": [
         [
           "planning",
-          0.002
-        ],
-        [
-          "subagent planning",
           0.004
         ],
         [
+          "subagent planning",
+          0.006
+        ],
+        [
           "worker execution",
-          0.052
+          0.054
         ],
         [
           "worker review",
-          0.002
+          0.005
         ],
         [
           "reconciliation",
-          0.181
+          0.194
         ],
         [
           "master review",
-          0.002
+          0.004
         ],
         [
           "follow-up planning",
-          0.065
+          0.079
         ],
         [
           "synthesis",
           0.0
         ]
       ],
-      "events": 42,
-      "workers": 0,
+      "events": 45,
+      "workers": 4,
       "attempts": 6,
-      "max_concurrency": 0,
-      "parallelism_note": "stage windows are differences between the first appearance of each stage in the ledger, not instrumented unit durations, so overlapping stages share their window rather than summing to the total. The ledger's zero is when the flow was built, 0.340s before its first event; the run's own clock starts when it is invoked, which is why the two totals differ."
+      "max_concurrency": 2,
+      "parallelism_note": "stage windows are differences between the first appearance of each stage in the ledger, not instrumented unit durations, so overlapping stages share their window rather than summing to the total. The ledger's zero is when the flow was built, 0.474s before its first event; the run's own clock starts when it is invoked, which is why the two totals differ."
     },
     "stopping": {
       "stopped": false,
-      "condition": "none",
-      "reason": "the run completed and recorded no stopping bound, so this dossier reports the absence rather than inventing one",
-      "kind": "not stated",
-      "reviews": 0,
-      "rounds": 0,
-      "bounds": [],
+      "condition": "complete",
+      "reason": "every mission criterion is met (1); 0 coverage gap(s) and 0 concern(s) remain as stated limitations",
+      "kind": "complete",
+      "reviews": 2,
+      "rounds": 1,
+      "bounds": [
+        "refused: 0 concern(s) remain outside every existing Subagent; they are reported as limitations"
+      ],
       "blocked_lines": [],
-      "foregone": [],
-      "statement": "the mission finished: the run completed and recorded no stopping bound, so this dossier reports the absence rather than inventing one. No stopping decision was part of this file, so the reason above is the whole of what the record says."
+      "foregone": [
+        "0 concern(s) remain outside every existing Subagent; they are reported as limitations"
+      ],
+      "statement": "the mission finished: every mission criterion is met (1); 0 coverage gap(s) and 0 concern(s) remain as stated limitations. The bound that ended it is on the record, so a reader can tell a finished mission from a stopped one."
     }
   },
   "sources": [
     {
-      "id": "src-1a9c8afe9779",
+      "id": "src-0b72e8e608eb",
       "kind": "local-artifact",
       "locator": "example.com",
       "title": "advisory-reader \u2014 published-advisories",
       "publisher": "",
-      "retrieved_at": "2026-11-11T11:48:19.132719Z",
+      "retrieved_at": "2026-11-12T09:04:47.612029Z",
       "method": "local-read",
       "http_status": null,
       "digest": "",
@@ -473,7 +537,7 @@
       "contradicts": [],
       "collected_by": "wrk-60aa16261035",
       "task_id": "",
-      "observed_at": "2026-11-11T11:48:19.192718Z",
+      "observed_at": "2026-11-12T09:04:47.680927Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -493,7 +557,7 @@
       "contradicts": [],
       "collected_by": "wrk-ac9fe515391b",
       "task_id": "",
-      "observed_at": "2026-11-11T11:48:19.312726Z",
+      "observed_at": "2026-11-12T09:04:47.807141Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -513,7 +577,7 @@
       "contradicts": [],
       "collected_by": "wrk-d9962bee6734",
       "task_id": "",
-      "observed_at": "2026-11-11T11:48:19.256661Z",
+      "observed_at": "2026-11-12T09:04:47.747643Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -533,7 +597,7 @@
       "contradicts": [],
       "collected_by": "wrk-03581617fd6c",
       "task_id": "",
-      "observed_at": "2026-11-11T11:48:19.373785Z",
+      "observed_at": "2026-11-12T09:04:47.872369Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -553,7 +617,7 @@
       "contradicts": [],
       "collected_by": "wrk-e9cfb6efebac",
       "task_id": "",
-      "observed_at": "2026-11-11T11:48:19.254052Z",
+      "observed_at": "2026-11-12T09:04:47.745281Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -573,7 +637,7 @@
       "contradicts": [],
       "collected_by": "wrk-7fa8d41b476a",
       "task_id": "",
-      "observed_at": "2026-11-11T11:48:19.132719Z",
+      "observed_at": "2026-11-12T09:04:47.612029Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -591,7 +655,7 @@
       "digest": "",
       "digest_complete": false,
       "collected_by": "wrk-7fa8d41b476a",
-      "collected_at": "2026-11-11T11:48:19.132876Z",
+      "collected_at": "2026-11-12T09:04:47.612375Z",
       "method": "local-read",
       "original_location": "example.com",
       "storage_location": "",
@@ -611,16 +675,16 @@
     "environment": {
       "app": "argus",
       "app_title": "ARGUS",
-      "version": "0.33.0",
-      "version_label": "0.33.0-alpha",
+      "version": "0.34.0",
+      "version_label": "0.34.0-alpha",
       "build_phase": 3,
       "format_version": "argus-audit/1",
       "python": "3.11.2",
       "implementation": "CPython",
       "platform": "Linux-6.1.158+-x86_64-with-glibc2.36",
       "machine": "x86_64",
-      "user_agent": "ARGUS/0.33.0 (+authorised-security-research)",
-      "command": "report --mission /tmp/argus-t32-cli-tiq12yqc/flow-exposure.json",
+      "user_agent": "ARGUS/0.34.0 (+authorised-security-research)",
+      "command": "report --mission /tmp/reg41/report-exposure.json",
       "operator": "",
       "dry_run": true,
       "mode": "live",
@@ -762,7 +826,7 @@
       },
       {
         "key": "network.user_agent",
-        "value": "ARGUS/0.33.0 (+authorised-security-research)",
+        "value": "ARGUS/0.34.0 (+authorised-security-research)",
         "source": "default",
         "redacted": false
       },
@@ -824,7 +888,7 @@
     },
     "policy": {
       "max_parallel_subagents": 4,
-      "max_parallel_workers": 8,
+      "max_parallel_workers": 4,
       "max_review_rounds": 2,
       "max_replan_rounds": 1,
       "max_master_reviews": 3,
@@ -841,38 +905,38 @@
       "supplied_from": "flow"
     },
     "stamps": {
-      "started_at": "2026-11-11T11:48:19+00:00",
-      "ended_at": "2026-11-11T11:48:19+00:00",
-      "recorded_at": "2026-11-11T11:48:21+00:00",
-      "duration_seconds": 0.312,
+      "started_at": "2026-11-12T09:04:47+00:00",
+      "ended_at": "2026-11-12T09:04:47+00:00",
+      "recorded_at": "2026-11-12T09:04:47+00:00",
+      "duration_seconds": 0.349,
       "stages": [
         [
           "planning",
-          0.002
-        ],
-        [
-          "subagent planning",
           0.004
         ],
         [
+          "subagent planning",
+          0.006
+        ],
+        [
           "worker execution",
-          0.052
+          0.054
         ],
         [
           "worker review",
-          0.002
+          0.005
         ],
         [
           "reconciliation",
-          0.181
+          0.194
         ],
         [
           "master review",
-          0.002
+          0.004
         ],
         [
           "follow-up planning",
-          0.065
+          0.079
         ],
         [
           "synthesis",
@@ -892,7 +956,7 @@
           "gate": "none",
           "attempts": 1,
           "evidence": 3,
-          "seconds": 0.055,
+          "seconds": 0.058,
           "origin": "planned",
           "spawned_by": "",
           "depends_on": [],
@@ -904,12 +968,12 @@
           "kind": "worker",
           "role": "advisory-reader",
           "parent": "sa-7adc0f884bde",
-          "objective": "",
+          "objective": "retrieve each advisory page and extract the fixed version",
           "status": "succeeded",
           "gate": "none",
           "attempts": 1,
           "evidence": 1,
-          "seconds": 0.05,
+          "seconds": 0.051,
           "origin": "planned",
           "spawned_by": "",
           "depends_on": [],
@@ -926,7 +990,7 @@
           "gate": "none",
           "attempts": 1,
           "evidence": 1,
-          "seconds": 0.05,
+          "seconds": 0.051,
           "origin": "runtime",
           "spawned_by": "",
           "depends_on": [],
@@ -936,14 +1000,14 @@
         {
           "id": "wrk-03581617fd6c",
           "kind": "worker",
-          "role": "published-advisories follow-up",
+          "role": "follow-up-flw-5b6f40",
           "parent": "sa-7adc0f884bde",
-          "objective": "",
+          "objective": "close the reviewed gap for published-advisories: coverage on nobody covers: each documented risk cites a first-party advisory",
           "status": "succeeded",
           "gate": "none",
           "attempts": 1,
           "evidence": 1,
-          "seconds": 0.05,
+          "seconds": 0.051,
           "origin": "follow-up",
           "spawned_by": "",
           "depends_on": [],
@@ -960,10 +1024,12 @@
           "gate": "none",
           "attempts": 1,
           "evidence": 3,
-          "seconds": 0.116,
+          "seconds": 0.122,
           "origin": "planned",
           "spawned_by": "",
-          "depends_on": [],
+          "depends_on": [
+            "sa-7adc0f884bde"
+          ],
           "completion_criteria": [],
           "dynamic": false
         },
@@ -972,7 +1038,7 @@
           "kind": "worker",
           "role": "dns-collector",
           "parent": "sa-4de82fcd5ca6",
-          "objective": "",
+          "objective": "collect the published record set for example.com",
           "status": "succeeded",
           "gate": "none",
           "attempts": 1,
@@ -989,12 +1055,12 @@
           "kind": "worker",
           "role": "archive-collector",
           "parent": "sa-4de82fcd5ca6",
-          "objective": "",
+          "objective": "list archive snapshots of example.com",
           "status": "succeeded",
           "gate": "none",
           "attempts": 1,
           "evidence": 1,
-          "seconds": 0.052,
+          "seconds": 0.051,
           "origin": "planned",
           "spawned_by": "",
           "depends_on": [],
@@ -1011,7 +1077,7 @@
           "gate": "none",
           "attempts": 1,
           "evidence": 1,
-          "seconds": 0.05,
+          "seconds": 0.051,
           "origin": "runtime",
           "spawned_by": "",
           "depends_on": [],
@@ -1038,7 +1104,7 @@
       "depth": 2,
       "planned": 5,
       "dynamic": 3,
-      "max_observed_concurrency": 0,
+      "max_observed_concurrency": 2,
       "waves": [
         [
           "sa-7adc0f884bde"
@@ -1051,19 +1117,21 @@
     },
     "tool_failures": [],
     "stopping": {
-      "kind": "not stated",
-      "condition": "none",
-      "reason": "the run completed and recorded no stopping bound, so this dossier reports the absence rather than inventing one",
+      "kind": "complete",
+      "condition": "complete",
+      "reason": "every mission criterion is met (1); 0 coverage gap(s) and 0 concern(s) remain as stated limitations",
       "stopped": false,
-      "bounded": false,
-      "reviews": 0,
-      "rounds": 0,
-      "bounds": []
+      "bounded": true,
+      "reviews": 2,
+      "rounds": 1,
+      "bounds": [
+        "refused: 0 concern(s) remain outside every existing Subagent; they are reported as limitations"
+      ]
     },
     "secrets": {
       "scanned": true,
       "clean": true,
-      "bytes_scanned": 58157,
+      "bytes_scanned": 62691,
       "findings": [],
       "rules": [
         {
@@ -1103,7 +1171,7 @@
           "removed": false
         }
       ],
-      "scanned_at": "2026-11-11T11:48:21+00:00",
+      "scanned_at": "2026-11-12T09:06:01+00:00",
       "patterns": [
         "connection-string-password",
         "json-credential-field",
@@ -1118,7 +1186,7 @@
         "known-credential-value",
         "credential-store-shape"
       ],
-      "scanned_text": "clean: 58,157 byte(s) scanned for 12 credential pattern(s)"
+      "scanned_text": "clean: 62,691 byte(s) scanned for 12 credential pattern(s)"
     },
     "reproduction": [
       {

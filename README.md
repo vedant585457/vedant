@@ -14,7 +14,7 @@ python vedant_osint.py adapter --self-test    # structured model output contract
 python vedant_osint.py master --self-test     # Master Agent boundaries
 python vedant_osint.py subagents --self-test  # runtime Subagent specifications
 python vedant_osint.py workers --self-test    # runtime Worker specifications
-python vedant_osint.py flow --self-test       # LangGraph execution flow
+python vedant_osint.py flow --self-test       # LangGraph execution flow, coverage (132)
 python vedant_osint.py flow --mock             # the whole graph over mock adapters
 python vedant_osint.py sched --self-test      # bounded queues, deadlines, licences
 python vedant_osint.py resume --self-test     # checkpointing and resumable missions
@@ -31,7 +31,7 @@ python vedant_osint.py aggregate --self-test # reviewed work only, and never ear
 python vedant_osint.py review-master --self-test # five lenses, five ways to stop
 python vedant_osint.py loops --self-test      # repeated work, blocked lines, saturation
 python vedant_osint.py synthesis --self-test  # a report that cannot outrun its evidence
-python vedant_osint.py report --self-test     # formats, presentation, audit, dry run (283)
+python vedant_osint.py report --self-test     # formats, presentation, audit, dry run (287)
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -1027,7 +1027,7 @@ one `MissionDossier` assembled from the reviewed record, so a fact that is not i
 is not in the Markdown either — the JSON is the authority and the other two are renderings.
 
 ```
-python vedant_osint.py report --self-test                    # 283 checks: formats, presentation, audit, dry run/mock
+python vedant_osint.py report --self-test                    # 287 checks: formats, presentation, audit, coverage, dry run/mock
 python vedant_osint.py report --demo                         # one mission, three formats
 python vedant_osint.py flow --demo exposure --json > m.json
 python vedant_osint.py report --mission m.json --out-dir out/ # writes m.md and m.json
@@ -1217,11 +1217,75 @@ python vedant_osint.py flow --mock --out-dir out/ --allow-mock-output   # and wr
   the reason it stopped, the evidence it did collect — so the failure is visible rather than
   turning into an error message.
 
-`report --self-test` covers the acceptance clause in 66 checks of its own (283 in total):
+`report --self-test` covers the acceptance clause in 66 checks of its own (287 in total):
 the dry run plans and refuses to execute, the mock run exercises the hierarchy, the review
 loops, the retries and the reports, a scoped tool failure changes what the plan predicted,
 the labels survive into the Markdown, the JSON, the audit record and the presentation, and a
 second run is identical to the first.
+
+## Investigation coverage matrix
+
+A mission that cannot say which of its own questions a task was for is a mission that can
+drop one without noticing. The coverage matrix is the Master's answer: after every round it
+recomputes, from the record, what it asked, who served each question, what evidence came back,
+how far that evidence should be believed, and what is still missing — and the next round is
+chosen from that table rather than from the shape of the last report.
+
+```bash
+python vedant_osint.py flow --demo exposure           # the table, the clause, the next question
+python vedant_osint.py flow --json | python3 -c "import json,sys; print(json.load(sys.stdin)['coverage_summary'])"
+python vedant_osint.py report --mission mission.json  # the ## Coverage section of the document
+```
+
+- **A row is a question, and every column is read from the record.** The row carries the
+  mission's own question, the units that claim it (resolved to report ids once the reports
+  arrive), the evidence ids that answer it, its confidence, and the reason for its status —
+  the same "checked by" discipline the review loop uses. Nothing in the row is typed in by
+  hand: a row that claimed coverage the record does not have would be the one place in the
+  build where a report could overstate itself.
+- **One question, one claim.** A claim is attached to the question it answers and to no
+  other, even when two questions share vocabulary, so the table never counts the same
+  evidence twice. The status ladder is `unassigned → assigned → partial → answered`, with
+  `contradicted` alongside `answered`: a question is not "answered" until a claim that shares
+  its subject *and* adds something new arrives, and it is not closed until one of the
+  mission's own criteria for it is met. A row that merely repeats the question — including
+  the `the result addresses: …` bookkeeping §39 writes for a gap — answers nothing, and the
+  scaffolding is stripped before the comparison so it cannot pass as evidence.
+- **The matrix is rebuilt after every round, never patched.** The plan produces the round-0
+  matrix (who is assigned what, before anything runs), each Master review produces the next
+  one, and the ledger keeps them all in round order with the round a question first moved
+  in. A question the mission stops asking is carried forward as `dropped` rather than
+  deleted: a question cannot be withdrawn by restating the objective, and the row says which
+  round it was lost in.
+- **The next action is a decision with a reason.** `nominate_question` orders open questions
+  by status (a disputed answer first), then by whether the row has a stated gap, then by
+  rotation — a question the last round already served goes to the back of the queue *within
+  its own rank*, so a mission with two equally open questions spends its rounds on both. The
+  nomination and its sentence of reasoning travel onto the decision (`serves_question`) and
+  onto every follow-up assignment it opens (`question_id`, `question`), which is what makes
+  "which mission question does this task serve?" answerable from the task itself.
+- **The clause has four enforceable halves and one count.** *Names the question*, *every task
+  serves one*, *nothing dropped*, *open questions explained* — and, reported but not enforced,
+  how many claims belong to no question at all. A claim that supports the objective without
+  answering a named question is honest work, not a dropped question; a *task* nobody can
+  explain is work with no reason, so that one fails the clause. The section prints the
+  clause in words (`**yes**`/`**NO**`) rather than in glyphs, because the Markdown is read
+  where a check mark does not render.
+- **It is visible where a reader already looks.** The `flow` screen shows the table and a
+  `coverage` line in the presentation footer (with the question the next round would take),
+  `flow --json` carries the whole ledger plus a `coverage_summary`, and the document has a
+  `## Coverage` section rendered from the report's own matrix — so the screen, the JSON and
+  the Markdown cannot disagree about coverage. A payload that carries no ledger (written by
+  an older build, or a mission that stated no question) renders as an explicit absence
+  rather than as an empty table, and a mock run's empty matrix reports its orphaned units
+  instead of pretending it covered them.
+
+`flow --self-test` covers the section in 55 checks (132 in total): the plan's matrix before
+any evidence, a claim moving a question's status, an echoed question answering nothing, one
+claim counted for one row, a dropped question carried forward and failing the clause, the
+nomination rotating between equally open questions, the ledger reading back as itself, and
+the real graph producing round-0 and reviewed matrices whose decisions name the question each
+round serves.
 
 ## Status
 
