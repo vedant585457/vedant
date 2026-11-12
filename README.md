@@ -14,7 +14,7 @@ python vedant_osint.py adapter --self-test    # structured model output contract
 python vedant_osint.py master --self-test     # Master Agent boundaries
 python vedant_osint.py subagents --self-test  # runtime Subagent specifications
 python vedant_osint.py workers --self-test    # runtime Worker specifications
-python vedant_osint.py flow --self-test       # execution flow, coverage, hypotheses (203)
+python vedant_osint.py flow --self-test       # flow, coverage, hypotheses, priority (285)
 python vedant_osint.py flow --mock             # the whole graph over mock adapters
 python vedant_osint.py sched --self-test      # bounded queues, deadlines, licences
 python vedant_osint.py resume --self-test     # checkpointing and resumable missions
@@ -31,7 +31,7 @@ python vedant_osint.py aggregate --self-test # reviewed work only, and never ear
 python vedant_osint.py review-master --self-test # five lenses, five ways to stop
 python vedant_osint.py loops --self-test      # repeated work, blocked lines, saturation
 python vedant_osint.py synthesis --self-test  # a report that cannot outrun its evidence
-python vedant_osint.py report --self-test     # formats, presentation, audit, dry run (292)
+python vedant_osint.py report --self-test     # formats, presentation, audit, dry run (296)
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -1027,7 +1027,7 @@ one `MissionDossier` assembled from the reviewed record, so a fact that is not i
 is not in the Markdown either — the JSON is the authority and the other two are renderings.
 
 ```
-python vedant_osint.py report --self-test                    # 292 checks: formats, presentation, audit, coverage, hypotheses, dry run/mock
+python vedant_osint.py report --self-test                    # 296 checks: formats, presentation, audit, coverage, hypotheses, priority, dry run/mock
 python vedant_osint.py report --demo                         # one mission, three formats
 python vedant_osint.py flow --demo exposure --json > m.json
 python vedant_osint.py report --mission m.json --out-dir out/ # writes m.md and m.json
@@ -1217,7 +1217,7 @@ python vedant_osint.py flow --mock --out-dir out/ --allow-mock-output   # and wr
   the reason it stopped, the evidence it did collect — so the failure is visible rather than
   turning into an error message.
 
-`report --self-test` covers the acceptance clause in 66 checks of its own (292 in total):
+`report --self-test` covers the acceptance clause in 66 checks of its own (296 in total):
 the dry run plans and refuses to execute, the mock run exercises the hierarchy, the review
 loops, the retries and the reports, a scoped tool failure changes what the plan predicted,
 the labels survive into the Markdown, the JSON, the audit record and the presentation, and a
@@ -1352,6 +1352,68 @@ alternatives it could not separate. `report --self-test` adds the other end: the
 required, its table holds every compared alternative once, and the document's clause agrees with
 the report's.
 
+## Information-value task prioritisation
+
+A mission's budget is not spent on the units that arrived first; it is spent on the ones that
+ran first. When the budget is a deadline, a model-call ceiling, a round cap and a spawn licence,
+the difference between a useful mission and a busy one is which unit was dispatched when. This
+section adds that decision, and it is careful about what it is not:
+
+- **Two schedulers, two questions.** `BoundedScheduler` (§24) still decides *who may hold a
+  slot*, strictly in arrival order — that fairness is a proven property and prioritisation must
+  not become a way around it. `PriorityScheduler` decides *which ready task runs next*, among
+  units that could all start at the same instant. It holds no slot, waits for nothing, and never
+  reorders a dependency edge: the readiness wave is the graph's, the order inside the wave is
+  the scheduler's.
+- **Every score has eight named parts.** Expected information gain (`contradicted` beats
+  `partial` beats `assigned` beats `unassigned` beats `answered`), relevance (does the task
+  serve a stated question, and would it disconfirm an explanation), source quality (read from
+  the tools the unit was actually granted), cost (model calls, attempts, a separate seat), time
+  (against what is left of the deadline), risk (sensitive scope, an unrepeatable source).
+  Duplication is not a weight — a task whose substance is already in the record scores **zero**
+  — and dependency readiness is not a weight either: a task that cannot start is not dispatched
+  at all. Each component is read from a record (the coverage row, the hypothesis set, the
+  Worker's own plan), never from a model's prose.
+- **Value per unit of price**, not value minus price: `(gain + relevance + source) / (1 + cost
+  + time + risk)`. A task that teaches twice as much for twice the budget is worth the same,
+  which is what a budget question actually asks. The subtraction form has a worse failure: with
+  a high enough price every score goes negative, and a negative score reads as *do not run this*
+  when it only ever meant *later*.
+- **A necessary long task cannot be starved.** Every dispatch a task is passed over raises its
+  wait count by one and adds `aging × waited` to its score, so a cheap urgent task's advantage
+  erodes instead of persisting; and once a task has waited `priority_starvation_after` dispatches
+  it runs next **whatever it scores**. The guarantee is a number in the policy, not a hope, and
+  the record says which of the two mechanisms decided each dispatch (`priority`, `aging`,
+  `starvation`).
+- **Bounded**: one decision reorders at most `priority_lookahead` ready tasks. A scheduler that
+  could reorder the whole plan would be a second planner, and the plan is the Master's.
+- **Recorded before the work runs.** Every dispatch writes a `PriorityDecision` — the score with
+  its components, the tasks passed over, the margin, the reason — to the run's ledger
+  (`master-priority`), to the JSONL log, to `flow --json`, and into the audit block, which
+  carries the weights and the clause as well as the decisions. A record written afterwards could
+  always be made to look prescient.
+- **The clause, evaluated rather than asserted**: *limited budgets are spent on high-value gaps
+  first, and priority decisions are recorded in the audit log* — `spent_on_high_value_first`,
+  `none_starved`, `recorded`, each able to fail, and each failing loudly on a doctored ledger.
+
+```bash
+python vedant_osint.py flow --demo forensic            # the decisions, the weights and the clause
+python vedant_osint.py flow --demo forensic --json > m.json
+python vedant_osint.py flow --dry-run -t example.net \
+    -o "map the publicly exposed services of example.net" --json   # priority_plan: the order it would use
+python vedant_osint.py report --mission m.json --audit  # the block a second operator can check
+```
+
+`flow --self-test` covers the section in 82 checks: each of the eight components moving the score
+in the right direction, a duplicate scoring zero, source quality read from the unit's own grant,
+the lookahead bound, aging promoting a task that keeps losing, the wait bound running a starved
+task whatever it scores, the record round-tripping, the clause failing on a doctored ledger, and
+a real graph whose dispatch decisions reach the payload, the document and the audit block.
+`report --self-test` adds four: the audit block carries every decision, the weights, the
+document's section, and the clause inside the audit's own verdict. A first-in-first-out run
+(`prioritise_tasks=False`) settles exactly the same work, so the ordering changes *when*, never
+*what*.
+
 ## Status
 
 | Phase | Scope | State |
@@ -1361,7 +1423,7 @@ the report's.
 | 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control, Worker outcome contract, Subagent quality review, targeted Worker retasking, Subagent aggregation with bounded runtime Workers, Master review with bounded replanning, loop detection with strategy change, blocked lines and saturation stops, evidence-based Master synthesis with cited findings and calibrated confidence) |
 | 4 | Browser — browser-use / Playwright sessions and capture | 🟡 started (policy, scope, capture, guarded closure, agent mode) |
 | 5 | Collection — passive OSINT sources, artefact hashing | 🟡 started (source-aware web research; safe document/page extraction with injection defence; read-only artifact manifests, hashing and access ledger) |
-| 6 | Synthesis — cross-source correlation and reporting | 🟡 started (deterministic timelines, explained indicator correlation, content de-duplication, the evidence-based Master report with citations and calibrated confidence, Markdown/JSON/terminal output formats with a source register, execution summary and chain of custody, the Rich mission presentation with four derived outcomes, the coverage matrix that ties every task to a mission question, competing-hypothesis analysis with a disconfirming-evidence plan and a comparison the report must publish) |
+| 6 | Synthesis — cross-source correlation and reporting | 🟡 started (deterministic timelines, explained indicator correlation, content de-duplication, the evidence-based Master report with citations and calibrated confidence, Markdown/JSON/terminal output formats with a source register, execution summary and chain of custody, the Rich mission presentation with four derived outcomes, the coverage matrix that ties every task to a mission question, competing-hypothesis analysis with a disconfirming-evidence plan and a comparison the report must publish, information-value task prioritisation with a wait bound and an audit-logged dispatch record) |
 | 7 | Operations — resume, budgets, audit trail, hardening | 🟡 started (checkpoints, resumable missions, capability router, budgets, reproducibility and audit metadata with a secret-refusing write, deterministic dry-run planning and a labelled mock mode) |
 
 ## Install

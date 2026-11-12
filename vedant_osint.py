@@ -1155,7 +1155,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 35
+VERSION_MINOR: int = 36
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -21720,6 +21720,10 @@ class FlowStage(str, Enum):
     #: it fans out to is data.
     MASTER_REPLAN = "master-replan"
     MASTER_SYNTHESIZE = "master-synthesize"
+    #: §47: the dispatch decision.  A stage and not a node, so the compiled structure stays
+    #: the same for every mission: the *ordering* is data, and a node per ordering would be a
+    #: node per policy.
+    PRIORITY = "master-priority"
 
 
 class FlowGate(str, Enum):
@@ -21820,6 +21824,15 @@ class FlowPolicy(StrictModel):
     #: every research report the run produces.  On by default: a claim with nothing
     #: retrievable behind it should not reach synthesis in any mission.
     research_first: bool = True
+    #: §47: order ready work by expected information value instead of by arrival.  Off
+    #: restores first-in-first-out, which is what the serial self-test compares against: a
+    #: flag nobody can turn off is not a policy, it is a claim.
+    prioritise_tasks: bool = True
+    #: How many ready tasks one decision may reorder (§47's bound on the scheduler).
+    priority_lookahead: int = Field(default=6, ge=1, le=32)
+    #: How many consecutive dispatches a task may be passed over before the wait bound runs
+    #: it whatever it scores.  This is the anti-starvation guarantee, and it is a number.
+    priority_starvation_after: int = Field(default=3, ge=1, le=32)
 
     @classmethod
     def from_context(cls, context: "MasterContext", **overrides: Any) -> "FlowPolicy":
@@ -22658,6 +22671,10 @@ class FlowResult(StrictModel):
     #: so a reader of `flow --json` sees the alternatives even for a mission that stopped before
     #: it could synthesise a document.
     hypotheses: "HypothesisSet | None" = None
+    #: §47: every dispatch decision, with the score that produced it.  On the result because
+    #: the audit log is built from the result: a priority rule that lived only in the trace
+    #: would be a rule the dossier could not carry.
+    priority: "PriorityLedger | None" = None
 
     @property
     def hypothesis_summary(self) -> dict[str, Any]:
@@ -22678,6 +22695,26 @@ class FlowResult(StrictModel):
                                          if row.status == "indistinguishable"],
                 "penalties": set_.only_confirming(),
                 "clause": hypothesis_acceptance(set_, alternatives)}
+
+    @property
+    def priority_summary(self) -> dict[str, Any]:
+        """§47's clause and counts — empty when the run recorded no priority decision."""
+
+        if self.priority is None or not self.priority.decisions:
+            return {}
+        clause = priority_acceptance(self.priority)
+        summary = {"decisions": clause["decisions"], "dispatch": clause["dispatch"],
+                   "moved": clause["churned"], "by_rule": clause["by_rule"],
+                   "lookahead": self.priority.lookahead,
+                   "starvation_after": self.priority.starvation_after,
+                   "weights": self.priority.weights.describe(),
+                   "unreached": list(self.priority.unreached),
+                   "clause": clause}
+        if self.priority.decisions:
+            first = self.priority.decisions[0]
+            summary["first"] = first.chosen_name or first.chosen
+            summary["first_rule"] = first.rule
+        return summary
 
     @property
     def coverage_summary(self) -> dict[str, Any]:
@@ -22830,6 +22867,8 @@ class FlowResult(StrictModel):
             "coverage_summary": self.coverage_summary,
             "hypotheses": self.hypotheses.to_dict() if self.hypotheses is not None else None,
             "hypothesis_summary": self.hypothesis_summary,
+            "priority": self.priority.to_dict() if self.priority is not None else None,
+            "priority_summary": self.priority_summary,
             "loop_summary": self.loop_summary,
             "mission_review": self.review_summary_of_mission,
             "stop_condition": self.stop_condition.value,
@@ -23185,6 +23224,17 @@ class HierarchicalFlow:
         #: after every review, and carried onto the report — the set is a record of what the
         #: mission was willing to be wrong about, and it may only grow, never shrink.
         self._hypotheses: HypothesisSet = HypothesisSet()
+        #: §47: the scheduler that orders ready work, and the decisions it has made.  Built
+        #: here so a second run of the same instance starts with empty wait counts, exactly as
+        #: the slot scheduler does.  ``None`` when the policy says first-in-first-out.
+        self._priority: PriorityScheduler | None = (
+            PriorityScheduler(lookahead=self.policy.priority_lookahead,
+                              starvation_after=self.policy.priority_starvation_after,
+                              remaining_seconds=self._priority_remaining)
+            if self.policy.prioritise_tasks else None)
+        #: The decision this branch's fan-out was ordered by, so the Worker node does not
+        #: take a second decision for a dispatch already decided.  One dispatch, one record.
+        self._dispatch_decision: dict[str, PriorityDecision] = {}
         #: Follow-up assignments this mission opened, in the order it opened them.
         self._follow_ups: list[FollowUpAssignment] = []
         #: What each follow-up round created, so the result can name it.
@@ -23883,12 +23933,20 @@ class HierarchicalFlow:
                 for worker in workers:
                     self.tracker.spawn(worker.id, worker.name, kind=LifecycleKind.WORKER,
                                        parent=subagent.id, detail=worker.objective[:60])
-            return {"subagent": subagent.id, "waves": [[worker.id for worker in workers]],
+            # §47: even a single runtime Worker is a dispatch, and the decision to run *it*
+            # is recorded like any other — otherwise a follow-up round would be work the
+            # priority log could not account for.
+            one_wave = self._order_dispatch(subagent, [[worker.id for worker in workers]],
+                                            workers)
+            return {"subagent": subagent.id, "waves": one_wave,
                     "runtime_workers": [json.loads(model_to_json(worker))
                                         for worker in workers],
                     "round": round_no}
 
         waves = self.worker_waves(subagent)
+        # §47: the readiness waves are the graph's; the order inside each wave is the
+        # scheduler's.  Decided once, here, before any of the wave's branches is sent.
+        waves = self._order_dispatch(subagent, waves, subagent.workers)
         self._record(FlowStage.SUBAGENT, unit=subagent.id, parent="master",
                      wave=int(state.get("wave") or 0),
                      detail=f"{len(subagent.workers)} worker(s) in {len(waves)} wave(s)")
@@ -25480,6 +25538,86 @@ class HierarchicalFlow:
         return {"kind": "new", "subagent": json.loads(model_to_json(subagent)),
                 "assignment": json.loads(model_to_json(assignment))}
 
+    # -- 7c. the dispatch order (§47) -----------------------------------------
+
+    def _priority_remaining(self) -> float | None:
+        """What is left of the mission's deadline, for the time term of a score."""
+
+        return self.runtime.deadline.remaining(time.monotonic)
+
+    def _priority_ledger(self) -> PriorityLedger:
+        """The decisions so far, as the record the result and the audit carry."""
+
+        if self._priority is None:
+            return PriorityLedger(lookahead=int(self.policy.priority_lookahead),
+                                  starvation_after=int(self.policy.priority_starvation_after))
+        ledger = self._priority.ledger()
+        # A run that ended before every planned task reached a dispatch says so, rather than
+        # leaving the record to imply the rest ran.  *Reached* is everything a decision saw —
+        # the one it chose and the ones it passed over — because passing a task over is still
+        # a decision about it; only a task no decision ever looked at was never dispatched.
+        seen = {worker_id for decision in ledger.decisions
+                for worker_id in [decision.chosen, *decision.passed_over] if worker_id}
+        planned = [worker.id for subagent in self.subagents for worker in subagent.workers]
+        ledger = ledger.model_copy(update={
+            "unreached": [worker_id for worker_id in planned if worker_id not in seen]})
+        return ledger
+
+    def _settled_ids(self) -> set[str]:
+        """Every Worker the run settled, by any path — the set an unreached task is not in."""
+
+        return {worker_id for ids in self._settled.values() for worker_id in ids}
+
+    def _priority_tasks_for(self, subagent: FlowSubagent, *,
+                            workers: Sequence[FlowWorker] | None = None) -> list[PriorityTask]:
+        """This Subagent's Workers as priority tasks, read from the round's own record."""
+
+        planned = list(workers if workers is not None else subagent.workers)
+        matrix = self._coverage.latest()
+        tasks = priority_tasks(
+            [subagent.model_copy(update={"workers": planned})], matrix=matrix,
+            hypotheses=self._hypotheses, settled=self._settled_ids(),
+            collected=[item.statement for report in self._latest.values()
+                       for item in report.evidence])
+        return [task.model_copy(update={"subagent_id": subagent.id, "role": subagent.role})
+                for task in tasks]
+
+    def _order_dispatch(self, subagent: FlowSubagent, waves: Sequence[Sequence[str]],
+                        workers: Sequence[FlowWorker]) -> list[list[str]]:
+        """The waves, with each wave ordered by expected information value (§47).
+
+        The wave is the *readiness* answer and is left alone: a Worker that reads another's
+        output still waits for it, so prioritisation can never reorder a dependency edge.  What
+        the scheduler decides is the order *inside* a wave — the units that could all start at
+        the same instant — which is exactly the ordering the acceptance clause is about.
+
+        The decision is taken once per wave, before anything in it runs, and recorded then.  If
+        the graph ignored the order (it cannot, but a future edit might), the record would show
+        what was decided rather than what happened, which is the honest failure.
+        """
+
+        if self._priority is None or not waves:
+            return [list(wave) for wave in waves]
+        ordered: list[list[str]] = []
+        hypotheses = [item.id for item in self._hypotheses.hypotheses]
+        for index, wave in enumerate(waves):
+            tasks = self._priority_tasks_for(subagent, workers=workers)
+            in_wave = [task for task in tasks if task.task_id in set(wave)]
+            decision = self._priority.choose(
+                in_wave, ready=list(wave), hypotheses=hypotheses,
+                round_number=len(self._master_reviews) or 0)
+            if decision is None:
+                ordered.append(list(wave))
+                continue
+            self._dispatch_decision[subagent.id] = decision
+            wanted = [decision.chosen, *decision.passed_over]
+            position = {worker_id: rank for rank, worker_id in enumerate(wanted)}
+            ordered.append(sorted(wave, key=lambda worker_id: (position.get(worker_id, 99),
+                                                              wave.index(worker_id))))
+            self._record(FlowStage.PRIORITY, unit=decision.chosen, parent=subagent.id,
+                         detail=f"wave {index + 1}: {decision.summary()}")
+        return ordered
+
     def _follow_up_refusals(self, subagent: FlowSubagent, *, spent: int,
                             licence: Any) -> list[str]:
         """Every reason the Master may not direct another Worker at this Subagent.
@@ -25778,7 +25916,9 @@ class HierarchicalFlow:
             # §46: the set as the last review weighed it.  Passed even when the frame is not
             # exposed: the document's own section says why it is empty, which is a different
             # statement from a section that failed to be written.
-            hypotheses_weighed=self._hypotheses)
+            hypotheses_weighed=self._hypotheses,
+            # §47: the dispatch decisions as they stood when the report was assembled.
+            priority=self._priority_ledger())
         synthesis = synthesis.model_copy(update={"report": report})
         self._record(FlowStage.MASTER_SYNTHESIZE,
                      detail=f"{barrier.describe()}; {len(synthesis.sourced_claims)} sourced "
@@ -25864,6 +26004,9 @@ class HierarchicalFlow:
             # A copy, for the same reason the ledger's is a copy: the payload outlives the
             # run, and a later round's weighing must not change a record already handed out.
             hypotheses=self._hypotheses.model_copy(deep=True),
+            # §47: the dispatch decisions, built after the last branch settled so
+            # ``unreached`` can be computed against what the run actually settled.
+            priority=self._priority_ledger(),
             research={"workers": len(self._research),
                       "audits": {worker_id: audit["audit"]
                                  for worker_id, audit in self._research.items()},
@@ -26088,6 +26231,16 @@ class _CountingRunner(DeterministicRunner):
 
 def _flow_check(name: str, ok: bool, detail: Any = "") -> FlowCheck:
     return FlowCheck(name=name, ok=bool(ok), detail=str(detail)[:160])
+
+
+def _flow_checks() -> list["FlowCheck"]:
+    """The sections whose checks may be run *inside* a demo payload (§45 and §46).
+
+    Split out because a demo's own record lists the checks about itself, and a suite that
+    included §47 would recurse: §47 runs a demo to prove the payload carries its decisions.
+    """
+
+    return [*run_coverage_self_test(), *run_hypothesis_self_test()]
 
 
 def run_flow_self_test(console: "Console | None" = None) -> list[FlowCheck]:
@@ -26451,6 +26604,9 @@ def run_flow_self_test(console: "Console | None" = None) -> list[FlowCheck]:
 
     # ---- 14. competing hypotheses (§46) --------------------------------
     checks.extend(run_hypothesis_self_test())
+
+    # ---- 15. information-value prioritisation (§47) ---------------------
+    checks.extend(run_priority_self_test())
     return checks
 
 
@@ -26578,6 +26734,9 @@ def _flow_demo(objective_key: str, *, out_dir: Path | None = None,
         "hypotheses": (result.hypotheses.model_copy(deep=True).to_dict()
                        if result.hypotheses is not None else None),
         "hypothesis_summary": result.hypothesis_summary,
+        "priority": (result.priority.model_copy(deep=True).to_dict()
+                     if result.priority is not None else None),
+        "priority_summary": result.priority_summary,
         "alternatives": (hypothesis_alternatives(result.hypotheses)
                          if result.hypotheses is not None
                          and result.hypotheses.required else []),
@@ -26585,8 +26744,12 @@ def _flow_demo(objective_key: str, *, out_dir: Path | None = None,
         "runtime_only": True,
         "browser": result.browser,
         "log_lines": len(logger.read_records()) if logger is not None else 0,
+        # The demo carries the checks that describe *it* — the flow's structure and the
+        # coverage/hypothesis work — not the whole suite.  §47's checks run the demo to prove
+        # a payload carries the decisions, so including them here would be a recursion: the
+        # suite would run the demo, which builds this payload, which runs the suite.
         "checks": [{"check": check.name, "ok": check.ok, "detail": check.detail}
-                   for check in run_flow_self_test()],
+                   for check in _flow_checks()],
     }
     if out_dir is not None:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -26663,6 +26826,23 @@ def render_flow_hypotheses(payload: Mapping[str, Any]) -> Group | None:
     return Group(*blocks)
 
 
+def priority_from_payload(payload: Mapping[str, Any]) -> PriorityLedger | None:
+    """The priority ledger a ``flow`` payload carries, or ``None``.  Tolerant, as §45/§46 are."""
+
+    return priority_ledger_from_payload(payload.get("priority"))
+
+
+def render_flow_priority(payload: Mapping[str, Any]) -> Group | None:
+    """§47's block for the ``flow`` screen: the decisions, or a line saying there are none."""
+
+    ledger = priority_from_payload(payload)
+    if ledger is None or not ledger.decisions:
+        return Group(Text("[dim]task priority: this payload carries no dispatch decision "
+                          "(written by a build before §47, or the policy left the queue "
+                          "first-in-first-out)[/dim]"))
+    return Group(render_priority_ledger(ledger), Text(""), render_priority_summary(ledger))
+
+
 def render_flow_summary(payload: Mapping[str, Any]) -> Table:
     """The shape of the run: breadth, order, concurrency and the joins."""
 
@@ -26731,6 +26911,18 @@ def render_flow_summary(payload: Mapping[str, Any]) -> Table:
         table.add_row("hypothesis clause", escape(
             "alternatives compared, each with a test" if clause.get("ok")
             else "penalty: " + "; ".join((clause.get("errors") or [])[:2])))
+    # §47: what decided the order, and whether the budget rule held.  Two rows, because a
+    # reader wants the first thing that ran *and* the verdict on the rule that chose it.
+    priority = payload.get("priority_summary") or {}
+    if priority.get("decisions"):
+        table.add_row("task priority", escape(
+            f"{priority['decisions']} decision(s); {priority.get('moved', 0)} went to the wait "
+            f"bound; first was {priority.get('first', 'not recorded')}"))
+        priority_clause = priority.get("clause") or {}
+        table.add_row("priority clause", escape(
+            "high-value gaps first, nothing starved, every decision recorded"
+            if priority_clause.get("ok")
+            else "; ".join((priority_clause.get("errors") or [])[:2])))
     if payload.get("stopped"):
         table.add_row("stopped", escape(str(payload["stop_reason"])))
     return table
@@ -26914,6 +27106,10 @@ def flow_command(
         if hypotheses is not None:
             console.print()
             console.print(hypotheses)
+        priority = render_flow_priority(payload)
+        if priority is not None:
+            console.print()
+            console.print(priority)
         console.print()
         console.print(render_offline_cost(payload["cost"]))
         console.print()
@@ -26980,6 +27176,10 @@ def flow_command(
         if hypotheses is not None:
             console.print()
             console.print(hypotheses)
+        priority = render_flow_priority(payload)
+        if priority is not None:
+            console.print()
+            console.print(priority)
         for report in payload["reports"]:
             console.print()
             console.print(Panel(Text("\n".join(
@@ -27089,6 +27289,9 @@ def flow_command(
             "hypotheses": (result.hypotheses.model_copy(deep=True).to_dict()
                            if result.hypotheses is not None else None),
             "hypothesis_summary": result.hypothesis_summary,
+            "priority": (result.priority.model_copy(deep=True).to_dict()
+                         if result.priority is not None else None),
+            "priority_summary": result.priority_summary,
             "alternatives": (hypothesis_alternatives(result.hypotheses)
                              if result.hypotheses is not None
                              and result.hypotheses.required else []),
@@ -27115,6 +27318,10 @@ def flow_command(
         if hypotheses is not None:
             console.print()
             console.print(hypotheses)
+        priority = render_flow_priority(payload)
+        if priority is not None:
+            console.print()
+            console.print(priority)
         console.print()
         console.print(render_flow_timeline(payload, limit=max(4, trace_limit)))
         if payload["synthesis"]:
@@ -27223,6 +27430,9 @@ def _run_mock_flow(context: "MasterContext", *, scenario: str,
         "hypotheses": (result.hypotheses.model_copy(deep=True).to_dict()
                        if result.hypotheses is not None else None),
         "hypothesis_summary": result.hypothesis_summary,
+        "priority": (result.priority.model_copy(deep=True).to_dict()
+                     if result.priority is not None else None),
+        "priority_summary": result.priority_summary,
         "alternatives": (hypothesis_alternatives(result.hypotheses)
                          if result.hypotheses is not None
                          and result.hypotheses.required else []),
@@ -53777,6 +53987,9 @@ class MasterReport(StrictModel):
     #: §46: the comparison the task asks for — one row per viable alternative, with its verdict
     #: and the test that would separate it from the leading explanation.
     alternatives: list["HypothesisAlternative"] = Field(default_factory=list)
+    #: §47: how the mission decided what to run first, carried on the report so the document
+    #: and the presentation can state the priority rule's verdict without reading the run.
+    priority: "PriorityLedger | None" = None
 
     @field_validator("generated_at", mode="before")
     @classmethod
@@ -54321,7 +54534,8 @@ def synthesise_report(reports: Sequence["SubagentOutcome"], *, context: "MasterC
                       review: "MasterReview | None" = None,
                       question: str = "",
                       coverage: "CoverageMatrix | None" = None,
-                      hypotheses_weighed: "HypothesisSet | None" = None) -> MasterReport:
+                      hypotheses_weighed: "HypothesisSet | None" = None,
+                      priority: "PriorityLedger | None" = None) -> MasterReport:
     """Assemble the finished document from the reviewed record.
 
     The order is the argument.  Evidence is indexed first (so every later step cites real
@@ -54377,7 +54591,7 @@ def synthesise_report(reports: Sequence["SubagentOutcome"], *, context: "MasterC
         # mission's evidence.  Deriving it at assembly rather than accepting it ready-made is
         # the same rule §39 applies to the findings: the document's comparison must be a
         # function of the record, not a paragraph someone handed in.
-        hypotheses_weighed=hypotheses_weighed,
+        hypotheses_weighed=hypotheses_weighed, priority=priority,
         alternatives=(hypothesis_alternatives(hypotheses_weighed)
                       if hypotheses_weighed is not None
                       and hypotheses_weighed.required else []))
@@ -57332,6 +57546,10 @@ class MissionPresentation(StrictModel):
     #: §46 on one line: the frame, how many explanations the mission carried, and how many
     #: the report compares — or that none was required, which is a different statement.
     hypotheses: str = ""
+    #: §47 on one line: what the mission ran first, on what basis, and whether the budget rule
+    #: held.  The presentation is what most readers see; a priority rule absent from it would
+    #: be a rule only the JSON knows about.
+    priority: str = ""
 
     @property
     def outcome(self) -> MissionOutcome:
@@ -57362,6 +57580,7 @@ class MissionPresentation(StrictModel):
                 "produced_by": self.produced_by, "networkshape": self.networkshape,
                 "coverage": self.coverage,
                 "hypotheses": self.hypotheses,
+                "priority": self.priority,
                 "retention": self.retention,
                 "outcome": self.outcome.value,
                 "blocking": [item.cause for item in self.blocking]}
@@ -57401,6 +57620,7 @@ class MissionPresentation(StrictModel):
             networkshape=str(payload.get("networkshape") or ""),
             coverage=str(payload.get("coverage") or ""),
             hypotheses=str(payload.get("hypotheses") or ""),
+            priority=str(payload.get("priority") or ""),
             retention=str(payload.get("retention") or ""))
 
 
@@ -57756,7 +57976,26 @@ def build_presentation(dossier: MissionDossier, *, report_paths: Sequence[str] =
                       f"stopped: {dossier.audit.stopping.kind}"),
         coverage=_presentation_coverage(report),
         hypotheses=_presentation_hypotheses(report),
+        priority=_presentation_priority(report),
         retention=RETENTION_SHORT)
+
+
+def _presentation_priority(report: "MasterReport") -> str:
+    """§47 as one line for the screen: the first dispatch, the rule, and the clause."""
+
+    ledger = report.priority
+    if ledger is None or not ledger.decisions:
+        return "no dispatch was ordered: the mission had no ready task to prioritise"
+    clause = priority_acceptance(ledger)
+    first = ledger.decisions[0]
+    line = (f"{len(ledger.decisions)} dispatch(es); first was "
+            f"{first.chosen_name or first.chosen} ({first.chosen_band.value}, "
+            f"{first.chosen_score.total:.2f})")
+    if clause["churned"]:
+        line += f"; {clause['churned']} went to the wait bound"
+    line += ("; high-value first, nothing starved, recorded"
+             if clause["ok"] else "; CLAUSE FAILED: " + "; ".join(clause["errors"][:2]))
+    return line
 
 
 def _presentation_hypotheses(report: "MasterReport") -> str:
@@ -57999,6 +58238,8 @@ def render_mission_presentation(presentation: MissionPresentation, *,
         footer.add_row("produced by", escape(presentation.produced_by))
     if presentation.networkshape:
         footer.add_row("shape", escape(presentation.networkshape))
+    if presentation.priority:
+        footer.add_row("task priority", escape(presentation.priority[:200]))
     if presentation.hypotheses:
         footer.add_row("hypotheses", escape(presentation.hypotheses[:200]))
     if presentation.coverage:
@@ -58741,6 +58982,12 @@ class AuditRunPolicy(StrictModel):
     capability_router: bool = True
     browser: bool = False
     browser_mode: str = "http"
+    #: §47: whether work was ordered by information value, and the two bounds that decide
+    #: how much of the queue could be reordered and when the wait bound fires.  A re-run
+    #: needs these to reproduce the *order*, which is most of what the audit is for.
+    prioritise_tasks: bool = True
+    priority_lookahead: int = 0
+    priority_starvation_after: int = 0
     #: ``flow`` when the run's own policy was supplied; ``default`` when it was not, and the
     #: record then states that these are the defaults rather than what happened.
     supplied_from: str = "default"
@@ -58753,6 +59000,7 @@ class AuditRunPolicy(StrictModel):
                  "max_follow_up_workers_per_subagent", "allow_runtime_workers",
                  "allow_follow_ups", "stop_on_blocking_failure", "allow_network",
                  "research_first", "capability_router", "browser", "browser_mode",
+                 "prioritise_tasks", "priority_lookahead", "priority_starvation_after",
                  "supplied_from")}
 
 
@@ -59048,6 +59296,11 @@ class AuditRecord(StrictModel):
     hierarchy: AuditHierarchy = Field(default_factory=AuditHierarchy)
     tool_failures: list[AuditToolFailure] = Field(default_factory=list)
     stopping: AuditStop = Field(default_factory=AuditStop)
+    #: §47: how the mission decided what to run first — the weights, the two bounds, every
+    #: dispatch decision with the score behind it, and the clause.  In the audit block rather
+    #: than only in the execution summary because a priority decision is a decision about the
+    #: operator's budget, and this is the block a reader checks budget claims against.
+    priority: dict[str, Any] = Field(default_factory=dict)
     secrets: AuditSecrets = Field(default_factory=AuditSecrets)
     reproduction: list[ReproductionStep] = Field(default_factory=list)
     retention: RetentionNote = Field(default_factory=RetentionNote)
@@ -59099,6 +59352,18 @@ class AuditRecord(StrictModel):
             errors.append("the record offers no command that would reproduce the procedure")
         if not self.retention.note:
             errors.append("the record carries no retention note")
+        # §47: a run that ordered its work says on what basis, and whether every dispatch is
+        # accounted for.  A record with no priority block is a run that recorded no dispatch,
+        # which is a fact rather than a fault — silence about *a decision that was taken* is
+        # the fault, and that is what this checks.
+        if self.priority:
+            if not self.priority.get("decisions"):
+                errors.append("the record carries a priority block with no decision in it")
+            if not self.priority.get("weights"):
+                errors.append("the record ordered work without stating the weights it used")
+            elif not (self.priority.get("clause") or {}).get("ok", True):
+                errors.append("the priority clause failed: "
+                              + "; ".join((self.priority.get("clause") or {}).get("errors") or [])[:200])
         if self.secrets.findings:
             errors.append(f"{len(self.secrets.findings)} credential-shaped value(s) were "
                           f"found in the text; the write must be refused")
@@ -59112,6 +59377,9 @@ class AuditRecord(StrictModel):
             and (self.stopping.kind != "not stated" or bool(self.stopping.reason)),
             "reproducible": bool(self.reproduction),
             "retention_stated": bool(self.retention.note),
+            # A run that recorded no priority decision passes: it had no dispatch to explain.
+            "priority_recorded": (not self.priority
+                                  or bool(self.priority.get("decisions"))),
             "no_secrets": not self.secrets.findings,
             "ok": not errors,
             "errors": errors,
@@ -59133,6 +59401,7 @@ class AuditRecord(StrictModel):
                     "supplied_from": self.hierarchy.supplied_from},
                 "tool_failures": [item.to_dict() for item in self.tool_failures],
                 "stopping": self.stopping.to_dict(),
+                "priority": dict(self.priority),
                 "secrets": self.secrets.to_dict(),
                 "reproduction": [step.to_dict() for step in self.reproduction],
                 "retention": self.retention.to_dict(),
@@ -59171,6 +59440,9 @@ class AuditRecord(StrictModel):
             tool_failures=[AuditToolFailure.model_validate(item)
                            for item in payload.get("tool_failures") or []],
             stopping=AuditStop.model_validate(payload.get("stopping") or {}),
+            # Written as a plain mapping by :meth:`to_dict`, so it reads back as one: the
+            # clause is recomputed on read, which is why the block is not a model.
+            priority=dict(payload.get("priority") or {}),
             secrets=AuditSecrets.model_validate(payload.get("secrets") or {}),
             reproduction=[ReproductionStep.model_validate(item)
                           for item in payload.get("reproduction") or []],
@@ -59387,7 +59659,10 @@ def _audit_policy(result: "FlowResult") -> AuditRunPolicy:
         stop_on_blocking_failure=policy.stop_on_blocking_failure,
         allow_network=policy.allow_network, research_first=policy.research_first,
         capability_router=policy.capability_router, browser=policy.browser,
-        browser_mode=policy.browser_mode, supplied_from=supplied)
+        browser_mode=policy.browser_mode, prioritise_tasks=policy.prioritise_tasks,
+        priority_lookahead=policy.priority_lookahead,
+        priority_starvation_after=policy.priority_starvation_after,
+        supplied_from=supplied)
 
 
 def _audit_hierarchy(result: "FlowResult", execution: ExecutionSummary) -> AuditHierarchy:
@@ -59508,6 +59783,20 @@ def _audit_tool_failures(result: "FlowResult") -> list[AuditToolFailure]:
             attempt=retask.attempt, retryable=True, handled_by="retasked"))
     rows.sort(key=lambda item: (item.unit, item.attempt, item.tool))
     return rows
+
+
+def _audit_priority(result: "FlowResult") -> dict[str, Any]:
+    """§47's block: the weights, the bounds, every decision, and the clause.
+
+    Empty for a run that ordered nothing — a report set, a hand-made record, a mission whose
+    policy left the queue first-in-first-out.  Empty is a statement, and the clause reads it as
+    one rather than as a pass that was earned.
+    """
+
+    ledger = result.priority
+    if ledger is None or not ledger.decisions:
+        return {}
+    return ledger.to_dict()
 
 
 def _audit_stopping(result: "FlowResult", execution: ExecutionSummary) -> AuditStop:
@@ -59661,6 +59950,7 @@ def build_audit_record(result: "FlowResult", *, execution: ExecutionSummary,
         hierarchy=_audit_hierarchy(result, execution),
         tool_failures=_audit_tool_failures(result),
         stopping=_audit_stopping(result, execution),
+        priority=_audit_priority(result),
         reproduction=[],                        # filled below: it reads the scope
         notes=_audit_notes(result, execution),
     ).model_copy(update={
@@ -59959,11 +60249,45 @@ def render_audit_markdown(record: AuditRecord) -> str:
         + (f"; bounded by {len(record.stopping.bounds)} refusal(s)"
            if record.stopping.bounds else "")
         + f"\n- reason: {_md_inline(record.stopping.reason)}\n",
+        "## Task priority\n\n" + _md_priority(record) + "\n",
         "## Reproduction\n\n" + _md_reproduction(record) + "\n",
         "## What is deliberately not recorded\n\n" + _md_secrets(record) + "\n",
         "## Retention\n\n" + _md_retention(record) + "\n",
         "## Audit clause\n\n" + _md_audit_clause(record) + "\n",
     ])
+
+
+def _md_priority(record: AuditRecord) -> str:
+    """§47's table, in the document, with the clause beneath it."""
+
+    block = record.priority or {}
+    decisions = block.get("decisions") or []
+    if not decisions:
+        return ("This record carries no priority decision: the mission had no dispatch to "
+                "order, so there is nothing to say about how its budget was spent.\n")
+    rows = [(_md_cell(str(item.get("sequence")), limit=4),
+             _md_cell(str(item.get("chosen_name") or item.get("chosen")), limit=60),
+             _md_cell(str(item.get("chosen_band"))),
+             _md_cell(f"{float((item.get('chosen_score') or {}).get('total', 0.0)):.2f}"),
+             _md_cell(str(item.get("rule"))), _md_cell(str(item.get("reason")), limit=180))
+            for item in decisions]
+    clause = block.get("clause") or {}
+    lines = [_md_table(["#", "ran first", "band", "score", "rule", "why"], rows), "",
+             f"- weights: {_md_inline(str(block.get('weights') or 'not stated'))}",
+             f"- wait bound: {block.get('starvation_after', 'not stated')}; lookahead "
+             f"{block.get('lookahead', 'not stated')}",
+             f"- the clause: high-value first "
+             f"**{'yes' if clause.get('spent_on_high_value_first') else 'NO'}** · nothing "
+             f"starved **{'yes' if clause.get('none_starved') else 'NO'}** · decisions "
+             f"recorded **{'yes' if clause.get('recorded') else 'NO'}**"]
+    if block.get("unreached"):
+        lines.append("- never reached: "
+                     + ", ".join(f"`{_md_inline(str(item))}`"
+                                 for item in (block.get("unreached") or [])[:8]))
+    if clause.get("errors"):
+        lines.append("- problems: " + "; ".join(_md_inline(item)
+                                               for item in clause.get("errors") or []))
+    return "\n".join(lines) + "\n"
 
 
 def _md_audit_clause(record: AuditRecord) -> str:
@@ -60040,6 +60364,11 @@ def render_audit_summary(record: AuditRecord) -> Table:
     table.add_row("secrets", f"[{colour}]{escape(record.secrets.describe())}[/{colour}]")
     table.add_row("retention", escape("stated in the report: "
                                      + _first_sentence(record.retention.note)[:100]))
+    if record.priority.get("decisions"):
+        clause = record.priority.get("clause") or {}
+        colour = "green" if clause.get("ok") else "red"
+        table.add_row("priority", f"[{colour}]{escape(str(record.priority.get('summary', '')))}"
+                                  f"[/{colour}]")
     return table
 
 
@@ -60163,6 +60492,20 @@ def run_audit_self_test() -> list[DossierCheck]:
     add("the audit clause names what it cannot confirm",
         set(record.acceptance()) >= {"names_the_software", "no_secrets", "reproducible",
                                      "retention_stated"})
+    # §47: the audit log is where the task says priority decisions go, so this is the check
+    # that keeps them there.  The block is read from the record the report was built from, not
+    # from the run: a decision the file does not carry is not recorded, whatever the run knew.
+    add("the audit log carries every dispatch decision",
+        bool((record.priority or {}).get("decisions"))
+        and len(record.priority["decisions"]) == len(result.priority.decisions),
+        len((record.priority or {}).get("decisions") or []))
+    add("the audit log carries the weights the order used",
+        "gain" in str((record.priority or {}).get("weights")))
+    add("the document prints the priority decisions",
+        "## Task priority" in render_dossier_markdown(dossier) and "ran first"
+        in render_dossier_markdown(dossier))
+    add("the priority clause is part of the audit's own verdict",
+        record.acceptance()["priority_recorded"])
 
     # ---- 3. the record refuses to carry a secret ----------------------------
     add("the record redacts a credential-shaped configuration key",
@@ -60540,6 +60883,10 @@ class PlanReport(StrictModel):
     #: penalty the *plan* already incurs.  A dry run states what would be tested, never what
     #: was found — no evidence was collected, so no explanation is weighed here.
     hypothesis_plan: dict[str, Any] = Field(default_factory=dict)
+    #: §47: the order the run would dispatch in, scored from the plan alone.  A dry run has
+    #: no evidence, so every task is scored with what the plan knows — its question, its
+    #: budget and its tools — and the block says so rather than implying a live score.
+    priority_plan: dict[str, Any] = Field(default_factory=dict)
     planned_at: datetime = Field(default_factory=utc_now)
     note: str = DRY_RUN_NOTE
 
@@ -60581,6 +60928,7 @@ class PlanReport(StrictModel):
                 "structure_source": self.structure_source,
                 "effects": self.effects.to_dict(),
                 "hypothesis_plan": dict(self.hypothesis_plan),
+                "priority_plan": dict(self.priority_plan),
                 "planned_at": _iso(self.planned_at), "note": self.note}
 
 
@@ -60735,7 +61083,9 @@ def plan_mission(context: "MasterContext", *, drafts: Sequence["SubagentSpecDraf
         frontier=sorted({unit.parent or "master" for unit in planned_units}),
         structure=structure, structure_source=PLAN_STRUCTURE_SOURCE,
         effects=EffectBoundary.of(RunMode.DRY_RUN),
-        hypothesis_plan=plan_hypothesis_penalty(context))
+        hypothesis_plan=plan_hypothesis_penalty(context),
+        priority_plan=(plan_priority_projection(_shape_context(context), units,
+                                               policy=resolved) if units else {}))
 
 
 def _shape_context(context: "MasterContext") -> "MasterContext":
@@ -63576,6 +63926,53 @@ def plan_hypothesis_penalty(context: "MasterContext") -> dict[str, Any]:
                      "evidence was collected, so no explanation is weighed here")}
 
 
+def plan_priority_projection(context: "MasterContext", units: Sequence["FlowSubagent"], *,
+                             policy: "FlowPolicy") -> dict[str, Any]:
+    """The order a run would dispatch in, computed from the plan and nothing else.
+
+    The coverage matrix is built here exactly as the flow builds it at round 0 (§45 plans the
+    matrix before any evidence exists), so a task's question and status are real rather than
+    assumed.  Two limits remain, and the block states them: no evidence exists yet, so nothing
+    can be a duplicate, and aging cannot be projected because it depends on how many dispatches
+    actually happen.  The dry run's value here is the *comparison* — seeing that the cheap,
+    well-sourced unit would go before the expensive one is the point, and it is visible without
+    running anything.
+    """
+
+    scheduler = PriorityScheduler(weights=PriorityWeights(),
+                                  lookahead=int(policy.priority_lookahead),
+                                  starvation_after=int(policy.priority_starvation_after))
+    try:
+        matrix = build_coverage_matrix(context, units=units, round_number=0, seen_at="plan")
+    except (ValueError, KeyError):           # a plan the matrix cannot describe
+        matrix = None
+    tasks = priority_tasks(units, matrix=matrix)
+    if not tasks:
+        return {}
+    ordered = scheduler.order(tasks)
+    scores = {task.task_id: scheduler.score(task) for task in tasks}
+    first = ordered[0]
+    return {
+        "enabled": bool(policy.prioritise_tasks),
+        "order": [{"task": task.name or task.task_id, "id": task.task_id,
+                   "role": task.role, "score": scores[task.task_id].total,
+                   "band": scheduler.band(task, scores[task.task_id]).value,
+                   "gain": scores[task.task_id].gain,
+                   "source_quality": scores[task.task_id].source_quality,
+                   "cost": scores[task.task_id].cost,
+                   "risk": scores[task.task_id].risk}
+                  for task in ordered],
+        "first": first.name or first.task_id,
+        "weights": scheduler.weights.describe(),
+        "lookahead": scheduler.lookahead,
+        "starvation_after": scheduler.starvation_after,
+        "note": ("a dry run orders the plan, not the mission: the questions are the plan's "
+                 "own (§45 builds the matrix before any evidence exists), nothing can be a "
+                 "duplicate because nothing has been collected, and aging cannot be projected "
+                 "because it depends on dispatches that have not happened"),
+    }
+
+
 # ➤ rendering -------------------------------------------------------------
 
 _HYPOTHESIS_STYLE: dict[str, str] = {
@@ -63936,6 +64333,1257 @@ def run_hypothesis_self_test() -> list["FlowCheck"]:
         report is not None and "explanation" in report.section_of("executive-summary").body,
         report.section_of("executive-summary").body[-160:] if report is not None else "")
 
+    return checks
+
+
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 47. Information-value task prioritisation: spending a budget where it buys an answer
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The flow has always had a queue, and the queue has always been first-in-first-out.  That is
+# fair, and it is the right rule for *capacity*: a unit that has been waiting longer should not
+# be overtaken by one that arrived a moment ago (§24 says so, and its checks hold the line).
+# It is the wrong rule for *work*, for one reason: the units are not equally worth running.
+# A mission has a budget — rounds, a deadline, model calls, a licence — and the difference
+# between a good and a bad use of it is rarely speed.  It is which unit ran first.
+#
+# So this section adds a second scheduler, and the two are deliberately separate:
+#
+#   * :class:`BoundedScheduler` (§24) decides **who may hold a slot now**.  Order is arrival.
+#     Nothing here changes it: prioritisation must not become a way to jump the concurrency
+#     queue, or the fairness §24 proves would be the first casualty.
+#   * :class:`PriorityScheduler` (here) decides **which unit runs next** among the ones that
+#     are ready.  Order is expected information value per unit of cost.  It never holds a slot
+#     and never waits: it is asked, it answers with an order, and the caller dispatches.
+#
+# Six properties, each of which the self-test falsifies:
+#
+#   1. **Every task carries a score, and the score has named components.**  `expected gain`
+#      (what the mission would learn), `relevance` (does it bear on a stated question),
+#      `source quality` (how good the evidence behind it is likely to be), divided by
+#      `cost` + `time`, and reduced by `risk`.  "Duplication" and "dependency readiness" are
+#      not weights: one multiplies the score by zero and the other removes the task from the
+#      ready set, because a task that repeats work already done, or cannot start, has no
+#      information value at all.  A component is never inferred from a model's prose: each one
+#      is read from the record (§45's row, §46's hypotheses, the Worker's own budget).
+#   2. **A starved task cannot be starved for ever.**  Strict priority is how urgent short
+#      tasks starve the necessary long one: every round the short work is worth a little, and
+#      the long work never reaches the front.  :class:`PriorityScheduler` therefore keeps a
+#      *wait* counter per task and adds `aging × waited` to its score, and a task that has
+#      waited `starvation_after` dispatches ignores priority entirely until it has run once.
+#      The guarantee is structural — bounded by a number in the policy — not statistical.
+#   3. **Bounded, not open.**  At most ``priority_lookahead`` ready tasks are reordered per
+#      dispatch.  A scheduler that could reorder the whole plan would be a second planner, and
+#      the plan is the Master's.
+#   4. **A decision is recorded before the work runs, not after it.**  Each dispatch writes a
+#      :class:`PriorityDecision` — the scores, the components, what was passed over and why —
+#      to the run's ledger, to the JSONL log when there is one, and onto the result.  A
+#      priority rule that only exists in the code is a rule nobody can audit.
+#   5. **The record states what the scores are made of.**  ``priority.weights`` travels with
+#      the run and with the audit block, so a reader who disagrees with a decision can see the
+#      arithmetic that produced it instead of guessing at it.
+#   6. **Order does not change what runs.**  Prioritisation decides *when*, never *whether*: a
+#      dispatched task that is outranked is still dispatched, later.  The one exception is a
+#      task the caller chooses to drop under backpressure, and that is a plan decision recorded
+#      elsewhere (§24's clip), not a priority decision.
+
+#: The prefix every priority task id carries, so a decision's task reads as one.
+PRIORITY_ID_PREFIX: str = "pr-"
+
+#: The eight things the task names, and the role each one plays in the arithmetic.  Data, so
+#: the weights, the document and the self-test cannot disagree about what a score contains.
+PRIORITY_COMPONENTS: tuple[tuple[str, str], ...] = (
+    ("gain", "expected information gain: what the mission would learn if this returned"),
+    ("relevance", "how directly the task bears on a question the mission stated"),
+    ("source_quality", "how well-sourced the evidence behind it is expected to be"),
+    ("cost", "what it spends: model calls, licence seats, the round itself"),
+    ("time", "how long it is expected to take, against what is left of the deadline"),
+    ("risk", "how much an unfavourable outcome costs: scope, policy, an irreplaceable source"),
+    ("duplication", "whether the mission has already done this, in substance"),
+    ("dependency", "whether everything it reads is settled"),
+)
+
+
+class PriorityBand(str, Enum):
+    """What a scored task is, in words a reader can act on."""
+
+    URGENT = "urgent"        # closes a disputed answer, or unblocks work behind it
+    HIGH = "high"            # an open question with evidence already pointing at it
+    NORMAL = "normal"        # ordinary planned work
+    LOW = "low"              # work nobody's question claims
+    BLOCKED = "blocked"      # cannot start: a dependency, the deadline, a refusal
+
+    @property
+    def rank(self) -> int:
+        return {PriorityBand.URGENT: 0, PriorityBand.HIGH: 1, PriorityBand.NORMAL: 2,
+                PriorityBand.LOW: 3, PriorityBand.BLOCKED: 9}[self]
+
+    @property
+    def label(self) -> str:
+        return self.value
+
+
+class PriorityWeights(StrictModel):
+    """How much each component is worth.  The numbers a decision was made with.
+
+    Kept as a model rather than as constants read from code so that (a) the record can carry
+    them, (b) the self-test can vary one at a time and watch the order change, and (c) a
+    reader who disagrees with the balance can argue with a number instead of a paragraph.
+    """
+
+    gain: float = Field(default=1.0, ge=0.0, le=5.0)
+    relevance: float = Field(default=0.45, ge=0.0, le=5.0)
+    source_quality: float = Field(default=0.25, ge=0.0, le=5.0)
+    cost: float = Field(default=0.35, ge=0.0, le=5.0)
+    time: float = Field(default=0.20, ge=0.0, le=5.0)
+    risk: float = Field(default=0.30, ge=0.0, le=5.0)
+    #: Added per dispatch a task has been passed over.  This is the anti-starvation term, and
+    #: it is a weight like any other so its effect is inspectable.
+    aging: float = Field(default=0.22, ge=0.0, le=5.0)
+
+    def describe(self) -> str:
+        return (f"gain {self.gain:g} + relevance {self.relevance:g} + source quality "
+                f"{self.source_quality:g}, divided by 1 + cost {self.cost:g} + time {self.time:g}"
+                f" + risk {self.risk:g}; +{self.aging:g} per dispatch waited")
+
+
+class PriorityScore(StrictModel):
+    """One task's score, with every component beside it.
+
+    ``total`` is computed in :func:`score_task` and carried here, not recomputed on read: a
+    score that changed when it was read would make the record disagree with itself.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    gain: float = Field(default=0.0, ge=0.0, le=10.0)
+    relevance: float = Field(default=0.0, ge=0.0, le=10.0)
+    source_quality: float = Field(default=0.0, ge=0.0, le=10.0)
+    cost: float = Field(default=0.0, ge=0.0, le=10.0)
+    time: float = Field(default=0.0, ge=0.0, le=10.0)
+    risk: float = Field(default=0.0, ge=0.0, le=10.0)
+    #: ``True`` when the substance of this task is already in the record.  A duplicate is not
+    #: a low score, it is a zero: running it again spends the budget to learn nothing.
+    duplicate: bool = False
+    #: The dependency that is not settled, when there is one.  Non-empty means "not ready".
+    waits_on: str = ""
+    #: How many dispatches this task has been passed over.  Aging is read from here.
+    waited: int = Field(default=0, ge=0)
+    total: float = 0.0
+    #: Whether the total was multiplied by zero by duplication or readiness, and why.
+    neutralised: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"gain": round(self.gain, 3), "relevance": round(self.relevance, 3),
+                "source_quality": round(self.source_quality, 3),
+                "cost": round(self.cost, 3), "time": round(self.time, 3),
+                "risk": round(self.risk, 3), "duplicate": self.duplicate,
+                "waits_on": self.waits_on, "waited": self.waited,
+                "total": round(self.total, 3), "neutralised": self.neutralised}
+
+    def value(self) -> float:
+        """The numerator: what the mission would learn, and how well it would learn it."""
+
+        return self.gain + 0.45 * self.relevance + 0.25 * self.source_quality
+
+    def price(self) -> float:
+        """The denominator, never below one: what the task costs to attempt."""
+
+        return 1.0 + 0.35 * self.cost + 0.20 * self.time + 0.30 * self.risk
+
+    def describe(self) -> str:
+        if self.neutralised:
+            return f"0.000 ({self.neutralised})"
+        return (f"{self.total:.3f} = value {self.value():.3f} (gain {self.gain:.2f}, "
+                f"relevance {self.relevance:.2f}, source {self.source_quality:.2f}) "
+                f"÷ price {self.price():.3f} (cost {self.cost:.2f}, time {self.time:.2f}, "
+                f"risk {self.risk:.2f})"
+                + (f" + aging {self.waited}" if self.waited else ""))
+
+
+class PriorityTask(StrictModel):
+    """One unit of work as the priority scheduler sees it.
+
+    This is a *view* of a Worker, not a second copy of it: ``task_id`` is the Worker's id, and
+    the fields here are the ones the score needs.  Keeping it a view is what stops the
+    scheduler from becoming a planner.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    task_id: str = Field(min_length=1)
+    name: str = ""
+    subagent_id: str = ""
+    role: str = ""
+    objective: str = ""
+    work_unit: str = ""
+    #: The coverage row this task serves (§45), or ``""`` when nothing claims it.
+    question_id: str = ""
+    question: str = ""
+    question_status: str = ""
+    #: The hypotheses this task would test (§46), so disconfirming work scores higher.
+    tests_hypotheses: list[str] = Field(default_factory=list)
+    #: The dependencies that must settle before this can start.
+    depends_on: list[str] = Field(default_factory=list)
+    #: Read from the Worker's own plan, never invented here.
+    max_attempts: int = Field(default=1, ge=1)
+    timeout_seconds: int = Field(default=0, ge=0)
+    #: How many model calls the unit is expected to make: its planned attempts, at least one.
+    model_calls: int = Field(default=1, ge=0)
+    #: ``True`` when the mission has already collected the substance of this work.
+    duplicate_of: str = ""
+    #: The tools the unit may use, so its expected source quality is read from its own grant.
+    tools: list[str] = Field(default_factory=list)
+    #: ``True`` when the task would touch something the policy marks as sensitive.
+    touches_sensitive: bool = False
+    #: ``True`` when the World is unwatched: a source that can only be read once, a live
+    #: system whose state changes.  A repeat is not merely wasteful, it is impossible.
+    irreversible: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"task_id": self.task_id, "name": self.name, "subagent_id": self.subagent_id,
+                "role": self.role, "objective": self.objective,
+                "work_unit": self.work_unit, "question_id": self.question_id,
+                "question": self.question, "question_status": self.question_status,
+                "tests_hypotheses": list(self.tests_hypotheses), "tools": list(self.tools),
+                "depends_on": list(self.depends_on), "max_attempts": self.max_attempts,
+                "timeout_seconds": self.timeout_seconds, "model_calls": self.model_calls,
+                "duplicate_of": self.duplicate_of,
+                "touches_sensitive": self.touches_sensitive,
+                "irreversible": self.irreversible}
+
+
+class PriorityDecision(StrictModel):
+    """One dispatch decision: what ran, what was passed over, and the arithmetic behind it.
+
+    Written *before* the work runs.  A record written afterwards could always be made to look
+    prescient, which is exactly the failure mode a priority log exists to prevent.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    format_version: str = "argus-priority/1"
+    sequence: int = Field(default=1, ge=1)
+    round: int = Field(default=0, ge=0)
+    #: The tasks that were ready when the decision was taken, in score order.
+    ready: list[str] = Field(default_factory=list)
+    chosen: str = ""
+    chosen_name: str = ""
+    chosen_band: PriorityBand = PriorityBand.NORMAL
+    chosen_score: PriorityScore = Field(default_factory=PriorityScore)
+    #: The ready tasks that were passed over, highest first, and by how much they lost.
+    passed_over: list[str] = Field(default_factory=list)
+    margin: float = 0.0
+    #: Why this one: a sentence, and the components that decided it.
+    reason: str = ""
+    decided_by: str = "information value"
+    #: ``aging`` when the anti-starvation term moved the task to the front, ``priority``
+    #: when the score alone did, and ``starvation`` when the wait bound did.
+    rule: str = "priority"
+    #: What the decision rests on, so a reader can check the mission question it serves.
+    question_id: str = ""
+    waited_flags: list[str] = Field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"format_version": self.format_version, "sequence": self.sequence,
+                "round": self.round, "ready": list(self.ready), "chosen": self.chosen,
+                "chosen_name": self.chosen_name, "chosen_band": self.chosen_band.value,
+                "chosen_score": self.chosen_score.to_dict(), "passed_over": list(self.passed_over),
+                "margin": round(self.margin, 3), "reason": self.reason,
+                "decided_by": self.decided_by, "rule": self.rule,
+                "question_id": self.question_id, "waited_flags": list(self.waited_flags)}
+
+    def summary(self) -> str:
+        return (f"{self.chosen_name or self.chosen} first ({self.chosen_band.value}, "
+                f"{self.chosen_score.total:.2f}"
+                + (f"; {len(self.passed_over)} passed over" if self.passed_over else "")
+                + (f"; by {self.rule}" if self.rule != "priority" else "") + ")")
+
+
+def priority_ledger_from_payload(payload: Any) -> "PriorityLedger | None":
+    """A written priority block back as a ledger, or ``None`` when it is not one.
+
+    ``to_dict`` writes two things the model cannot read back as itself — ``weights`` as the
+    sentence a reader wants, and ``clause`` as the verdict — so a written block is read field
+    by field and the derived keys are dropped.  A block that cannot be read gives ``None``
+    rather than raising: a dossier rendered from a payload written by an older build should
+    lose the priority table, not fail to render at all.
+    """
+
+    if not isinstance(payload, Mapping):
+        return None
+    if not payload.get("decisions") and not payload.get("weights"):
+        return None
+    weights = payload.get("weights")
+    try:
+        return PriorityLedger(
+            lookahead=int(payload.get("lookahead") or PriorityScheduler.DEFAULT_LOOKAHEAD),
+            starvation_after=int(payload.get("starvation_after")
+                                 or PriorityScheduler.DEFAULT_STARVATION_AFTER),
+            weights=(PriorityWeights.model_validate(weights)
+                     if isinstance(weights, Mapping) else PriorityWeights()),
+            decisions=[PriorityDecision.model_validate(item)
+                       for item in payload.get("decisions") or []
+                       if isinstance(item, Mapping)],
+            unreached=[str(item) for item in payload.get("unreached") or []])
+    except (ValueError, TypeError):          # a block this build cannot read
+        return None
+
+
+class PriorityLedger(StrictModel):
+    """Every decision a run made, in order, plus the weights they were made with."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    format_version: str = "argus-priority-ledger/1"
+    weights: PriorityWeights = Field(default_factory=PriorityWeights)
+    lookahead: int = Field(default=6, ge=1, le=256)
+    starvation_after: int = Field(default=3, ge=1, le=256)
+    decisions: list[PriorityDecision] = Field(default_factory=list)
+    #: Tasks the ordering never reached: a summary of why, when a run ended early.
+    unreached: list[str] = Field(default_factory=list)
+
+    def by_rule(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for decision in self.decisions:
+            counts[decision.rule] = counts.get(decision.rule, 0) + 1
+        return dict(sorted(counts.items()))
+
+    def churned(self) -> int:
+        """How often the highest-scoring task was *not* the one that ran.
+
+        Not a defect: aging and the starvation bound exist precisely to produce this number.
+        It is reported so that "the scheduler was fair" is a measurement rather than a claim.
+        """
+
+        return sum(1 for decision in self.decisions
+                   if decision.rule in {"aging", "starvation"})
+
+    def summary(self) -> str:
+        if not self.decisions:
+            return "no priority decision was recorded (no work was ready)"
+        return (f"{len(self.decisions)} decision(s); chosen first by priority "
+                f"{len(self.decisions) - self.churned()}, by the wait bound {self.churned()}"
+                + (f"; {len(self.unreached)} task(s) never reached"
+                   if self.unreached else ""))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"format_version": self.format_version, "weights": self.weights.describe(),
+                "lookahead": self.lookahead, "starvation_after": self.starvation_after,
+                "decisions": [decision.to_dict() for decision in self.decisions],
+                "unreached": list(self.unreached),
+                "by_rule": self.by_rule(), "churned": self.churned(),
+                "summary": self.summary(),
+                "clause": priority_acceptance(self)}
+
+
+# --------------------------------------------------------------------------
+# 47.1 The score
+# --------------------------------------------------------------------------
+
+#: Question statuses (§45) and what each is worth as *expected gain*.  The mapping is a
+#: judgement, written here once rather than scattered through the scheduler: a contradicted
+#: answer is worth most because the report cannot state it, and an answered question is worth
+#: nothing because a round spent re-answering it changes nothing.
+_QUESTION_GAIN: dict[str, float] = {
+    QuestionStatus.CONTRADICTED.value: 1.00,
+    QuestionStatus.PARTIAL.value: 0.80,
+    QuestionStatus.ASSIGNED.value: 0.60,
+    QuestionStatus.UNASSIGNED.value: 0.45,
+    QuestionStatus.ANSWERED.value: 0.05,
+    QuestionStatus.DROPPED.value: 0.0,
+}
+
+#: How well the tools named by a unit are expected to source what it claims.  Read from the
+#: unit's own capability, never guessed: a hash of a local artefact is a stronger record than
+#: an unsourced post, and the difference should show up in the order.
+_SOURCE_QUALITY: tuple[tuple[str, float], ...] = (
+    ("forensic", 1.00), ("hash", 1.00), ("artifact", 0.95), ("log.parse", 0.90),
+    ("advisory", 0.85), ("dns", 0.80), ("archive", 0.75), ("timeline", 0.80),
+    ("http", 0.70), ("browse", 0.65), ("browser", 0.60), ("evidence.read", 0.50),
+)
+
+
+def task_source_quality(tools: Sequence[str]) -> float:
+    """The best sourcing any of a unit's tools is expected to give, in ``0..1``.
+
+    The best rather than the average: a unit that *can* reach a primary source will use it for
+    the claim that matters, and averaging it with a weaker tool would make a well-equipped unit
+    look like a poorly equipped one.
+    """
+
+    best = 0.0
+    for tool in tools or ():
+        lowered = str(tool).strip().lower()
+        for stem, value in _SOURCE_QUALITY:
+            if lowered.startswith(stem) or stem in lowered:
+                best = max(best, value)
+    return best or 0.40
+
+
+def _cost_of(task: PriorityTask) -> float:
+    """What one unit of this task spends, in ``0..2``.
+
+    Not a currency: a *relative* cost, so that two tasks can be compared without the scheduler
+    pretending to know what a model call costs the operator.  The round is the expensive thing
+    (a follow-up round costs one of ``max_replan_rounds``), so a task that needs a new Subagent
+    or a new round carries more of it than one that reuses an existing seat.
+    """
+
+    model = min(1.0, task.model_calls / 4.0)
+    attempts = min(0.5, (task.max_attempts - 1) * 0.25)
+    separate = 0.25 if task.subagent_id and not task.question_id else 0.0
+    return round(min(2.0, 0.1 + model + attempts + separate), 3)
+
+
+def _time_of(task: PriorityTask, *, remaining_seconds: float | None = None) -> float:
+    """How long the unit is expected to take, relative to what is left of the deadline.
+
+    With a deadline the number is a *share*: a unit that would spend a tenth of the remaining
+    mission is cheap, one that would spend all of it is not.  Without a deadline the timeout is
+    read as a nominal length, so the term still orders work rather than vanishing.
+    """
+
+    nominal = max(1.0, float(task.timeout_seconds or 300)) * max(1, task.max_attempts)
+    if remaining_seconds is None or remaining_seconds <= 0:
+        return round(min(1.0, nominal / 3600.0), 3)
+    share = nominal / max(1.0, remaining_seconds)
+    return round(min(1.0, share), 3)
+
+
+def _risk_of(task: PriorityTask) -> float:
+    """What an unfavourable outcome would cost, in ``0..1``.
+
+    Sensitive scope and an irreplaceable source are both risks in the sense that matters here:
+    a unit whose failure cannot be undone is worth running *later*, when the cheap high-value
+    work has already been done with the budget it costs.
+    """
+
+    risk = 0.0
+    if task.touches_sensitive:
+        risk += 0.5
+    if task.irreversible:
+        risk += 0.35
+    return round(min(1.0, risk), 3)
+
+
+def score_task(task: PriorityTask, *, weights: PriorityWeights | None = None,
+               waited: int = 0, remaining_seconds: float | None = None,
+               hypotheses: Sequence[str] = ()) -> PriorityScore:
+    """Score one task, component by component.  Pure: the same inputs give the same number.
+
+    ``relevance`` is read from the task's own question (§45) and from the explanations it would
+    test (§46): a task that serves a stated question is more valuable than one nobody claims,
+    and a task that would *disconfirm* an explanation is more valuable than one that only adds
+    more of the same support.  ``hypotheses`` is the set of explanation ids the mission is
+    currently testing; a task naming one of them is doing §46's work and is scored for it.
+    """
+
+    settings = weights or PriorityWeights()
+    relevance = 0.0
+    if task.question_id:
+        relevance += 0.6
+        relevance += 0.25 if task.question_status in {
+            QuestionStatus.CONTRADICTED.value, QuestionStatus.PARTIAL.value} else 0.0
+        relevance += 0.15 if task.question else 0.0
+    if hypotheses and task.tests_hypotheses:
+        relevance += 0.3
+    gain = _QUESTION_GAIN.get(task.question_status, 0.30 if task.question_id else 0.15)
+    score = PriorityScore(
+        gain=round(min(1.0, gain), 3), relevance=round(min(1.0, relevance), 3),
+        source_quality=round(task_source_quality(task.tools), 3), cost=_cost_of(task),
+        time=_time_of(task, remaining_seconds=remaining_seconds), risk=_risk_of(task),
+        duplicate=bool(task.duplicate_of), waits_on="",
+        waited=max(0, int(waited)))
+    # Value per unit of price, not value minus price.  A task that would teach the mission
+    # twice as much for twice the budget is worth the same, and a difference of scores then
+    # means a difference in *efficiency* — which is the question a budget actually asks.  The
+    # subtraction form has a worse failure: with a high enough price every score is negative,
+    # and a negative score reads as "do not run this" when it only ever meant "later".
+    value = (settings.gain * score.gain
+             + settings.relevance * score.relevance
+             + settings.source_quality * score.source_quality)
+    price = (1.0
+             + settings.cost * score.cost
+             + settings.time * score.time
+             + settings.risk * score.risk)
+    total = value / price + settings.aging * score.waited
+    score.total = round(total, 3)
+    if score.duplicate:
+        score.neutralised = f"the mission already holds this work ({task.duplicate_of or 'unknown'})"
+        score.total = 0.0
+    return score
+
+
+# --------------------------------------------------------------------------
+# 47.2 The scheduler: bounded, aging, and unable to starve a task for ever
+# --------------------------------------------------------------------------
+
+class PriorityScheduler:
+    """Decide which ready task runs next — bounded, aging, and recorded.
+
+    The class holds *only* wait counts and a decision log.  It does not own a queue, a slot or a
+    thread: the caller asks it for an order and dispatches.  That is deliberate, because it
+    means the fairness §24 proves for capacity and the ordering decided here can never be
+    confused with one another in an incident review.
+    """
+
+    #: How many ready tasks one decision may look at.  A number in the policy, not a constant:
+    #: a mission with sixty ready units should still be reordered, but not all at once.
+    DEFAULT_LOOKAHEAD: int = 6
+    #: How many consecutive decisions a task may be passed over before the wait bound runs it.
+    DEFAULT_STARVATION_AFTER: int = 3
+
+    def __init__(self, *, weights: PriorityWeights | None = None,
+                 lookahead: int = DEFAULT_LOOKAHEAD,
+                 starvation_after: int = DEFAULT_STARVATION_AFTER,
+                 remaining_seconds: Callable[[], float | None] | None = None,
+                 on_event: Callable[[str, dict[str, Any]], None] | None = None) -> None:
+        self.weights = weights or PriorityWeights()
+        self.lookahead = max(1, int(lookahead))
+        self.starvation_after = max(1, int(starvation_after))
+        self._remaining = remaining_seconds
+        self._on_event = on_event
+        self._waits: dict[str, int] = {}
+        self._decisions: list[PriorityDecision] = []
+        self._sequence = 0
+
+    # -- inspection ----------------------------------------------------------
+
+    @property
+    def decisions(self) -> list[PriorityDecision]:
+        return list(self._decisions)
+
+    def ledger(self) -> PriorityLedger:
+        """The decisions and the settings they were made with, as one record."""
+
+        return PriorityLedger(weights=self.weights, lookahead=self.lookahead,
+                              starvation_after=self.starvation_after,
+                              decisions=list(self._decisions))
+
+    def waited(self, task_id: str) -> int:
+        return self._waits.get(task_id, 0)
+
+    def remaining(self) -> float | None:
+        if self._remaining is None:
+            return None
+        try:
+            return self._remaining()
+        except Exception:                    # telemetry must never break a decision
+            return None
+
+    # -- scoring -------------------------------------------------------------
+
+    def score(self, task: PriorityTask, *,
+              hypotheses: Sequence[str] = ()) -> PriorityScore:
+        """This task's score, with this scheduler's weights and its own wait count."""
+
+        return score_task(task, weights=self.weights, waited=self.waited(task.task_id),
+                          remaining_seconds=self.remaining(), hypotheses=hypotheses)
+
+    def band(self, task: PriorityTask, score: PriorityScore) -> PriorityBand:
+        """The band a task falls in — a word for the number, for a reader in a hurry."""
+
+        if score.neutralised or task.duplicate_of:
+            return PriorityBand.LOW
+        if task.question_status == QuestionStatus.CONTRADICTED.value:
+            return PriorityBand.URGENT
+        if task.tests_hypotheses and task.question_status in {
+                QuestionStatus.CONTRADICTED.value, QuestionStatus.PARTIAL.value,
+                QuestionStatus.ASSIGNED.value}:
+            return PriorityBand.URGENT if score.total >= 1.4 else PriorityBand.HIGH
+        if task.question_status in {QuestionStatus.PARTIAL.value, QuestionStatus.ASSIGNED.value}:
+            return PriorityBand.HIGH if score.total >= 1.1 else PriorityBand.NORMAL
+        if task.question_status in {QuestionStatus.ANSWERED.value, QuestionStatus.DROPPED.value}:
+            return PriorityBand.LOW
+        return PriorityBand.NORMAL
+
+    # -- the decision --------------------------------------------------------
+
+    def choose(self, tasks: Sequence[PriorityTask], *, ready: Sequence[str] | None = None,
+               hypotheses: Sequence[str] = (), round_number: int = 0,
+               record: bool = True) -> PriorityDecision | None:
+        """The task to run next, with the decision that selected it.
+
+        ``ready`` names the ids that may run now.  It defaults to the tasks the caller passed,
+        because the caller is the one that knows — a dependency is settled by the graph
+        (§25's wait), not by a scheduler guessing from a list of names.  A task whose
+        dependency is named but not settled arrives with ``waits_on`` set and is excluded;
+        that field is how a caller reports readiness *to* the scheduler without asking it to
+        model the graph.
+
+        Returned ``None`` means nothing is ready, which is a real answer: the caller stops
+        dispatching rather than spinning.
+        """
+
+        permitted = set(ready) if ready is not None else {task.task_id for task in tasks}
+        candidates = [task for task in tasks if task.task_id in permitted
+                      and not task.duplicate_of]
+        blocked = [task for task in tasks if task.task_id in permitted and task.duplicate_of]
+        if not candidates:
+            if blocked and record:
+                self._record_blocked(blocked, round_number)
+            return None
+
+        scored = [(task, self.score(task, hypotheses=hypotheses)) for task in candidates]
+        # A lookahead window, not the whole plan: the scheduler reorders the front of the
+        # queue, and the plan's own order decides everything behind it.
+        scored.sort(key=lambda pair: (-pair[1].total, pair[0].task_id))
+        window = scored[: self.lookahead]
+        flagged = [task.task_id for task, _score in window
+                   if self.waited(task.task_id) >= self.starvation_after]
+        rule = "priority"
+        if flagged:
+            # The wait bound outranks the score.  It is checked *before* the ordering rather
+            # than blended into it, so "this task could wait for ever" has one mechanism
+            # rather than a tuning exercise.
+            chosen, chosen_score = window[0]
+            starved = [pair for pair in window if pair[0].task_id == flagged[0]]
+            chosen, chosen_score = starved[0]
+            rule = "starvation"
+        else:
+            chosen, chosen_score = window[0]
+            if chosen_score.waited and self._aging_decided(window, chosen):
+                rule = "aging"
+        decision = PriorityDecision(
+            sequence=self._next_sequence(), round=round_number,
+            ready=[task.task_id for task, _score in scored],
+            chosen=chosen.task_id, chosen_name=chosen.name or chosen.work_unit or chosen.task_id,
+            chosen_band=(PriorityBand.BLOCKED if chosen_score.waits_on
+                         else self.band(chosen, chosen_score)),
+            chosen_score=chosen_score.model_copy(deep=True),
+            passed_over=[task.task_id for task, _score in scored
+                         if task.task_id != chosen.task_id][: max(0, self.lookahead - 1)],
+            margin=round(chosen_score.total - max(
+                [score.total for task, score in scored if task.task_id != chosen.task_id],
+                default=0.0), 3),
+            reason=self._reason(chosen, chosen_score, rule),
+            rule=rule, question_id=chosen.question_id,
+            waited_flags=flagged[:4])
+        if record:
+            self._decisions.append(decision)
+            self._charge_wait(scored, chosen)
+            self._emit("priority.decided", {
+                "chosen": decision.chosen, "rule": decision.rule,
+                "band": decision.chosen_band.value, "score": decision.chosen_score.total,
+                "passed_over": len(decision.passed_over)})
+        return decision
+
+    def order(self, tasks: Sequence[PriorityTask], *, hypotheses: Sequence[str] = (),
+              ready: Sequence[str] | None = None) -> list[PriorityTask]:
+        """Every ready task, in the order the scheduler would run them.
+
+        Not the same as calling :meth:`choose` repeatedly, and not meant to be: this is the
+        *plan* the dispatch will follow, used by the screen and by the dry run.  It charges no
+        waits and records no decision, because nothing has been dispatched yet.
+        """
+
+        permitted = set(ready) if ready is not None else {task.task_id for task in tasks}
+        pairs = [(task, score_task(task, weights=self.weights,
+                                   waited=self.waited(task.task_id),
+                                   remaining_seconds=self.remaining(), hypotheses=hypotheses))
+                 for task in tasks if task.task_id in permitted]
+        pairs.sort(key=lambda pair: (-pair[1].total, pair[0].task_id))
+        return [task for task, _score in pairs]
+
+    # -- internal ------------------------------------------------------------
+
+    def _aging_decided(self, window: Sequence[tuple[PriorityTask, PriorityScore]],
+                       chosen: PriorityTask) -> bool:
+        """Whether the aging term is what put ``chosen`` in front.
+
+        Reported rather than silent: "the wait term moved this to the front" is a different
+        fact from "this scored highest on its merits", and a record that conflated them would
+        make the anti-starvation mechanism invisible in exactly the case it exists for.  The
+        test is a counterfactual: recompute the window with aging set to zero and see whether
+        the same task would still have led.
+        """
+
+        if not any(task.task_id == chosen.task_id for task, _score in window):
+            return False
+        flat = self.weights.model_copy(update={"aging": 0.0})
+        without = sorted(
+            ((task, score_task(task, weights=flat, waited=0,
+                               remaining_seconds=self.remaining())) for task, _score in window),
+            key=lambda pair: (-pair[1].total, pair[0].task_id))
+        return bool(without) and without[0][0].task_id != chosen.task_id
+
+    def _charge_wait(self, scored: Sequence[tuple[PriorityTask, PriorityScore]],
+                     chosen: PriorityTask) -> None:
+        """One dispatch happened: the chosen task's wait resets, everyone else's grows."""
+
+        for task, _score in scored:
+            if task.task_id == chosen.task_id:
+                self._waits[task.task_id] = 0
+            else:
+                self._waits[task.task_id] = self._waits.get(task.task_id, 0) + 1
+
+    def _reason(self, task: PriorityTask, score: PriorityScore, rule: str) -> str:
+        served = (f"serves {task.question_id} ({task.question_status})"
+                  if task.question_id else "serves no stated question")
+        if rule == "starvation":
+            return (f"{task.task_id} has been passed over {score.waited} time(s), which is the "
+                    f"wait bound; it runs now whatever its score, because a task that can be "
+                    f"passed over for ever is a task the mission never does")
+        if rule == "aging":
+            return (f"{task.task_id} scored {score.total:.2f} with {score.waited} dispatch(es) "
+                    f"of waiting, and that is what put it ahead: {served}")
+        return (f"{task.task_id} has the highest expected information value per unit of price "
+                f"({score.total:.2f}): gain {score.gain:.2f}, relevance {score.relevance:.2f}, "
+                f"source quality {score.source_quality:.2f}, cost {score.cost:.2f}, "
+                f"time {score.time:.2f}, risk {score.risk:.2f}; {served}")
+
+    def _record_blocked(self, blocked: Sequence[PriorityTask], round_number: int) -> None:
+        """Every candidate was a duplicate: say so, rather than recording nothing."""
+
+        decision = PriorityDecision(
+            sequence=self._next_sequence(), round=round_number,
+            ready=[task.task_id for task in blocked], chosen="", chosen_band=PriorityBand.BLOCKED,
+            chosen_score=PriorityScore(neutralised="every ready task repeats work already done"),
+            reason=("every ready task duplicates work the mission already holds, so nothing "
+                    "in the window has any information value"),
+            rule="duplication")
+        self._decisions.append(decision)
+        self._emit("priority.nothing_worth_running", {"duplicates": list(decision.ready)})
+
+    def _next_sequence(self) -> int:
+        self._sequence += 1
+        return self._sequence
+
+    def _emit(self, event: str, payload: dict[str, Any]) -> None:
+        if self._on_event is None:
+            return
+        try:
+            self._on_event(event, payload)
+        except Exception:                    # telemetry must never break a mission
+            pass
+
+
+# --------------------------------------------------------------------------
+# 47.3 Building the ready set from the record
+# --------------------------------------------------------------------------
+
+def priority_tasks(units: Sequence["FlowSubagent"], *, matrix: "CoverageMatrix | None" = None,
+                   hypotheses: "HypothesisSet | None" = None,
+                   settled: Sequence[str] = (),
+                   collected: Sequence[str] = ()) -> list[PriorityTask]:
+    """Every planned Worker as a priority task, with what the record already says about it.
+
+    Four readings, all from records that exist by now: the question the Worker serves (§45),
+    the explanations its objective names (§46), the budget the Worker was planned with (its own
+    specification), and whether its substance is already in the evidence set (§36's claim key).
+    Nothing here invents a number: a mission with no coverage matrix produces tasks that serve
+    no question, which is a fact the score reflects rather than a defect to paper over.
+    """
+
+    rows = list(matrix.rows) if matrix is not None else []
+    by_unit: dict[str, "CoverageCell"] = {}
+    for row in rows:
+        for subagent_id in row.subagent_ids:
+            by_unit.setdefault(subagent_id, row)
+    claims = {_claim_key(text) for text in collected if text}
+    ready = set(settled)
+    tasks: list[PriorityTask] = []
+    for subagent in units:
+        row = by_unit.get(subagent.id)
+        for worker in subagent.workers:
+            key = _claim_key(f"{worker.objective} {worker.work_unit}")
+            duplicate = next((claim for claim in claims if claim and claim in key), "")
+            tasks.append(PriorityTask(
+                task_id=worker.id, name=worker.name, subagent_id=subagent.id,
+                role=subagent.role, objective=worker.objective[:300],
+                work_unit=worker.work_unit, tools=list(worker.tools),
+                question_id=row.id if row is not None else "",
+                question=row.question if row is not None else "",
+                question_status=row.status.value if row is not None else "",
+                tests_hypotheses=[item.id for item in (hypotheses.hypotheses
+                                                       if hypotheses is not None else ())
+                                  if item.id and item.id in worker.objective],
+                depends_on=[dep for dep in worker.depends_on if dep not in ready],
+                max_attempts=max(1, worker.max_attempts),
+                timeout_seconds=max(0, worker.timeout_seconds),
+                model_calls=max(1, worker.max_attempts),
+                duplicate_of=duplicate,
+                touches_sensitive=subagent.role.strip().lower().startswith(
+                    ("forensic", "integrity", "credential")),
+                irreversible=any("forensic" in tool.lower() or "hash" in tool.lower()
+                                 for tool in worker.tools)))
+    return tasks
+
+
+def priority_acceptance(ledger: PriorityLedger) -> dict[str, Any]:
+    """Task 43's clause, evaluated on the record rather than asserted about it.
+
+    *Limited budgets are spent on high-value gaps first, and priority decisions are recorded in
+    the audit log.*  Three claims, each falsifiable:
+
+    * ``spent_on_high_value_first`` — no dispatch ran a task the record itself scores lower than
+      one it passed over, except where aging or the wait bound explains the inversion.
+    * ``none_starved`` — no task was passed over more times than the wait bound without running.
+    * ``recorded`` — every decision that dispatched something is on the ledger, in sequence.
+    """
+
+    errors: list[str] = []
+    unexplained = [decision for decision in ledger.decisions
+                   if decision.chosen and decision.margin < 0 and decision.rule == "priority"]
+    if unexplained:
+        errors.append(f"{len(unexplained)} dispatch(es) ran a task the record scores below one "
+                      f"they passed over, with no aging or wait bound to explain it")
+    starved = [task_id for task_id in {task for decision in ledger.decisions
+                                       for task in decision.passed_over}
+               if sum(1 for decision in ledger.decisions
+                      if task_id in decision.passed_over) > ledger.starvation_after
+               and not any(decision.chosen == task_id for decision in ledger.decisions)]
+    if starved:
+        errors.append(f"{len(starved)} task(s) were passed over more than the wait bound of "
+                      f"{ledger.starvation_after} without ever running: {', '.join(starved[:4])}")
+    sequences = [decision.sequence for decision in ledger.decisions]
+    if sequences != list(range(1, len(sequences) + 1)):
+        errors.append("the decisions are not in dispatch order, so the log is not a log")
+    return {
+        "decisions": len(ledger.decisions),
+        "dispatch": len([decision for decision in ledger.decisions if decision.chosen]),
+        "spent_on_high_value_first": not unexplained,
+        "none_starved": not starved,
+        "recorded": not any("dispatch order" in item for item in errors),
+        "by_rule": ledger.by_rule(),
+        "churned": ledger.churned(),
+        "weights": ledger.weights.describe(),
+        "ok": not errors,
+        "errors": errors,
+    }
+
+
+# --------------------------------------------------------------------------
+# 47.4 Rendering: what a reader sees
+# --------------------------------------------------------------------------
+
+_PRIORITY_STYLE: dict[PriorityBand, str] = {
+    PriorityBand.URGENT: "red", PriorityBand.HIGH: "yellow",
+    PriorityBand.NORMAL: "cyan", PriorityBand.LOW: "dim", PriorityBand.BLOCKED: "magenta",
+}
+
+
+def render_priority_ledger(ledger: PriorityLedger, *, limit: int = 8) -> Table:
+    """The decisions as a table: what ran first, what it beat, and by how much."""
+
+    table = Table(title=f"task priority — {ledger.summary()}", title_justify="left",
+                  box=None, pad_edge=False, expand=True)
+    table.add_column("#", justify="right", width=3, no_wrap=True)
+    table.add_column("chosen first", overflow="fold", ratio=3)
+    table.add_column("band", no_wrap=True)
+    table.add_column("score", justify="right", no_wrap=True)
+    table.add_column("margin", justify="right", no_wrap=True)
+    table.add_column("why it won", overflow="fold", ratio=3)
+    for decision in ledger.decisions[:limit]:
+        colour = _PRIORITY_STYLE[decision.chosen_band]
+        table.add_row(str(decision.sequence),
+                      escape(decision.chosen_name or decision.chosen or "—"),
+                      f"[{colour}]{decision.chosen_band.value}[/{colour}]",
+                      f"{decision.chosen_score.total:.2f}",
+                      f"{decision.margin:+.2f}",
+                      escape(decision.reason[:150] or decision.rule))
+    blocks: list[Any] = [table]
+    if len(ledger.decisions) > limit:
+        blocks.append(Text(f"  {len(ledger.decisions) - limit} further decision(s) in the "
+                           f"record; the JSON carries all of them", style="dim"))
+    clause = priority_acceptance(ledger)
+    colour = "green" if clause["ok"] else "red"
+    blocks.append(Text(""))
+    blocks.append(Text.assemble(
+        (f"{'✔' if clause['ok'] else '✘'} ", colour),
+        ("budget spent on high-value gaps first", "white"),
+        (f" · {clause['decisions']} decision(s) recorded · wait bound "
+         f"{ledger.starvation_after} · {clause['churned']} dispatch(es) went to the wait bound",
+         "dim")))
+    return Group(*blocks)
+
+
+def render_priority_summary(ledger: PriorityLedger) -> Table:
+    """The one-line version: the clause, the weights, and how often aging decided."""
+
+    clause = priority_acceptance(ledger)
+    table = Table(box=None, pad_edge=False, expand=False)
+    table.add_column("what", style="dim", no_wrap=True)
+    table.add_column("value", overflow="fold", max_width=84)
+    table.add_row("priority", escape(ledger.summary()))
+    table.add_row("by rule", escape(", ".join(f"{rule} {count}"
+                                              for rule, count in clause["by_rule"].items())
+                                    or "no decision"))
+    table.add_row("weights", escape(ledger.weights.describe()))
+    colour = "green" if clause["ok"] else "red"
+    table.add_row("clause", f"[{colour}]{escape('high-value first, none starved, recorded')}"
+                            f"[/{colour}]")
+    return table
+
+
+def priority_markdown(ledger: PriorityLedger) -> str:
+    """The decisions as a Markdown block, for the report's own record of what it spent."""
+
+    clause = priority_acceptance(ledger)
+    if not ledger.decisions:
+        return ("No priority decision was recorded: the mission had no work to order, so "
+                "nothing was spent and nothing is claimed about how.\n")
+    rows = [(_md_cell(str(decision.sequence)),
+             _md_cell(decision.chosen_name or decision.chosen, limit=60),
+             _md_cell(decision.chosen_band.value), _md_cell(f"{decision.chosen_score.total:.2f}"),
+             _md_cell(f"{decision.margin:+.2f}"), _md_cell(decision.rule),
+             _md_cell(decision.reason, limit=180))
+            for decision in ledger.decisions]
+    lines = [_md_table(["#", "ran first", "band", "score", "margin", "rule", "why"], rows),
+             "",
+             f"- weights: {_md_inline(ledger.weights.describe())}",
+             f"- wait bound: a task passed over {ledger.starvation_after} time(s) runs next "
+             f"whatever it scores; the window is {ledger.lookahead} ready task(s)",
+             f"- the clause: high-value first **{'yes' if clause['spent_on_high_value_first'] else 'NO'}**"
+             f" · nothing starved **{'yes' if clause['none_starved'] else 'NO'}**"
+             f" · decisions recorded **{'yes' if clause['recorded'] else 'NO'}**"]
+    if clause["errors"]:
+        lines.append("- problems: " + "; ".join(_md_inline(item) for item in clause["errors"]))
+    return "\n".join(lines) + "\n"
+
+
+
+
+@dataclass(frozen=True)
+class PriorityCheck:
+    """One claim about task prioritisation, and the evidence for it."""
+
+    name: str
+    ok: bool
+    detail: str = ""
+
+
+def _priority_task(task_id: str, *, name: str = "", question: str = "cq-1",
+                   status: str = "assigned", gain_tools: Sequence[str] = ("http.fetch",),
+                   model_calls: int = 1, max_attempts: int = 1, timeout: int = 300,
+                   tests: Sequence[str] = (), sensitive: bool = False,
+                   irreversible: bool = False, duplicate: str = "") -> PriorityTask:
+    """One task for the checks, with the knobs that change a score and nothing else."""
+
+    return PriorityTask(
+        task_id=task_id, name=name or task_id, subagent_id="sa-1", role="reader",
+        objective=f"read the sources that bear on {task_id}",
+        work_unit=f"{task_id} unit", tools=list(gain_tools),
+        question_id=question, question=f"what does {task_id} show" if question else "",
+        question_status=status, tests_hypotheses=list(tests),
+        max_attempts=max_attempts, timeout_seconds=timeout, model_calls=model_calls,
+        duplicate_of=duplicate, touches_sensitive=sensitive, irreversible=irreversible)
+
+
+def run_priority_self_test() -> list[PriorityCheck]:
+    """Task 43's acceptance clause, as executable checks against the real machinery.
+
+    Three groups.  The **score** must be a sum of named components, each read from the record,
+    and it must respond to each of them in the right direction.  The **scheduler** must bound
+    its own reordering, must age a passed-over task, and must run a starving task whatever it
+    scores.  The **record** must carry every decision into the ledger, the JSON and the audit
+    block, and the clause must fail when the record is edited to be wrong.
+
+    Nothing here needs a provider, a network or an artefact: every check is a property of the
+    arithmetic or of the record.
+    """
+
+    checks: list[PriorityCheck] = []
+
+    def add(name: str, ok: bool, detail: Any = "") -> None:
+        checks.append(PriorityCheck(name=name, ok=bool(ok), detail=str(detail)[:180]))
+
+    # ---- 1. the score is eight named things, and none of them is a guess ------
+    add("the task names eight scoring components",
+        len(PRIORITY_COMPONENTS) == 8
+        and {name for name, _why in PRIORITY_COMPONENTS}
+        == {"gain", "relevance", "source_quality", "cost", "time", "risk", "duplication",
+            "dependency"},
+        [name for name, _why in PRIORITY_COMPONENTS])
+    add("every component says what it means",
+        all(len(why) > 20 for _name, why in PRIORITY_COMPONENTS))
+    without_question = score_task(_priority_task("a", question="", status=""))
+    with_question = score_task(_priority_task("b"))
+    add("a task that serves a stated question scores higher than one that serves none",
+        with_question.total > without_question.total,
+        (with_question.total, without_question.total))
+    add("the question's relevance is a component, not a constant",
+        with_question.relevance > without_question.relevance,
+        (with_question.relevance, without_question.relevance))
+    disputed = score_task(_priority_task("c", status="contradicted"))
+    answered = score_task(_priority_task("d", status="answered"))
+    add("a disputed answer is worth more than one already answered",
+        disputed.gain > answered.gain, (disputed.gain, answered.gain))
+    add("a disputed answer outscores an assigned one", disputed.total > with_question.total,
+        (disputed.total, with_question.total))
+
+    # ---- 2. source quality is read from the unit's own grant -----------------
+    forensic = score_task(_priority_task("e", gain_tools=("forensic.timeline",)))
+    browsing = score_task(_priority_task("f", gain_tools=("browser.interact",)))
+    add("a well-sourcing tool scores above a weaker one",
+        forensic.source_quality > browsing.source_quality,
+        (forensic.source_quality, browsing.source_quality))
+    add("a unit with no recognised tool still scores, at the floor",
+        score_task(_priority_task("g", gain_tools=())).source_quality > 0)
+
+    # ---- 3. cost, time and risk all push the score down ---------------------
+    cheap = score_task(_priority_task("h", model_calls=1, max_attempts=1))
+    dear = score_task(_priority_task("i", model_calls=8, max_attempts=4))
+    add("a task that spends more scores lower", dear.total < cheap.total,
+        (dear.total, cheap.total))
+    add("cost is a component and is higher for the dearer task", dear.cost > cheap.cost,
+        (dear.cost, cheap.cost))
+    quick = score_task(_priority_task("j", timeout=30))
+    slow = score_task(_priority_task("k", timeout=3000))
+    add("a task that takes longer scores lower", slow.total < quick.total,
+        (slow.total, quick.total))
+    risky = score_task(_priority_task("l", sensitive=True, irreversible=True))
+    plain = score_task(_priority_task("m"))
+    add("a task with a sensitive, unrepeatable effect scores lower",
+        risky.total < plain.total, (risky.total, plain.total))
+    deadline_short = score_task(_priority_task("n", timeout=3000), remaining_seconds=60.0)
+    deadline_long = score_task(_priority_task("o", timeout=3000), remaining_seconds=60_000.0)
+    add("time is read against what is left of the deadline, not in the abstract",
+        deadline_short.time > deadline_long.time, (deadline_short.time, deadline_long.time))
+
+    # ---- 4. duplication and dependency are not weights ----------------------
+    duplicated = score_task(_priority_task("p", duplicate="the mission already read this"))
+    add("a duplicate scores zero rather than low", duplicated.total == 0.0, duplicated.total)
+    add("the duplicate says why its score is zero",
+        "already holds" in duplicated.neutralised, duplicated.neutralised)
+    add("a non-duplicate is not neutralised", not plain.neutralised)
+
+    scheduler = PriorityScheduler(lookahead=6)
+    unique = _priority_task("q1", status="partial")
+    repeat = _priority_task("q2", duplicate="done last round")
+    decision = scheduler.choose([repeat, unique], ready=["q1", "q2"])
+    add("a duplicate is never dispatched ahead of live work",
+        decision is not None and decision.chosen == "q1",
+        decision.chosen if decision else None)
+    add("a disabled scheduler dispatches nothing on its own",
+        PriorityScheduler().choose([]) is None)
+
+    # ---- 5. the scheduler stays bounded -------------------------------------
+    wide = [_priority_task(f"w{index}", status="assigned") for index in range(12)]
+    bounded = PriorityScheduler(lookahead=3)
+    decision = bounded.choose(wide, ready=[task.task_id for task in wide])
+    add("one decision looks at no more than the lookahead window",
+        len(decision.passed_over) <= 2, len(decision.passed_over))
+    add("the decision still names every ready task",
+        len(decision.ready) == len(wide), len(decision.ready))
+    add("the window is the policy's, not a constant",
+        PriorityScheduler(lookahead=9).lookahead == 9)
+
+    # ---- 6. the wait bound: a task cannot be starved for ever ---------------
+    starving = PriorityScheduler(lookahead=4, starvation_after=2)
+    urgent = _priority_task("u", status="contradicted", gain_tools=("forensic.hash",))
+    long_haul = _priority_task("l", status="assigned", gain_tools=("browser.browse",),
+                               model_calls=8, max_attempts=4, timeout=3600)
+    first = starving.choose([urgent, long_haul], ready=["u", "l"])
+    second = starving.choose([urgent, long_haul], ready=["u", "l"])
+    third = starving.choose([urgent, long_haul], ready=["u", "l"])
+    add("the cheap urgent task goes first on its merits", first.chosen == "u", first.chosen)
+    add("the necessary long task is passed over once", second.chosen == "u", second.chosen)
+    add("the necessary long task runs at the wait bound, whatever it scores",
+        third.chosen == "l", (third.chosen, third.rule))
+    add("the record says the wait bound decided it", third.rule == "starvation", third.rule)
+    add("the reason names the bound rather than the score",
+        "passed over" in third.reason and "wait bound" in third.reason, third.reason[:120])
+    within = PriorityScheduler(lookahead=4, starvation_after=9)
+    for _index in range(5):
+        within.choose([urgent, long_haul], ready=["u", "l"])
+    add("a higher wait bound does not fire early",
+        all(item.rule != "starvation" for item in within.decisions), within.ledger().by_rule())
+    add("aging is reported separately from the wait bound",
+        within.ledger().by_rule().get("starvation", 0) == 0
+        and within.ledger().by_rule().get("aging", 0) >= 1, within.ledger().by_rule())
+    add("waits are per task and reset when the task runs",
+        PriorityScheduler().waited("nothing") == 0)
+
+    # ---- 7. aging: the long task climbs before the bound fires -------------
+    aging = PriorityScheduler(lookahead=4, starvation_after=99)
+    just_barely = _priority_task("a", status="assigned", gain_tools=("advisory.read",))
+    expensive = _priority_task("b", status="assigned", gain_tools=("browser.browse",),
+                               model_calls=4, max_attempts=2, timeout=1800)
+    picked = []
+    for _index in range(6):
+        chosen = aging.choose([just_barely, expensive], ready=["a", "b"])
+        picked.append((chosen.chosen, chosen.rule))
+    add("aging eventually promotes the task that keeps losing, before the bound",
+        any(worker == "b" and rule in {"aging", "starvation"} for worker, rule in picked),
+        picked)
+    add("the ledger counts how often the wait rule decided",
+        aging.ledger().churned() == sum(1 for _w, rule in picked if rule != "priority"),
+        aging.ledger().by_rule())
+    add("aging is a weight a reader can see", PriorityWeights().aging > 0)
+
+    # ---- 8. priority never overrides readiness -----------------------------
+    blocked = _priority_task("blocked", status="contradicted")
+    blocked = blocked.model_copy(update={"task_id": "blocked"})
+    ready_only = PriorityScheduler().choose([_priority_task("r", status="answered"), blocked],
+                                            ready=["r"])
+    add("a task whose dependency is not settled is not dispatched",
+        ready_only is not None and ready_only.chosen == "r",
+        ready_only.chosen if ready_only else None)
+    add("an empty ready set is answered with nothing, not with a guess",
+        PriorityScheduler().choose([_priority_task("z")], ready=[]) is None)
+
+    # ---- 9. the decision is a record ---------------------------------------
+    recorder = PriorityScheduler(lookahead=4)
+    record = recorder.choose([_priority_task("x", name="advisory reader"),
+                              _priority_task("y", name="dns collector")],
+                            ready=["x", "y"], round_number=2)
+    add("a decision names the task and its score", record.chosen and record.chosen_score.total > 0)
+    add("a decision carries the components behind the score",
+        record.chosen_score.gain > 0 and record.chosen_score.cost > 0,
+        record.chosen_score.to_dict())
+    add("a decision names what it passed over", record.passed_over == ["y"], record.passed_over)
+    add("a decision says why, in a sentence a reader can check",
+        len(record.reason) > 40 and str(record.chosen) in record.reason, record.reason[:90])
+    add("a decision carries the round it was taken in", record.round == 2)
+    add("decisions are numbered in dispatch order",
+        [item.sequence for item in recorder.ledger().decisions] == [1], recorder.ledger().by_rule())
+    written = recorder.ledger().to_dict()
+    add("the ledger reads back as itself",
+        priority_ledger_from_payload(written).decisions[0].chosen == "x",
+        list(written)[:4])
+    add("the ledger carries the weights it decided with",
+        "gain" in recorder.ledger().weights.describe())
+
+    # ---- 10. the clause can fail -------------------------------------------
+    good = priority_acceptance(recorder.ledger())
+    add("the clause reports the three claims it makes",
+        {"spent_on_high_value_first", "none_starved", "recorded"} <= set(good), sorted(good))
+    add("a well-ordered ledger passes the clause", good["ok"], good["errors"])
+    starved_ledger = PriorityLedger(
+        decisions=[PriorityDecision(sequence=index + 1, chosen="first",
+                                    passed_over=["forgotten"] if index < 5 else [],
+                                    chosen_score=PriorityScore(total=1.0))
+                   for index in range(6)], starvation_after=2)
+    add("a task passed over beyond the wait bound fails the clause",
+        not priority_acceptance(starved_ledger)["ok"],
+        priority_acceptance(starved_ledger)["errors"])
+    out_of_order = PriorityLedger(decisions=[
+        PriorityDecision(sequence=2, chosen="a"), PriorityDecision(sequence=2, chosen="b")])
+    add("a log whose sequence is broken fails the clause",
+        not priority_acceptance(out_of_order)["recorded"],
+        priority_acceptance(out_of_order)["errors"])
+    add("an empty ledger is not a failure, it is an absence",
+        priority_acceptance(PriorityLedger())["ok"])
+
+    # ---- 11. the order does not change what runs ---------------------------
+    context = _selftest_context("forensic")
+    units = flow_units_for(context, "forensic")
+    prioritised = HierarchicalFlow(
+        context=context, subagents=units,
+        runner=_CountingRunner(scope=context.scope_entries)).run()
+    plain_flow = HierarchicalFlow(
+        context=context, subagents=units, policy=FlowPolicy(prioritise_tasks=False),
+        runner=_CountingRunner(scope=context.scope_entries)).run()
+    add("a prioritised run settles every unit the first-in-first-out run does",
+        {report.subagent_id for report in prioritised.reports}
+        == {report.subagent_id for report in plain_flow.reports},
+        len(prioritised.reports))
+    add("prioritisation changes no Worker's outcome",
+        sorted((report.role, report.status.value) for report in prioritised.reports)
+        == sorted((report.role, report.status.value) for report in plain_flow.reports))
+    add("a run with prioritisation off records no priority decision",
+        plain_flow.priority is not None and not plain_flow.priority.decisions,
+        plain_flow.priority_summary)
+
+    # ---- 12. the real graph records what it decided ------------------------
+    live = prioritised.priority
+    add("a real run carries its dispatch decisions", live is not None and live.decisions,
+        len(live.decisions) if live is not None else None)
+    add("every decision was taken before its Worker ran",
+        all(decision.sequence > 0 for decision in live.decisions))
+    add("the run's clause passes", prioritised.priority_summary["clause"]["ok"],
+        prioritised.priority_summary["clause"]["errors"])
+    add("the summary names the first dispatch and the rule that chose it",
+        bool(prioritised.priority_summary.get("first"))
+        and bool(prioritised.priority_summary.get("first_rule")),
+        prioritised.priority_summary.get("first_rule"))
+    add("the ledger says which tasks no decision ever reached",
+        isinstance(prioritised.priority_summary.get("unreached"), list),
+        prioritised.priority_summary.get("unreached"))
+    add("every planned Worker reached a decision",
+        prioritised.priority_summary.get("unreached") == [],
+        prioritised.priority_summary.get("unreached"))
+    add("the trace carries a priority stage", "master-priority" in prioritised.stage_order(),
+        prioritised.stage_order())
+    priority_events = [event for event in prioritised.trace
+                       if event.get("stage") == FlowStage.PRIORITY.value]
+    worker_events = [event for event in prioritised.trace
+                     if event.get("stage") == FlowStage.WORKER.value]
+    add("the priority stage happens before the work it orders",
+        bool(priority_events) and bool(worker_events)
+        and min(event["seq"] for event in priority_events)
+        < min(event["seq"] for event in worker_events),
+        (priority_events[0]["seq"] if priority_events else None,
+         worker_events[0]["seq"] if worker_events else None))
+
+    # ---- 13. the record reaches the payload, the log and the audit ----------
+    payload = prioritised.to_dict()
+    add("the result serialises the ledger", isinstance(payload.get("priority"), dict))
+    add("the payload carries the clause", payload["priority_summary"]["clause"]["ok"])
+    demo = _flow_demo("forensic")
+    add("the demo payload carries the decisions", bool(demo.get("priority", {}).get("decisions")))
+    add("the demo's presentation speaks priority",
+        "dispatch" in (demo["presentation"].get("priority") or ""),
+        demo["presentation"].get("priority"))
+    add("a re-run from the payload reports the same order",
+        [item.chosen for item in _flow_result_from_payload(demo).priority.decisions]
+        == [item["chosen"] for item in demo["priority"]["decisions"]])
+    add("a payload without a ledger reads back as one",
+        priority_ledger_from_payload({"weights": "a sentence", "decisions": []}).decisions == [])
+    add("a payload with nothing in it reads as absent rather than failing",
+        priority_ledger_from_payload({}) is None and priority_ledger_from_payload("no") is None)
+
+    dossier = build_dossier(prioritised, context=context,
+                            settings=build_settings({}, {}).settings)
+    record = dossier.audit
+    add("the audit block carries the decisions",
+        bool((record.priority or {}).get("decisions")),
+        len((record.priority or {}).get("decisions") or []))
+    add("the audit block carries the weights the decisions used",
+        bool((record.priority or {}).get("weights")))
+    add("the audit clause checks the priority record",
+        "priority_recorded" in record.acceptance() and record.acceptance()["priority_recorded"])
+    add("the audit block survives a round trip",
+        AuditRecord.from_dict(record.to_dict()).priority.get("decisions")
+        == record.priority.get("decisions"))
+    markdown = render_dossier_markdown(dossier)
+    add("the document has a task-priority section", "## Task priority" in markdown)
+    add("the document states the weights it decided with",
+        "weights:" in markdown and "gain" in markdown)
+    add("the document states the clause in words",
+        "high-value first" in markdown and "nothing starved" in markdown)
+
+    # ---- 14. the dry run orders the plan, and says it did not run it -------
+    plan_context = MasterContext(
+        objective="map the publicly exposed services of example.net and rank them",
+        scope_entries=["example.net"], mode=MissionMode.PASSIVE,
+        available_tools=["http.fetch", "dns.lookup"], mission_questions=[])
+    plan = plan_mission(plan_context)
+    projection = plan.priority_plan
+    add("a dry run projects an order", bool(projection.get("order")), len(projection.get("order") or []))
+    add("the projection names what would run first",
+        bool(projection.get("first")) and projection["order"][0]["task"] == projection["first"])
+    add("the projection carries the weights",
+        "gain" in str(projection.get("weights")))
+    add("the projection says what it could not know",
+        "not the mission" in str(projection.get("note")), str(projection.get("note"))[:90])
+    add("the projection is scored, not asserted",
+        all(isinstance(row.get("score"), float) for row in projection.get("order") or []))
+
+    # ---- 15. the surfaces a reader uses ------------------------------------
+    screen = render_priority_ledger(prioritised.priority)
+    add("the ledger is renderable for a terminal", screen is not None)
+    summary_table = render_priority_summary(prioritised.priority)
+    add("the summary is renderable for a terminal", summary_table is not None)
+    block = priority_markdown(prioritised.priority)
+    add("the markdown block has the decisions as a table", "| # | ran first |" in block)
+    add("the markdown block states the clause", "high-value first" in block)
+    add("an empty ledger renders as an absence rather than an empty table",
+        "No priority decision" in priority_markdown(PriorityLedger()))
     return checks
 
 
@@ -65390,7 +67038,10 @@ def _flow_result_from_payload(payload: Mapping[str, Any]) -> FlowResult:
         coverage=(CoverageLedger.model_validate(payload["coverage"])
                   if isinstance(payload.get("coverage"), dict) else None),
         hypotheses=(HypothesisSet.model_validate(payload["hypotheses"])
-                    if isinstance(payload.get("hypotheses"), dict) else None))
+                    if isinstance(payload.get("hypotheses"), dict) else None),
+        # §47: the decisions travel with the record, so a document rebuilt from a written
+        # payload reports the same order it was written with rather than no order at all.
+        priority=priority_ledger_from_payload(payload.get("priority")))
 
 
 def _written_like_model(payload: Any, model: type[BaseModel]) -> bool:

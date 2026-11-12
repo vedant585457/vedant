@@ -2,13 +2,13 @@
   "schema_version": 1,
   "mission_id": "flow-4da3c70d0ab3",
   "objective": "determine from the supplied disk image which processes wrote to /etc/hosts on 2026-02-11",
-  "generated_at": "2026-11-12T09:51:28.666320Z",
+  "generated_at": "2026-11-12T10:51:59.993700Z",
   "format_version": "argus-dossier/1",
   "report": {
     "mission_id": "flow-4da3c70d0ab3",
     "objective": "determine from the supplied disk image which processes wrote to /etc/hosts on 2026-02-11",
     "question": "a package upgrade rewrote /etc/hosts",
-    "generated_at": "2026-11-12T09:51:28.643812Z",
+    "generated_at": "2026-11-12T10:51:59.968703Z",
     "sections": [
       {
         "kind": "executive-summary",
@@ -547,7 +547,337 @@
         "basis": "indistinguishable: the record disagrees with it, and the same records support it: the mission cannot tell the two apart; neither it nor hyp-1-h-eb291e is favoured: the mission's evidence does not separate the two",
         "discriminator": "collect one first-party record that states this explanation outright and one that would be false if it holds: an interactive edit rewrote /etc/hosts"
       }
-    ]
+    ],
+    "priority": {
+      "format_version": "argus-priority-ledger/1",
+      "weights": {
+        "gain": 1.0,
+        "relevance": 0.45,
+        "source_quality": 0.25,
+        "cost": 0.35,
+        "time": 0.2,
+        "risk": 0.3,
+        "aging": 0.22
+      },
+      "lookahead": 6,
+      "starvation_after": 3,
+      "decisions": [
+        {
+          "format_version": "argus-priority/1",
+          "sequence": 1,
+          "round": 0,
+          "ready": [
+            "wrk-1c07b0fb8d33"
+          ],
+          "chosen": "wrk-1c07b0fb8d33",
+          "chosen_name": "timeline-builder",
+          "chosen_band": "normal",
+          "chosen_score": {
+            "gain": 0.6,
+            "relevance": 0.75,
+            "source_quality": 1.0,
+            "cost": 0.85,
+            "time": 0.167,
+            "risk": 0.35,
+            "duplicate": false,
+            "waits_on": "",
+            "waited": 0,
+            "total": 0.827,
+            "neutralised": ""
+          },
+          "passed_over": [],
+          "margin": 0.827,
+          "reason": "wrk-1c07b0fb8d33 has the highest expected information value per unit of price (0.83): gain 0.60, relevance 0.75, source quality 1.00, cost 0.85, time 0.17, risk 0.35; serves cq-1-q-317bb5 (assigned)",
+          "decided_by": "information value",
+          "rule": "priority",
+          "question_id": "cq-1-q-317bb5",
+          "waited_flags": []
+        },
+        {
+          "format_version": "argus-priority/1",
+          "sequence": 2,
+          "round": 0,
+          "ready": [
+            "wrk-747fa27d8781",
+            "wrk-e9172d9b03fe"
+          ],
+          "chosen": "wrk-747fa27d8781",
+          "chosen_name": "custody-recorder",
+          "chosen_band": "normal",
+          "chosen_score": {
+            "gain": 0.6,
+            "relevance": 0.75,
+            "source_quality": 1.0,
+            "cost": 0.85,
+            "time": 0.167,
+            "risk": 0.85,
+            "duplicate": false,
+            "waits_on": "",
+            "waited": 0,
+            "total": 0.749,
+            "neutralised": ""
+          },
+          "passed_over": [
+            "wrk-e9172d9b03fe"
+          ],
+          "margin": 0.0,
+          "reason": "wrk-747fa27d8781 has the highest expected information value per unit of price (0.75): gain 0.60, relevance 0.75, source quality 1.00, cost 0.85, time 0.17, risk 0.85; serves cq-1-q-317bb5 (assigned)",
+          "decided_by": "information value",
+          "rule": "priority",
+          "question_id": "cq-1-q-317bb5",
+          "waited_flags": []
+        },
+        {
+          "format_version": "argus-priority/1",
+          "sequence": 3,
+          "round": 0,
+          "ready": [
+            "wrk-9fbce6f2d677"
+          ],
+          "chosen": "wrk-9fbce6f2d677",
+          "chosen_name": "gap-gap-3191f2",
+          "chosen_band": "normal",
+          "chosen_score": {
+            "gain": 0.6,
+            "relevance": 0.75,
+            "source_quality": 1.0,
+            "cost": 0.85,
+            "time": 0.167,
+            "risk": 0.85,
+            "duplicate": false,
+            "waits_on": "",
+            "waited": 0,
+            "total": 0.749,
+            "neutralised": ""
+          },
+          "passed_over": [],
+          "margin": 0.749,
+          "reason": "wrk-9fbce6f2d677 has the highest expected information value per unit of price (0.75): gain 0.60, relevance 0.75, source quality 1.00, cost 0.85, time 0.17, risk 0.85; serves cq-1-q-317bb5 (assigned)",
+          "decided_by": "information value",
+          "rule": "priority",
+          "question_id": "cq-1-q-317bb5",
+          "waited_flags": []
+        },
+        {
+          "format_version": "argus-priority/1",
+          "sequence": 4,
+          "round": 0,
+          "ready": [
+            "wrk-5858dc9ac0db"
+          ],
+          "chosen": "wrk-5858dc9ac0db",
+          "chosen_name": "gap-gap-3191f2",
+          "chosen_band": "normal",
+          "chosen_score": {
+            "gain": 0.6,
+            "relevance": 0.75,
+            "source_quality": 1.0,
+            "cost": 0.85,
+            "time": 0.167,
+            "risk": 0.35,
+            "duplicate": false,
+            "waits_on": "",
+            "waited": 0,
+            "total": 0.827,
+            "neutralised": ""
+          },
+          "passed_over": [],
+          "margin": 0.827,
+          "reason": "wrk-5858dc9ac0db has the highest expected information value per unit of price (0.83): gain 0.60, relevance 0.75, source quality 1.00, cost 0.85, time 0.17, risk 0.35; serves cq-1-q-317bb5 (assigned)",
+          "decided_by": "information value",
+          "rule": "priority",
+          "question_id": "cq-1-q-317bb5",
+          "waited_flags": []
+        },
+        {
+          "format_version": "argus-priority/1",
+          "sequence": 5,
+          "round": 0,
+          "ready": [
+            "wrk-23f0456d4738"
+          ],
+          "chosen": "wrk-23f0456d4738",
+          "chosen_name": "gap-gap-c6138f",
+          "chosen_band": "normal",
+          "chosen_score": {
+            "gain": 0.6,
+            "relevance": 0.75,
+            "source_quality": 1.0,
+            "cost": 0.85,
+            "time": 0.167,
+            "risk": 0.85,
+            "duplicate": false,
+            "waits_on": "",
+            "waited": 0,
+            "total": 0.749,
+            "neutralised": ""
+          },
+          "passed_over": [],
+          "margin": 0.749,
+          "reason": "wrk-23f0456d4738 has the highest expected information value per unit of price (0.75): gain 0.60, relevance 0.75, source quality 1.00, cost 0.85, time 0.17, risk 0.85; serves cq-1-q-317bb5 (assigned)",
+          "decided_by": "information value",
+          "rule": "priority",
+          "question_id": "cq-1-q-317bb5",
+          "waited_flags": []
+        },
+        {
+          "format_version": "argus-priority/1",
+          "sequence": 6,
+          "round": 0,
+          "ready": [
+            "wrk-bb85d666fcc9"
+          ],
+          "chosen": "wrk-bb85d666fcc9",
+          "chosen_name": "gap-gap-c6138f",
+          "chosen_band": "normal",
+          "chosen_score": {
+            "gain": 0.6,
+            "relevance": 0.75,
+            "source_quality": 1.0,
+            "cost": 0.85,
+            "time": 0.167,
+            "risk": 0.35,
+            "duplicate": false,
+            "waits_on": "",
+            "waited": 0,
+            "total": 0.827,
+            "neutralised": ""
+          },
+          "passed_over": [],
+          "margin": 0.827,
+          "reason": "wrk-bb85d666fcc9 has the highest expected information value per unit of price (0.83): gain 0.60, relevance 0.75, source quality 1.00, cost 0.85, time 0.17, risk 0.35; serves cq-1-q-317bb5 (assigned)",
+          "decided_by": "information value",
+          "rule": "priority",
+          "question_id": "cq-1-q-317bb5",
+          "waited_flags": []
+        },
+        {
+          "format_version": "argus-priority/1",
+          "sequence": 7,
+          "round": 0,
+          "ready": [
+            "wrk-431fc1477437"
+          ],
+          "chosen": "wrk-431fc1477437",
+          "chosen_name": "log-correlator",
+          "chosen_band": "normal",
+          "chosen_score": {
+            "gain": 0.6,
+            "relevance": 0.75,
+            "source_quality": 0.9,
+            "cost": 0.85,
+            "time": 0.167,
+            "risk": 0.0,
+            "duplicate": false,
+            "waits_on": "",
+            "waited": 0,
+            "total": 0.873,
+            "neutralised": ""
+          },
+          "passed_over": [],
+          "margin": 0.873,
+          "reason": "wrk-431fc1477437 has the highest expected information value per unit of price (0.87): gain 0.60, relevance 0.75, source quality 0.90, cost 0.85, time 0.17, risk 0.00; serves cq-1-q-317bb5 (assigned)",
+          "decided_by": "information value",
+          "rule": "priority",
+          "question_id": "cq-1-q-317bb5",
+          "waited_flags": []
+        },
+        {
+          "format_version": "argus-priority/1",
+          "sequence": 8,
+          "round": 0,
+          "ready": [
+            "wrk-b6e8a4138214"
+          ],
+          "chosen": "wrk-b6e8a4138214",
+          "chosen_name": "gap-gap-3191f2",
+          "chosen_band": "normal",
+          "chosen_score": {
+            "gain": 0.6,
+            "relevance": 0.75,
+            "source_quality": 0.9,
+            "cost": 0.85,
+            "time": 0.167,
+            "risk": 0.0,
+            "duplicate": false,
+            "waits_on": "",
+            "waited": 0,
+            "total": 0.873,
+            "neutralised": ""
+          },
+          "passed_over": [],
+          "margin": 0.873,
+          "reason": "wrk-b6e8a4138214 has the highest expected information value per unit of price (0.87): gain 0.60, relevance 0.75, source quality 0.90, cost 0.85, time 0.17, risk 0.00; serves cq-1-q-317bb5 (assigned)",
+          "decided_by": "information value",
+          "rule": "priority",
+          "question_id": "cq-1-q-317bb5",
+          "waited_flags": []
+        },
+        {
+          "format_version": "argus-priority/1",
+          "sequence": 9,
+          "round": 0,
+          "ready": [
+            "wrk-497329fad247"
+          ],
+          "chosen": "wrk-497329fad247",
+          "chosen_name": "gap-gap-c6138f",
+          "chosen_band": "normal",
+          "chosen_score": {
+            "gain": 0.6,
+            "relevance": 0.75,
+            "source_quality": 0.9,
+            "cost": 0.85,
+            "time": 0.167,
+            "risk": 0.0,
+            "duplicate": false,
+            "waits_on": "",
+            "waited": 0,
+            "total": 0.873,
+            "neutralised": ""
+          },
+          "passed_over": [],
+          "margin": 0.873,
+          "reason": "wrk-497329fad247 has the highest expected information value per unit of price (0.87): gain 0.60, relevance 0.75, source quality 0.90, cost 0.85, time 0.17, risk 0.00; serves cq-1-q-317bb5 (assigned)",
+          "decided_by": "information value",
+          "rule": "priority",
+          "question_id": "cq-1-q-317bb5",
+          "waited_flags": []
+        },
+        {
+          "format_version": "argus-priority/1",
+          "sequence": 10,
+          "round": 1,
+          "ready": [
+            "wrk-4d732ce2f31d"
+          ],
+          "chosen": "wrk-4d732ce2f31d",
+          "chosen_name": "follow-up-flw-ed7c9f",
+          "chosen_band": "urgent",
+          "chosen_score": {
+            "gain": 1.0,
+            "relevance": 1.0,
+            "source_quality": 1.0,
+            "cost": 0.85,
+            "time": 0.167,
+            "risk": 0.35,
+            "duplicate": false,
+            "waits_on": "",
+            "waited": 0,
+            "total": 1.184,
+            "neutralised": ""
+          },
+          "passed_over": [],
+          "margin": 1.184,
+          "reason": "wrk-4d732ce2f31d has the highest expected information value per unit of price (1.18): gain 1.00, relevance 1.00, source quality 1.00, cost 0.85, time 0.17, risk 0.35; serves cq-1-q-317bb5 (contradicted)",
+          "decided_by": "information value",
+          "rule": "priority",
+          "question_id": "cq-1-q-317bb5",
+          "waited_flags": []
+        }
+      ],
+      "unreached": []
+    }
   },
   "execution": {
     "mission_id": "flow-4da3c70d0ab3",
@@ -572,7 +902,7 @@
         "gate": "none",
         "attempts": 1,
         "evidence": 4,
-        "seconds": 0.06,
+        "seconds": 0.058,
         "origin": "planned",
         "note": "ready"
       },
@@ -598,7 +928,7 @@
         "gate": "none",
         "attempts": 1,
         "evidence": 1,
-        "seconds": 0.054,
+        "seconds": 0.052,
         "origin": "runtime",
         "note": ""
       },
@@ -611,7 +941,7 @@
         "gate": "none",
         "attempts": 1,
         "evidence": 1,
-        "seconds": 0.051,
+        "seconds": 0.057,
         "origin": "runtime",
         "note": ""
       },
@@ -637,7 +967,7 @@
         "gate": "none",
         "attempts": 1,
         "evidence": 3,
-        "seconds": 0.174,
+        "seconds": 0.175,
         "origin": "planned",
         "note": "ready"
       },
@@ -650,7 +980,7 @@
         "gate": "none",
         "attempts": 1,
         "evidence": 1,
-        "seconds": 0.05,
+        "seconds": 0.051,
         "origin": "planned",
         "note": ""
       },
@@ -663,7 +993,7 @@
         "gate": "none",
         "attempts": 1,
         "evidence": 1,
-        "seconds": 0.05,
+        "seconds": 0.051,
         "origin": "runtime",
         "note": ""
       },
@@ -676,7 +1006,7 @@
         "gate": "none",
         "attempts": 1,
         "evidence": 1,
-        "seconds": 0.05,
+        "seconds": 0.051,
         "origin": "runtime",
         "note": ""
       },
@@ -689,7 +1019,7 @@
         "gate": "none",
         "attempts": 1,
         "evidence": 4,
-        "seconds": 0.185,
+        "seconds": 0.19,
         "origin": "planned",
         "note": "ready"
       },
@@ -754,26 +1084,30 @@
     "adopted": [],
     "withheld": [],
     "time": {
-      "total_seconds": 0.48,
-      "critical_path_seconds": 0.477,
-      "ledger_origin_seconds": 0.486,
+      "total_seconds": 0.483,
+      "critical_path_seconds": 0.479,
+      "ledger_origin_seconds": 0.475,
       "per_unit_seconds": {
         "wrk-1c07b0fb8d33": 0.051,
         "wrk-23f0456d4738": 0.05,
-        "wrk-431fc1477437": 0.05,
-        "wrk-497329fad247": 0.05,
+        "wrk-431fc1477437": 0.051,
+        "wrk-497329fad247": 0.051,
         "wrk-4d732ce2f31d": 0.051,
-        "wrk-5858dc9ac0db": 0.054,
+        "wrk-5858dc9ac0db": 0.052,
         "wrk-747fa27d8781": 0.052,
         "wrk-9fbce6f2d677": 0.05,
-        "wrk-b6e8a4138214": 0.05,
-        "wrk-bb85d666fcc9": 0.051,
+        "wrk-b6e8a4138214": 0.051,
+        "wrk-bb85d666fcc9": 0.057,
         "wrk-e9172d9b03fe": 0.052
       },
       "stages": [
         [
           "planning",
-          0.006
+          0.007
+        ],
+        [
+          "master-priority",
+          0.0
         ],
         [
           "subagent planning",
@@ -789,26 +1123,26 @@
         ],
         [
           "reconciliation",
-          0.317
+          0.32
         ],
         [
           "master review",
-          0.007
+          0.006
         ],
         [
           "follow-up planning",
-          0.088
+          0.087
         ],
         [
           "synthesis",
           0.0
         ]
       ],
-      "events": 82,
+      "events": 92,
       "workers": 5,
       "attempts": 11,
       "max_concurrency": 3,
-      "parallelism_note": "stage windows are differences between the first appearance of each stage in the ledger, not instrumented unit durations, so overlapping stages share their window rather than summing to the total. The ledger's zero is when the flow was built, 0.486s before its first event; the run's own clock starts when it is invoked, which is why the two totals differ."
+      "parallelism_note": "stage windows are differences between the first appearance of each stage in the ledger, not instrumented unit durations, so overlapping stages share their window rather than summing to the total. The ledger's zero is when the flow was built, 0.475s before its first event; the run's own clock starts when it is invoked, which is why the two totals differ."
     },
     "stopping": {
       "stopped": false,
@@ -831,12 +1165,12 @@
   },
   "sources": [
     {
-      "id": "src-7d369937d90b",
+      "id": "src-141896e4061c",
       "kind": "local-artifact",
       "locator": "artifact:disk-01.img",
       "title": "timeline-builder \u2014 filesystem-timeline",
       "publisher": "",
-      "retrieved_at": "2026-11-12T09:51:28.231000Z",
+      "retrieved_at": "2026-11-12T10:51:59.553959Z",
       "method": "local-read",
       "http_status": null,
       "digest": "",
@@ -866,7 +1200,7 @@
       "contradicts": [],
       "collected_by": "wrk-e9172d9b03fe",
       "task_id": "",
-      "observed_at": "2026-11-12T09:51:28.237571Z",
+      "observed_at": "2026-11-12T10:51:59.560228Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -886,7 +1220,7 @@
       "contradicts": [],
       "collected_by": "wrk-747fa27d8781",
       "task_id": "",
-      "observed_at": "2026-11-12T09:51:28.239133Z",
+      "observed_at": "2026-11-12T10:51:59.561995Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -906,7 +1240,7 @@
       "contradicts": [],
       "collected_by": "wrk-4d732ce2f31d",
       "task_id": "",
-      "observed_at": "2026-11-12T09:51:28.615245Z",
+      "observed_at": "2026-11-12T10:51:59.941009Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -926,7 +1260,7 @@
       "contradicts": [],
       "collected_by": "wrk-bb85d666fcc9",
       "task_id": "",
-      "observed_at": "2026-11-12T09:51:28.368140Z",
+      "observed_at": "2026-11-12T10:51:59.695871Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -946,7 +1280,7 @@
       "contradicts": [],
       "collected_by": "wrk-497329fad247",
       "task_id": "",
-      "observed_at": "2026-11-12T09:51:28.546742Z",
+      "observed_at": "2026-11-12T10:51:59.873380Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -966,7 +1300,7 @@
       "contradicts": [],
       "collected_by": "wrk-23f0456d4738",
       "task_id": "",
-      "observed_at": "2026-11-12T09:51:28.361597Z",
+      "observed_at": "2026-11-12T10:51:59.689279Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -986,7 +1320,7 @@
       "contradicts": [],
       "collected_by": "wrk-5858dc9ac0db",
       "task_id": "",
-      "observed_at": "2026-11-12T09:51:28.309741Z",
+      "observed_at": "2026-11-12T10:51:59.628836Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -1006,7 +1340,7 @@
       "contradicts": [],
       "collected_by": "wrk-b6e8a4138214",
       "task_id": "",
-      "observed_at": "2026-11-12T09:51:28.488958Z",
+      "observed_at": "2026-11-12T10:51:59.814844Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -1026,7 +1360,7 @@
       "contradicts": [],
       "collected_by": "wrk-9fbce6f2d677",
       "task_id": "",
-      "observed_at": "2026-11-12T09:51:28.301784Z",
+      "observed_at": "2026-11-12T10:51:59.623845Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -1046,7 +1380,7 @@
       "contradicts": [],
       "collected_by": "wrk-1c07b0fb8d33",
       "task_id": "",
-      "observed_at": "2026-11-12T09:51:28.231000Z",
+      "observed_at": "2026-11-12T10:51:59.553959Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -1066,7 +1400,7 @@
       "contradicts": [],
       "collected_by": "wrk-431fc1477437",
       "task_id": "",
-      "observed_at": "2026-11-12T09:51:28.431220Z",
+      "observed_at": "2026-11-12T10:51:59.756340Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -1084,7 +1418,7 @@
       "digest": "",
       "digest_complete": false,
       "collected_by": "wrk-1c07b0fb8d33",
-      "collected_at": "2026-11-12T09:51:28.231221Z",
+      "collected_at": "2026-11-12T10:51:59.554182Z",
       "method": "local-read",
       "original_location": "artifact:disk-01.img",
       "storage_location": "",
@@ -1104,16 +1438,16 @@
     "environment": {
       "app": "argus",
       "app_title": "ARGUS",
-      "version": "0.35.0",
-      "version_label": "0.35.0-alpha",
+      "version": "0.36.0",
+      "version_label": "0.36.0-alpha",
       "build_phase": 3,
       "format_version": "argus-audit/1",
       "python": "3.11.2",
       "implementation": "CPython",
       "platform": "Linux-6.1.158+-x86_64-with-glibc2.36",
       "machine": "x86_64",
-      "user_agent": "ARGUS/0.35.0 (+authorised-security-research)",
-      "command": "report --mission flow-4da3c70d0ab3.json",
+      "user_agent": "ARGUS/0.36.0 (+authorised-security-research)",
+      "command": "report --mission /tmp/tmpbcoo71rp/report-forensic.json",
       "operator": "",
       "dry_run": true,
       "mode": "live",
@@ -1255,7 +1589,7 @@
       },
       {
         "key": "network.user_agent",
-        "value": "ARGUS/0.35.0 (+authorised-security-research)",
+        "value": "ARGUS/0.36.0 (+authorised-security-research)",
         "source": "default",
         "redacted": false
       },
@@ -1333,17 +1667,24 @@
       "capability_router": true,
       "browser": false,
       "browser_mode": "http",
+      "prioritise_tasks": true,
+      "priority_lookahead": 6,
+      "priority_starvation_after": 3,
       "supplied_from": "flow"
     },
     "stamps": {
-      "started_at": "2026-11-12T09:51:28+00:00",
-      "ended_at": "2026-11-12T09:51:28+00:00",
-      "recorded_at": "2026-11-12T09:51:28+00:00",
-      "duration_seconds": 0.48,
+      "started_at": "2026-11-12T10:51:59+00:00",
+      "ended_at": "2026-11-12T10:51:59+00:00",
+      "recorded_at": "2026-11-12T10:51:59+00:00",
+      "duration_seconds": 0.483,
       "stages": [
         [
           "planning",
-          0.006
+          0.007
+        ],
+        [
+          "master-priority",
+          0.0
         ],
         [
           "subagent planning",
@@ -1359,15 +1700,15 @@
         ],
         [
           "reconciliation",
-          0.317
+          0.32
         ],
         [
           "master review",
-          0.007
+          0.006
         ],
         [
           "follow-up planning",
-          0.088
+          0.087
         ],
         [
           "synthesis",
@@ -1387,7 +1728,7 @@
           "gate": "none",
           "attempts": 1,
           "evidence": 4,
-          "seconds": 0.06,
+          "seconds": 0.058,
           "origin": "planned",
           "spawned_by": "",
           "depends_on": [],
@@ -1421,7 +1762,7 @@
           "gate": "none",
           "attempts": 1,
           "evidence": 1,
-          "seconds": 0.054,
+          "seconds": 0.052,
           "origin": "runtime",
           "spawned_by": "",
           "depends_on": [],
@@ -1438,7 +1779,7 @@
           "gate": "none",
           "attempts": 1,
           "evidence": 1,
-          "seconds": 0.051,
+          "seconds": 0.057,
           "origin": "runtime",
           "spawned_by": "",
           "depends_on": [],
@@ -1472,7 +1813,7 @@
           "gate": "none",
           "attempts": 1,
           "evidence": 3,
-          "seconds": 0.174,
+          "seconds": 0.175,
           "origin": "planned",
           "spawned_by": "",
           "depends_on": [
@@ -1491,7 +1832,7 @@
           "gate": "none",
           "attempts": 1,
           "evidence": 1,
-          "seconds": 0.05,
+          "seconds": 0.051,
           "origin": "planned",
           "spawned_by": "",
           "depends_on": [],
@@ -1508,7 +1849,7 @@
           "gate": "none",
           "attempts": 1,
           "evidence": 1,
-          "seconds": 0.05,
+          "seconds": 0.051,
           "origin": "runtime",
           "spawned_by": "",
           "depends_on": [],
@@ -1525,7 +1866,7 @@
           "gate": "none",
           "attempts": 1,
           "evidence": 1,
-          "seconds": 0.05,
+          "seconds": 0.051,
           "origin": "runtime",
           "spawned_by": "",
           "depends_on": [],
@@ -1542,7 +1883,7 @@
           "gate": "none",
           "attempts": 1,
           "evidence": 4,
-          "seconds": 0.185,
+          "seconds": 0.19,
           "origin": "planned",
           "spawned_by": "",
           "depends_on": [],
@@ -1671,10 +2012,351 @@
         "refused: the replanning budget of 1 round(s) is spent"
       ]
     },
+    "priority": {
+      "format_version": "argus-priority-ledger/1",
+      "weights": "gain 1 + relevance 0.45 + source quality 0.25, divided by 1 + cost 0.35 + time 0.2 + risk 0.3; +0.22 per dispatch waited",
+      "lookahead": 6,
+      "starvation_after": 3,
+      "decisions": [
+        {
+          "format_version": "argus-priority/1",
+          "sequence": 1,
+          "round": 0,
+          "ready": [
+            "wrk-1c07b0fb8d33"
+          ],
+          "chosen": "wrk-1c07b0fb8d33",
+          "chosen_name": "timeline-builder",
+          "chosen_band": "normal",
+          "chosen_score": {
+            "gain": 0.6,
+            "relevance": 0.75,
+            "source_quality": 1.0,
+            "cost": 0.85,
+            "time": 0.167,
+            "risk": 0.35,
+            "duplicate": false,
+            "waits_on": "",
+            "waited": 0,
+            "total": 0.827,
+            "neutralised": ""
+          },
+          "passed_over": [],
+          "margin": 0.827,
+          "reason": "wrk-1c07b0fb8d33 has the highest expected information value per unit of price (0.83): gain 0.60, relevance 0.75, source quality 1.00, cost 0.85, time 0.17, risk 0.35; serves cq-1-q-317bb5 (assigned)",
+          "decided_by": "information value",
+          "rule": "priority",
+          "question_id": "cq-1-q-317bb5",
+          "waited_flags": []
+        },
+        {
+          "format_version": "argus-priority/1",
+          "sequence": 2,
+          "round": 0,
+          "ready": [
+            "wrk-747fa27d8781",
+            "wrk-e9172d9b03fe"
+          ],
+          "chosen": "wrk-747fa27d8781",
+          "chosen_name": "custody-recorder",
+          "chosen_band": "normal",
+          "chosen_score": {
+            "gain": 0.6,
+            "relevance": 0.75,
+            "source_quality": 1.0,
+            "cost": 0.85,
+            "time": 0.167,
+            "risk": 0.85,
+            "duplicate": false,
+            "waits_on": "",
+            "waited": 0,
+            "total": 0.749,
+            "neutralised": ""
+          },
+          "passed_over": [
+            "wrk-e9172d9b03fe"
+          ],
+          "margin": 0.0,
+          "reason": "wrk-747fa27d8781 has the highest expected information value per unit of price (0.75): gain 0.60, relevance 0.75, source quality 1.00, cost 0.85, time 0.17, risk 0.85; serves cq-1-q-317bb5 (assigned)",
+          "decided_by": "information value",
+          "rule": "priority",
+          "question_id": "cq-1-q-317bb5",
+          "waited_flags": []
+        },
+        {
+          "format_version": "argus-priority/1",
+          "sequence": 3,
+          "round": 0,
+          "ready": [
+            "wrk-9fbce6f2d677"
+          ],
+          "chosen": "wrk-9fbce6f2d677",
+          "chosen_name": "gap-gap-3191f2",
+          "chosen_band": "normal",
+          "chosen_score": {
+            "gain": 0.6,
+            "relevance": 0.75,
+            "source_quality": 1.0,
+            "cost": 0.85,
+            "time": 0.167,
+            "risk": 0.85,
+            "duplicate": false,
+            "waits_on": "",
+            "waited": 0,
+            "total": 0.749,
+            "neutralised": ""
+          },
+          "passed_over": [],
+          "margin": 0.749,
+          "reason": "wrk-9fbce6f2d677 has the highest expected information value per unit of price (0.75): gain 0.60, relevance 0.75, source quality 1.00, cost 0.85, time 0.17, risk 0.85; serves cq-1-q-317bb5 (assigned)",
+          "decided_by": "information value",
+          "rule": "priority",
+          "question_id": "cq-1-q-317bb5",
+          "waited_flags": []
+        },
+        {
+          "format_version": "argus-priority/1",
+          "sequence": 4,
+          "round": 0,
+          "ready": [
+            "wrk-5858dc9ac0db"
+          ],
+          "chosen": "wrk-5858dc9ac0db",
+          "chosen_name": "gap-gap-3191f2",
+          "chosen_band": "normal",
+          "chosen_score": {
+            "gain": 0.6,
+            "relevance": 0.75,
+            "source_quality": 1.0,
+            "cost": 0.85,
+            "time": 0.167,
+            "risk": 0.35,
+            "duplicate": false,
+            "waits_on": "",
+            "waited": 0,
+            "total": 0.827,
+            "neutralised": ""
+          },
+          "passed_over": [],
+          "margin": 0.827,
+          "reason": "wrk-5858dc9ac0db has the highest expected information value per unit of price (0.83): gain 0.60, relevance 0.75, source quality 1.00, cost 0.85, time 0.17, risk 0.35; serves cq-1-q-317bb5 (assigned)",
+          "decided_by": "information value",
+          "rule": "priority",
+          "question_id": "cq-1-q-317bb5",
+          "waited_flags": []
+        },
+        {
+          "format_version": "argus-priority/1",
+          "sequence": 5,
+          "round": 0,
+          "ready": [
+            "wrk-23f0456d4738"
+          ],
+          "chosen": "wrk-23f0456d4738",
+          "chosen_name": "gap-gap-c6138f",
+          "chosen_band": "normal",
+          "chosen_score": {
+            "gain": 0.6,
+            "relevance": 0.75,
+            "source_quality": 1.0,
+            "cost": 0.85,
+            "time": 0.167,
+            "risk": 0.85,
+            "duplicate": false,
+            "waits_on": "",
+            "waited": 0,
+            "total": 0.749,
+            "neutralised": ""
+          },
+          "passed_over": [],
+          "margin": 0.749,
+          "reason": "wrk-23f0456d4738 has the highest expected information value per unit of price (0.75): gain 0.60, relevance 0.75, source quality 1.00, cost 0.85, time 0.17, risk 0.85; serves cq-1-q-317bb5 (assigned)",
+          "decided_by": "information value",
+          "rule": "priority",
+          "question_id": "cq-1-q-317bb5",
+          "waited_flags": []
+        },
+        {
+          "format_version": "argus-priority/1",
+          "sequence": 6,
+          "round": 0,
+          "ready": [
+            "wrk-bb85d666fcc9"
+          ],
+          "chosen": "wrk-bb85d666fcc9",
+          "chosen_name": "gap-gap-c6138f",
+          "chosen_band": "normal",
+          "chosen_score": {
+            "gain": 0.6,
+            "relevance": 0.75,
+            "source_quality": 1.0,
+            "cost": 0.85,
+            "time": 0.167,
+            "risk": 0.35,
+            "duplicate": false,
+            "waits_on": "",
+            "waited": 0,
+            "total": 0.827,
+            "neutralised": ""
+          },
+          "passed_over": [],
+          "margin": 0.827,
+          "reason": "wrk-bb85d666fcc9 has the highest expected information value per unit of price (0.83): gain 0.60, relevance 0.75, source quality 1.00, cost 0.85, time 0.17, risk 0.35; serves cq-1-q-317bb5 (assigned)",
+          "decided_by": "information value",
+          "rule": "priority",
+          "question_id": "cq-1-q-317bb5",
+          "waited_flags": []
+        },
+        {
+          "format_version": "argus-priority/1",
+          "sequence": 7,
+          "round": 0,
+          "ready": [
+            "wrk-431fc1477437"
+          ],
+          "chosen": "wrk-431fc1477437",
+          "chosen_name": "log-correlator",
+          "chosen_band": "normal",
+          "chosen_score": {
+            "gain": 0.6,
+            "relevance": 0.75,
+            "source_quality": 0.9,
+            "cost": 0.85,
+            "time": 0.167,
+            "risk": 0.0,
+            "duplicate": false,
+            "waits_on": "",
+            "waited": 0,
+            "total": 0.873,
+            "neutralised": ""
+          },
+          "passed_over": [],
+          "margin": 0.873,
+          "reason": "wrk-431fc1477437 has the highest expected information value per unit of price (0.87): gain 0.60, relevance 0.75, source quality 0.90, cost 0.85, time 0.17, risk 0.00; serves cq-1-q-317bb5 (assigned)",
+          "decided_by": "information value",
+          "rule": "priority",
+          "question_id": "cq-1-q-317bb5",
+          "waited_flags": []
+        },
+        {
+          "format_version": "argus-priority/1",
+          "sequence": 8,
+          "round": 0,
+          "ready": [
+            "wrk-b6e8a4138214"
+          ],
+          "chosen": "wrk-b6e8a4138214",
+          "chosen_name": "gap-gap-3191f2",
+          "chosen_band": "normal",
+          "chosen_score": {
+            "gain": 0.6,
+            "relevance": 0.75,
+            "source_quality": 0.9,
+            "cost": 0.85,
+            "time": 0.167,
+            "risk": 0.0,
+            "duplicate": false,
+            "waits_on": "",
+            "waited": 0,
+            "total": 0.873,
+            "neutralised": ""
+          },
+          "passed_over": [],
+          "margin": 0.873,
+          "reason": "wrk-b6e8a4138214 has the highest expected information value per unit of price (0.87): gain 0.60, relevance 0.75, source quality 0.90, cost 0.85, time 0.17, risk 0.00; serves cq-1-q-317bb5 (assigned)",
+          "decided_by": "information value",
+          "rule": "priority",
+          "question_id": "cq-1-q-317bb5",
+          "waited_flags": []
+        },
+        {
+          "format_version": "argus-priority/1",
+          "sequence": 9,
+          "round": 0,
+          "ready": [
+            "wrk-497329fad247"
+          ],
+          "chosen": "wrk-497329fad247",
+          "chosen_name": "gap-gap-c6138f",
+          "chosen_band": "normal",
+          "chosen_score": {
+            "gain": 0.6,
+            "relevance": 0.75,
+            "source_quality": 0.9,
+            "cost": 0.85,
+            "time": 0.167,
+            "risk": 0.0,
+            "duplicate": false,
+            "waits_on": "",
+            "waited": 0,
+            "total": 0.873,
+            "neutralised": ""
+          },
+          "passed_over": [],
+          "margin": 0.873,
+          "reason": "wrk-497329fad247 has the highest expected information value per unit of price (0.87): gain 0.60, relevance 0.75, source quality 0.90, cost 0.85, time 0.17, risk 0.00; serves cq-1-q-317bb5 (assigned)",
+          "decided_by": "information value",
+          "rule": "priority",
+          "question_id": "cq-1-q-317bb5",
+          "waited_flags": []
+        },
+        {
+          "format_version": "argus-priority/1",
+          "sequence": 10,
+          "round": 1,
+          "ready": [
+            "wrk-4d732ce2f31d"
+          ],
+          "chosen": "wrk-4d732ce2f31d",
+          "chosen_name": "follow-up-flw-ed7c9f",
+          "chosen_band": "urgent",
+          "chosen_score": {
+            "gain": 1.0,
+            "relevance": 1.0,
+            "source_quality": 1.0,
+            "cost": 0.85,
+            "time": 0.167,
+            "risk": 0.35,
+            "duplicate": false,
+            "waits_on": "",
+            "waited": 0,
+            "total": 1.184,
+            "neutralised": ""
+          },
+          "passed_over": [],
+          "margin": 1.184,
+          "reason": "wrk-4d732ce2f31d has the highest expected information value per unit of price (1.18): gain 1.00, relevance 1.00, source quality 1.00, cost 0.85, time 0.17, risk 0.35; serves cq-1-q-317bb5 (contradicted)",
+          "decided_by": "information value",
+          "rule": "priority",
+          "question_id": "cq-1-q-317bb5",
+          "waited_flags": []
+        }
+      ],
+      "unreached": [],
+      "by_rule": {
+        "priority": 10
+      },
+      "churned": 0,
+      "summary": "10 decision(s); chosen first by priority 10, by the wait bound 0",
+      "clause": {
+        "decisions": 10,
+        "dispatch": 10,
+        "spent_on_high_value_first": true,
+        "none_starved": true,
+        "recorded": true,
+        "by_rule": {
+          "priority": 10
+        },
+        "churned": 0,
+        "weights": "gain 1 + relevance 0.45 + source quality 0.25, divided by 1 + cost 0.35 + time 0.2 + risk 0.3; +0.22 per dispatch waited",
+        "ok": true,
+        "errors": []
+      }
+    },
     "secrets": {
       "scanned": true,
       "clean": true,
-      "bytes_scanned": 91411,
+      "bytes_scanned": 117506,
       "findings": [],
       "rules": [
         {
@@ -1714,7 +2396,7 @@
           "removed": false
         }
       ],
-      "scanned_at": "2026-11-12T09:52:45+00:00",
+      "scanned_at": "2026-11-12T10:52:01+00:00",
       "patterns": [
         "connection-string-password",
         "json-credential-field",
@@ -1729,7 +2411,7 @@
         "known-credential-value",
         "credential-store-shape"
       ],
-      "scanned_text": "clean: 91,411 byte(s) scanned for 12 credential pattern(s)"
+      "scanned_text": "clean: 117,506 byte(s) scanned for 12 credential pattern(s)"
     },
     "reproduction": [
       {
@@ -1775,6 +2457,7 @@
       "names_the_stop": true,
       "reproducible": true,
       "retention_stated": true,
+      "priority_recorded": true,
       "no_secrets": true,
       "ok": true,
       "errors": []

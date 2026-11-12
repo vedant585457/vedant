@@ -1,9 +1,9 @@
 # Mission report — map the publicly documented exposure of example.com and rank the advisory-backed risks
 
 - mission: `flow-a995e56deaae`
-- generated: 2026-11-12T09:52:40+00:00
+- generated: 2026-11-12T10:51:43+00:00
 - format: `argus-dossier/1` (schema version 1)
-- produced by: argus 0.35.0 on Python 3.11.2 (CPython, x86\_64); schema argus-audit/1
+- produced by: argus 0.36.0 on Python 3.11.2 (CPython, x86\_64); schema argus-audit/1
 - run mode: **live**
 - confidence: **low** — the weakest of 5 finding(s) sets the level: single-source (1 origin(s)), because the answer cannot be stronger than the claim it depends on
 - evidence: 5 citation(s) from 5 independent origin(s); 6 item(s) in the table
@@ -97,7 +97,7 @@ This objective asks no attribution, timeline, identity or intent question, so co
 | wrk-7fa8d41b476a | worker | advisory-reader | succeeded | none | 1 | 1 | 0.05s | planned |
 | wrk-60aa16261035 | worker | published-advisories gap closure | succeeded | none | 1 | 1 | 0.05s | runtime |
 | wrk-03581617fd6c | worker | follow-up-flw-5b6f40 | succeeded | none | 1 | 1 | 0.05s | follow-up |
-| sa-4de82fcd5ca6 | subagent | dns-and-archive | succeeded | none | 1 | 3 | 0.13s | planned |
+| sa-4de82fcd5ca6 | subagent | dns-and-archive | succeeded | none | 1 | 3 | 0.12s | planned |
 | wrk-e9cfb6efebac | worker | dns-collector | succeeded | none | 1 | 1 | 0.05s | planned |
 | wrk-d9962bee6734 | worker | archive-collector | succeeded | none | 1 | 1 | 0.05s | planned |
 | wrk-ac9fe515391b | worker | dns-and-archive gap closure | succeeded | none | 1 | 1 | 0.05s | runtime |
@@ -106,20 +106,21 @@ Follow-up work: existing: coverage → sa-7adc0f884bde.
 
 ## Time usage
 
-Total wall-clock: 0.37s. First ledger event to last: 0.36s (the ledger opened 0.55s before its first event). 48 ledger event(s), 6 Worker attempt(s), peak 2 resource(s) in flight.
+Total wall-clock: 0.35s. First ledger event to last: 0.34s (the ledger opened 0.48s before its first event). 53 ledger event(s), 6 Worker attempt(s), peak 2 resource(s) in flight.
 
 | stage | window |
 | --- | --- |
-| reconciliation | 0.204s |
-| follow-up planning | 0.085s |
-| worker execution | 0.054s |
-| planning | 0.006s |
+| reconciliation | 0.192s |
+| follow-up planning | 0.080s |
+| worker execution | 0.053s |
+| planning | 0.007s |
 | worker review | 0.005s |
-| master review | 0.005s |
-| subagent planning | 0.003s |
+| master review | 0.004s |
+| subagent planning | 0.002s |
+| master-priority | 0.000s |
 | synthesis | 0.000s |
 
-stage windows are differences between the first appearance of each stage in the ledger, not instrumented unit durations, so overlapping stages share their window rather than summing to the total. The ledger's zero is when the flow was built, 0.547s before its first event; the run's own clock starts when it is invoked, which is why the two totals differ.
+stage windows are differences between the first appearance of each stage in the ledger, not instrumented unit durations, so overlapping stages share their window rather than summing to the total. The ledger's zero is when the flow was built, 0.481s before its first event; the run's own clock starts when it is invoked, which is why the two totals differ.
 
 ## Errors
 
@@ -145,7 +146,7 @@ the mission finished: every mission criterion is met (1); 0 coverage gap(s) and 
 
 | id | title | locator | kind | method | retrieved | digest | items | cited |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `src-b6994f507612` | advisory-reader — published-advisories | example.com | local-artifact | local-read | 2026-11-12T09:52:39+00:00 | not hashed | 5 | 5 |
+| `src-600c802356c1` | advisory-reader — published-advisories | example.com | local-artifact | local-read | 2026-11-12T10:51:43+00:00 | not hashed | 5 | 5 |
 
 ## Evidence table
 
@@ -166,27 +167,27 @@ the mission finished: every mission criterion is met (1); 0 coverage gap(s) and 
 
 | evidence | artefact | digest | coverage | handled by | when | method | preserved | status |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `ev-c759a5e97a06` | example.com | **not hashed** | — | wrk-7fa8d41b476a | 2026-11-12T09:52:39+00:00 | local-read | **no** | not-assessed |
+| `ev-c759a5e97a06` | example.com | **not hashed** | — | wrk-7fa8d41b476a | 2026-11-12T10:51:43+00:00 | local-read | **no** | not-assessed |
 
 - `ev-c759a5e97a06`: no digest recorded — no custody record was made for this artefact: the digest alone does not establish who handled it or whether it was preserved
 
 ## Audit and reproducibility
 
-This mission ran on argus 0.35.0 on Python 3.11.2 (CPython, x86\_64); schema argus-audit/1. It was invoked as `report --mission flow-a995e56deaae.json`. 
+This mission ran on argus 0.36.0 on Python 3.11.2 (CPython, x86\_64); schema argus-audit/1. It was invoked as `report --mission flow-a995e56deaae.json`. 
 
 ## Environment
 
 | field | value |
 | --- | --- |
 | application | argus |
-| version | 0.35.0 |
-| version label | 0.35.0-alpha |
+| version | 0.36.0 |
+| version label | 0.36.0-alpha |
 | build phase | 3 |
 | record format | argus-audit/1 |
 | python | 3.11.2 (CPython) |
 | platform | Linux-6.1.158+-x86_64-with-glibc2.36 |
 | machine | x86_64 |
-| user agent | ARGUS/0.35.0 (+authorised-security-research) |
+| user agent | ARGUS/0.36.0 (+authorised-security-research) |
 | dry run | yes |
 | run mode | live |
 
@@ -215,7 +216,7 @@ This mission ran on argus 0.35.0 on Python 3.11.2 (CPython, x86\_64); schema arg
 | network.respect_robots | yes | default |
 | network.http_concurrency | 8 | default |
 | network.http_timeout | 30.0 | default |
-| network.user_agent | ARGUS/0.35.0 (+authorised-security-research) | default |
+| network.user_agent | ARGUS/0.36.0 (+authorised-security-research) | default |
 | paths.output_dir | argus_home/output | settings |
 | paths.case_dir | not set | settings |
 Redacted by name, with the *state* of each kept: `model.api_key` (<redacted: unset, value not recorded>).
@@ -240,11 +241,11 @@ The credential itself is never recorded: a reader who needs one supplies their o
 
 ## Timestamps
 
-- recorded: 2026-11-12T09:52:40+00:00
-- mission started: 2026-11-12T09:52:39+00:00
-- mission ended: 2026-11-12T09:52:40+00:00
-- duration: 0.37s
-- per stage: planning 0.01s, subagent planning 0.00s, worker execution 0.05s, worker review 0.01s, reconciliation 0.20s, master review 0.01s, follow-up planning 0.09s, synthesis 0.00s.
+- recorded: 2026-11-12T10:51:43+00:00
+- mission started: 2026-11-12T10:51:43+00:00
+- mission ended: 2026-11-12T10:51:43+00:00
+- duration: 0.35s
+- per stage: planning 0.01s, master-priority 0.00s, subagent planning 0.00s, worker execution 0.05s, worker review 0.01s, reconciliation 0.19s, master review 0.00s, follow-up planning 0.08s, synthesis 0.00s.
 
 
 ## Dynamic hierarchy
@@ -275,6 +276,21 @@ No tool failure was recorded by this mission. That is a fact about this run, not
 - kind: **complete** (condition `complete`); the mission finished; bounded by 1 refusal(s)
 - reason: every mission criterion is met (1); 0 coverage gap(s) and 0 concern(s) remain as stated limitations
 
+## Task priority
+
+| # | ran first | band | score | rule | why |
+| --- | --- | --- | --- | --- | --- |
+| 1 | advisory-reader | normal | 0.86 | priority | wrk-7fa8d41b476a has the highest expected information value per unit of price (0.86): gain 0.60, relevance 0.75, source quality 0.85, cost 0.85, time 0.17, risk 0.00; serves cq-1-… |
+| 2 | gap-gap-567041 | normal | 0.86 | priority | wrk-60aa16261035 has the highest expected information value per unit of price (0.86): gain 0.60, relevance 0.75, source quality 0.85, cost 0.85, time 0.17, risk 0.00; serves cq-1-… |
+| 3 | dns-collector | normal | 0.85 | priority | wrk-e9cfb6efebac has the highest expected information value per unit of price (0.85): gain 0.60, relevance 0.75, source quality 0.80, cost 0.85, time 0.17, risk 0.00; serves cq-1-… |
+| 4 | gap-gap-567041 | normal | 0.85 | priority | wrk-ac9fe515391b has the highest expected information value per unit of price (0.85): gain 0.60, relevance 0.75, source quality 0.80, cost 0.85, time 0.17, risk 0.00; serves cq-1-… |
+| 5 | follow-up-flw-5b6f40 | normal | 0.86 | priority | wrk-03581617fd6c has the highest expected information value per unit of price (0.86): gain 0.60, relevance 0.75, source quality 0.85, cost 0.85, time 0.17, risk 0.00; serves cq-1-… |
+
+- weights: gain 1 + relevance 0.45 + source quality 0.25, divided by 1 + cost 0.35 + time 0.2 + risk 0.3; +0.22 per dispatch waited
+- wait bound: 3; lookahead 6
+- the clause: high-value first **yes** · nothing starved **yes** · decisions recorded **yes**
+
+
 ## Reproduction
 
 1. `python -m pip install -r requirements.txt` — install the same dependency set (typer, rich, pydantic, langgraph, …)
@@ -287,7 +303,7 @@ Following these steps reproduces the *procedure*, not the answer. A re-run colle
 
 ## What is deliberately not recorded
 
-- scan: clean: 66,461 byte(s) scanned for 12 credential pattern(s)
+- scan: clean: 80,541 byte(s) scanned for 12 credential pattern(s)
 - not recorded — api keys and provider tokens: a credential is authority, not procedure: a record that carried one would let a reader act as the operator instead of reproducing their setup.
 - not recorded — cookies and browser session state: a cookie is the operator's authenticated identity on somebody else's service.
 - not recorded — browser profile contents and credentials: the profile directory is named so the setup can be repeated; none of its contents are copied.
@@ -321,6 +337,7 @@ This report is an investigation record, not a log file. It can contain personal 
 - names the stop: yes
 - reproducible: yes
 - retention stated: yes
+- priority recorded: yes
 - no secrets: yes
 - problems: none: another operator can reproduce this procedure from the record above without being given a secret.
 
