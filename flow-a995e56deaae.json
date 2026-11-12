@@ -2,13 +2,13 @@
   "schema_version": 1,
   "mission_id": "flow-a995e56deaae",
   "objective": "map the publicly documented exposure of example.com and rank the advisory-backed risks",
-  "generated_at": "2026-11-12T09:04:47.918631Z",
+  "generated_at": "2026-11-12T09:52:40.248231Z",
   "format_version": "argus-dossier/1",
   "report": {
     "mission_id": "flow-a995e56deaae",
     "objective": "map the publicly documented exposure of example.com and rank the advisory-backed risks",
     "question": "the published advisories name the affected component",
-    "generated_at": "2026-11-12T09:04:47.893954Z",
+    "generated_at": "2026-11-12T09:52:40.222497Z",
     "sections": [
       {
         "kind": "executive-summary",
@@ -120,6 +120,13 @@
         "kind": "coverage",
         "title": "Coverage",
         "body": "The mission asked 1 question(s). This table is the Master's coverage after round 2, recomputed from the reports it had received:\n\n| # | question | status | served by | evidence | confidence |\n|---|----------|--------|-----------|----------|------------|\n| 1 | the published advisories name the affected component | assigned | published-advisories, dns-and-archive | 0 | unknown |\n\n**Still open, and why:**\n- Q1 (assigned): a planned unit names it in its assignment\n\n6 claim(s) in the evidence table answer no named question; they support the objective rather than a question, and are listed here rather than folded into one.\n\n**Coverage clause:** every task serves a question **yes** \u00b7 nothing dropped **yes** \u00b7 open questions explained **yes**",
+        "evidence_ids": [],
+        "item_ids": []
+      },
+      {
+        "kind": "alternatives",
+        "title": "Alternative explanations",
+        "body": "This objective asks no attribution, timeline, identity or intent question, so competing explanations were not required. That is a fact about the mission's question rather than a weakness in its evidence \u2014 and it is stated here so a reader of a later attribution mission knows what this section looks like when it has something to say.",
         "evidence_ids": [],
         "item_ids": []
       }
@@ -305,7 +312,59 @@
       "dropped": [],
       "next_question": "cq-1-q-d0838f",
       "next_reason": "Q1 is assigned and no reviewed statement answers it yet"
-    }
+    },
+    "hypotheses_weighed": {
+      "format_version": "argus-hypotheses/1",
+      "objective": "map the publicly documented exposure of example.com and rank the advisory-backed risks",
+      "frame": "none",
+      "frame_basis": "the objective names no attribution, timeline, identity or intent question, and the mission is not forensic",
+      "hypotheses": [
+        {
+          "id": "hyp-1-h-3a9e76",
+          "statement": "the explanation that the published advisories name the affected component",
+          "predicts": "the evidence that would confirm it exists and is dated inside the mission's window, and no reviewed record states the opposite",
+          "competes_with": "hyp-2-h-2fc23d",
+          "generated_from": "question-1",
+          "test": "collect one first-party record that states this explanation outright and one that would be false if it holds: the published advisories name the affected component",
+          "disconfirming": [],
+          "supporting": [
+            "ev-5a152a290231"
+          ],
+          "status": "favoured",
+          "checked_by": "the evidence supports it with 1 record(s) that support no other explanation"
+        },
+        {
+          "id": "hyp-2-h-2fc23d",
+          "statement": "the same records are equally consistent with routine configuration, shared infrastructure or ordinary administrative work that nobody recorded",
+          "predicts": "routine operation normally leaves a dated record of authorised change; one such record in the same window would settle this without an adversary",
+          "competes_with": "hyp-3-h-7977e4",
+          "generated_from": "question-1",
+          "test": "find one dated record of authorised change or routine operation covering the same window, and this explanation stops needing an adversary",
+          "disconfirming": [
+            "ev-5a152a290231"
+          ],
+          "supporting": [],
+          "status": "untested",
+          "checked_by": "no reviewed statement bears on it yet"
+        },
+        {
+          "id": "hyp-3-h-7977e4",
+          "statement": "a different party acted in the same window and produced the same observations \u2014 a third-party provider, a scheduled job, or another operator",
+          "predicts": "independent activity from a subject outside the mission's scope would share the window and leave a differently-signed trace",
+          "competes_with": "hyp-1-h-3a9e76",
+          "generated_from": "question-1",
+          "test": "find one record of independent activity in the same window from a subject outside the mission's scope, and this explanation must be weighed against the leading one",
+          "disconfirming": [
+            "ev-5a152a290231"
+          ],
+          "supporting": [],
+          "status": "untested",
+          "checked_by": "no reviewed statement bears on it yet"
+        }
+      ],
+      "generated_round": 0
+    },
+    "alternatives": []
   },
   "execution": {
     "mission_id": "flow-a995e56deaae",
@@ -330,7 +389,7 @@
         "gate": "none",
         "attempts": 1,
         "evidence": 3,
-        "seconds": 0.058,
+        "seconds": 0.059,
         "origin": "planned",
         "note": "ready"
       },
@@ -382,7 +441,7 @@
         "gate": "none",
         "attempts": 1,
         "evidence": 3,
-        "seconds": 0.122,
+        "seconds": 0.132,
         "origin": "planned",
         "note": "ready"
       },
@@ -408,7 +467,7 @@
         "gate": "none",
         "attempts": 1,
         "evidence": 1,
-        "seconds": 0.051,
+        "seconds": 0.054,
         "origin": "planned",
         "note": ""
       },
@@ -434,25 +493,25 @@
     "adopted": [],
     "withheld": [],
     "time": {
-      "total_seconds": 0.349,
-      "critical_path_seconds": 0.346,
-      "ledger_origin_seconds": 0.474,
+      "total_seconds": 0.366,
+      "critical_path_seconds": 0.362,
+      "ledger_origin_seconds": 0.547,
       "per_unit_seconds": {
         "wrk-03581617fd6c": 0.051,
         "wrk-60aa16261035": 0.051,
         "wrk-7fa8d41b476a": 0.051,
         "wrk-ac9fe515391b": 0.051,
-        "wrk-d9962bee6734": 0.051,
+        "wrk-d9962bee6734": 0.054,
         "wrk-e9cfb6efebac": 0.051
       },
       "stages": [
         [
           "planning",
-          0.004
+          0.006
         ],
         [
           "subagent planning",
-          0.006
+          0.003
         ],
         [
           "worker execution",
@@ -464,26 +523,26 @@
         ],
         [
           "reconciliation",
-          0.194
+          0.204
         ],
         [
           "master review",
-          0.004
+          0.005
         ],
         [
           "follow-up planning",
-          0.079
+          0.085
         ],
         [
           "synthesis",
           0.0
         ]
       ],
-      "events": 45,
+      "events": 48,
       "workers": 4,
       "attempts": 6,
       "max_concurrency": 2,
-      "parallelism_note": "stage windows are differences between the first appearance of each stage in the ledger, not instrumented unit durations, so overlapping stages share their window rather than summing to the total. The ledger's zero is when the flow was built, 0.474s before its first event; the run's own clock starts when it is invoked, which is why the two totals differ."
+      "parallelism_note": "stage windows are differences between the first appearance of each stage in the ledger, not instrumented unit durations, so overlapping stages share their window rather than summing to the total. The ledger's zero is when the flow was built, 0.547s before its first event; the run's own clock starts when it is invoked, which is why the two totals differ."
     },
     "stopping": {
       "stopped": false,
@@ -504,12 +563,12 @@
   },
   "sources": [
     {
-      "id": "src-0b72e8e608eb",
+      "id": "src-b6994f507612",
       "kind": "local-artifact",
       "locator": "example.com",
       "title": "advisory-reader \u2014 published-advisories",
       "publisher": "",
-      "retrieved_at": "2026-11-12T09:04:47.612029Z",
+      "retrieved_at": "2026-11-12T09:52:39.924059Z",
       "method": "local-read",
       "http_status": null,
       "digest": "",
@@ -537,7 +596,7 @@
       "contradicts": [],
       "collected_by": "wrk-60aa16261035",
       "task_id": "",
-      "observed_at": "2026-11-12T09:04:47.680927Z",
+      "observed_at": "2026-11-12T09:52:39.993128Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -557,7 +616,7 @@
       "contradicts": [],
       "collected_by": "wrk-ac9fe515391b",
       "task_id": "",
-      "observed_at": "2026-11-12T09:04:47.807141Z",
+      "observed_at": "2026-11-12T09:52:40.129055Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -577,7 +636,7 @@
       "contradicts": [],
       "collected_by": "wrk-d9962bee6734",
       "task_id": "",
-      "observed_at": "2026-11-12T09:04:47.747643Z",
+      "observed_at": "2026-11-12T09:52:40.066250Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -597,7 +656,7 @@
       "contradicts": [],
       "collected_by": "wrk-03581617fd6c",
       "task_id": "",
-      "observed_at": "2026-11-12T09:04:47.872369Z",
+      "observed_at": "2026-11-12T09:52:40.196233Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -617,7 +676,7 @@
       "contradicts": [],
       "collected_by": "wrk-e9cfb6efebac",
       "task_id": "",
-      "observed_at": "2026-11-12T09:04:47.745281Z",
+      "observed_at": "2026-11-12T09:52:40.060409Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -637,7 +696,7 @@
       "contradicts": [],
       "collected_by": "wrk-7fa8d41b476a",
       "task_id": "",
-      "observed_at": "2026-11-12T09:04:47.612029Z",
+      "observed_at": "2026-11-12T09:52:39.924059Z",
       "digest": "",
       "custody_id": "",
       "cited_by": [
@@ -655,7 +714,7 @@
       "digest": "",
       "digest_complete": false,
       "collected_by": "wrk-7fa8d41b476a",
-      "collected_at": "2026-11-12T09:04:47.612375Z",
+      "collected_at": "2026-11-12T09:52:39.924344Z",
       "method": "local-read",
       "original_location": "example.com",
       "storage_location": "",
@@ -675,16 +734,16 @@
     "environment": {
       "app": "argus",
       "app_title": "ARGUS",
-      "version": "0.34.0",
-      "version_label": "0.34.0-alpha",
+      "version": "0.35.0",
+      "version_label": "0.35.0-alpha",
       "build_phase": 3,
       "format_version": "argus-audit/1",
       "python": "3.11.2",
       "implementation": "CPython",
       "platform": "Linux-6.1.158+-x86_64-with-glibc2.36",
       "machine": "x86_64",
-      "user_agent": "ARGUS/0.34.0 (+authorised-security-research)",
-      "command": "report --mission /tmp/reg41/report-exposure.json",
+      "user_agent": "ARGUS/0.35.0 (+authorised-security-research)",
+      "command": "report --mission flow-a995e56deaae.json",
       "operator": "",
       "dry_run": true,
       "mode": "live",
@@ -826,7 +885,7 @@
       },
       {
         "key": "network.user_agent",
-        "value": "ARGUS/0.34.0 (+authorised-security-research)",
+        "value": "ARGUS/0.35.0 (+authorised-security-research)",
         "source": "default",
         "redacted": false
       },
@@ -905,18 +964,18 @@
       "supplied_from": "flow"
     },
     "stamps": {
-      "started_at": "2026-11-12T09:04:47+00:00",
-      "ended_at": "2026-11-12T09:04:47+00:00",
-      "recorded_at": "2026-11-12T09:04:47+00:00",
-      "duration_seconds": 0.349,
+      "started_at": "2026-11-12T09:52:39+00:00",
+      "ended_at": "2026-11-12T09:52:40+00:00",
+      "recorded_at": "2026-11-12T09:52:40+00:00",
+      "duration_seconds": 0.366,
       "stages": [
         [
           "planning",
-          0.004
+          0.006
         ],
         [
           "subagent planning",
-          0.006
+          0.003
         ],
         [
           "worker execution",
@@ -928,15 +987,15 @@
         ],
         [
           "reconciliation",
-          0.194
+          0.204
         ],
         [
           "master review",
-          0.004
+          0.005
         ],
         [
           "follow-up planning",
-          0.079
+          0.085
         ],
         [
           "synthesis",
@@ -956,7 +1015,7 @@
           "gate": "none",
           "attempts": 1,
           "evidence": 3,
-          "seconds": 0.058,
+          "seconds": 0.059,
           "origin": "planned",
           "spawned_by": "",
           "depends_on": [],
@@ -1024,7 +1083,7 @@
           "gate": "none",
           "attempts": 1,
           "evidence": 3,
-          "seconds": 0.122,
+          "seconds": 0.132,
           "origin": "planned",
           "spawned_by": "",
           "depends_on": [
@@ -1060,7 +1119,7 @@
           "gate": "none",
           "attempts": 1,
           "evidence": 1,
-          "seconds": 0.051,
+          "seconds": 0.054,
           "origin": "planned",
           "spawned_by": "",
           "depends_on": [],
@@ -1131,7 +1190,7 @@
     "secrets": {
       "scanned": true,
       "clean": true,
-      "bytes_scanned": 62691,
+      "bytes_scanned": 66461,
       "findings": [],
       "rules": [
         {
@@ -1171,7 +1230,7 @@
           "removed": false
         }
       ],
-      "scanned_at": "2026-11-12T09:06:01+00:00",
+      "scanned_at": "2026-11-12T09:52:46+00:00",
       "patterns": [
         "connection-string-password",
         "json-credential-field",
@@ -1186,7 +1245,7 @@
         "known-credential-value",
         "credential-store-shape"
       ],
-      "scanned_text": "clean: 62,691 byte(s) scanned for 12 credential pattern(s)"
+      "scanned_text": "clean: 66,461 byte(s) scanned for 12 credential pattern(s)"
     },
     "reproduction": [
       {

@@ -433,11 +433,13 @@ by side).  There is no node named after a specialist role and no roster constant
   travel with the artefacts, and an artefact nobody preserved says so in the same table as
   the one that was.
 * **The document cannot outrun its evidence.**  The finished report is assembled from
-  the reviewed record in ten sections — executive summary, scope and methods, key
-  findings, corroborated indicators, competing hypotheses, contradictions, confidence,
-  gaps, limitations and lawful next steps.  Every finding cites the evidence ids that
-  carry it, confidence is *derived* from independent origins and capped by the claim's
-  epistemic kind, contradictions are preserved rather than settled, and no sentence may
+  the reviewed record in sections — executive summary, scope and methods, key findings,
+  corroborated indicators, competing hypotheses, contradictions, confidence, gaps,
+  limitations, lawful next steps, coverage (which mission question each task served) and
+  alternative explanations (which competing explanation the evidence does not separate).
+  Every finding cites the evidence ids that carry it, confidence is *derived* from
+  independent origins and capped by the claim's epistemic kind, contradictions are
+  preserved rather than settled, and no sentence may
   declare guilt or attribute identity with certainty.  A report that cannot meet its own
   acceptance clause is refused rather than printed.
 
@@ -1153,7 +1155,7 @@ APP_SUBTITLE: str = "autonomous OSINT & digital-forensics agent"
 APP_SLUG: str = "vedant_osint"
 
 VERSION_MAJOR: int = 0
-VERSION_MINOR: int = 34
+VERSION_MINOR: int = 35
 VERSION_PATCH: int = 0
 VERSION_STAGE: str = "alpha"             # skeleton → alpha → beta → stable
 __version__: str = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"
@@ -22652,6 +22654,30 @@ class FlowResult(StrictModel):
     #: §45: every coverage matrix the Master built, in round order.  A reader can see what
     #: the mission believed after each round, not only what it concluded at the end.
     coverage: "CoverageLedger | None" = None
+    #: §46: every explanation the mission carried, with the verdict each earned.  On the result
+    #: so a reader of `flow --json` sees the alternatives even for a mission that stopped before
+    #: it could synthesise a document.
+    hypotheses: "HypothesisSet | None" = None
+
+    @property
+    def hypothesis_summary(self) -> dict[str, Any]:
+        """The set as counts — empty when the mission carried no hypothesis."""
+
+        if self.hypotheses is None or not self.hypotheses.hypotheses:
+            return {}
+        set_ = self.hypotheses
+        alternatives = hypothesis_alternatives(set_) if set_.required else []
+        return {"frame": set_.frame.value, "required": set_.required,
+                "hypotheses": len(set_.hypotheses),
+                "statuses": {status: sum(1 for item in set_.hypotheses
+                                         if item.status == status)
+                             for status in sorted({item.status for item in set_.hypotheses})},
+                "leading": set_.leading.id if set_.leading is not None else "",
+                "alternatives_compared": len(alternatives),
+                "fails_to_distinguish": [row.statement[:90] for row in alternatives
+                                         if row.status == "indistinguishable"],
+                "penalties": set_.only_confirming(),
+                "clause": hypothesis_acceptance(set_, alternatives)}
 
     @property
     def coverage_summary(self) -> dict[str, Any]:
@@ -22802,6 +22828,8 @@ class FlowResult(StrictModel):
             "loops": self.loops.to_dict() if self.loops is not None else None,
             "coverage": self.coverage.to_dict() if self.coverage is not None else None,
             "coverage_summary": self.coverage_summary,
+            "hypotheses": self.hypotheses.to_dict() if self.hypotheses is not None else None,
+            "hypothesis_summary": self.hypothesis_summary,
             "loop_summary": self.loop_summary,
             "mission_review": self.review_summary_of_mission,
             "stop_condition": self.stop_condition.value,
@@ -23153,6 +23181,10 @@ class HierarchicalFlow:
         #: end, and the ledger says what it believed after each round, so a question can be
         #: seen becoming answered (or failing to).
         self._coverage: CoverageLedger = CoverageLedger()
+        #: §46: every explanation this mission is testing.  Generated at the plan, weighed
+        #: after every review, and carried onto the report — the set is a record of what the
+        #: mission was willing to be wrong about, and it may only grow, never shrink.
+        self._hypotheses: HypothesisSet = HypothesisSet()
         #: Follow-up assignments this mission opened, in the order it opened them.
         self._follow_ups: list[FollowUpAssignment] = []
         #: What each follow-up round created, so the result can name it.
@@ -23569,6 +23601,16 @@ class HierarchicalFlow:
         opening = self._coverage.latest()
         self._record(FlowStage.PLAN, detail=opening.summary() if opening is not None else
                      "coverage: no questions were stated")
+        # §46: the alternatives, generated from the mission's own questions before any work
+        # runs.  A plan is the last moment at which adding an explanation is free; after the
+        # first round it costs a licence seat and a round of the operator's budget.
+        self._hypotheses = generate_hypotheses(
+            self.context.mission_questions, objective=self.context.objective,
+            mode=self.context.mode, round_number=0)
+        self._record(FlowStage.PLAN, detail=(
+            f"hypotheses: {self._hypotheses.summary()}"
+            + (f"; penalty: {self._hypotheses.only_confirming()[0][:100]}"
+               if self._hypotheses.only_confirming() else "")))
         return {"mission_id": self.mission_id, "objective": self.context.objective,
                 "waves": [list(wave) for wave in waves]}
 
@@ -25065,6 +25107,25 @@ class HierarchicalFlow:
             self._round_evidence[-1] = (before, len(review.evidence_ids))
         self._round_evidence.append((len(review.evidence_ids), len(review.evidence_ids)))
 
+        # §46: weigh the explanations against the evidence *this review* holds, before the
+        # next round is planned.  The set may only grow, and it grows here: an alternative the
+        # evidence has just made visible is added by re-generating from the mission's questions
+        # plus this round, never by editing a hypothesis by hand.
+        generated = generate_hypotheses(
+            self.context.mission_questions, objective=self.context.objective,
+            mode=self.context.mode, round_number=rounds_done)
+        self._hypotheses = self._hypotheses.model_copy(update={
+            "frame": generated.frame, "frame_basis": generated.frame_basis,
+            "objective": generated.objective})
+        self._hypotheses = weigh_hypotheses(
+            self._hypotheses, [(item.id, item.statement) for item in mission_evidence],
+            conflicts=[conflict.topic for report in ordered
+                       for conflict in report.disagreements])
+        self._record(FlowStage.MASTER_REVIEW, detail=(
+            f"hypotheses: {self._hypotheses.summary()}"
+            + (f"; {len(self._hypotheses.only_confirming())} penalty(ies)"
+               if self._hypotheses.only_confirming() else "")))
+
         # §45: the matrix, after this round's reports — recomputed from the record, never
         # carried forward and patched.  A matrix that was edited instead of rebuilt could
         # report a question answered by a claim no report still makes.  Built here, before
@@ -25099,7 +25160,11 @@ class HierarchicalFlow:
         assignments = (plan_follow_ups(
             review, reports=ordered, subagents=self.subagents, policy=self.policy,
             round_number=rounds_done + 1, licence_remaining=seats,
-            serving=nominated)
+            serving=nominated,
+            # §46: every follow-up the round opens is told which explanation to try to
+            # disconfirm.  A round planned before the set exists gets none, which the
+            # plan penalty reports rather than hides.
+            disconfirming=disconfirming_tests(self._hypotheses))
             if not stopped else [])
         # Saturation is measured in *substance*, not in ids: §36 and §37 both create new
         # evidence rows by giving a Worker a new objective, so an id-only test would
@@ -25709,7 +25774,11 @@ class HierarchicalFlow:
             # §45: the matrix as the last review left it, so the document carries what the
             # run believed about its own coverage rather than a matrix rebuilt from the
             # document it is part of.
-            coverage=self._coverage.latest())
+            coverage=self._coverage.latest(),
+            # §46: the set as the last review weighed it.  Passed even when the frame is not
+            # exposed: the document's own section says why it is empty, which is a different
+            # statement from a section that failed to be written.
+            hypotheses_weighed=self._hypotheses)
         synthesis = synthesis.model_copy(update={"report": report})
         self._record(FlowStage.MASTER_SYNTHESIZE,
                      detail=f"{barrier.describe()}; {len(synthesis.sourced_claims)} sourced "
@@ -25792,6 +25861,9 @@ class HierarchicalFlow:
             follow_ups=self.follow_ups(),
             loops=self._loops.model_copy(update={"saturation": self.loop_saturation()}),
             coverage=self._coverage,
+            # A copy, for the same reason the ledger's is a copy: the payload outlives the
+            # run, and a later round's weighing must not change a record already handed out.
+            hypotheses=self._hypotheses.model_copy(deep=True),
             research={"workers": len(self._research),
                       "audits": {worker_id: audit["audit"]
                                  for worker_id, audit in self._research.items()},
@@ -26376,6 +26448,9 @@ def run_flow_self_test(console: "Console | None" = None) -> list[FlowCheck]:
 
     # ---- 13. the coverage matrix (§45) ---------------------------------
     checks.extend(run_coverage_self_test())
+
+    # ---- 14. competing hypotheses (§46) --------------------------------
+    checks.extend(run_hypothesis_self_test())
     return checks
 
 
@@ -26500,6 +26575,12 @@ def _flow_demo(objective_key: str, *, out_dir: Path | None = None,
         # change a record that was already handed to a reader.
         "coverage": (result.coverage.model_copy(deep=True).to_dict()
                      if result.coverage is not None else None),
+        "hypotheses": (result.hypotheses.model_copy(deep=True).to_dict()
+                       if result.hypotheses is not None else None),
+        "hypothesis_summary": result.hypothesis_summary,
+        "alternatives": (hypothesis_alternatives(result.hypotheses)
+                         if result.hypotheses is not None
+                         and result.hypotheses.required else []),
         "coverage_summary": result.coverage_summary,
         "runtime_only": True,
         "browser": result.browser,
@@ -26542,6 +26623,44 @@ def render_flow_coverage(payload: Mapping[str, Any]) -> Group | None:
                           "(written by a build before §45, or the mission tracked no "
                           "question)[/dim]"))
     return render_coverage_matrix(matrix)
+
+
+def hypotheses_from_payload(payload: Mapping[str, Any]) -> HypothesisSet | None:
+    """The hypothesis set a ``flow`` payload carries, or ``None``.
+
+    Tolerant for the same reason as :func:`coverage_from_payload`: a payload written by an
+    older build has no ``hypotheses`` key, and an unreadable one should cost the screen a
+    block rather than the whole output.  Nothing is invented — an absent set renders as absent.
+    """
+
+    written = payload.get("hypotheses")
+    if not isinstance(written, Mapping):
+        return None
+    try:
+        return HypothesisSet.model_validate(written)
+    except Exception:                                # pydantic ValidationError and friends
+        return None
+
+
+def render_flow_hypotheses(payload: Mapping[str, Any]) -> Group | None:
+    """§46's block for the ``flow`` screen: the alternative sets, or a line saying there is none."""
+
+    hypotheses = hypotheses_from_payload(payload)
+    if hypotheses is None:
+        return Group(Text("[dim]hypotheses: this payload carries no hypothesis set "
+                          "(written by a build before §46, or the mission carried "
+                          "none)[/dim]"))
+    if not hypotheses.hypotheses:
+        return Group(Text("[dim]hypotheses: the mission carried no explanation[/dim]"))
+    blocks: list[Any] = [render_hypotheses(hypotheses)]
+    # The comparison the payload carries, not a second derivation: the screen must quote the
+    # rows the record holds, or the two agree only by coincidence.
+    rows = [row for row in (HypothesisAlternative.model_validate(item) for item
+                            in payload.get("alternatives") or ())
+            if isinstance(row, HypothesisAlternative)]
+    if hypotheses.required:
+        blocks.extend([Text(""), render_hypothesis_comparison(rows)])
+    return Group(*blocks)
 
 
 def render_flow_summary(payload: Mapping[str, Any]) -> Table:
@@ -26601,6 +26720,17 @@ def render_flow_summary(payload: Mapping[str, Any]) -> Table:
         table.add_row("coverage clause", escape(
             "every task serves a question and none is dropped" if clause["ok"]
             else "explainable: " + "; ".join(clause["errors"][:2])))
+    # §46: the frame, the alternatives and the penalty — the plain version of the table
+    # printed beside it, for the summary a reader scans first.
+    hypotheses = payload.get("hypothesis_summary") or {}
+    if hypotheses.get("hypotheses"):
+        table.add_row("hypotheses", escape(
+            f"{hypotheses['frame']} frame, {hypotheses['hypotheses']} explanation(s), "
+            f"{hypotheses.get('alternatives_compared', 0)} compared"))
+        clause = hypotheses.get("clause") or {}
+        table.add_row("hypothesis clause", escape(
+            "alternatives compared, each with a test" if clause.get("ok")
+            else "penalty: " + "; ".join((clause.get("errors") or [])[:2])))
     if payload.get("stopped"):
         table.add_row("stopped", escape(str(payload["stop_reason"])))
     return table
@@ -26780,6 +26910,10 @@ def flow_command(
         if coverage is not None:
             console.print()
             console.print(coverage)
+        hypotheses = render_flow_hypotheses(payload)
+        if hypotheses is not None:
+            console.print()
+            console.print(hypotheses)
         console.print()
         console.print(render_offline_cost(payload["cost"]))
         console.print()
@@ -26842,6 +26976,10 @@ def flow_command(
         if coverage is not None:
             console.print()
             console.print(coverage)
+        hypotheses = render_flow_hypotheses(payload)
+        if hypotheses is not None:
+            console.print()
+            console.print(hypotheses)
         for report in payload["reports"]:
             console.print()
             console.print(Panel(Text("\n".join(
@@ -26948,6 +27086,12 @@ def flow_command(
             # believed after each round, not only what it concluded.
             "coverage": result.coverage.to_dict() if result.coverage is not None else None,
             "coverage_summary": result.coverage_summary,
+            "hypotheses": (result.hypotheses.model_copy(deep=True).to_dict()
+                           if result.hypotheses is not None else None),
+            "hypothesis_summary": result.hypothesis_summary,
+            "alternatives": (hypothesis_alternatives(result.hypotheses)
+                             if result.hypotheses is not None
+                             and result.hypotheses.required else []),
             "peak_concurrency": flow.trace.max_concurrency(),
             "ledger_concurrency": flow.trace.max_concurrency(),
             "threads": sorted(flow.trace.threads())[:4],
@@ -26967,6 +27111,10 @@ def flow_command(
         if coverage is not None:
             console.print()
             console.print(coverage)
+        hypotheses = render_flow_hypotheses(payload)
+        if hypotheses is not None:
+            console.print()
+            console.print(hypotheses)
         console.print()
         console.print(render_flow_timeline(payload, limit=max(4, trace_limit)))
         if payload["synthesis"]:
@@ -27072,6 +27220,12 @@ def _run_mock_flow(context: "MasterContext", *, scenario: str,
         "reviews": result.reviews.to_dict() if result.reviews is not None else None,
         "coverage": (result.coverage.model_copy(deep=True).to_dict()
                      if result.coverage is not None else None),
+        "hypotheses": (result.hypotheses.model_copy(deep=True).to_dict()
+                       if result.hypotheses is not None else None),
+        "hypothesis_summary": result.hypothesis_summary,
+        "alternatives": (hypothesis_alternatives(result.hypotheses)
+                         if result.hypotheses is not None
+                         and result.hypotheses.required else []),
         "coverage_summary": result.coverage_summary,
         "peak_concurrency": 1, "ledger_concurrency": 1, "threads": [],
         "seconds": round(result.seconds, 3), "stopped": result.stopped,
@@ -50904,7 +51058,8 @@ def plan_follow_ups(review: MasterReview, *, reports: Sequence["SubagentOutcome"
                     round_number: int = 1,
                     licence_remaining: int | None = None,
                     max_new_subagents: int = 1,
-                    serving: "CoverageCell | None" = None) -> list[FollowUpAssignment]:
+                    serving: "CoverageCell | None" = None,
+                    disconfirming: Sequence[tuple[str, str]] = ()) -> list[FollowUpAssignment]:
     """The assignments a continue decision would run, most-specific first.
 
     Two routes, and the choice between them is a *bound*, not a preference:
@@ -50921,6 +51076,12 @@ def plan_follow_ups(review: MasterReview, *, reports: Sequence["SubagentOutcome"
     Nothing is returned for a lens that found a concern with no remedy: an assignment
     with no way to close its gap is busy-work, and the loop would spin on it.
 
+    ``disconfirming`` is §46's assignment: for each follow-up the round opens, the hypothesis
+    it should try to *disconfirm* rather than corroborate, and the test that would do it.  It is
+    appended to the objective rather than replacing it, because the gap is still the reason the
+    work exists — the alternative is what keeps the work from being a search for confirmation.
+    A branch told only what it is looking for will find it.
+
     ``serving`` is §45's nomination: the coverage row the Master has decided the round should
     serve.  Its question is attached to every assignment the round opens, so the assignment
     answers "which mission question does this task serve?" by itself, and its wording is
@@ -50930,6 +51091,9 @@ def plan_follow_ups(review: MasterReview, *, reports: Sequence["SubagentOutcome"
 
     assignments: list[FollowUpAssignment] = []
     seen: set[tuple[str, str]] = set()
+    # One disconfirming instruction per follow-up, in order: the round's assignments are
+    # numbered, so the pairing is fixed and a reader can predict which branch tested what.
+    tests = list(disconfirming or ())
     tools = _tools_for_follow_up(reports, subagents)
     seats = licence_remaining if licence_remaining is not None else max_new_subagents
     created = 0
@@ -50954,8 +51118,10 @@ def plan_follow_ups(review: MasterReview, *, reports: Sequence["SubagentOutcome"
                 route="existing", target_subagent=owner,
                 role=next((subagent.role for subagent in subagents
                            if subagent.id == owner), "follow-up"),
-                objective=(f"close one gap reported by the master review: "
-                           f"{finding.remedy or finding.detail[:140]}")[:400],
+                objective=_widen_objective(
+                    f"close one gap reported by the master review: "
+                    f"{finding.remedy or finding.detail[:140]}",
+                    tests, len(assignments))[:400],
                 gap=finding.detail[:300] or finding.target[:300],
                 lens=finding.lens,
                 completion_criteria=[
@@ -50979,7 +51145,9 @@ def plan_follow_ups(review: MasterReview, *, reports: Sequence["SubagentOutcome"
         role = f"gap-{finding.lens.value}-{content_id('flw', target, length=6)}"
         assignments.append(FollowUpAssignment(
             route="new", role=role,
-            objective=(f"cover what no report covers for the mission: {target[:200]}"),
+            objective=_widen_objective(
+                f"cover what no report covers for the mission: {target[:200]}",
+                tests, len(assignments))[:400],
             gap=finding.detail[:300] or finding.target[:300],
             lens=finding.lens,
             completion_criteria=[
@@ -50992,6 +51160,32 @@ def plan_follow_ups(review: MasterReview, *, reports: Sequence["SubagentOutcome"
             question_id=serving.id if serving is not None else "",
             question=serving.question if serving is not None else ""))
     return assignments
+
+
+def _widen_objective(objective: str, tests: Sequence[tuple[str, str]], index: int) -> str:
+    """A follow-up's objective, plus the disconfirming half §46 requires of it.
+
+    ``tests`` is one ``(hypothesis_id, instruction)`` pair per branch; a branch beyond the list
+    gets the first one, so a round that opens more work than there are hypotheses still asks
+    every branch to look for evidence against *something*.
+    """
+
+    if not tests:
+        return objective
+    hypothesis_id, instruction = tests[index % len(tests)]
+    return f"{objective}. Disconfirming test ({hypothesis_id}): {instruction}"
+
+
+def disconfirming_tests(hypotheses: "HypothesisSet") -> list[tuple[str, str]]:
+    """The per-branch disconfirming instructions a round plans from the set."""
+
+    if not hypotheses.required or not hypotheses.hypotheses:
+        return []
+    pairs: list[tuple[str, str]] = []
+    for index, item in enumerate(hypotheses.hypotheses):
+        sibling = hypotheses.hypotheses[(index + 1) % len(hypotheses.hypotheses)]
+        pairs.append((item.id, disconfirming_assignment(item, sibling)))
+    return pairs
 
 
 def follow_up_draft(assignment: FollowUpAssignment, *,
@@ -53476,7 +53670,7 @@ class SynthesisSection(StrictModel):
 
     kind: str = Field(pattern="^(executive-summary|scope-and-methods|key-findings|"
                               "indicators|hypotheses|contradictions|confidence|gaps|"
-                              "limitations|next-steps|coverage)$")
+                              "limitations|next-steps|coverage|alternatives)$")
     title: str = Field(min_length=3)
     #: The prose.  May be empty for a section whose content is entirely structured
     #: (key findings, indicators, contradictions), which is why it is not ``min_length=1``.
@@ -53503,10 +53697,10 @@ class SynthesisSection(StrictModel):
         return bool(self.body.strip()) or bool(self.item_ids)
 
 
-#: The ten sections the task names, in the order a reader needs them.  A report missing
-#: any one of them is refused: not because ten is a magic number, but because each answers
-#: a question a reader will ask, and a report that cannot answer one of them is a report
-#: that has not been finished.
+#: The sections a finished document must carry, in the order a reader needs them.  A report
+#: missing any one of them is refused: not because twelve is a magic number, but because each
+#: answers a question a reader will ask — what was found, for which question, and what else
+#: could it be — and a report that cannot answer one of them has not been finished.
 REQUIRED_SECTIONS: tuple[tuple[str, str], ...] = (
     ("executive-summary", "Executive summary"),
     ("scope-and-methods", "Scope and methods"),
@@ -53522,11 +53716,16 @@ REQUIRED_SECTIONS: tuple[tuple[str, str], ...] = (
     # *for which question*, and a report that cannot say that is one a reader has to trust
     # rather than check.
     ("coverage", "Coverage"),
+    # §46: the twelfth, and the one an attribution report cannot do without.  A comparison of
+    # viable alternatives, and for each one whether the evidence favours it, weakens it, or
+    # cannot tell it apart from the leading explanation.
+    ("alternatives", "Alternative explanations"),
 )
 
 
 class MasterReport(StrictModel):
-    """The finished document: ten sections, every finding cited, every level calibrated.
+    """The finished document: every required section, every finding cited, every level
+    calibrated.
 
     This is what the mission produces when it is allowed to speak, and it is the object
     the acceptance clause is a property of.  Nothing here is a free-text field a model
@@ -53571,6 +53770,13 @@ class MasterReport(StrictModel):
     #: on the run, because a reader holding the document is the reader who needs to know
     #: whether an important question was left out.
     coverage: "CoverageMatrix | None" = None
+    #: §46: every explanation the mission carried, and what the evidence did to each.  On the
+    #: report rather than only on the run because a reader holding the document is the reader
+    #: who needs to know whether an alternative was ever tested.
+    hypotheses_weighed: "HypothesisSet | None" = None
+    #: §46: the comparison the task asks for — one row per viable alternative, with its verdict
+    #: and the test that would separate it from the leading explanation.
+    alternatives: list["HypothesisAlternative"] = Field(default_factory=list)
 
     @field_validator("generated_at", mode="before")
     @classmethod
@@ -53644,6 +53850,14 @@ class MasterReport(StrictModel):
                 "uncertainty_statement": self.uncertainty_statement,
                 "cited_ids": list(self.cited_ids), "origins": list(self.origins),
                 "withheld": list(self.withheld),
+                # §46: the set and the comparison.  Written through their own ``to_dict`` so a
+                # reloaded report carries what the run believed and not a summary of it.
+                "hypotheses_weighed": (self.hypotheses_weighed.to_dict()
+                                       if self.hypotheses_weighed is not None else None),
+                "alternatives": [{"statement": row.statement, "status": row.status,
+                                  "evidence_ids": list(row.evidence_ids),
+                                  "basis": row.basis, "discriminator": row.discriminator}
+                                 for row in self.alternatives],
                 # The acceptance clause, as the report's own claim about itself — checkable
                 # against the fields above rather than taken on trust.
                 "acceptance": self.acceptance(),
@@ -53655,6 +53869,8 @@ class MasterReport(StrictModel):
         uncited = [finding.id for finding in self.findings if not finding.cited]
         over = [finding.id for finding in self.findings
                 if finding.band.rank > _KIND_CEILING[finding.kind].rank]
+        comparisons = hypothesis_acceptance(self.hypotheses_weighed, self.alternatives) \
+            if self.hypotheses_weighed is not None else None
         return {"every_finding_cited": not uncited,
                 "uncited": uncited,
                 "no_conclusion_exceeds_its_evidence": not over,
@@ -53663,6 +53879,15 @@ class MasterReport(StrictModel):
                 == len(REQUIRED_SECTIONS),
                 "no_attribution": not any(
                     _declares(finding.statement) for finding in self.findings),
+                # §46: the task's clause, on the document rather than on the plan.  ``None``
+                # means the report carried no hypothesis set (a mission that never ran the
+                # graph, or a file written before this section), which is reported as such
+                # rather than as a silent pass.
+                "alternatives_compared": (comparisons["alternatives_compared"]
+                                          if comparisons else 0),
+                "explains_alternatives": (comparisons["ok"] if comparisons else False),
+                "fails_to_distinguish": (comparisons["fails_to_distinguish"]
+                                         if comparisons else []),
                 "cited": len(self.cited_ids)}
 
 
@@ -53904,7 +54129,7 @@ def _confidence_of(findings: Sequence[KeyFinding]) -> tuple[Confidence, str]:
 
 
 # --------------------------------------------------------------------------
-# 39.2 Assembling the ten sections
+# 39.2 Assembling the sections
 # --------------------------------------------------------------------------
 
 
@@ -54071,8 +54296,12 @@ def _executive_summary(report: MasterReport) -> str:
         # A count of what is still open, never a count of what has been excluded: "no
         # explanation remains" is the one sentence this document may not write, because
         # excluding an alternative requires evidence, not the absence of a hypothesis.
-        (f"{len(report.open_hypotheses)} explanation(s) remain open; this document does not "
-         f"claim that it has excluded the others"
+        (f"{len(report.open_hypotheses)} explanation(s) remain open"
+         + (f", {len(report.alternatives)} of them compared against the leading one, and "
+            f"{len([row for row in report.alternatives if row.status == 'indistinguishable'])} "
+            f"that the evidence cannot tell apart"
+            if report.alternatives else "")
+         + "; this document does not claim that it has excluded the others"
          + (f", and {len(report.conflicts)} contradiction(s) are stated rather than settled"
             if report.conflicts else "")
          + f". Confidence: {report.confidence.value}."),
@@ -54091,7 +54320,8 @@ def synthesise_report(reports: Sequence["SubagentOutcome"], *, context: "MasterC
                       barrier: JoinBarrier | None = None,
                       review: "MasterReview | None" = None,
                       question: str = "",
-                      coverage: "CoverageMatrix | None" = None) -> MasterReport:
+                      coverage: "CoverageMatrix | None" = None,
+                      hypotheses_weighed: "HypothesisSet | None" = None) -> MasterReport:
     """Assemble the finished document from the reviewed record.
 
     The order is the argument.  Evidence is indexed first (so every later step cites real
@@ -54142,7 +54372,15 @@ def synthesise_report(reports: Sequence["SubagentOutcome"], *, context: "MasterC
             "origins and capped by epistemic kind, contradictions are preserved rather "
             "than settled, and no attribution of conduct or identity is made. Nothing "
             "outside the gaps and limitations sections should be read as established."),
-        aggregate_basis=barrier, withheld=list(withheld), coverage=coverage)
+        aggregate_basis=barrier, withheld=list(withheld), coverage=coverage,
+        # §46: the comparison is derived *here*, from the set the caller weighed against this
+        # mission's evidence.  Deriving it at assembly rather than accepting it ready-made is
+        # the same rule §39 applies to the findings: the document's comparison must be a
+        # function of the record, not a paragraph someone handed in.
+        hypotheses_weighed=hypotheses_weighed,
+        alternatives=(hypothesis_alternatives(hypotheses_weighed)
+                      if hypotheses_weighed is not None
+                      and hypotheses_weighed.required else []))
 
     indicator_section = _indicators_section(index, indicators)
 
@@ -54159,6 +54397,10 @@ def synthesise_report(reports: Sequence["SubagentOutcome"], *, context: "MasterC
         _limitations_section(limitations, withheld),
         _next_steps_section(report.next_steps),
         _coverage_section(coverage),
+        _alternatives_section(hypotheses_weighed,
+                              hypothesis_alternatives(hypotheses_weighed)
+                              if hypotheses_weighed is not None
+                              and hypotheses_weighed.required else []),
     ]
     # The summary is a *section* like the others, so the completeness check and the
     # citation check treat it the same way — and so a reader can ask what it rests on.
@@ -54239,6 +54481,85 @@ def _coverage_section(matrix: "CoverageMatrix | None") -> SynthesisSection:
     evidence_ids = list(dict.fromkeys(item for row in matrix.rows for item in row.evidence_ids))
     return SynthesisSection(kind="coverage", title="Coverage", body="\n".join(lines),
                             evidence_ids=evidence_ids)
+
+
+def _alternatives_section(hypotheses: "HypothesisSet | None",
+                          alternatives: Sequence["HypothesisAlternative"] = ()) -> SynthesisSection:
+    """§46 in the document: the alternatives, and what the evidence did to each.
+
+    Written from the compared rows rather than from the hypothesis set, because the comparison
+    is the task's actual requirement: a report can list six explanations and still fail to say
+    which ones the evidence separates.  A mission outside the four exposed frames gets a
+    section that says so — the document is uniform, so a reader always knows where to look for
+    the answer to "what else could this be?".
+
+    ``NO`` in a clause is written as a word: the Markdown is read where a glyph does not render,
+    and a report that argued against itself in a symbol is a report nobody reads twice.
+    """
+
+    if hypotheses is None:
+        return SynthesisSection(
+            kind="alternatives", title="Alternative explanations", body=(
+                "The mission did not record a hypothesis set: the explanations it considered, "
+                "and what would distinguish them, were not tracked, so this report cannot say "
+                "whether it tested more than one."),
+            evidence_ids=[])
+    clause = hypothesis_acceptance(hypotheses, alternatives)
+    if not hypotheses.required:
+        return SynthesisSection(
+            kind="alternatives", title="Alternative explanations", body=(
+                "This objective asks no attribution, timeline, identity or intent question, "
+                "so competing explanations were not required. That is a fact about the "
+                "mission's question rather than a weakness in its evidence — and it is "
+                "stated here so a reader of a later attribution mission knows what this "
+                "section looks like when it has something to say."),
+            evidence_ids=[])
+    lines = [
+        f"The objective is an {hypotheses.frame.value} question, so the mission carried "
+        f"{len(hypotheses.hypotheses)} explanation(s) and looked for evidence against them, "
+        f"not only for them.",
+        "",
+    ]
+    lead = hypotheses.leading
+    if lead is not None:
+        lines.append(f"**Leading explanation** ({hypotheses.leading_status}): "
+                     f"{_md_inline(lead.statement)}")
+        if lead.status != "favoured":
+            lines.append("")
+            lines.append("No explanation is favoured by the evidence the mission collected: "
+                         "the alternatives below are the explanations it could not separate, "
+                         "and each says what would separate it.")
+        lines.append("")
+    if alternatives:
+        lines.extend(["| alternative | verdict | evidence | why |", "|---|---|---|---|"])
+        for row in alternatives:
+            lines.append(f"| {_md_cell(row.statement, limit=160)} | {row.status} "
+                         f"| {len(row.evidence_ids)} | {_md_cell(row.basis, limit=200)} |")
+        lines.append("")
+        lines.append("**What would distinguish each alternative from the leading one:**")
+        for row in alternatives:
+            lines.append(f"- {_md_inline(row.discriminator)}")
+    else:
+        lines.append("No alternative explanation survived the evidence: every competing "
+                     "explanation the mission generated was argued against by a reviewed "
+                     "record.")
+    if clause["fails_to_distinguish"]:
+        lines.extend(["", "**The evidence does not distinguish:** "
+                      + "; ".join(clause["fails_to_distinguish"][:4])
+                      + ". This is a result, not a gap: the mission collected the records "
+                        "both explanations sit under, and none of them separates the two."])
+    if clause["only_confirming"]:
+        lines.extend(["", "**Plan penalty:** " + "; ".join(clause["only_confirming"][:3])
+                      + ". A plan that only confirms is scored here rather than trusted."])
+    lines.extend(["", f"**Alternative-explanations clause:** alternatives compared "
+                      f"{_mark_word(bool(alternatives) or not hypotheses.required)} · "
+                      f"each carries a discriminator {_mark_word(not clause['errors'])} "
+                      f"· plan seeks disconfirmation "
+                      f"{_mark_word(not clause['only_confirming'])}"])
+    evidence_ids = list(dict.fromkeys(item for row in alternatives
+                                      for item in row.evidence_ids))
+    return SynthesisSection(kind="alternatives", title="Alternative explanations",
+                            body="\n".join(lines), evidence_ids=evidence_ids)
 
 
 def _mark_word(ok: bool) -> str:
@@ -54493,6 +54814,7 @@ DOCUMENT_SECTIONS: tuple[tuple[str, str], ...] = (
     ("limitations", "Limitations"),
     ("next-steps", "Recommended next steps"),
     ("coverage", "Coverage"),
+    ("alternatives", "Alternative explanations"),
     ("execution", "Agent and task execution"),
     ("time", "Time usage"),
     ("errors", "Errors"),
@@ -55920,6 +56242,10 @@ def render_dossier_markdown(dossier: MissionDossier, *, width: int = 96) -> str:
     # it was written through ``_md_cell``/``_md_inline``, which is where the untrusted text
     # from the mission is neutralised.
     parts.append("## Coverage\n\n" + report.section_of("coverage").body.strip() + "\n")
+    # §46: the comparison of alternatives, in the same way and for the same reason — the body
+    # is the document's own Markdown table, every cell of it already neutralised by the writer.
+    parts.append("## Alternative explanations\n\n"
+                 + report.section_of("alternatives").body.strip() + "\n")
     parts.append("## Agent and task execution\n\n" + _md_execution(execution))
     parts.append("## Time usage\n\n" + _md_time(execution.time))
     parts.append("## Errors\n\n" + _md_errors(execution))
@@ -56429,6 +56755,28 @@ def run_dossier_self_test() -> list[DossierCheck]:
     add("the document states the coverage clause in words",
         coverage_section is not None and "Coverage clause" in coverage_section.body,
         coverage_section.body[-70:] if coverage_section is not None else "")
+    # §46: the alternatives the mission carried, and what the evidence did to each.  The
+    # document prints the comparison the report holds, so a reader of the Markdown and a reader
+    # of the JSON cannot be told different things about what the mission could not separate.
+    alternatives_section = report.section_of("alternatives") if report is not None else None
+    add("the report carries the explanations it weighed",
+        report is not None and report.hypotheses_weighed is not None,
+        report.hypotheses_weighed.summary() if report is not None
+        and report.hypotheses_weighed is not None else None)
+    add("the document prints every compared alternative",
+        alternatives_section is not None
+        and all(_md_cell(row.statement, limit=160) in markdown
+                for row in report.alternatives),
+        len(report.alternatives) if report is not None else 0)
+    add("the document states what would distinguish each alternative",
+        alternatives_section is not None
+        and ("What would distinguish" in alternatives_section.body
+             or not report.alternatives),
+        alternatives_section.body[:80] if alternatives_section is not None else "")
+    add("the report's acceptance clause judges the comparison",
+        report is not None and "explains_alternatives" in report.acceptance()
+        and report.acceptance()["explains_alternatives"], report.acceptance()
+        if report is not None else None)
 
     # ---- 3. the JSON -------------------------------------------------------
     payload = dossier.to_json()
@@ -56981,6 +57329,9 @@ class MissionPresentation(StrictModel):
     #: when one exists — the question the Master would spend the next round on.  Short
     #: because the screen's job is to make a reader open the report, not to replace it.
     coverage: str = ""
+    #: §46 on one line: the frame, how many explanations the mission carried, and how many
+    #: the report compares — or that none was required, which is a different statement.
+    hypotheses: str = ""
 
     @property
     def outcome(self) -> MissionOutcome:
@@ -57010,6 +57361,7 @@ class MissionPresentation(StrictModel):
                 "unfinished": [item.to_dict() for item in self.unfinished],
                 "produced_by": self.produced_by, "networkshape": self.networkshape,
                 "coverage": self.coverage,
+                "hypotheses": self.hypotheses,
                 "retention": self.retention,
                 "outcome": self.outcome.value,
                 "blocking": [item.cause for item in self.blocking]}
@@ -57048,6 +57400,7 @@ class MissionPresentation(StrictModel):
             produced_by=str(payload.get("produced_by") or ""),
             networkshape=str(payload.get("networkshape") or ""),
             coverage=str(payload.get("coverage") or ""),
+            hypotheses=str(payload.get("hypotheses") or ""),
             retention=str(payload.get("retention") or ""))
 
 
@@ -57402,7 +57755,28 @@ def build_presentation(dossier: MissionDossier, *, report_paths: Sequence[str] =
         networkshape=(f"{dossier.audit.hierarchy.describe()} — "
                       f"stopped: {dossier.audit.stopping.kind}"),
         coverage=_presentation_coverage(report),
+        hypotheses=_presentation_hypotheses(report),
         retention=RETENTION_SHORT)
+
+
+def _presentation_hypotheses(report: "MasterReport") -> str:
+    """The hypothesis set as one line for the screen."""
+
+    hypotheses = report.hypotheses_weighed
+    if hypotheses is None:
+        return "no hypothesis set: the mission did not track the explanations it considered"
+    if not hypotheses.required:
+        return f"no competing hypothesis required ({hypotheses.frame.value} frame)"
+    lead = hypotheses.leading
+    line = (f"{hypotheses.frame.value} frame: {len(hypotheses.hypotheses)} explanation(s), "
+            f"{len(report.alternatives)} compared")
+    if lead is not None and lead.status != "favoured":
+        line += "; none favoured by the evidence"
+    elif lead is not None:
+        line += f"; leading (favoured): {lead.statement[:80]}"
+    if hypotheses.only_confirming():
+        line += "; PLAN PENALTY: only confirming"
+    return line
 
 
 def _presentation_coverage(report: "MasterReport") -> str:
@@ -57625,6 +57999,8 @@ def render_mission_presentation(presentation: MissionPresentation, *,
         footer.add_row("produced by", escape(presentation.produced_by))
     if presentation.networkshape:
         footer.add_row("shape", escape(presentation.networkshape))
+    if presentation.hypotheses:
+        footer.add_row("hypotheses", escape(presentation.hypotheses[:200]))
     if presentation.coverage:
         # §45: above "next", because the next step is chosen from it — a reader should meet
         # the question before the recommendation that answers it.
@@ -60160,6 +60536,10 @@ class PlanReport(StrictModel):
     #: Where the hierarchy came from — see :data:`PLAN_STRUCTURE_SOURCE`.
     structure_source: str = PLAN_STRUCTURE_SOURCE
     effects: EffectBoundary = Field(default_factory=EffectBoundary)
+    #: §46: the frame the objective falls in, the explanations a run would carry, and the
+    #: penalty the *plan* already incurs.  A dry run states what would be tested, never what
+    #: was found — no evidence was collected, so no explanation is weighed here.
+    hypothesis_plan: dict[str, Any] = Field(default_factory=dict)
     planned_at: datetime = Field(default_factory=utc_now)
     note: str = DRY_RUN_NOTE
 
@@ -60200,6 +60580,7 @@ class PlanReport(StrictModel):
                 "structure": list(self.structure),
                 "structure_source": self.structure_source,
                 "effects": self.effects.to_dict(),
+                "hypothesis_plan": dict(self.hypothesis_plan),
                 "planned_at": _iso(self.planned_at), "note": self.note}
 
 
@@ -60353,7 +60734,8 @@ def plan_mission(context: "MasterContext", *, drafts: Sequence["SubagentSpecDraf
         units=planned_units, bounds=bounds,
         frontier=sorted({unit.parent or "master" for unit in planned_units}),
         structure=structure, structure_source=PLAN_STRUCTURE_SOURCE,
-        effects=EffectBoundary.of(RunMode.DRY_RUN))
+        effects=EffectBoundary.of(RunMode.DRY_RUN),
+        hypothesis_plan=plan_hypothesis_penalty(context))
 
 
 def _shape_context(context: "MasterContext") -> "MasterContext":
@@ -62506,6 +62888,1058 @@ def run_coverage_self_test() -> list["FlowCheck"]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# 46. Competing hypotheses: an investigation that tries to be wrong
+# --------------------------------------------------------------------------
+#
+# An investigation that looks only for evidence *for* its first suspicion will find it —
+# that is not a property of the target, it is a property of searching.  Four kinds of
+# objective are especially exposed, because more than one explanation fits the same
+# observations: **attribution** (who or what did this?), **timeline** (when, and in what
+# order?), **identity** (is this the same subject?), and **intent** (was this deliberate?).
+# For those, this section makes the alternatives part of the mission rather than a caveat
+# in the report:
+#
+# *   **The frame is derived from the objective, not chosen by a model.**  A keyword
+#     classifier (:func:`analysis_frame`) decides whether the mission is in one of the four
+#     classes, and a mission in none of them is told so — the machinery is not applied where
+#     it would be decoration, and the record says why it was not applied.
+# *   **The alternatives are generated from the mission's own questions.**  For an objective
+#     in one of the four classes, every hypothesis the mission stated gets its negations:
+#     the benign, the other-actor and the subject-mismatch reading, each one testable and
+#     each one carrying what it would predict.  A mission that stated no hypothesis still
+#     gets the two explanations the objective itself implies, so a one-explanation plan is
+#     impossible by construction rather than by instruction.
+# *   **Each branch is told to hunt the *other* explanation's evidence.**  A Worker working
+#     for hypothesis *i* is assigned to look for what would disconfirm hypothesis *j*.  Work
+#     that only confirms is not refused — it is *scored*, and the plan is penalised
+#     (:meth:`HypothesisSet.only_confirming`), because a plan that cannot name a
+#     disconfirming test has not looked for one.
+# *   **The report weighs the alternatives instead of resolving them.**  Each viable
+#     alternative gets a verdict derived from evidence ids: *favoured*, *weakened* or
+#     *indistinguishable*, with the disconfirming evidence the mission actually collected,
+#     and the test that would separate it from the leading explanation.  *Not distinguishable*
+#     is a result, not a failure — and it is the one a confirmatory investigation can never
+#     produce, because it never ran the test.
+
+#: Keywords that put an objective in one of the four exposed classes.  Matched on the
+#: mission's objective with :func:`_topic_words`' normalisation, so "who wrote" and "wrote by
+#: whom" land in the same class.  Order is precedence: attribution outranks the rest, because
+#: an attribution objective also involves a timeline and an intent.
+_FRAME_KEYWORDS: tuple[tuple["HypothesisFrame", tuple[str, ...]], ...] = (
+    # The stems carry their derived forms ("attribut" matches attribute, attributed,
+    # attribution, attributing) and the multi-word entries are matched as phrases — so
+    # "which process wrote" and "attribute … to a process" land in the same class, which is
+    # the property the classifier is for.
+    ("attribution", ("who", "attribut*", "whois", "actor", "responsible", "perpetrator",
+                     "which process", "which host", "which account", "which user")),
+    ("timeline", ("when", "timeline", "sequenc*", "ordering", "order", "window",
+                  "before", "after", "earliest", "latest")),
+    ("identity", ("identity", "same person", "same actor", "alias", "pseudonym",
+                  "account match", "linked", "sock puppet", "the same")),
+    ("intent", ("intent", "intentional", "deliberate", "malicious", "negligence",
+                "accidentally", "accident", "mistake", "error", "motive")),
+)
+
+#: The four classes, with the sentence a report owes a reader when it is in one of them.
+_FRAME_LABEL: dict[str, str] = {
+    "attribution": "attribution — who or what is responsible",
+    "timeline": "timeline — when, and in what order",
+    "identity": "identity — whether two subjects are the same",
+    "intent": "intent — whether conduct was deliberate",
+}
+
+#: How many hypotheses a mission will carry.  Three is a floor rather than a rounding: the
+#: leading explanation, the benign one, and the one that says the *subject* is wrong.  Six is
+#: the ceiling because a reader who is handed a dozen alternatives weighs none of them.
+HYPOTHESIS_FLOOR: int = 2
+HYPOTHESIS_CEILING: int = 6
+
+
+class HypothesisFrame(str, Enum):
+    """Why a mission needs competing hypotheses at all.
+
+    The four classes the task names, plus ``none`` for a mission that is not in one of them.
+    ``none`` is a real answer and is recorded as one: applying this machinery to a mission
+    that ranks advisories would produce alternatives nobody could test, which is worse than
+    no alternatives at all.
+    """
+
+    ATTRIBUTION = "attribution"
+    TIMELINE = "timeline"
+    IDENTITY = "identity"
+    INTENT = "intent"
+    NONE = "none"
+
+    @property
+    def required(self) -> bool:
+        """Whether a mission in this class owes the report competing explanations."""
+
+        return self is not HypothesisFrame.NONE
+
+    @property
+    def label(self) -> str:
+        return _FRAME_LABEL.get(self.value, "no exposed frame: one explanation is not a test")
+
+
+def analysis_frame(objective: str, *, mode: "MissionMode | str | None" = None) -> HypothesisFrame:
+    """Which of the four exposed classes an objective falls in, by its own words.
+
+    Deliberately a keyword classifier and not a model call: the gate that decides whether a
+    mission owes alternative explanations must be identical on every run, in every mode, and
+    inspectable by a reader who has the objective in front of them.  A forensic mode earns
+    ``attribution`` by default — a disk image is investigated to find out what did something,
+    and the mission that says otherwise is answering a different question.
+    """
+
+    words = _topic_words(objective)
+    text = " " + " ".join(str(objective or "").lower().split()) + " "
+    for frame, keywords in _FRAME_KEYWORDS:
+        for keyword in keywords:
+            if " " in keyword:
+                if keyword in text:
+                    return HypothesisFrame(frame)
+            elif keyword.endswith("*"):
+                # A stem: the mission's own word has to start with it, so "attribut" matches
+                # "attributed" and "attribution" without matching an unrelated word by accident.
+                if any(word.startswith(keyword[:-1]) for word in words):
+                    return HypothesisFrame(frame)
+            elif keyword in words:
+                return HypothesisFrame(frame)
+    if str(getattr(mode, "value", mode) or "") == MissionMode.FORENSIC.value:
+        return HypothesisFrame.ATTRIBUTION
+    return HypothesisFrame.NONE
+
+
+def _hedge(statement: str) -> str:
+    """A hypothesis phrased as one: the report may state an explanation, never a verdict.
+
+    Two of the four frames touch conduct, and :func:`check_attribution` refuses a declaration
+    of guilt *and* certain identity attribution.  A generated alternative therefore has to be
+    phrased as something the evidence would test — which is what a hypothesis is — so the
+    guard and the generator agree instead of the guard rejecting the section's own output.
+    """
+
+    text = " ".join(str(statement or "").split())
+    lowered = text.lower()
+    if not text or any(word in lowered for word in ("would", "whether", "could", "may", "if ")):
+        return text
+    return (f"the explanation that {text[:1].lower()}{text[1:]}" if text
+            else text)
+
+
+#: The three alternatives generated for a stated explanation, and what each predicts.  Written
+#: as data so the section adds no prose it cannot point at: every generated hypothesis traces
+#: to one of these rows and to the question it was generated from.
+_ALTERNATIVE_TEMPLATES: tuple[tuple[str, str, str, str], ...] = (
+    # (key, phrasing — "{subject}" is the explanation it negates —, what it predicts,
+    #  the test that separates it).  A phrasing rather than a sentence fragment: the benign
+    #  reading of "a package upgrade rewrote /etc/hosts" is not "explain that a package
+    #  upgrade ..." but "the same records are consistent with routine operation", and the
+    #  difference is whether a reader can test the alternative at all.
+    ("benign",
+     "the same records are equally consistent with routine configuration, shared "
+     "infrastructure or ordinary administrative work that nobody recorded",
+     "routine operation normally leaves a dated record of authorised change; one such record "
+     "in the same window would settle this without an adversary",
+     "find one dated record of authorised change or routine operation covering the same "
+     "window, and this explanation stops needing an adversary"),
+    ("other-actor",
+     "a different party acted in the same window and produced the same observations — a "
+     "third-party provider, a scheduled job, or another operator",
+     "independent activity from a subject outside the mission's scope would share the window "
+     "and leave a differently-signed trace",
+     "find one record of independent activity in the same window from a subject outside the "
+     "mission's scope, and this explanation must be weighed against the leading one"),
+    ("subject-mismatch",
+     "the records the mission read belong to a different subject, and the resemblance is in "
+     "the words rather than in the identifying fields",
+     "two different subjects produce identifying fields — address, account, digest or time — "
+     "that disagree when compared",
+     "compare the identifying fields of the two subjects — address, account, digest or time — "
+     "and state whether they agree"),
+)
+
+#: What a hypothesis's branch is told to hunt: not more of its own evidence, but the evidence
+#: that would *disconfirm* the sibling it is paired with.  The pairing is fixed (i, i+1) so a
+#: run is reproducible and a reader can predict which branch tested what.
+_DISCONFIRM_TEMPLATE: str = (
+    "seek evidence that would disconfirm the competing explanation {target}: {test}. "
+    "Record what you looked for even when you do not find it — an absent record is a "
+    "result, and the branch that only looks for its own explanation is the branch this "
+    "mission exists to avoid.")
+
+
+class CompetingHypothesis(StrictModel):
+    """One explanation the mission will test, with the test that would show it is wrong.
+
+    ``predicts`` is what makes this a hypothesis rather than a belief: a statement that cannot
+    say what would be different if it were false is refused at construction, by the same
+    discipline §39 applies to the report's hypotheses.  ``generated_from`` names the mission
+    question it was derived from, or ``objective`` for the two the mission gets when it stated
+    no question — so "why is this alternative here?" is always answerable.
+
+    ``to_dict`` writes a derived boolean (``viable``) beside the fields, so the model ignores
+    unknown input: a written set is a record this build can read back, which is the same rule
+    §45's ledger and rows follow.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(min_length=1)
+    statement: str = Field(min_length=12)
+    #: What an investigator would see if this explanation were true, and not if it were false.
+    predicts: str = Field(min_length=12)
+    #: The hypothesis this one competes with (another id), fixed at generation.
+    competes_with: str = ""
+    #: The question (or ``objective``) it was derived from.
+    generated_from: str = ""
+    #: The test that separates it from the leading explanation.
+    test: str = Field(min_length=12)
+    #: Disconfirming evidence the mission holds: evidence ids that *weaken* this explanation.
+    disconfirming: list[str] = Field(default_factory=list)
+    #: Supporting evidence: evidence ids whose words bear on it.
+    supporting: list[str] = Field(default_factory=list)
+    #: The hypothesis's own verdict, derived from the two lists — see :func:`weigh_hypotheses`.
+    status: str = Field(default="untested",
+                        pattern="^(favoured|viable|weakened|indistinguishable|untested)$")
+    checked_by: str = ""
+
+    @property
+    def viable(self) -> bool:
+        """Whether the evidence leaves this explanation standing."""
+
+        return self.status in {"favoured", "viable", "indistinguishable", "untested"}
+
+    def describe(self) -> str:
+        return f"{self.id} [{self.status}] {self.statement[:90]}"
+
+
+class HypothesisAlternative(StrictModel):
+    """One row of the report's comparison: an alternative, its verdict, and what would decide it.
+
+    The report owes a reader four things per alternative — which explanation it is, what the
+    evidence did to it, what evidence that was, and what would distinguish it from the leading
+    explanation.  Keeping them in one model is what lets the acceptance clause check them
+    together: a comparison missing its deciding test is a paragraph of opinion.
+    """
+
+    statement: str = Field(min_length=12)
+    status: str = Field(pattern="^(favoured|viable|weakened|indistinguishable|untested)$")
+    #: Evidence that bears on it — the ids, in either direction.
+    evidence_ids: list[str] = Field(default_factory=list)
+    #: Why it is where it is, in one sentence.
+    basis: str = Field(min_length=12)
+    #: The test that would separate it from the leading explanation.  Required, always.
+    discriminator: str = Field(min_length=12)
+
+    @property
+    def distinguishable(self) -> bool:
+        return self.status != "indistinguishable"
+
+
+class HypothesisSet(StrictModel):
+    """Every explanation a mission is testing, and what that plan costs it.
+
+    The set is what the Master holds after planning, what each round adds to, and what the
+    report weighs.  ``penalties`` is the branch the task asks for: a plan that only collects
+    confirming evidence is not refused, because refusing it would stop a mission in its first
+    round — it is *scored*, and the score is in the record where a reader can see it.
+
+    ``to_dict`` carries derived keys (``required``, ``leading``, ``penalties``) that are
+    properties here, so unknown input is ignored and a written set reads back as itself.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    format_version: str = "argus-hypotheses/1"
+    objective: str = ""
+    frame: HypothesisFrame = HypothesisFrame.NONE
+    #: Why the frame is the frame — the word or the mode that decided it.
+    frame_basis: str = ""
+    hypotheses: list[CompetingHypothesis] = Field(default_factory=list)
+    #: The round each hypothesis was generated in, so a round that added an alternative is
+    #: visible in the ledger rather than only in the final report.
+    generated_round: int = Field(default=0, ge=0)
+
+    @property
+    def required(self) -> bool:
+        return self.frame.required
+
+    @property
+    def leading(self) -> CompetingHypothesis | None:
+        """The explanation the mission is currently working from.
+
+        ``favoured`` when the evidence chose one; otherwise the best-supported explanation,
+        and failing that the mission's own first statement.  The distinction matters: a leading
+        explanation that is *not* favoured is one the evidence has not chosen, and the report
+        says so rather than presenting the first guess as a conclusion.
+        """
+
+        favoured = next((item for item in self.hypotheses if item.status == "favoured"), None)
+        if favoured is not None:
+            return favoured
+        supported = [item for item in self.hypotheses if item.supporting]
+        return (max(supported, key=lambda item: len(item.supporting)) if supported
+                else (self.hypotheses[0] if self.hypotheses else None))
+
+    @property
+    def leading_status(self) -> str:
+        """What to call the leading explanation in a report: chosen, or merely working."""
+
+        lead = self.leading
+        if lead is None:
+            return "none"
+        return "favoured" if lead.status == "favoured" else "not favoured by the evidence"
+
+    @property
+    def alternatives(self) -> list[CompetingHypothesis]:
+        """Every hypothesis except the leading one — what the report compares against it."""
+
+        lead = self.leading
+        return [item for item in self.hypotheses if lead is None or item.id != lead.id]
+
+    def get(self, hypothesis_id: str) -> CompetingHypothesis | None:
+        return next((item for item in self.hypotheses if item.id == hypothesis_id), None)
+
+    @property
+    def disconfirming_tests(self) -> int:
+        """How many hypotheses carry a disconfirming assignment rather than a confirming one."""
+
+        return sum(1 for item in self.hypotheses if item.checked_by.startswith("disconfirm"))
+
+    def only_confirming(self) -> list[str]:
+        """The penalty: explanations with no test that could show them wrong.
+
+        Empty means the plan is balanced.  Each entry names the hypothesis and the reason, so
+        the penalty is a finding a reader can act on rather than a number.
+        """
+
+        findings: list[str] = []
+        for item in self.hypotheses:
+            if not item.test.strip():
+                findings.append(f"{item.id}: no test was stated, so nothing could disconfirm it")
+            elif not item.predicts.strip():
+                findings.append(f"{item.id}: no prediction was stated, so the test cannot tell "
+                                f"two explanations apart")
+        if self.required and len(self.hypotheses) < HYPOTHESIS_FLOOR:
+            findings.append(
+                f"only {len(self.hypotheses)} explanation(s) for a {self.frame.value} "
+                f"objective: a mission with one explanation has not tested it")
+        return findings
+
+    def summary(self) -> str:
+        if not self.hypotheses:
+            return (f"{self.frame.value} frame; no hypothesis generated"
+                    if self.required else "no exposed frame; hypotheses not required")
+        counts: dict[str, int] = {}
+        for item in self.hypotheses:
+            counts[item.status] = counts.get(item.status, 0) + 1
+        return (f"{self.frame.value} frame, {len(self.hypotheses)} explanation(s): "
+                + ", ".join(f"{count} {status}" for status, count in sorted(counts.items())))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"format_version": self.format_version, "objective": self.objective,
+                "frame": self.frame.value, "frame_basis": self.frame_basis,
+                "generated_round": self.generated_round,
+                "required": self.required,
+                "leading": self.leading.id if self.leading is not None else "",
+                "penalties": self.only_confirming(),
+                "hypotheses": [{"id": item.id, "statement": item.statement,
+                                "predicts": item.predicts,
+                                "competes_with": item.competes_with,
+                                "generated_from": item.generated_from, "test": item.test,
+                                "supporting": list(item.supporting),
+                                "disconfirming": list(item.disconfirming),
+                                "status": item.status, "viable": item.viable,
+                                "checked_by": item.checked_by}
+                               for item in self.hypotheses]}
+
+
+# ➤ generating the alternatives -------------------------------------------
+
+#: What an unquotable stated explanation is replaced with.  The mission's own words are used
+#: wherever the report may legally carry them; when a question declares conduct the evidence
+#: does not establish, the alternative set says *that* rather than laundering the sentence into
+#: the document — the guard's rule, applied one level up.
+_UNQUOTABLE_STATEMENT: str = (
+    "the explanation the mission stated in its own question, which is not reproduced here "
+    "because it declares conduct or identity the evidence does not establish")
+
+
+def quotable(statement: str) -> tuple[bool, str]:
+    """Whether a stated explanation may appear in the document, and why not when it may not."""
+
+    for check in (check_attribution, check_identity_claim):
+        try:
+            check(statement)
+        except SynthesisConflict as exc:
+            return False, _first_sentence(str(exc))[:200]
+    return True, ""
+
+
+def hypothesis_id(index: int, statement: str) -> str:
+    """A stable id for an explanation: its position and its own words (the §45 rule)."""
+
+    return f"hyp-{index}-{content_id('h', _claim_key(statement), length=6)}"
+
+
+def _alternative_for(subject: str, short: str, template: str,
+                     predicts: str, test: str) -> tuple[str, str]:
+    """One generated alternative's statement and prediction, with the subject filled in."""
+
+    statement = template.replace("{subject}", subject[:200]).replace("{short}", short[:120])
+    return statement.strip(), predicts
+
+
+def generate_hypotheses(questions: Sequence[str] = (), *, objective: str = "",
+                        mode: "MissionMode | str | None" = None,
+                        round_number: int = 0) -> HypothesisSet:
+    """The explanations a mission in an exposed frame will test, generated from its own words.
+
+    Two sources, in order of authority.  A mission's stated questions are the explanations it
+    came with — the Master said what it suspected — and each one gets its negations, drawn from
+    :data:`_ALTERNATIVE_TEMPLATES`.  A mission that stated none is not left without an
+    alternative: the objective itself yields the benign reading and the other-actor reading,
+    which are the two a one-explanation mission never tests.
+
+    The result is *not* filtered for length: a caller that wants the first three of six can
+    slice it, and a mission that silently dropped the benign alternative because its budget was
+    small would be the failure this section exists to prevent.
+    """
+
+    frame = analysis_frame(objective, mode=mode)
+    basis = (f"the objective's own words put it in the {frame.value} class"
+             if frame.required else
+             "the objective names no attribution, timeline, identity or intent question, and "
+             "the mission is not forensic")
+    hypotheses: list[CompetingHypothesis] = []
+    source = [text for text in (questions or ()) if str(text).strip()][:HYPOTHESIS_CEILING - 1]
+    origin = "objective" if not source else "question"
+    for index, question in enumerate(source or [objective], start=1):
+        subject = str(question).strip()
+        if not subject:
+            continue
+        allowed, refusal = quotable(subject)
+        stated = _hedge(subject) if allowed else _UNQUOTABLE_STATEMENT
+        hypotheses.append(CompetingHypothesis(
+            id=hypothesis_id(len(hypotheses) + 1, stated), statement=stated,
+            predicts=("the evidence that would confirm it exists and is dated inside the "
+                      "mission's window, and no reviewed record states the opposite"),
+            generated_from=f"{origin}-{index}",
+            test=(f"collect one first-party record that states this explanation outright and "
+                  f"one that would be false if it holds: {subject[:100]}"),
+            # The refusal is carried on the hypothesis rather than dropped: a reader should
+            # see that the mission's question was unquotable, not wonder why it is missing.
+            checked_by=(f"pre-check: {refusal}" if not allowed else "")))
+        for _key, template, predicts, test in _ALTERNATIVE_TEMPLATES:
+            if _key == "subject-mismatch" and frame is not HypothesisFrame.IDENTITY:
+                # A mismatch of subjects is the identity frame's alternative; generating it
+                # for an attribution objective would be an explanation nobody can test with
+                # the mission's tools, and untestable alternatives are what the penalty is for.
+                continue
+            statement, prediction = _alternative_for(subject, subject, template, predicts,
+                                                     test)
+            hypotheses.append(CompetingHypothesis(
+                id=hypothesis_id(len(hypotheses) + 1, statement),
+                statement=statement, predicts=prediction, generated_from=f"{origin}-{index}",
+                test=test))
+            if len(hypotheses) >= HYPOTHESIS_CEILING:
+                break
+        if len(hypotheses) >= HYPOTHESIS_CEILING:
+            break
+    if len(hypotheses) >= HYPOTHESIS_FLOOR:
+        for index, item in enumerate(hypotheses):
+            sibling = hypotheses[(index + 1) % len(hypotheses)]
+            # The pre-check note (a stated explanation the report may not quote) survives the
+            # pairing: it is the only record of why a mission question is not in the set.
+            note = (f"disconfirm {sibling.id}: {sibling.test[:120]}"
+                    if sibling.id != item.id else item.checked_by)
+            hypotheses[index] = item.model_copy(update={
+                "competes_with": sibling.id if sibling.id != item.id else "",
+                "checked_by": (f"{item.checked_by}; {note}"
+                               if item.checked_by.startswith("pre-check") else note)})
+    return HypothesisSet(objective=objective or "", frame=frame, frame_basis=basis,
+                         hypotheses=hypotheses[:HYPOTHESIS_CEILING],
+                         generated_round=round_number)
+
+
+def disconfirming_assignment(hypothesis: CompetingHypothesis,
+                             sibling: CompetingHypothesis) -> str:
+    """The instruction a branch gets: hunt the *other* explanation's disconfirming evidence."""
+
+    return _DISCONFIRM_TEMPLATE.format(target=sibling.id, test=sibling.test[:180])
+
+
+def hypothesis_questions(hypotheses: HypothesisSet) -> list[str]:
+    """The hypotheses as mission questions, so §45's matrix covers them too.
+
+    This is where §46 and §45 meet, and the join is not cosmetic: an alternative that is
+    generated but never assigned to anybody is an alternative nobody tests, and the coverage
+    matrix is the record that would show it.
+    """
+
+    return [f"is it the case that {item.statement[:180]}"
+            for item in hypotheses.hypotheses
+            if item.statement.strip()] if hypotheses.required else []
+
+
+# ➤ weighing the alternatives against the evidence ------------------------
+
+def weigh_hypotheses(hypotheses: HypothesisSet,
+                     evidence: Sequence[tuple[str, str]],
+                     *, conflicts: Sequence[str] = ()) -> HypothesisSet:
+    """Attach the evidence to each explanation and derive its verdict.
+
+    ``evidence`` is ``(id, statement)`` pairs from the reviewed record; ``conflicts`` are the
+    subjects of stated disagreements, which weaken the explanation they bear on.
+
+    The rule is about *discrimination*, not about counting.  A record that supports two
+    explanations equally does not separate them, so it cannot make either one the answer; only
+    a record that supports one and *not* the others does.  Three verdicts follow:
+
+    *   ``favoured`` — the explanation has evidence of its own, nothing argues against it, and
+        it has more exclusive support than any rival.
+    *   ``weakened`` — another explanation has evidence this one does not, or the record
+        disputes it.  A weakened explanation is not refuted: refuting one takes a record that
+        is false if it holds, which this build does not synthesise.
+    *   ``indistinguishable`` — the records are argued both for and against it, typically
+        because the mission collected one set of facts that every explanation sits under.  That
+        is the honest result of a confirmatory investigation, and it is the verdict that makes
+        the report's comparison worth reading: *the evidence does not decide this* is a finding.
+    """
+
+    words = {item_id: _topic_words(statement) for item_id, statement in evidence}
+    conflicted = " ".join(str(item) for item in conflicts).lower()
+    support: dict[str, list[str]] = {}
+    for item in hypotheses.hypotheses:
+        wanted = _topic_words(item.statement)
+        support[item.id] = [item_id for item_id, tokens in words.items()
+                            if wanted and len(wanted & tokens) >= 2]
+    # A record's discriminating power: which explanations it supports.  A record supporting
+    # one explanation is that explanation's evidence; a record supporting three is evidence of
+    # a shared subject and nothing more.
+    holders: dict[str, set[str]] = {}
+    for hypothesis_id, ids in support.items():
+        for item_id in ids:
+            holders.setdefault(item_id, set()).add(hypothesis_id)
+    weighed: list[CompetingHypothesis] = []
+    for item in hypotheses.hypotheses:
+        wanted = _topic_words(item.statement)
+        mine = support[item.id]
+        contested = [item_id for item_id in mine if len(holders[item_id]) > 1]
+        rival_evidence = [item_id for item_id, ids in holders.items()
+                          if item.id not in ids and len(ids) == 1]
+        disputed = [item_id for item_id in mine
+                    if any(token in conflicted for token in wanted if len(token) > 4)]
+        against = list(dict.fromkeys([*rival_evidence, *contested, *disputed]))[:8]
+        if disputed:
+            status = "indistinguishable" if mine else "untested"
+            note = ("the record disagrees with it, and the same records support it: the "
+                    "mission cannot tell the two apart")
+        elif not mine:
+            status, note = "untested", "no reviewed statement bears on it yet"
+        elif rival_evidence:
+            status, note = "weakened", (
+                f"{len(rival_evidence)} record(s) support another explanation and not this one")
+        elif contested:
+            status, note = "indistinguishable", (
+                "the records that support it support another explanation equally, so they do "
+                "not separate the two")
+        else:
+            status, note = "viable", (
+                "the evidence bears on it and nothing in the record argues against it")
+        weighed.append(item.model_copy(update={
+            "supporting": mine[:6], "disconfirming": against, "status": status,
+            "checked_by": note}))
+    # Exactly one explanation may be favoured, and only on a margin of exclusive support.
+    candidates = [(item, len(item.supporting) - len(
+        [item_id for item_id in item.supporting
+         if item_id in {other for other in item.disconfirming}]))
+        for item in weighed]
+    eligible = [(item, margin) for item, margin in candidates
+                if item.status == "viable" and margin > 0]
+    if eligible:
+        best = max(eligible, key=lambda pair: (pair[1], -len(pair[0].disconfirming)))[0]
+        weighed = [item.model_copy(update={
+            "status": "favoured" if item.id == best.id else item.status,
+            "checked_by": (f"the evidence supports it with {len(item.supporting)} record(s) "
+                           f"that support no other explanation"
+                           if item.id == best.id else item.checked_by)})
+            for item in weighed]
+    return hypotheses.model_copy(update={"hypotheses": weighed})
+
+
+def hypothesis_alternatives(hypotheses: HypothesisSet,
+                            *, limit: int = 4) -> list[HypothesisAlternative]:
+    """The comparison the report publishes: every viable alternative against the leader.
+
+    Only explanations the evidence leaves standing are compared — a refuted one is not an
+    alternative, it is a finding — and each row carries the test that would separate it, so
+    the comparison cannot read as a shrug.
+    """
+
+    if not hypotheses.required:
+        # Nothing to compare: the objective asks no question of attribution, timeline,
+        # identity or intent, so an "alternative" would be a piece of prose with no standard
+        # to hold it to.  The document says that in words instead.
+        return []
+    lead = hypotheses.leading
+    rows: list[HypothesisAlternative] = []
+    seen: set[str] = set()
+    for item in hypotheses.hypotheses:
+        if lead is not None and item.id == lead.id:
+            continue
+        # Two questions can generate the same alternative — the benign reading is the same
+        # reading whichever question produced it.  Comparing it twice would look like two
+        # alternatives, so the first occurrence is the one the table keeps.
+        key = " ".join(item.statement.lower().split())
+        if key in seen:
+            continue
+        seen.add(key)
+        if item.status == "weakened" and not item.disconfirming:
+            continue
+        basis = (f"{item.status}: {item.checked_by}"
+                 if item.checked_by else f"{item.status}: no reviewed statement bears on it")
+        if lead is not None and item.status != "weakened":
+            basis += ((f"; the evidence that favours {lead.id} does not separate the two, so "
+                       f"this explanation remains possible")
+                      if lead.status == "favoured" else
+                      (f"; neither it nor {lead.id} is favoured: the mission's evidence does "
+                       f"not separate the two"))
+        rows.append(HypothesisAlternative(
+            statement=item.statement, status=item.status,
+            evidence_ids=list(dict.fromkeys([*item.supporting, *item.disconfirming]))[:8],
+            basis=basis[:400],
+            # A hypothesis with no test is a penalty, not a construction error: the comparison
+            # still has to exist so the penalty has somewhere to be reported.  The clause
+            # reads the *empty* test below, which is why the placeholder is not a lie.
+            discriminator=(item.test.strip()[:300]
+                           or "no test was stated, so nothing in the plan could distinguish "
+                              "this explanation")))
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def hypothesis_acceptance(hypotheses: HypothesisSet,
+                          alternatives: Sequence[HypothesisAlternative]) -> dict[str, Any]:
+    """The task's clause, evaluated on the set and the comparison rather than asserted.
+
+    *Compare viable alternatives* and *explain why evidence favours, weakens, or fails to
+    distinguish them* — plus the plan penalty.  A mission in no exposed frame passes by not
+    needing the comparison, and says so; a mission in one that published no alternative fails,
+    because that is the report the task exists to prevent.
+    """
+
+    errors: list[str] = []
+    compared = len(alternatives)
+    if hypotheses.required and not hypotheses.hypotheses:
+        errors.append("the objective is in an exposed frame and no competing hypothesis was "
+                      "generated")
+    if hypotheses.required and hypotheses.hypotheses and not compared and \
+            len(hypotheses.hypotheses) > 1:
+        errors.append("no alternative was compared in the report: a single explanation is not "
+                      "a comparison")
+    if any(not row.discriminator.strip() for row in alternatives):
+        errors.append("an alternative was compared without stating what would distinguish it")
+    penalties = hypotheses.only_confirming()
+    if hypotheses.required and penalties:
+        errors.append(f"the plan only confirms: {penalties[0][:160]}")
+    return {"frame": hypotheses.frame.value,
+            "required": hypotheses.required,
+            "hypotheses": len(hypotheses.hypotheses),
+            "alternatives_compared": compared if hypotheses.required else 0,
+            "fails_to_distinguish": [row.statement[:80] for row in alternatives
+                                     if row.status == "indistinguishable"],
+            "only_confirming": penalties,
+            "ok": not errors, "errors": errors}
+
+
+# ➤ the plan's view ------------------------------------------------------
+
+def plan_hypothesis_penalty(context: "MasterContext") -> dict[str, Any]:
+    """What a dry run says about the plan's hypothesis work, before anything is executed.
+
+    A dry run cannot weigh evidence it does not have, and it does not pretend to: it reports
+    the frame, the explanations the plan would generate, and the penalty the *plan* already
+    incurs.  A plan for an attribution objective whose units all collect one family of evidence
+    is penalised here, which is the earliest point at which the mistake can be seen.
+    """
+
+    hypotheses = generate_hypotheses(context.mission_questions, objective=context.objective,
+                                     mode=context.mode)
+    return {"frame": hypotheses.frame.value, "frame_basis": hypotheses.frame_basis,
+            "required": hypotheses.required,
+            "generated": [item.statement[:120] for item in hypotheses.hypotheses],
+            "penalties": hypotheses.only_confirming(),
+            "note": ("a dry run states what the plan would test, not what it found: no "
+                     "evidence was collected, so no explanation is weighed here")}
+
+
+# ➤ rendering -------------------------------------------------------------
+
+_HYPOTHESIS_STYLE: dict[str, str] = {
+    "favoured": "green", "viable": "cyan", "weakened": "yellow",
+    "indistinguishable": "magenta", "untested": "dim",
+}
+
+
+def render_hypotheses(hypotheses: HypothesisSet, *, width: int = 120) -> Group:
+    """The set as a table: each explanation, its verdict, and the test that would move it."""
+
+    table = Table(title=f"competing hypotheses — {hypotheses.frame.value} frame",
+                  title_justify="left", box=None, pad_edge=False, expand=True)
+    table.add_column("#", justify="right", width=2, no_wrap=True)
+    table.add_column("explanation", overflow="fold", ratio=3)
+    table.add_column("status", no_wrap=True)
+    table.add_column("against", justify="right", no_wrap=True)
+    table.add_column("test that separates it", overflow="fold", ratio=3)
+    for index, item in enumerate(hypotheses.hypotheses, start=1):
+        colour = _HYPOTHESIS_STYLE.get(item.status, "white")
+        table.add_row(str(index), escape(item.statement[:200]),
+                      f"[{colour}]{item.status}[/{colour}]",
+                      str(len(item.disconfirming)), escape(item.test[:160]))
+    notes = Table.grid(padding=(0, 1))
+    notes.add_column(width=2, no_wrap=True)
+    notes.add_column(overflow="fold", max_width=width)
+    notes.add_row("[dim]·[/dim]", escape(hypotheses.summary()))
+    notes.add_row("[dim]·[/dim]", escape(hypotheses.frame_basis))
+    for penalty in hypotheses.only_confirming()[:3]:
+        notes.add_row("[yellow]![/yellow]", escape(penalty))
+    return Group(table, Text(""), notes)
+
+
+def render_hypothesis_comparison(rows: Sequence[HypothesisAlternative],
+                                 *, width: int = 120) -> Group:
+    """The report's comparison, as the screen shows it."""
+
+    if not rows:
+        return Group(Text("[dim]no alternative explanation was left standing[/dim]"))
+    table = Table(title="viable alternatives", title_justify="left", box=None,
+                  pad_edge=False, expand=True)
+    table.add_column("alternative", overflow="fold", ratio=3)
+    table.add_column("status", no_wrap=True)
+    table.add_column("evidence", justify="right", no_wrap=True)
+    table.add_column("what would distinguish it", overflow="fold", ratio=3)
+    for row in rows:
+        colour = _HYPOTHESIS_STYLE.get(row.status, "white")
+        table.add_row(escape(row.statement[:200]), f"[{colour}]{row.status}[/{colour}]",
+                      str(len(row.evidence_ids)), escape(row.discriminator[:160]))
+    return Group(table)
+
+
+def render_hypothesis_summary(hypotheses: HypothesisSet) -> str:
+    """The set as plain text, for a log or a pipe."""
+
+    lines = [f"competing hypotheses — {hypotheses.frame.value} frame", hypotheses.summary(),
+             hypotheses.frame_basis]
+    for item in hypotheses.hypotheses:
+        lines.append(f"  {item.id:<22} [{item.status:<17}] {item.statement[:90]}")
+        lines.append(f"  {'':<22} against {len(item.disconfirming)}, "
+                     f"for {len(item.supporting)}: {item.checked_by[:100]}")
+    for penalty in hypotheses.only_confirming()[:4]:
+        lines.append(f"  penalty: {penalty[:140]}")
+    return "\n".join(lines)
+
+
+def run_hypothesis_self_test() -> list["FlowCheck"]:
+    """Prove §46 offline: the frame is derived, the alternatives are generated and tested.
+
+    Every check builds its own set from an objective and a list of claims, so the suite is a
+    property of the section rather than of one fixture — and the last group runs the real graph,
+    because a section that is right in isolation and never wired in would pass all the rest and
+    tell a report nothing.
+    """
+
+    checks: list[FlowCheck] = []
+
+    def add(name: str, ok: bool, detail: Any = "") -> None:
+        checks.append(_flow_check(name, ok, detail))
+
+    def claim(statement: str) -> EvidenceItem:
+        """One reviewed claim with a real source, so the model's own rules still apply."""
+
+        return EvidenceItem(
+            kind=EvidenceKind.OBSERVATION, statement=statement, collected_by="collector",
+            confidence=Confidence.LOW, confidence_basis="one local record, uncorroborated",
+            sources=[SourceReference(kind=SourceKind.LOCAL_ARTIFACT, artifact_path="/tmp/log",
+                                     retrieval_method=RetrievalMethod.LOCAL_READ)])
+
+    def evidence_of(*items: EvidenceItem) -> list[tuple[str, str]]:
+        return [(item.id, item.statement) for item in items]
+
+    # ---- 1. the frame comes from the objective, not from a preference ----
+    frames = {
+        "attribution": "attribute the modification of /etc/hosts to a process",
+        "timeline": "establish when the file was changed, and in what order",
+        "identity": "establish whether the account and the seller are one identity",
+        "intent": "decide whether the change was deliberate or accidental",
+    }
+    for frame, objective in frames.items():
+        add(f"an {frame} objective is in the {frame} frame",
+            analysis_frame(objective) is HypothesisFrame(frame),
+            analysis_frame(objective).value)
+    exposure = "map the publicly documented exposure of example.com and rank the risks"
+    add("an objective in none of the four frames is not forced into one",
+        analysis_frame(exposure) is HypothesisFrame.NONE, analysis_frame(exposure).value)
+    add("a forensic mission earns the attribution frame by its mode",
+        analysis_frame("hash the supplied image", mode=MissionMode.FORENSIC)
+        is HypothesisFrame.ATTRIBUTION)
+    add("a passive mission with the same words does not",
+        analysis_frame("hash the supplied image", mode=MissionMode.PASSIVE)
+        is HypothesisFrame.NONE)
+    add("the frame is recorded with the word or mode that decided it",
+        "words" in generate_hypotheses([], objective=frames["timeline"]).frame_basis
+        or "class" in generate_hypotheses([], objective=frames["timeline"]).frame_basis,
+        generate_hypotheses([], objective=frames["timeline"]).frame_basis)
+
+    # ---- 2. alternatives are generated, and each one is testable -------
+    exposure_context = _selftest_context("exposure")
+    forensic_context = _selftest_context("forensic")
+    forensic = generate_hypotheses(forensic_context.mission_questions,
+                                   objective=forensic_context.objective,
+                                   mode=forensic_context.mode)
+    add("an attribution mission carries more than one explanation",
+        forensic.required and len(forensic.hypotheses) >= HYPOTHESIS_FLOOR,
+        forensic.summary())
+    add("every generated explanation names what it predicts",
+        all(item.predicts.strip() for item in forensic.hypotheses),
+        [item.id for item in forensic.hypotheses if not item.predicts.strip()])
+    add("every generated explanation names the test that would refute it",
+        all(item.test.strip() for item in forensic.hypotheses))
+    add("every explanation traces to the question it was generated from",
+        all(item.generated_from for item in forensic.hypotheses),
+        [item.generated_from for item in forensic.hypotheses][:3])
+    add("the benign explanation is generated for an attribution objective",
+        any("routine configuration" in item.statement for item in forensic.hypotheses),
+        [item.statement[:50] for item in forensic.hypotheses])
+    add("a competing explanation is generated beside the mission's own",
+        any("different party" in item.statement for item in forensic.hypotheses))
+    add("the set is capped, so a reader can weigh it",
+        len(forensic.hypotheses) <= HYPOTHESIS_CEILING, len(forensic.hypotheses))
+    identity = generate_hypotheses(
+        ["the account and the seller are the same person"],
+        objective="establish whether the two accounts are one identity", round_number=1)
+    add("an identity objective gets the subject-mismatch alternative",
+        any("different subject" in item.statement for item in identity.hypotheses),
+        [item.statement[:60] for item in identity.hypotheses])
+    add("an attribution objective does not get an untestable subject-mismatch",
+        not any("belongs to a different subject" in item.statement
+                for item in forensic.hypotheses))
+    empty = generate_hypotheses([], objective=frames["attribution"])
+    add("a mission that stated no question still gets alternatives",
+        len(empty.hypotheses) >= HYPOTHESIS_FLOOR, empty.summary())
+    unrequired = generate_hypotheses(exposure_context.mission_questions,
+                                     objective=exposure_context.objective,
+                                     mode=exposure_context.mode)
+    add("a mission in no exposed frame is told so, and carries no requirement",
+        not unrequired.required and not hypothesis_questions(unrequired))
+
+    # ---- 3. the plan is told to disconfirm, not to confirm ------------
+    add("every plan pairs an explanation with the one it competes with",
+        all(item.competes_with for item in forensic.hypotheses),
+        [item.id for item in forensic.hypotheses if not item.competes_with])
+    add("each branch's instruction names the rival it must argue against",
+        all(f"disconfirm {item.competes_with}" in item.checked_by
+            for item in forensic.hypotheses),
+        [item.checked_by[:60] for item in forensic.hypotheses if item.competes_with
+         and f"disconfirm {item.competes_with}" not in item.checked_by][:2])
+    instructions = disconfirming_tests(forensic)
+    add("the round plans one disconfirming instruction per explanation",
+        len(instructions) == len(forensic.hypotheses), len(instructions))
+    add("a disconfirming instruction asks for evidence against the rival",
+        all("disconfirm" in text.lower() for _id, text in instructions),
+        instructions[0][1][:80] if instructions else "")
+    add("no disconfirming instruction is planned for a mission that needs none",
+        disconfirming_tests(unrequired) == [])
+    add("a follow-up objective carries the disconfirming test",
+        "Disconfirming test (" in _widen_objective("close a gap", instructions, 0),
+        _widen_objective("close a gap", instructions, 0)[-90:])
+    add("a round with more branches than explanations still asks every branch",
+        "Disconfirming test (" in _widen_objective("close a gap", instructions, 99))
+
+    # ---- 4. weighing: support, disconfirmation, and the honest middle --
+    hypotheses = generate_hypotheses(
+        ["a package upgrade rewrote /etc/hosts"],
+        objective="determine which process rewrote /etc/hosts", mode=MissionMode.FORENSIC,
+        round_number=1)
+    package = claim("a package upgrade rewrote /etc/hosts during the unattended window")
+    apt = claim("the package upgrade history shows the change at 03:12 local time")
+    provider = claim("a third-party provider ran a scheduled job in the same window from "
+                     "outside the mission's scope")
+    weighed = weigh_hypotheses(hypotheses, evidence_of(package, apt))
+    lead = weighed.get("hyp-1-h-317bb5") or weighed.hypotheses[0]
+    add("the explanation the evidence supports is the one the mission leads with",
+        weighed.leading is not None and weighed.leading.supporting,
+        (weighed.leading.id if weighed.leading else None))
+    add("an explanation with support and no evidence against it is favoured",
+        lead.status == "favoured", (lead.status, lead.checked_by[:70]))
+    add("an explanation with no evidence bearing on it is untested, not refuted",
+        any(item.status == "untested" for item in weighed.hypotheses),
+        [item.status for item in weighed.hypotheses])
+    attacked = weigh_hypotheses(hypotheses, evidence_of(package, apt, provider))
+    better = attacked.get(lead.id)
+    add("evidence for the competing explanation weakens the leading one",
+        better is not None and better.status in {"weakened", "indistinguishable"},
+        (better.status if better else None, better.disconfirming if better else None))
+    moved = attacked.get(lead.id)
+    add("the record collected for the competing explanation moves the leading one",
+        moved is not None and moved.status != weighed.get(lead.id).status,
+        (moved.status if moved else None,
+         weighed.get(lead.id).status if weighed.get(lead.id) else None))
+    add("the competing explanation holds the new record as support of its own",
+        any(provider.id in item.supporting for item in attacked.hypotheses
+            if item.id != lead.id)
+        or any(provider.id in item.disconfirming for item in attacked.hypotheses),
+        [(item.id, item.status, item.supporting, item.disconfirming)
+         for item in attacked.hypotheses])
+    add("a verdict names the items it rests on",
+        all((item.status == "untested") or item.supporting or item.disconfirming
+            for item in attacked.hypotheses),
+        [(item.id, item.status) for item in attacked.hypotheses])
+    both = weigh_hypotheses(hypotheses, evidence_of(package, apt),
+                            conflicts=[package.statement])
+    add("a disputed explanation is not reported as favoured on the same rows",
+        all(item.status != "favoured" for item in both.hypotheses
+            if set(item.supporting) and set(item.supporting) <= set(item.disconfirming)),
+        [(item.id, item.status) for item in both.hypotheses])
+    indistinguishable = [item for item in both.hypotheses
+                         if item.status == "indistinguishable"]
+    add("'the evidence cannot tell them apart' is a verdict the section can reach",
+        bool(indistinguishable), [item.status for item in both.hypotheses])
+
+    # ---- 5. the alternative set may not cite evidence the mission lacks --
+    unknown = weigh_hypotheses(hypotheses, [("ev-not-collected", "a package upgrade rewrote "
+                                             "/etc/hosts")])
+    add("a weighed explanation cites only ids it was given",
+        all(set(item.supporting) <= {"ev-not-collected"}
+            for item in unknown.hypotheses))
+
+    # ---- 6. the comparison the report publishes -----------------------
+    alternatives = hypothesis_alternatives(attacked)
+    add("the comparison leaves out the leading explanation",
+        all(row.statement != attacked.leading.statement for row in alternatives),
+        len(alternatives))
+    add("the comparison compares something for a mission that needs it", bool(alternatives))
+    add("every compared alternative carries a discriminator",
+        all(row.discriminator.strip() for row in alternatives))
+    add("every compared alternative says why it is where it is",
+        all(len(row.basis) >= 12 for row in alternatives), [row.basis[:40] for row in alternatives])
+    add("every compared alternative carries evidence or says it has none",
+        all(row.evidence_ids or row.status == "untested" for row in alternatives),
+        [(row.status, len(row.evidence_ids)) for row in alternatives])
+    add("a mission in no exposed frame compares nothing",
+        hypothesis_alternatives(unrequired) == [])
+
+    # ---- 7. the clause says all of it, and can fail -------------------
+    good = hypothesis_acceptance(attacked, alternatives)
+    add("the clause reports the frame and the comparison",
+        {"frame", "required", "alternatives_compared", "fails_to_distinguish",
+         "only_confirming", "ok"} <= set(good), sorted(good))
+    add("a mission that compared its alternatives passes", good["ok"], good["errors"])
+    add("a mission in no exposed frame passes without a comparison",
+        hypothesis_acceptance(unrequired, []).ok if hasattr(
+            hypothesis_acceptance(unrequired, []), "ok")
+        else hypothesis_acceptance(unrequired, [])["ok"])
+    penalised = attacked.model_copy(deep=True, update={
+        "hypotheses": [item.model_copy(update={"test": "   ", "predicts": "  "})
+                       for item in attacked.hypotheses]})
+    add("a plan that only confirms is penalised", bool(penalised.only_confirming()),
+        penalised.only_confirming()[:2])
+    add("the penalty fails the clause",
+        not hypothesis_acceptance(penalised,
+                                  hypothesis_alternatives(penalised))["ok"],
+        hypothesis_acceptance(penalised, hypothesis_alternatives(penalised))["errors"])
+    single = attacked.model_copy(deep=True, update={"hypotheses": attacked.hypotheses[:1]})
+    add("one explanation for an attribution objective is a penalty",
+        bool(single.only_confirming()), single.only_confirming())
+    # A mission that owes a comparison and published none: the report the task exists to stop.
+    blind = attacked.model_copy(deep=True, update={
+        "hypotheses": [item.model_copy(update={"test": "unknown" * 3, "predicts": "unknown" * 3})
+                       for item in attacked.hypotheses]})
+    blind_rows = hypothesis_alternatives(blind)
+    add("a comparison carries a placeholder discriminator rather than raising",
+        all(len(row.discriminator) >= 12 for row in blind_rows), len(blind_rows))
+    bare = hypothesis_acceptance(attacked, [])
+    add("a mission in an exposed frame with no comparison fails the clause",
+        not bare["ok"] and "no alternative was compared" in " ".join(bare["errors"]),
+        bare["errors"])
+
+    # ---- 8. the document says it, in words ----------------------------
+    section = _alternatives_section(attacked, alternatives)
+    add("the report has an alternative-explanations section",
+        section.kind == "alternatives" and section.title == "Alternative explanations")
+    add("the section carries the comparison as a table",
+        "| alternative | verdict | evidence |" in section.body, section.body[:60])
+    add("the section states what would separate each alternative",
+        "What would distinguish" in section.body or not alternatives)
+    add("the section names the frame that required it", "attribution" in section.body)
+    add("the section says the clause in words, not glyphs",
+        "**yes**" in section.body or "**NO**" in section.body, section.body[-80:])
+    add("a mission with no exposed frame says so rather than showing an empty table",
+        "not required" in _alternatives_section(unrequired, []).body
+        and "|" not in _alternatives_section(unrequired, []).body)
+    add("alternative explanations are a document section and a required one",
+        ("alternatives", "Alternative explanations") in DOCUMENT_SECTIONS
+        and any(kind == "alternatives" for kind, _title in REQUIRED_SECTIONS),
+        len(REQUIRED_SECTIONS))
+
+    # ---- 9. the guard and the generator agree --------------------------
+    add("a generated explanation may be quoted in the report",
+        all(quotable(item.statement)[0] for item in attacked.hypotheses),
+        [item.statement[:40] for item in attacked.hypotheses
+         if not quotable(item.statement)[0]])
+    hostile = generate_hypotheses(
+        ["the attacker who rewrote the file is the administrator"],
+        objective="attribute the rewrite of the file to a person", round_number=1)
+    add("a stated explanation that declares guilt is not reprinted",
+        hostile.hypotheses[0].statement == _UNQUOTABLE_STATEMENT,
+        hostile.hypotheses[0].statement[:60])
+    add("the refusal is recorded on the hypothesis rather than dropped",
+        hostile.hypotheses[0].checked_by.startswith("pre-check"), 
+        hostile.hypotheses[0].checked_by[:70])
+    add("every explanation in an unquotable mission still passes the report's guard",
+        all(quotable(item.statement)[0] for item in hostile.hypotheses))
+
+    # ---- 10. the real graph builds and weighs it ----------------------
+    hypothesis_flow = HierarchicalFlow(
+        context=forensic_context, subagents=flow_units_for(forensic_context, "forensic"),
+        runner=_CountingRunner(scope=forensic_context.scope_entries))
+    hypothesis_result = hypothesis_flow.run()
+    live = hypothesis_result.hypotheses
+    add("a real run carries a hypothesis set", live is not None and bool(live.hypotheses))
+    add("the plan recorded the set at round 0",
+        live is not None and live.generated_round == 0,
+        live.generated_round if live is not None else None)
+    add("the frame reached the run's record",
+        live is not None and live.frame is HypothesisFrame.ATTRIBUTION,
+        live.frame.value if live is not None else None)
+    add("the run's explanations were weighed against its evidence",
+        live is not None and any(item.status != "untested" for item in live.hypotheses),
+        [item.status for item in live.hypotheses] if live is not None else None)
+    add("the run carries the summary to its readers",
+        hypothesis_result.hypothesis_summary.get("hypotheses", 0) >= HYPOTHESIS_FLOOR,
+        hypothesis_result.hypothesis_summary)
+    report = hypothesis_result.synthesis.report if hypothesis_result.synthesis else None
+    add("the finished report carries the set", report is not None
+        and report.hypotheses_weighed is not None)
+    add("the finished report carries the comparison",
+        report is not None and bool(report.alternatives),
+        len(report.alternatives) if report is not None else None)
+    add("the report's clause passes on the real run",
+        report is not None and report.acceptance()["explains_alternatives"],
+        report.acceptance() if report is not None else None)
+    add("the report's comparison is derived from the set it carries",
+        report is not None and [row.statement for row in report.alternatives]
+        == [row.statement for row in hypothesis_alternatives(report.hypotheses_weighed)])
+    add("the executive summary says more than one explanation was live",
+        report is not None and "explanation" in report.section_of("executive-summary").body,
+        report.section_of("executive-summary").body[-160:] if report is not None else "")
+
+    return checks
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 44. Entry point
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -63377,7 +64811,7 @@ def run_synthesis_self_test() -> list[SynthesisCheck]:
 
     # -- 4. the document ------------------------------------------------------
     report = synthesise_report(cases["corroborated"], context=context)
-    add("the report has all ten sections",
+    add("the report has every required section",
         [section.kind for section in report.sections]
         == [kind for kind, _title in REQUIRED_SECTIONS],
         [section.kind for section in report.sections])
@@ -63954,7 +65388,9 @@ def _flow_result_from_payload(payload: Mapping[str, Any]) -> FlowResult:
         loops=(LoopLedger.model_validate(payload["loops"])
                if isinstance(payload.get("loops"), dict) else None),
         coverage=(CoverageLedger.model_validate(payload["coverage"])
-                  if isinstance(payload.get("coverage"), dict) else None))
+                  if isinstance(payload.get("coverage"), dict) else None),
+        hypotheses=(HypothesisSet.model_validate(payload["hypotheses"])
+                    if isinstance(payload.get("hypotheses"), dict) else None))
 
 
 def _written_like_model(payload: Any, model: type[BaseModel]) -> bool:

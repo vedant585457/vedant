@@ -14,7 +14,7 @@ python vedant_osint.py adapter --self-test    # structured model output contract
 python vedant_osint.py master --self-test     # Master Agent boundaries
 python vedant_osint.py subagents --self-test  # runtime Subagent specifications
 python vedant_osint.py workers --self-test    # runtime Worker specifications
-python vedant_osint.py flow --self-test       # LangGraph execution flow, coverage (132)
+python vedant_osint.py flow --self-test       # execution flow, coverage, hypotheses (203)
 python vedant_osint.py flow --mock             # the whole graph over mock adapters
 python vedant_osint.py sched --self-test      # bounded queues, deadlines, licences
 python vedant_osint.py resume --self-test     # checkpointing and resumable missions
@@ -31,7 +31,7 @@ python vedant_osint.py aggregate --self-test # reviewed work only, and never ear
 python vedant_osint.py review-master --self-test # five lenses, five ways to stop
 python vedant_osint.py loops --self-test      # repeated work, blocked lines, saturation
 python vedant_osint.py synthesis --self-test  # a report that cannot outrun its evidence
-python vedant_osint.py report --self-test     # formats, presentation, audit, dry run (287)
+python vedant_osint.py report --self-test     # formats, presentation, audit, dry run (292)
 python vedant_osint.py mission -t example.com -o "..." --phase settings
 ```
 
@@ -1027,7 +1027,7 @@ one `MissionDossier` assembled from the reviewed record, so a fact that is not i
 is not in the Markdown either — the JSON is the authority and the other two are renderings.
 
 ```
-python vedant_osint.py report --self-test                    # 287 checks: formats, presentation, audit, coverage, dry run/mock
+python vedant_osint.py report --self-test                    # 292 checks: formats, presentation, audit, coverage, hypotheses, dry run/mock
 python vedant_osint.py report --demo                         # one mission, three formats
 python vedant_osint.py flow --demo exposure --json > m.json
 python vedant_osint.py report --mission m.json --out-dir out/ # writes m.md and m.json
@@ -1217,7 +1217,7 @@ python vedant_osint.py flow --mock --out-dir out/ --allow-mock-output   # and wr
   the reason it stopped, the evidence it did collect — so the failure is visible rather than
   turning into an error message.
 
-`report --self-test` covers the acceptance clause in 66 checks of its own (287 in total):
+`report --self-test` covers the acceptance clause in 66 checks of its own (292 in total):
 the dry run plans and refuses to execute, the mock run exercises the hierarchy, the review
 loops, the retries and the reports, a scoped tool failure changes what the plan predicted,
 the labels survive into the Markdown, the JSON, the audit record and the presentation, and a
@@ -1280,12 +1280,77 @@ python vedant_osint.py report --mission mission.json  # the ## Coverage section 
   rather than as an empty table, and a mock run's empty matrix reports its orphaned units
   instead of pretending it covered them.
 
-`flow --self-test` covers the section in 55 checks (132 in total): the plan's matrix before
+`flow --self-test` covers the section in 55 checks: the plan's matrix before
 any evidence, a claim moving a question's status, an echoed question answering nothing, one
 claim counted for one row, a dropped question carried forward and failing the clause, the
 nomination rotating between equally open questions, the ledger reading back as itself, and
 the real graph producing round-0 and reviewed matrices whose decisions name the question each
 round serves.
+
+## Competing hypotheses
+
+An investigation that looks only for evidence *for* its first suspicion will find it. Four
+kinds of objective are especially exposed, because more than one explanation fits the same
+observations — **attribution** (who or what did this?), **timeline** (when, and in what
+order?), **identity** (is this the same subject?) and **intent** (was this deliberate?). For
+those, the alternatives are part of the mission rather than a caveat at the end of the report.
+
+```bash
+python vedant_osint.py flow --demo forensic        # the frame, the explanations, the comparison
+python vedant_osint.py flow --demo forensic --json > m.json   # the same set, as a record
+python vedant_osint.py report --mission m.json                # the ## Alternative explanations section
+python vedant_osint.py flow --dry-run -t example.com \
+    -o "attribute the /etc/hosts rewrite" --json    # the frame and tests a plan would carry
+```
+
+- **The frame is derived from the objective, by a classifier you can read.** `analysis_frame`
+  matches the objective's own words, with a forensic mission earning the attribution frame by
+  its mode. A mission in none of the four classes is *told* so, in the record and in the
+  document: applying this machinery to a mission that ranks advisories would generate
+  alternatives nobody can test, which is worse than none. The frame is recorded with the word
+  that decided it.
+- **The alternatives come from the mission's own questions.** Every explanation the mission
+  stated gets its negations — the benign reading (routine configuration, shared
+  infrastructure), the other-actor reading (a different party in the same window), and, for an
+  identity objective, the subject-mismatch reading. A mission that stated no question still gets
+  them from the objective itself, so a single-explanation plan is impossible by construction.
+  Each carries what it *predicts* and the test that would refute it; the set is capped at six,
+  because a reader handed a dozen alternatives weighs none of them.
+- **Each branch is told to hunt the other explanation's evidence.** A Worker working for
+  explanation *i* is assigned to look for what would disconfirm its paired alternative, and the
+  instruction is appended to the follow-up's objective (`Disconfirming test (hyp-3-...): ...`),
+  so the disconfirming half of the work is in the assignment, not in a plan document nobody
+  reads during the round.
+- **Only discriminating evidence moves a verdict.** A record that supports three explanations
+  equally says nothing about which is true. An explanation is *favoured* only on a margin of
+  support that is its own, *weakened* when another explanation has records this one does not,
+  *untested* when nothing bears on it — and *indistinguishable* when the same records are
+  argued both ways, which is what a confirmatory investigation honestly produces. Refutation is
+  not in the vocabulary: that would take a record that is false if the explanation holds, and
+  this build does not synthesise one.
+- **A plan that only confirms is penalised, not refused.** Refusing it would stop a mission in
+  its first round; so it is scored — a hypothesis with no test, or no prediction, or one
+  explanation where three are owed — and the score is a penalty the report prints, the clause
+  fails on, and the dry run predicts before anything runs.
+- **The report compares instead of resolving.** A required `## Alternative explanations` section
+  lists each viable alternative with its verdict, the evidence ids behind it, and the test that
+  would separate it from the leading explanation. When nothing separates them the section says
+  that in words: *the evidence cannot tell these apart, and here is what would.* That is the one
+  finding a confirmatory investigation can never produce, and it is the point of the section.
+- **The guard and the generator agree.** An explanation that would declare guilt or certain
+  identity (`the attacker who ...`) is not reprinted as a hypothesis: the generated set carries
+  a stated replacement and records the refusal, so the report's own guard never has to reject
+  the section's output — and the mission's question is not laundered into the document by
+  being called an alternative.
+
+`flow --self-test` covers the section in 71 checks: every frame from an objective, the
+alternatives and their predictions, the disconfirming pairing, discriminating evidence moving a
+verdict while shared evidence does not, the penalty for a plan that only confirms, the clause
+failing when a mission in an exposed frame publishes no comparison, an unquotable stated
+explanation, and the real graph carrying round-0 and weighed sets whose report compares the
+alternatives it could not separate. `report --self-test` adds the other end: the section is
+required, its table holds every compared alternative once, and the document's clause agrees with
+the report's.
 
 ## Status
 
@@ -1296,7 +1361,7 @@ round serves.
 | 3 | Orchestration — Master Agent (only fixed agent), runtime Subagent/Worker factories, LangGraph execution flow, bounded concurrency and budgets | 🟡 started (Master Agent, Subagent and Worker specifications, execution flow, admission control, Worker outcome contract, Subagent quality review, targeted Worker retasking, Subagent aggregation with bounded runtime Workers, Master review with bounded replanning, loop detection with strategy change, blocked lines and saturation stops, evidence-based Master synthesis with cited findings and calibrated confidence) |
 | 4 | Browser — browser-use / Playwright sessions and capture | 🟡 started (policy, scope, capture, guarded closure, agent mode) |
 | 5 | Collection — passive OSINT sources, artefact hashing | 🟡 started (source-aware web research; safe document/page extraction with injection defence; read-only artifact manifests, hashing and access ledger) |
-| 6 | Synthesis — cross-source correlation and reporting | 🟡 started (deterministic timelines, explained indicator correlation, content de-duplication, the evidence-based Master report with citations and calibrated confidence, Markdown/JSON/terminal output formats with a source register, execution summary and chain of custody, the Rich mission presentation with four derived outcomes) |
+| 6 | Synthesis — cross-source correlation and reporting | 🟡 started (deterministic timelines, explained indicator correlation, content de-duplication, the evidence-based Master report with citations and calibrated confidence, Markdown/JSON/terminal output formats with a source register, execution summary and chain of custody, the Rich mission presentation with four derived outcomes, the coverage matrix that ties every task to a mission question, competing-hypothesis analysis with a disconfirming-evidence plan and a comparison the report must publish) |
 | 7 | Operations — resume, budgets, audit trail, hardening | 🟡 started (checkpoints, resumable missions, capability router, budgets, reproducibility and audit metadata with a secret-refusing write, deterministic dry-run planning and a labelled mock mode) |
 
 ## Install

@@ -1,0 +1,1793 @@
+{
+  "schema_version": 1,
+  "mission_id": "flow-4da3c70d0ab3",
+  "objective": "determine from the supplied disk image which processes wrote to /etc/hosts on 2026-02-11",
+  "generated_at": "2026-11-12T09:51:28.666320Z",
+  "format_version": "argus-dossier/1",
+  "report": {
+    "mission_id": "flow-4da3c70d0ab3",
+    "objective": "determine from the supplied disk image which processes wrote to /etc/hosts on 2026-02-11",
+    "question": "a package upgrade rewrote /etc/hosts",
+    "generated_at": "2026-11-12T09:51:28.643812Z",
+    "sections": [
+      {
+        "kind": "executive-summary",
+        "title": "Executive summary",
+        "body": "7 reviewed finding(s) bear on: determine from the supplied disk image which processes wrote to /etc/hosts on 2026-02-11. None of them is corroborated by a second independent origin, so every finding below carries the band it earned. 2 explanation(s) remain open, 3 of them compared against the leading one, and 1 that the evidence cannot tell apart; this document does not claim that it has excluded the others. Confidence: low.",
+        "evidence_ids": [
+          "ev-63d3042b41b3",
+          "ev-593d6a753234",
+          "ev-537dc47ffae5",
+          "ev-3a566a69fc75",
+          "ev-6d0bd99f3fdd",
+          "ev-075704736cf6",
+          "ev-0aed38e90d09"
+        ],
+        "item_ids": []
+      },
+      {
+        "kind": "scope-and-methods",
+        "title": "Scope and methods",
+        "body": "Objective: determine from the supplied disk image which processes wrote to /etc/hosts on 2026-02-11\nThe question this mission set out to answer: a package upgrade rewrote /etc/hosts\nSources reviewed: filesystem-timeline (4 item(s)); process-attribution (3 item(s)); integrity (4 item(s))\nMethods: every Worker result was judged on seven quality dimensions (\u00a734) before it could be forwarded, retried attempts were re-tasked with a specific correction (\u00a735), each Subagent reconciled duplicates and preserved disagreements (\u00a736), the Master reviewed the report set with five lenses and a bounded loop (\u00a737, \u00a738), and this synthesis cites only evidence that survived all four.\nEvidence base: 7 reviewed item(s) from 7 independent origin(s).",
+        "evidence_ids": [
+          "ev-63d3042b41b3",
+          "ev-593d6a753234",
+          "ev-537dc47ffae5",
+          "ev-3a566a69fc75",
+          "ev-6d0bd99f3fdd",
+          "ev-075704736cf6",
+          "ev-0aed38e90d09"
+        ],
+        "item_ids": []
+      },
+      {
+        "kind": "key-findings",
+        "title": "Key findings",
+        "body": "Each finding below is a reviewed evidence item, restated without embellishment. Confidence is derived from the number of independent origins behind it and capped by its epistemic kind.",
+        "evidence_ids": [
+          "ev-63d3042b41b3",
+          "ev-593d6a753234",
+          "ev-537dc47ffae5",
+          "ev-3a566a69fc75",
+          "ev-6d0bd99f3fdd",
+          "ev-075704736cf6",
+          "ev-0aed38e90d09"
+        ],
+        "item_ids": [
+          "kf-fc64013552",
+          "kf-daaa07c90b",
+          "kf-b2aa9cb5a2",
+          "kf-5009ddfb5f",
+          "kf-0ee603e83e",
+          "kf-bc475a4f85",
+          "kf-bf1f37d85c"
+        ]
+      },
+      {
+        "kind": "indicators",
+        "title": "Corroborated indicators",
+        "body": "No claim was corroborated by a second independent origin, so the mission reports none. Every finding above is single-source and says so.",
+        "evidence_ids": [],
+        "item_ids": []
+      },
+      {
+        "kind": "hypotheses",
+        "title": "Competing hypotheses",
+        "body": "2 explanation(s) were tested; 2 remain possible. A hypothesis the mission could not test is listed as untested rather than omitted.",
+        "evidence_ids": [
+          "ev-593d6a753234",
+          "ev-537dc47ffae5"
+        ],
+        "item_ids": [
+          "a package upgrade rewrote /etc/hosts",
+          "an interactive edit rewrote /etc/hosts"
+        ]
+      },
+      {
+        "kind": "contradictions",
+        "title": "Contradictions",
+        "body": "No two reviewed items make the same claim with opposite polarity, so the mission records no contradiction. Silence here is a finding: nothing the mission collected conflicts with anything else it collected.",
+        "evidence_ids": [],
+        "item_ids": []
+      },
+      {
+        "kind": "confidence",
+        "title": "Confidence levels",
+        "body": "Mission confidence: low.\nBasis: the weakest of 7 finding(s) sets the level: single-source (1 origin(s)), because the answer cannot be stronger than the claim it depends on\nBands: single-source 7, corroborated 0, well-corroborated 0\nBand rules: one independent origin is single-source; two are corroborated; three or more are well-corroborated. An allegation is capped at corroborated \u2014 a third party repeating a claim does not establish it \u2014 and an inference is capped at corroborated, because reasoning over good evidence is still reasoning.",
+        "evidence_ids": [
+          "ev-63d3042b41b3",
+          "ev-593d6a753234",
+          "ev-537dc47ffae5",
+          "ev-3a566a69fc75",
+          "ev-6d0bd99f3fdd",
+          "ev-075704736cf6",
+          "ev-0aed38e90d09"
+        ],
+        "item_ids": []
+      },
+      {
+        "kind": "gaps",
+        "title": "Evidence gaps",
+        "body": "The mission closed every gap it opened. That is a claim about the questions it asked, not about the target: questions it did not think to ask are not in this list.",
+        "evidence_ids": [],
+        "item_ids": []
+      },
+      {
+        "kind": "limitations",
+        "title": "Limitations",
+        "body": "\u2014 the deterministic runner does not contact the target",
+        "evidence_ids": [],
+        "item_ids": []
+      },
+      {
+        "kind": "next-steps",
+        "title": "Recommended next steps",
+        "body": "1 step(s), each naming what it settles and why it is lawful. None requires touching a system or contacting a person.",
+        "evidence_ids": [],
+        "item_ids": [
+          "gap-1"
+        ]
+      },
+      {
+        "kind": "coverage",
+        "title": "Coverage",
+        "body": "The mission asked 2 question(s). This table is the Master's coverage after round 2, recomputed from the reports it had received:\n\n| # | question | status | served by | evidence | confidence |\n|---|----------|--------|-----------|----------|------------|\n| 1 | a package upgrade rewrote /etc/hosts | contradicted | filesystem-timeline, process-attribution, integrity | 3 | low |\n| 2 | an interactive edit rewrote /etc/hosts | contradicted | filesystem-timeline, process-attribution, integrity | 3 | low |\n\n**Still open, and why:**\n- Q1 (contradicted): a report disputes this question: addresse etchost result rewrote\n- Q2 (contradicted): a report disputes this question: addresse etchost result rewrote\n\n5 claim(s) in the evidence table answer no named question; they support the objective rather than a question, and are listed here rather than folded into one.\n\n**Coverage clause:** every task serves a question **yes** \u00b7 nothing dropped **yes** \u00b7 open questions explained **yes**",
+        "evidence_ids": [
+          "ev-537dc47ffae5",
+          "ev-593d6a753234"
+        ],
+        "item_ids": []
+      },
+      {
+        "kind": "alternatives",
+        "title": "Alternative explanations",
+        "body": "The objective is an attribution question, so the mission carried 6 explanation(s) and looked for evidence against them, not only for them.\n\n**Leading explanation** (not favoured by the evidence): the explanation that a package upgrade rewrote /etc/hosts\n\nNo explanation is favoured by the evidence the mission collected: the alternatives below are the explanations it could not separate, and each says what would separate it.\n\n| alternative | verdict | evidence | why |\n|---|---|---|---|\n| the same records are equally consistent with routine configuration, shared infrastructure or ordinary administrative work that nobody recorded | untested | 0 | untested: no reviewed statement bears on it yet; neither it nor hyp-1-h-eb291e is favoured: the mission's evidence does not separate the two |\n| a different party acted in the same window and produced the same observations \u2014 a third-party provider, a scheduled job, or another operator | untested | 0 | untested: no reviewed statement bears on it yet; neither it nor hyp-1-h-eb291e is favoured: the mission's evidence does not separate the two |\n| the explanation that an interactive edit rewrote /etc/hosts | indistinguishable | 2 | indistinguishable: the record disagrees with it, and the same records support it: the mission cannot tell the two apart; neither it nor hyp-1-h-eb291e is favoured: the mission's evidence does not sep\u2026 |\n\n**What would distinguish each alternative from the leading one:**\n- find one dated record of authorised change or routine operation covering the same window, and this explanation stops needing an adversary\n- find one record of independent activity in the same window from a subject outside the mission's scope, and this explanation must be weighed against the leading one\n- collect one first-party record that states this explanation outright and one that would be false if it holds: an interactive edit rewrote /etc/hosts\n\n**The evidence does not distinguish:** the explanation that an interactive edit rewrote /etc/hosts. This is a result, not a gap: the mission collected the records both explanations sit under, and none of them separates the two.\n\n**Alternative-explanations clause:** alternatives compared **yes** \u00b7 each carries a discriminator **yes** \u00b7 plan seeks disconfirmation **yes**",
+        "evidence_ids": [
+          "ev-593d6a753234",
+          "ev-537dc47ffae5"
+        ],
+        "item_ids": []
+      }
+    ],
+    "findings": [
+      {
+        "id": "kf-fc64013552",
+        "statement": "timeline-builder: timeline exported and hashed",
+        "evidence_ids": [
+          "ev-63d3042b41b3"
+        ],
+        "kind": "observation",
+        "band": "single-source",
+        "confidence": "low",
+        "confidence_basis": "1 independent origin(s) state this claim; band single-source",
+        "origins": 1,
+        "falsifier": "a first-party record contradicting it, or a second independent origin failing to reproduce it",
+        "subject": ""
+      },
+      {
+        "id": "kf-daaa07c90b",
+        "statement": "gap-gap-3191f2: the result addresses: a package upgrade rewrote /etc/hosts",
+        "evidence_ids": [
+          "ev-593d6a753234"
+        ],
+        "kind": "observation",
+        "band": "single-source",
+        "confidence": "low",
+        "confidence_basis": "1 independent origin(s) state this claim; band single-source",
+        "origins": 1,
+        "falsifier": "a first-party record contradicting it, or a second independent origin failing to reproduce it",
+        "subject": ""
+      },
+      {
+        "id": "kf-b2aa9cb5a2",
+        "statement": "gap-gap-c6138f: the result addresses: an interactive edit rewrote /etc/hosts",
+        "evidence_ids": [
+          "ev-537dc47ffae5"
+        ],
+        "kind": "observation",
+        "band": "single-source",
+        "confidence": "low",
+        "confidence_basis": "1 independent origin(s) state this claim; band single-source",
+        "origins": 1,
+        "falsifier": "a first-party record contradicting it, or a second independent origin failing to reproduce it",
+        "subject": ""
+      },
+      {
+        "id": "kf-5009ddfb5f",
+        "statement": "follow-up-flw-ed7c9f: at least one reviewed observation addresses: the image integrity is proven",
+        "evidence_ids": [
+          "ev-3a566a69fc75"
+        ],
+        "kind": "observation",
+        "band": "single-source",
+        "confidence": "low",
+        "confidence_basis": "1 independent origin(s) state this claim; band single-source",
+        "origins": 1,
+        "falsifier": "a first-party record contradicting it, or a second independent origin failing to reproduce it",
+        "subject": ""
+      },
+      {
+        "id": "kf-0ee603e83e",
+        "statement": "log-correlator: each candidate process is listed with the record placing it in the write window, or stated as absent",
+        "evidence_ids": [
+          "ev-6d0bd99f3fdd"
+        ],
+        "kind": "observation",
+        "band": "single-source",
+        "confidence": "low",
+        "confidence_basis": "1 independent origin(s) state this claim; band single-source",
+        "origins": 1,
+        "falsifier": "a first-party record contradicting it, or a second independent origin failing to reproduce it",
+        "subject": ""
+      },
+      {
+        "id": "kf-bc475a4f85",
+        "statement": "hasher: hash manifest written",
+        "evidence_ids": [
+          "ev-075704736cf6"
+        ],
+        "kind": "observation",
+        "band": "single-source",
+        "confidence": "low",
+        "confidence_basis": "1 independent origin(s) state this claim; band single-source",
+        "origins": 1,
+        "falsifier": "a first-party record contradicting it, or a second independent origin failing to reproduce it",
+        "subject": ""
+      },
+      {
+        "id": "kf-bf1f37d85c",
+        "statement": "custody-recorder: custody log written for every artefact",
+        "evidence_ids": [
+          "ev-0aed38e90d09"
+        ],
+        "kind": "observation",
+        "band": "single-source",
+        "confidence": "low",
+        "confidence_basis": "1 independent origin(s) state this claim; band single-source",
+        "origins": 1,
+        "falsifier": "a first-party record contradicting it, or a second independent origin failing to reproduce it",
+        "subject": ""
+      }
+    ],
+    "indicators": [],
+    "hypotheses": [
+      {
+        "statement": "a package upgrade rewrote /etc/hosts",
+        "status": "supported",
+        "evidence_ids": [
+          "ev-593d6a753234",
+          "ev-537dc47ffae5",
+          "ev-593d6a753234",
+          "ev-537dc47ffae5"
+        ],
+        "competes_with": "the benign explanation: the same observations are consistent with configuration drift or a shared provider, and no evidence here excludes it",
+        "test": "a first-party record that directly addresses question 1, dated and independently reproducible: a package upgrade rewrote /etc/hosts"
+      },
+      {
+        "statement": "an interactive edit rewrote /etc/hosts",
+        "status": "supported",
+        "evidence_ids": [
+          "ev-593d6a753234",
+          "ev-537dc47ffae5",
+          "ev-593d6a753234",
+          "ev-537dc47ffae5"
+        ],
+        "competes_with": "the benign explanation: the same observations are consistent with configuration drift or a shared provider, and no evidence here excludes it",
+        "test": "a first-party record that directly addresses question 2, dated and independently reproducible: an interactive edit rewrote /etc/hosts"
+      }
+    ],
+    "conflicts": [],
+    "gaps": [],
+    "limitations": [
+      "the deterministic runner does not contact the target"
+    ],
+    "next_steps": [
+      {
+        "action": "re-run the same passive checks after the target publishes its next advisory, so a change in the record is distinguishable from a change in the collection",
+        "addresses": "gap-1",
+        "basis": "the same scope and method the mission already used (artifact:disk-01.img)",
+        "within_scope": true,
+        "authorised": true,
+        "passive": true,
+        "value": "low"
+      }
+    ],
+    "confidence": "low",
+    "confidence_basis": "the weakest of 7 finding(s) sets the level: single-source (1 origin(s)), because the answer cannot be stronger than the claim it depends on",
+    "uncertainty_statement": "This report states only what reviewed evidence supports: every key finding cites the evidence ids behind it, confidence is derived from independent origins and capped by epistemic kind, contradictions are preserved rather than settled, and no attribution of conduct or identity is made. Nothing outside the gaps and limitations sections should be read as established.",
+    "cited_ids": [
+      "ev-075704736cf6",
+      "ev-0aed38e90d09",
+      "ev-3a566a69fc75",
+      "ev-537dc47ffae5",
+      "ev-593d6a753234",
+      "ev-63d3042b41b3",
+      "ev-6d0bd99f3fdd"
+    ],
+    "origins": [
+      "custody-recorder \u2014 integrity",
+      "follow-up-flw-ed7c9f \u2014 filesystem-timeline",
+      "gap-gap-3191f2 \u2014 filesystem-timeline",
+      "gap-gap-c6138f \u2014 filesystem-timeline",
+      "hasher \u2014 integrity",
+      "log-correlator \u2014 process-attribution",
+      "timeline-builder \u2014 filesystem-timeline"
+    ],
+    "aggregate_basis": {
+      "stage": "master-synthesize",
+      "expected": [
+        "sa-d5d2ce6948d6",
+        "sa-4086c156a6ac",
+        "sa-e78a4faf4252"
+      ],
+      "received": [
+        "sa-d5d2ce6948d6",
+        "sa-4086c156a6ac",
+        "sa-e78a4faf4252"
+      ],
+      "missing": []
+    },
+    "withheld": [
+      "no report from: the image integrity is proven"
+    ],
+    "coverage": {
+      "format_version": "argus-coverage/1",
+      "mission_id": "cov-4da3c70d0ab3",
+      "objective": "determine from the supplied disk image which processes wrote to /etc/hosts on 2026-02-11",
+      "round": 2,
+      "seen_at": "review",
+      "rows": [
+        {
+          "id": "cq-1-q-317bb5",
+          "index": 1,
+          "question": "a package upgrade rewrote /etc/hosts",
+          "status": "contradicted",
+          "subagent_ids": [
+            "sa-d5d2ce6948d6",
+            "sa-4086c156a6ac",
+            "sa-e78a4faf4252"
+          ],
+          "subagent_roles": [
+            "filesystem-timeline",
+            "process-attribution",
+            "integrity"
+          ],
+          "required": [
+            "timeline exported and hashed",
+            "at least one reviewed observation addresses: the image integrity is proven",
+            "each candidate process is listed with the record placing it in the write window, or stated as absent",
+            "hash manifest written"
+          ],
+          "criteria": [],
+          "evidence_ids": [
+            "ev-537dc47ffae5",
+            "ev-537dc47ffae5",
+            "ev-537dc47ffae5"
+          ],
+          "statements": [
+            "gap-gap-c6138f: the result addresses: an interactive edit rewrote /etc/hosts",
+            "gap-gap-c6138f: the result addresses: an interactive edit rewrote /etc/hosts",
+            "gap-gap-c6138f: the result addresses: an interactive edit rewrote /etc/hosts"
+          ],
+          "confidence": "low",
+          "checked_by": "a report disputes this question: addresse etchost result rewrote",
+          "gaps": [],
+          "last_round": 2,
+          "answered_round": 1,
+          "contradicted_by": "addresse etchost result rewrote"
+        },
+        {
+          "id": "cq-2-q-76b0dd",
+          "index": 2,
+          "question": "an interactive edit rewrote /etc/hosts",
+          "status": "contradicted",
+          "subagent_ids": [
+            "sa-d5d2ce6948d6",
+            "sa-4086c156a6ac",
+            "sa-e78a4faf4252"
+          ],
+          "subagent_roles": [
+            "filesystem-timeline",
+            "process-attribution",
+            "integrity"
+          ],
+          "required": [
+            "timeline exported and hashed",
+            "at least one reviewed observation addresses: the image integrity is proven",
+            "each candidate process is listed with the record placing it in the write window, or stated as absent",
+            "hash manifest written"
+          ],
+          "criteria": [],
+          "evidence_ids": [
+            "ev-593d6a753234",
+            "ev-593d6a753234",
+            "ev-593d6a753234"
+          ],
+          "statements": [
+            "gap-gap-3191f2: the result addresses: a package upgrade rewrote /etc/hosts",
+            "gap-gap-3191f2: the result addresses: a package upgrade rewrote /etc/hosts",
+            "gap-gap-3191f2: the result addresses: a package upgrade rewrote /etc/hosts"
+          ],
+          "confidence": "low",
+          "checked_by": "a report disputes this question: addresse etchost result rewrote",
+          "gaps": [],
+          "last_round": 2,
+          "answered_round": 1,
+          "contradicted_by": "addresse etchost result rewrote"
+        }
+      ],
+      "orphans": [],
+      "unattributed": [
+        "ev-63d3042b41b3",
+        "ev-3a566a69fc75",
+        "ev-6d0bd99f3fdd",
+        "ev-075704736cf6",
+        "ev-0aed38e90d09"
+      ],
+      "unassigned": [],
+      "dropped": [],
+      "next_question": "cq-2-q-76b0dd",
+      "next_reason": "a report disputes the answer to Q2, so the report cannot state it until the dispute is settled"
+    },
+    "hypotheses_weighed": {
+      "format_version": "argus-hypotheses/1",
+      "objective": "determine from the supplied disk image which processes wrote to /etc/hosts on 2026-02-11",
+      "frame": "attribution",
+      "frame_basis": "the objective's own words put it in the attribution class",
+      "hypotheses": [
+        {
+          "id": "hyp-1-h-eb291e",
+          "statement": "the explanation that a package upgrade rewrote /etc/hosts",
+          "predicts": "the evidence that would confirm it exists and is dated inside the mission's window, and no reviewed record states the opposite",
+          "competes_with": "hyp-2-h-2fc23d",
+          "generated_from": "question-1",
+          "test": "collect one first-party record that states this explanation outright and one that would be false if it holds: a package upgrade rewrote /etc/hosts",
+          "disconfirming": [
+            "ev-593d6a753234",
+            "ev-537dc47ffae5"
+          ],
+          "supporting": [
+            "ev-593d6a753234",
+            "ev-537dc47ffae5"
+          ],
+          "status": "indistinguishable",
+          "checked_by": "the record disagrees with it, and the same records support it: the mission cannot tell the two apart"
+        },
+        {
+          "id": "hyp-2-h-2fc23d",
+          "statement": "the same records are equally consistent with routine configuration, shared infrastructure or ordinary administrative work that nobody recorded",
+          "predicts": "routine operation normally leaves a dated record of authorised change; one such record in the same window would settle this without an adversary",
+          "competes_with": "hyp-3-h-7977e4",
+          "generated_from": "question-1",
+          "test": "find one dated record of authorised change or routine operation covering the same window, and this explanation stops needing an adversary",
+          "disconfirming": [],
+          "supporting": [],
+          "status": "untested",
+          "checked_by": "no reviewed statement bears on it yet"
+        },
+        {
+          "id": "hyp-3-h-7977e4",
+          "statement": "a different party acted in the same window and produced the same observations \u2014 a third-party provider, a scheduled job, or another operator",
+          "predicts": "independent activity from a subject outside the mission's scope would share the window and leave a differently-signed trace",
+          "competes_with": "hyp-4-h-9e4990",
+          "generated_from": "question-1",
+          "test": "find one record of independent activity in the same window from a subject outside the mission's scope, and this explanation must be weighed against the leading one",
+          "disconfirming": [],
+          "supporting": [],
+          "status": "untested",
+          "checked_by": "no reviewed statement bears on it yet"
+        },
+        {
+          "id": "hyp-4-h-9e4990",
+          "statement": "the explanation that an interactive edit rewrote /etc/hosts",
+          "predicts": "the evidence that would confirm it exists and is dated inside the mission's window, and no reviewed record states the opposite",
+          "competes_with": "hyp-5-h-2fc23d",
+          "generated_from": "question-2",
+          "test": "collect one first-party record that states this explanation outright and one that would be false if it holds: an interactive edit rewrote /etc/hosts",
+          "disconfirming": [
+            "ev-593d6a753234",
+            "ev-537dc47ffae5"
+          ],
+          "supporting": [
+            "ev-593d6a753234",
+            "ev-537dc47ffae5"
+          ],
+          "status": "indistinguishable",
+          "checked_by": "the record disagrees with it, and the same records support it: the mission cannot tell the two apart"
+        },
+        {
+          "id": "hyp-5-h-2fc23d",
+          "statement": "the same records are equally consistent with routine configuration, shared infrastructure or ordinary administrative work that nobody recorded",
+          "predicts": "routine operation normally leaves a dated record of authorised change; one such record in the same window would settle this without an adversary",
+          "competes_with": "hyp-6-h-7977e4",
+          "generated_from": "question-2",
+          "test": "find one dated record of authorised change or routine operation covering the same window, and this explanation stops needing an adversary",
+          "disconfirming": [],
+          "supporting": [],
+          "status": "untested",
+          "checked_by": "no reviewed statement bears on it yet"
+        },
+        {
+          "id": "hyp-6-h-7977e4",
+          "statement": "a different party acted in the same window and produced the same observations \u2014 a third-party provider, a scheduled job, or another operator",
+          "predicts": "independent activity from a subject outside the mission's scope would share the window and leave a differently-signed trace",
+          "competes_with": "hyp-1-h-eb291e",
+          "generated_from": "question-2",
+          "test": "find one record of independent activity in the same window from a subject outside the mission's scope, and this explanation must be weighed against the leading one",
+          "disconfirming": [],
+          "supporting": [],
+          "status": "untested",
+          "checked_by": "no reviewed statement bears on it yet"
+        }
+      ],
+      "generated_round": 0
+    },
+    "alternatives": [
+      {
+        "statement": "the same records are equally consistent with routine configuration, shared infrastructure or ordinary administrative work that nobody recorded",
+        "status": "untested",
+        "evidence_ids": [],
+        "basis": "untested: no reviewed statement bears on it yet; neither it nor hyp-1-h-eb291e is favoured: the mission's evidence does not separate the two",
+        "discriminator": "find one dated record of authorised change or routine operation covering the same window, and this explanation stops needing an adversary"
+      },
+      {
+        "statement": "a different party acted in the same window and produced the same observations \u2014 a third-party provider, a scheduled job, or another operator",
+        "status": "untested",
+        "evidence_ids": [],
+        "basis": "untested: no reviewed statement bears on it yet; neither it nor hyp-1-h-eb291e is favoured: the mission's evidence does not separate the two",
+        "discriminator": "find one record of independent activity in the same window from a subject outside the mission's scope, and this explanation must be weighed against the leading one"
+      },
+      {
+        "statement": "the explanation that an interactive edit rewrote /etc/hosts",
+        "status": "indistinguishable",
+        "evidence_ids": [
+          "ev-593d6a753234",
+          "ev-537dc47ffae5"
+        ],
+        "basis": "indistinguishable: the record disagrees with it, and the same records support it: the mission cannot tell the two apart; neither it nor hyp-1-h-eb291e is favoured: the mission's evidence does not separate the two",
+        "discriminator": "collect one first-party record that states this explanation outright and one that would be false if it holds: an interactive edit rewrote /etc/hosts"
+      }
+    ]
+  },
+  "execution": {
+    "mission_id": "flow-4da3c70d0ab3",
+    "objective": "determine from the supplied disk image which processes wrote to /etc/hosts on 2026-02-11",
+    "mode": "forensic",
+    "scope": [
+      "artifact:disk-01.img"
+    ],
+    "subagents": 3,
+    "workers": 11,
+    "attempts": 11,
+    "retries": 0,
+    "evidence": 11,
+    "findings": 7,
+    "tasks": [
+      {
+        "id": "sa-d5d2ce6948d6",
+        "kind": "subagent",
+        "role": "filesystem-timeline",
+        "objective": "build a filesystem timeline for /etc/hosts from the supplied disk image",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 4,
+        "seconds": 0.06,
+        "origin": "planned",
+        "note": "ready"
+      },
+      {
+        "id": "wrk-1c07b0fb8d33",
+        "kind": "worker",
+        "role": "timeline-builder",
+        "objective": "export the filesystem timeline entries for /etc/hosts",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 1,
+        "seconds": 0.051,
+        "origin": "planned",
+        "note": ""
+      },
+      {
+        "id": "wrk-5858dc9ac0db",
+        "kind": "worker",
+        "role": "filesystem-timeline gap closure",
+        "objective": "",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 1,
+        "seconds": 0.054,
+        "origin": "runtime",
+        "note": ""
+      },
+      {
+        "id": "wrk-bb85d666fcc9",
+        "kind": "worker",
+        "role": "filesystem-timeline gap closure",
+        "objective": "",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 1,
+        "seconds": 0.051,
+        "origin": "runtime",
+        "note": ""
+      },
+      {
+        "id": "wrk-4d732ce2f31d",
+        "kind": "worker",
+        "role": "follow-up-flw-ed7c9f",
+        "objective": "close the reviewed gap for filesystem-timeline: coverage on nobody covers: the image integrity is proven",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 1,
+        "seconds": 0.051,
+        "origin": "follow-up",
+        "note": ""
+      },
+      {
+        "id": "sa-4086c156a6ac",
+        "kind": "subagent",
+        "role": "process-attribution",
+        "objective": "identify which process wrote /etc/hosts, using logs and the timeline window",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 3,
+        "seconds": 0.174,
+        "origin": "planned",
+        "note": "ready"
+      },
+      {
+        "id": "wrk-431fc1477437",
+        "kind": "worker",
+        "role": "log-correlator",
+        "objective": "correlate process records with the write window",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 1,
+        "seconds": 0.05,
+        "origin": "planned",
+        "note": ""
+      },
+      {
+        "id": "wrk-b6e8a4138214",
+        "kind": "worker",
+        "role": "process-attribution gap closure",
+        "objective": "",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 1,
+        "seconds": 0.05,
+        "origin": "runtime",
+        "note": ""
+      },
+      {
+        "id": "wrk-497329fad247",
+        "kind": "worker",
+        "role": "process-attribution gap closure",
+        "objective": "",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 1,
+        "seconds": 0.05,
+        "origin": "runtime",
+        "note": ""
+      },
+      {
+        "id": "sa-e78a4faf4252",
+        "kind": "subagent",
+        "role": "integrity",
+        "objective": "hash the image and the extracted artefacts so findings are reproducible",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 4,
+        "seconds": 0.185,
+        "origin": "planned",
+        "note": "ready"
+      },
+      {
+        "id": "wrk-e9172d9b03fe",
+        "kind": "worker",
+        "role": "hasher",
+        "objective": "hash the image and every extracted artefact",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 1,
+        "seconds": 0.052,
+        "origin": "planned",
+        "note": ""
+      },
+      {
+        "id": "wrk-747fa27d8781",
+        "kind": "worker",
+        "role": "custody-recorder",
+        "objective": "record who handled each artefact and when",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 1,
+        "seconds": 0.052,
+        "origin": "planned",
+        "note": ""
+      },
+      {
+        "id": "wrk-9fbce6f2d677",
+        "kind": "worker",
+        "role": "integrity gap closure",
+        "objective": "",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 1,
+        "seconds": 0.05,
+        "origin": "runtime",
+        "note": ""
+      },
+      {
+        "id": "wrk-23f0456d4738",
+        "kind": "worker",
+        "role": "integrity gap closure",
+        "objective": "",
+        "status": "succeeded",
+        "gate": "none",
+        "attempts": 1,
+        "evidence": 1,
+        "seconds": 0.05,
+        "origin": "runtime",
+        "note": ""
+      }
+    ],
+    "errors": [],
+    "retries_history": [],
+    "follow_ups": [
+      "existing: coverage \u2192 sa-d5d2ce6948d6"
+    ],
+    "adopted": [],
+    "withheld": [],
+    "time": {
+      "total_seconds": 0.48,
+      "critical_path_seconds": 0.477,
+      "ledger_origin_seconds": 0.486,
+      "per_unit_seconds": {
+        "wrk-1c07b0fb8d33": 0.051,
+        "wrk-23f0456d4738": 0.05,
+        "wrk-431fc1477437": 0.05,
+        "wrk-497329fad247": 0.05,
+        "wrk-4d732ce2f31d": 0.051,
+        "wrk-5858dc9ac0db": 0.054,
+        "wrk-747fa27d8781": 0.052,
+        "wrk-9fbce6f2d677": 0.05,
+        "wrk-b6e8a4138214": 0.05,
+        "wrk-bb85d666fcc9": 0.051,
+        "wrk-e9172d9b03fe": 0.052
+      },
+      "stages": [
+        [
+          "planning",
+          0.006
+        ],
+        [
+          "subagent planning",
+          0.002
+        ],
+        [
+          "worker execution",
+          0.053
+        ],
+        [
+          "worker review",
+          0.004
+        ],
+        [
+          "reconciliation",
+          0.317
+        ],
+        [
+          "master review",
+          0.007
+        ],
+        [
+          "follow-up planning",
+          0.088
+        ],
+        [
+          "synthesis",
+          0.0
+        ]
+      ],
+      "events": 82,
+      "workers": 5,
+      "attempts": 11,
+      "max_concurrency": 3,
+      "parallelism_note": "stage windows are differences between the first appearance of each stage in the ledger, not instrumented unit durations, so overlapping stages share their window rather than summing to the total. The ledger's zero is when the flow was built, 0.486s before its first event; the run's own clock starts when it is invoked, which is why the two totals differ."
+    },
+    "stopping": {
+      "stopped": false,
+      "condition": "saturation",
+      "reason": "no further round is allowed: round 2 planned the same work as round 1 over 3 target(s) that round had already addressed (saturation); the replanning budget of 1 round(s) is spent",
+      "kind": "saturation",
+      "reviews": 2,
+      "rounds": 1,
+      "bounds": [
+        "refused: round 2 planned the same work as round 1 over 3 target(s) that round had already addressed (saturation)",
+        "refused: the replanning budget of 1 round(s) is spent"
+      ],
+      "blocked_lines": [],
+      "foregone": [
+        "round 2 planned the same work as round 1 over 3 target(s) that round had already addressed (saturation)",
+        "the replanning budget of 1 round(s) is spent"
+      ],
+      "statement": "the mission finished: no further round is allowed: round 2 planned the same work as round 1 over 3 target(s) that round had already addressed (saturation); the replanning budget of 1 round(s) is spent. The bound that ended it is on the record, so a reader can tell a finished mission from a stopped one."
+    }
+  },
+  "sources": [
+    {
+      "id": "src-7d369937d90b",
+      "kind": "local-artifact",
+      "locator": "artifact:disk-01.img",
+      "title": "timeline-builder \u2014 filesystem-timeline",
+      "publisher": "",
+      "retrieved_at": "2026-11-12T09:51:28.231000Z",
+      "method": "local-read",
+      "http_status": null,
+      "digest": "",
+      "digest_complete": false,
+      "items": 7,
+      "evidence_ids": [
+        "ev-63d3042b41b3",
+        "ev-593d6a753234",
+        "ev-537dc47ffae5",
+        "ev-3a566a69fc75",
+        "ev-6d0bd99f3fdd",
+        "ev-075704736cf6",
+        "ev-0aed38e90d09"
+      ]
+    }
+  ],
+  "evidence": [
+    {
+      "id": "ev-075704736cf6",
+      "kind": "observation",
+      "statement": "hasher: hash manifest written",
+      "confidence": "low",
+      "sources": [
+        "artifact:disk-01.img"
+      ],
+      "supports": [],
+      "contradicts": [],
+      "collected_by": "wrk-e9172d9b03fe",
+      "task_id": "",
+      "observed_at": "2026-11-12T09:51:28.237571Z",
+      "digest": "",
+      "custody_id": "",
+      "cited_by": [
+        "kf-bc475a4f85"
+      ],
+      "corrected": false
+    },
+    {
+      "id": "ev-0aed38e90d09",
+      "kind": "observation",
+      "statement": "custody-recorder: custody log written for every artefact",
+      "confidence": "low",
+      "sources": [
+        "artifact:disk-01.img"
+      ],
+      "supports": [],
+      "contradicts": [],
+      "collected_by": "wrk-747fa27d8781",
+      "task_id": "",
+      "observed_at": "2026-11-12T09:51:28.239133Z",
+      "digest": "",
+      "custody_id": "",
+      "cited_by": [
+        "kf-bf1f37d85c"
+      ],
+      "corrected": false
+    },
+    {
+      "id": "ev-3a566a69fc75",
+      "kind": "observation",
+      "statement": "follow-up-flw-ed7c9f: at least one reviewed observation addresses: the image integrity is proven",
+      "confidence": "low",
+      "sources": [
+        "artifact:disk-01.img"
+      ],
+      "supports": [],
+      "contradicts": [],
+      "collected_by": "wrk-4d732ce2f31d",
+      "task_id": "",
+      "observed_at": "2026-11-12T09:51:28.615245Z",
+      "digest": "",
+      "custody_id": "",
+      "cited_by": [
+        "kf-5009ddfb5f"
+      ],
+      "corrected": false
+    },
+    {
+      "id": "ev-537dc47ffae5",
+      "kind": "observation",
+      "statement": "gap-gap-c6138f: the result addresses: an interactive edit rewrote /etc/hosts",
+      "confidence": "low",
+      "sources": [
+        "artifact:disk-01.img"
+      ],
+      "supports": [],
+      "contradicts": [],
+      "collected_by": "wrk-bb85d666fcc9",
+      "task_id": "",
+      "observed_at": "2026-11-12T09:51:28.368140Z",
+      "digest": "",
+      "custody_id": "",
+      "cited_by": [
+        "kf-b2aa9cb5a2"
+      ],
+      "corrected": false
+    },
+    {
+      "id": "ev-537dc47ffae5",
+      "kind": "observation",
+      "statement": "gap-gap-c6138f: the result addresses: an interactive edit rewrote /etc/hosts",
+      "confidence": "low",
+      "sources": [
+        "artifact:disk-01.img"
+      ],
+      "supports": [],
+      "contradicts": [],
+      "collected_by": "wrk-497329fad247",
+      "task_id": "",
+      "observed_at": "2026-11-12T09:51:28.546742Z",
+      "digest": "",
+      "custody_id": "",
+      "cited_by": [
+        "kf-b2aa9cb5a2"
+      ],
+      "corrected": false
+    },
+    {
+      "id": "ev-537dc47ffae5",
+      "kind": "observation",
+      "statement": "gap-gap-c6138f: the result addresses: an interactive edit rewrote /etc/hosts",
+      "confidence": "low",
+      "sources": [
+        "artifact:disk-01.img"
+      ],
+      "supports": [],
+      "contradicts": [],
+      "collected_by": "wrk-23f0456d4738",
+      "task_id": "",
+      "observed_at": "2026-11-12T09:51:28.361597Z",
+      "digest": "",
+      "custody_id": "",
+      "cited_by": [
+        "kf-b2aa9cb5a2"
+      ],
+      "corrected": false
+    },
+    {
+      "id": "ev-593d6a753234",
+      "kind": "observation",
+      "statement": "gap-gap-3191f2: the result addresses: a package upgrade rewrote /etc/hosts",
+      "confidence": "low",
+      "sources": [
+        "artifact:disk-01.img"
+      ],
+      "supports": [],
+      "contradicts": [],
+      "collected_by": "wrk-5858dc9ac0db",
+      "task_id": "",
+      "observed_at": "2026-11-12T09:51:28.309741Z",
+      "digest": "",
+      "custody_id": "",
+      "cited_by": [
+        "kf-daaa07c90b"
+      ],
+      "corrected": false
+    },
+    {
+      "id": "ev-593d6a753234",
+      "kind": "observation",
+      "statement": "gap-gap-3191f2: the result addresses: a package upgrade rewrote /etc/hosts",
+      "confidence": "low",
+      "sources": [
+        "artifact:disk-01.img"
+      ],
+      "supports": [],
+      "contradicts": [],
+      "collected_by": "wrk-b6e8a4138214",
+      "task_id": "",
+      "observed_at": "2026-11-12T09:51:28.488958Z",
+      "digest": "",
+      "custody_id": "",
+      "cited_by": [
+        "kf-daaa07c90b"
+      ],
+      "corrected": false
+    },
+    {
+      "id": "ev-593d6a753234",
+      "kind": "observation",
+      "statement": "gap-gap-3191f2: the result addresses: a package upgrade rewrote /etc/hosts",
+      "confidence": "low",
+      "sources": [
+        "artifact:disk-01.img"
+      ],
+      "supports": [],
+      "contradicts": [],
+      "collected_by": "wrk-9fbce6f2d677",
+      "task_id": "",
+      "observed_at": "2026-11-12T09:51:28.301784Z",
+      "digest": "",
+      "custody_id": "",
+      "cited_by": [
+        "kf-daaa07c90b"
+      ],
+      "corrected": false
+    },
+    {
+      "id": "ev-63d3042b41b3",
+      "kind": "observation",
+      "statement": "timeline-builder: timeline exported and hashed",
+      "confidence": "low",
+      "sources": [
+        "artifact:disk-01.img"
+      ],
+      "supports": [],
+      "contradicts": [],
+      "collected_by": "wrk-1c07b0fb8d33",
+      "task_id": "",
+      "observed_at": "2026-11-12T09:51:28.231000Z",
+      "digest": "",
+      "custody_id": "",
+      "cited_by": [
+        "kf-fc64013552"
+      ],
+      "corrected": false
+    },
+    {
+      "id": "ev-6d0bd99f3fdd",
+      "kind": "observation",
+      "statement": "log-correlator: each candidate process is listed with the record placing it in the write window, or stated as absent",
+      "confidence": "low",
+      "sources": [
+        "artifact:disk-01.img"
+      ],
+      "supports": [],
+      "contradicts": [],
+      "collected_by": "wrk-431fc1477437",
+      "task_id": "",
+      "observed_at": "2026-11-12T09:51:28.431220Z",
+      "digest": "",
+      "custody_id": "",
+      "cited_by": [
+        "kf-0ee603e83e"
+      ],
+      "corrected": false
+    }
+  ],
+  "custody": [
+    {
+      "evidence_id": "ev-63d3042b41b3",
+      "custody_id": "",
+      "artefact": "artifact:disk-01.img",
+      "algorithm": "",
+      "digest": "",
+      "digest_complete": false,
+      "collected_by": "wrk-1c07b0fb8d33",
+      "collected_at": "2026-11-12T09:51:28.231221Z",
+      "method": "local-read",
+      "original_location": "artifact:disk-01.img",
+      "storage_location": "",
+      "write_protected": false,
+      "read_only_verified": false,
+      "preserved": false,
+      "status": "not-assessed",
+      "events": [],
+      "gaps": [
+        "no custody record was made for this artefact: the digest alone does not establish who handled it or whether it was preserved"
+      ]
+    }
+  ],
+  "audit": {
+    "format_version": "argus-audit/1",
+    "mission_id": "flow-4da3c70d0ab3",
+    "environment": {
+      "app": "argus",
+      "app_title": "ARGUS",
+      "version": "0.35.0",
+      "version_label": "0.35.0-alpha",
+      "build_phase": 3,
+      "format_version": "argus-audit/1",
+      "python": "3.11.2",
+      "implementation": "CPython",
+      "platform": "Linux-6.1.158+-x86_64-with-glibc2.36",
+      "machine": "x86_64",
+      "user_agent": "ARGUS/0.35.0 (+authorised-security-research)",
+      "command": "report --mission flow-4da3c70d0ab3.json",
+      "operator": "",
+      "dry_run": true,
+      "mode": "live",
+      "invoked_from": "vedant_osint.py",
+      "ci": false
+    },
+    "configuration": [
+      {
+        "key": "model.provider",
+        "value": "openai",
+        "source": "default",
+        "redacted": false
+      },
+      {
+        "key": "model.provider_label",
+        "value": "OpenAI",
+        "source": "settings",
+        "redacted": false
+      },
+      {
+        "key": "model.model",
+        "value": "not set",
+        "source": "default",
+        "redacted": false
+      },
+      {
+        "key": "model.base_url",
+        "value": "not set",
+        "source": "default",
+        "redacted": false
+      },
+      {
+        "key": "model.api_key",
+        "value": "<redacted: unset, value not recorded>",
+        "source": "redacted",
+        "redacted": true
+      },
+      {
+        "key": "log_level",
+        "value": "INFO",
+        "source": "default",
+        "redacted": false
+      },
+      {
+        "key": "dry_run",
+        "value": "yes",
+        "source": "cli",
+        "redacted": false
+      },
+      {
+        "key": "orchestration.max_subagents",
+        "value": "5",
+        "source": "default",
+        "redacted": false
+      },
+      {
+        "key": "orchestration.max_workers_per_agent",
+        "value": "4",
+        "source": "default",
+        "redacted": false
+      },
+      {
+        "key": "orchestration.max_total_workers",
+        "value": "16",
+        "source": "default",
+        "redacted": false
+      },
+      {
+        "key": "orchestration.max_potential_workers",
+        "value": "20",
+        "source": "settings",
+        "redacted": false
+      },
+      {
+        "key": "orchestration.worker_retries",
+        "value": "2",
+        "source": "default",
+        "redacted": false
+      },
+      {
+        "key": "orchestration.review_retries",
+        "value": "2",
+        "source": "default",
+        "redacted": false
+      },
+      {
+        "key": "budgets.mission_budget_seconds",
+        "value": "3600",
+        "source": "default",
+        "redacted": false
+      },
+      {
+        "key": "budgets.task_budget_seconds",
+        "value": "300",
+        "source": "default",
+        "redacted": false
+      },
+      {
+        "key": "browser.headless",
+        "value": "yes",
+        "source": "settings",
+        "redacted": false
+      },
+      {
+        "key": "browser.concurrency",
+        "value": "2",
+        "source": "settings",
+        "redacted": false
+      },
+      {
+        "key": "browser.profile_dir",
+        "value": "not set",
+        "source": "settings",
+        "redacted": false
+      },
+      {
+        "key": "network.allow_network",
+        "value": "yes",
+        "source": "default",
+        "redacted": false
+      },
+      {
+        "key": "network.respect_robots",
+        "value": "yes",
+        "source": "default",
+        "redacted": false
+      },
+      {
+        "key": "network.http_concurrency",
+        "value": "8",
+        "source": "default",
+        "redacted": false
+      },
+      {
+        "key": "network.http_timeout",
+        "value": "30.0",
+        "source": "default",
+        "redacted": false
+      },
+      {
+        "key": "network.user_agent",
+        "value": "ARGUS/0.35.0 (+authorised-security-research)",
+        "source": "default",
+        "redacted": false
+      },
+      {
+        "key": "paths.output_dir",
+        "value": "argus_home/output",
+        "source": "settings",
+        "redacted": false
+      },
+      {
+        "key": "paths.case_dir",
+        "value": "not set",
+        "source": "settings",
+        "redacted": false
+      }
+    ],
+    "models": [
+      {
+        "role": "master-and-workers",
+        "provider": "openai",
+        "model": "",
+        "base_url": "",
+        "credential_state": "absent (looked in ARGUS_LLM_API_KEY | OPENAI_API_KEY)",
+        "credential_vars": [
+          "ARGUS_LLM_API_KEY",
+          "OPENAI_API_KEY"
+        ],
+        "provenance": "default"
+      }
+    ],
+    "scope": {
+      "objective": "determine from the supplied disk image which processes wrote to /etc/hosts on 2026-02-11",
+      "mode": "forensic",
+      "scope_entries": [
+        "artifact:disk-01.img"
+      ],
+      "exclusions": [],
+      "data_classes": [],
+      "available_tools": [
+        "forensic.mount",
+        "forensic.timeline",
+        "forensic.hash",
+        "log.parse"
+      ],
+      "completion_criteria": [
+        "the write is attributed to a process or the gap is stated",
+        "the image integrity is proven"
+      ],
+      "mission_questions": [
+        "a package upgrade rewrote /etc/hosts",
+        "an interactive edit rewrote /etc/hosts"
+      ],
+      "operator_notes": [],
+      "prior_findings": [],
+      "limits": {
+        "max_subagents": 4,
+        "max_total_workers": 8,
+        "mission_budget_seconds": 3600
+      },
+      "supplied_from": "context"
+    },
+    "policy": {
+      "max_parallel_subagents": 4,
+      "max_parallel_workers": 4,
+      "max_review_rounds": 2,
+      "max_replan_rounds": 1,
+      "max_master_reviews": 3,
+      "max_runtime_workers_per_subagent": 2,
+      "max_follow_up_workers_per_subagent": 1,
+      "allow_runtime_workers": true,
+      "allow_follow_ups": true,
+      "stop_on_blocking_failure": true,
+      "allow_network": true,
+      "research_first": true,
+      "capability_router": true,
+      "browser": false,
+      "browser_mode": "http",
+      "supplied_from": "flow"
+    },
+    "stamps": {
+      "started_at": "2026-11-12T09:51:28+00:00",
+      "ended_at": "2026-11-12T09:51:28+00:00",
+      "recorded_at": "2026-11-12T09:51:28+00:00",
+      "duration_seconds": 0.48,
+      "stages": [
+        [
+          "planning",
+          0.006
+        ],
+        [
+          "subagent planning",
+          0.002
+        ],
+        [
+          "worker execution",
+          0.053
+        ],
+        [
+          "worker review",
+          0.004
+        ],
+        [
+          "reconciliation",
+          0.317
+        ],
+        [
+          "master review",
+          0.007
+        ],
+        [
+          "follow-up planning",
+          0.088
+        ],
+        [
+          "synthesis",
+          0.0
+        ]
+      ]
+    },
+    "hierarchy": {
+      "units": [
+        {
+          "id": "sa-d5d2ce6948d6",
+          "kind": "subagent",
+          "role": "filesystem-timeline",
+          "parent": "master",
+          "objective": "build a filesystem timeline for /etc/hosts from the supplied disk image",
+          "status": "succeeded",
+          "gate": "none",
+          "attempts": 1,
+          "evidence": 4,
+          "seconds": 0.06,
+          "origin": "planned",
+          "spawned_by": "",
+          "depends_on": [],
+          "completion_criteria": [],
+          "dynamic": false
+        },
+        {
+          "id": "wrk-1c07b0fb8d33",
+          "kind": "worker",
+          "role": "timeline-builder",
+          "parent": "sa-d5d2ce6948d6",
+          "objective": "export the filesystem timeline entries for /etc/hosts",
+          "status": "succeeded",
+          "gate": "none",
+          "attempts": 1,
+          "evidence": 1,
+          "seconds": 0.051,
+          "origin": "planned",
+          "spawned_by": "",
+          "depends_on": [],
+          "completion_criteria": [],
+          "dynamic": false
+        },
+        {
+          "id": "wrk-5858dc9ac0db",
+          "kind": "worker",
+          "role": "filesystem-timeline gap closure",
+          "parent": "sa-d5d2ce6948d6",
+          "objective": "",
+          "status": "succeeded",
+          "gate": "none",
+          "attempts": 1,
+          "evidence": 1,
+          "seconds": 0.054,
+          "origin": "runtime",
+          "spawned_by": "",
+          "depends_on": [],
+          "completion_criteria": [],
+          "dynamic": true
+        },
+        {
+          "id": "wrk-bb85d666fcc9",
+          "kind": "worker",
+          "role": "filesystem-timeline gap closure",
+          "parent": "sa-d5d2ce6948d6",
+          "objective": "",
+          "status": "succeeded",
+          "gate": "none",
+          "attempts": 1,
+          "evidence": 1,
+          "seconds": 0.051,
+          "origin": "runtime",
+          "spawned_by": "",
+          "depends_on": [],
+          "completion_criteria": [],
+          "dynamic": true
+        },
+        {
+          "id": "wrk-4d732ce2f31d",
+          "kind": "worker",
+          "role": "follow-up-flw-ed7c9f",
+          "parent": "sa-d5d2ce6948d6",
+          "objective": "close the reviewed gap for filesystem-timeline: coverage on nobody covers: the image integrity is proven",
+          "status": "succeeded",
+          "gate": "none",
+          "attempts": 1,
+          "evidence": 1,
+          "seconds": 0.051,
+          "origin": "follow-up",
+          "spawned_by": "",
+          "depends_on": [],
+          "completion_criteria": [],
+          "dynamic": true
+        },
+        {
+          "id": "sa-4086c156a6ac",
+          "kind": "subagent",
+          "role": "process-attribution",
+          "parent": "master",
+          "objective": "identify which process wrote /etc/hosts, using logs and the timeline window",
+          "status": "succeeded",
+          "gate": "none",
+          "attempts": 1,
+          "evidence": 3,
+          "seconds": 0.174,
+          "origin": "planned",
+          "spawned_by": "",
+          "depends_on": [
+            "sa-d5d2ce6948d6"
+          ],
+          "completion_criteria": [],
+          "dynamic": false
+        },
+        {
+          "id": "wrk-431fc1477437",
+          "kind": "worker",
+          "role": "log-correlator",
+          "parent": "sa-4086c156a6ac",
+          "objective": "correlate process records with the write window",
+          "status": "succeeded",
+          "gate": "none",
+          "attempts": 1,
+          "evidence": 1,
+          "seconds": 0.05,
+          "origin": "planned",
+          "spawned_by": "",
+          "depends_on": [],
+          "completion_criteria": [],
+          "dynamic": false
+        },
+        {
+          "id": "wrk-b6e8a4138214",
+          "kind": "worker",
+          "role": "process-attribution gap closure",
+          "parent": "sa-4086c156a6ac",
+          "objective": "",
+          "status": "succeeded",
+          "gate": "none",
+          "attempts": 1,
+          "evidence": 1,
+          "seconds": 0.05,
+          "origin": "runtime",
+          "spawned_by": "",
+          "depends_on": [],
+          "completion_criteria": [],
+          "dynamic": true
+        },
+        {
+          "id": "wrk-497329fad247",
+          "kind": "worker",
+          "role": "process-attribution gap closure",
+          "parent": "sa-4086c156a6ac",
+          "objective": "",
+          "status": "succeeded",
+          "gate": "none",
+          "attempts": 1,
+          "evidence": 1,
+          "seconds": 0.05,
+          "origin": "runtime",
+          "spawned_by": "",
+          "depends_on": [],
+          "completion_criteria": [],
+          "dynamic": true
+        },
+        {
+          "id": "sa-e78a4faf4252",
+          "kind": "subagent",
+          "role": "integrity",
+          "parent": "master",
+          "objective": "hash the image and the extracted artefacts so findings are reproducible",
+          "status": "succeeded",
+          "gate": "none",
+          "attempts": 1,
+          "evidence": 4,
+          "seconds": 0.185,
+          "origin": "planned",
+          "spawned_by": "",
+          "depends_on": [],
+          "completion_criteria": [],
+          "dynamic": false
+        },
+        {
+          "id": "wrk-e9172d9b03fe",
+          "kind": "worker",
+          "role": "hasher",
+          "parent": "sa-e78a4faf4252",
+          "objective": "hash the image and every extracted artefact",
+          "status": "succeeded",
+          "gate": "none",
+          "attempts": 1,
+          "evidence": 1,
+          "seconds": 0.052,
+          "origin": "planned",
+          "spawned_by": "",
+          "depends_on": [],
+          "completion_criteria": [],
+          "dynamic": false
+        },
+        {
+          "id": "wrk-747fa27d8781",
+          "kind": "worker",
+          "role": "custody-recorder",
+          "parent": "sa-e78a4faf4252",
+          "objective": "record who handled each artefact and when",
+          "status": "succeeded",
+          "gate": "none",
+          "attempts": 1,
+          "evidence": 1,
+          "seconds": 0.052,
+          "origin": "planned",
+          "spawned_by": "",
+          "depends_on": [],
+          "completion_criteria": [],
+          "dynamic": false
+        },
+        {
+          "id": "wrk-9fbce6f2d677",
+          "kind": "worker",
+          "role": "integrity gap closure",
+          "parent": "sa-e78a4faf4252",
+          "objective": "",
+          "status": "succeeded",
+          "gate": "none",
+          "attempts": 1,
+          "evidence": 1,
+          "seconds": 0.05,
+          "origin": "runtime",
+          "spawned_by": "",
+          "depends_on": [],
+          "completion_criteria": [],
+          "dynamic": true
+        },
+        {
+          "id": "wrk-23f0456d4738",
+          "kind": "worker",
+          "role": "integrity gap closure",
+          "parent": "sa-e78a4faf4252",
+          "objective": "",
+          "status": "succeeded",
+          "gate": "none",
+          "attempts": 1,
+          "evidence": 1,
+          "seconds": 0.05,
+          "origin": "runtime",
+          "spawned_by": "",
+          "depends_on": [],
+          "completion_criteria": [],
+          "dynamic": true
+        }
+      ],
+      "edges": {
+        "master": [
+          "sa-4086c156a6ac",
+          "sa-d5d2ce6948d6",
+          "sa-e78a4faf4252"
+        ],
+        "sa-d5d2ce6948d6": [
+          "wrk-1c07b0fb8d33",
+          "wrk-4d732ce2f31d",
+          "wrk-5858dc9ac0db",
+          "wrk-bb85d666fcc9"
+        ],
+        "sa-4086c156a6ac": [
+          "wrk-431fc1477437",
+          "wrk-497329fad247",
+          "wrk-b6e8a4138214"
+        ],
+        "sa-e78a4faf4252": [
+          "wrk-23f0456d4738",
+          "wrk-747fa27d8781",
+          "wrk-9fbce6f2d677",
+          "wrk-e9172d9b03fe"
+        ]
+      },
+      "depth": 2,
+      "planned": 7,
+      "dynamic": 7,
+      "max_observed_concurrency": 3,
+      "waves": [
+        [
+          "sa-d5d2ce6948d6",
+          "sa-e78a4faf4252"
+        ],
+        [
+          "sa-4086c156a6ac"
+        ]
+      ],
+      "supplied_from": "flow"
+    },
+    "tool_failures": [],
+    "stopping": {
+      "kind": "saturation",
+      "condition": "saturation",
+      "reason": "no further round is allowed: round 2 planned the same work as round 1 over 3 target(s) that round had already addressed (saturation); the replanning budget of 1 round(s) is spent",
+      "stopped": false,
+      "bounded": true,
+      "reviews": 2,
+      "rounds": 1,
+      "bounds": [
+        "refused: round 2 planned the same work as round 1 over 3 target(s) that round had already addressed (saturation)",
+        "refused: the replanning budget of 1 round(s) is spent"
+      ]
+    },
+    "secrets": {
+      "scanned": true,
+      "clean": true,
+      "bytes_scanned": 91411,
+      "findings": [],
+      "rules": [
+        {
+          "what": "api keys and provider tokens",
+          "why": "a credential is authority, not procedure: a record that carried one would let a reader act as the operator instead of reproducing their setup",
+          "count": 0,
+          "removed": false
+        },
+        {
+          "what": "cookies and browser session state",
+          "why": "a cookie is the operator's authenticated identity on somebody else's service",
+          "count": 0,
+          "removed": false
+        },
+        {
+          "what": "browser profile contents and credentials",
+          "why": "the profile directory is named so the setup can be repeated; none of its contents are copied",
+          "count": 0,
+          "removed": false
+        },
+        {
+          "what": "page content beyond cited findings",
+          "why": "the evidence table carries what a finding rests on, quoted and hashed; copying the pages themselves would spread third-party material the report does not need",
+          "count": 14,
+          "removed": false
+        },
+        {
+          "what": "model prompts, scratchpads and raw completions",
+          "why": "a prompt carries the operator's phrasing and every retrieved page; the identifiers and limits are kept, the text is not",
+          "count": 0,
+          "removed": false
+        },
+        {
+          "what": "the operator's home directory",
+          "why": "the path is a fact about a workstation, not about the procedure",
+          "count": 0,
+          "removed": false
+        }
+      ],
+      "scanned_at": "2026-11-12T09:52:45+00:00",
+      "patterns": [
+        "connection-string-password",
+        "json-credential-field",
+        "key-value-credential",
+        "bearer-token",
+        "bearer-header",
+        "cookie-header",
+        "set-cookie",
+        "session-id",
+        "private-key-block",
+        "known-prefix",
+        "known-credential-value",
+        "credential-store-shape"
+      ],
+      "scanned_text": "clean: 91,411 byte(s) scanned for 12 credential pattern(s)"
+    },
+    "reproduction": [
+      {
+        "order": 1,
+        "command": "python -m pip install -r requirements.txt",
+        "purpose": "install the same dependency set (typer, rich, pydantic, langgraph, \u2026)",
+        "needs_credential": false
+      },
+      {
+        "order": 2,
+        "command": "export ARGUS_LLM_MODEL=<model> && python vedant_osint.py flow -t artifact:disk-01.img -o \"determine from the supplied disk image which processes wrote to /etc/hosts on 2026-02-11\" --out-dir out/",
+        "purpose": "run the same mission with your own credential and the model named in the Models section; the limits were max_subagents=4, max_total_workers=8, mission_budget_seconds=3600",
+        "needs_credential": true
+      },
+      {
+        "order": 3,
+        "command": "python vedant_osint.py report --mission out/flow-*.json --out-dir out/",
+        "purpose": "write the same three formats from the new run",
+        "needs_credential": false
+      }
+    ],
+    "retention": {
+      "note": "This report is an investigation record, not a log file. It can contain personal data, unpublished material about a third party, and evidence that has been hashed so that it can be identified later. Protect it accordingly: keep it on access-controlled storage, share it only with people entitled to see the investigation, and keep the chain-of-custody sheet with the artefacts it describes \u2014 a digest without the artefact proves nothing. Scope, collection and retention of the data in this file are the operator's responsibility under the law that applies to them; this tool records what happened and does not decide how long that record may be kept. No API key, cookie, browser credential or page content beyond the cited findings is stored in it, and a copy of it is safe to hand to another operator *for the purpose of reproducing the procedure* \u2014 which is not the same as safe to publish.",
+      "contains_personal_data": true,
+      "contains_third_party_material": true,
+      "contains_forensic_artefacts": false,
+      "handled_by": "the operator",
+      "retention_decided_by": "the operator, under the law that applies to them",
+      "guidance": [
+        "keep the .json beside the .md: the JSON is the record, the Markdown is a view of it",
+        "keep the chain-of-custody sheet with the artefacts it describes",
+        "do not commit investigation output to a public repository",
+        "remove the file when the investigation's retention period ends, on the schedule the operator's own policy sets"
+      ]
+    },
+    "notes": [],
+    "clause": {
+      "names_the_software": true,
+      "names_the_configuration": true,
+      "names_the_models": true,
+      "names_the_scope": true,
+      "names_the_hierarchy": true,
+      "names_the_stop": true,
+      "reproducible": true,
+      "retention_stated": true,
+      "no_secrets": true,
+      "ok": true,
+      "errors": []
+    },
+    "redacted_keys": [
+      "model.api_key"
+    ]
+  },
+  "acceptance": {
+    "markdown_complete": true,
+    "json_round_trips": true,
+    "summary_concise": true,
+    "custody_preserved": true,
+    "errors": []
+  }
+}
